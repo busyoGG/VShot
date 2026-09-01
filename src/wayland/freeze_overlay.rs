@@ -33,6 +33,7 @@ pub(crate) struct BufferUserData {
 pub(crate) struct ShmSlot {
     pub(crate) _file: tempfile::NamedTempFile,
     pub(crate) map: MmapMut,
+    dimmed: Option<Vec<u8>>,
     pub(crate) buffer: wl_buffer::WlBuffer,
     pub(crate) stride: usize,
     pub(crate) width: u32,
@@ -116,6 +117,7 @@ impl ShmSlot {
         Ok(Self {
             _file: file,
             map,
+            dimmed: None,
             buffer,
             stride,
             width,
@@ -152,12 +154,18 @@ impl ShmSlot {
                 self.height
             )));
         }
+        let map_len = checked_buffer_len(self.stride, self.width, self.height)?;
+        if self.map.len() < map_len {
+            return Err(VshotError::WaylandProtocol(
+                "SHM map is smaller than its declared dimensions".into(),
+            ));
+        }
         if let Some(editor) = editor {
             let mut rendered = frame.clone();
             render_annotations(&mut rendered, editor, output_geometry, scale)?;
-            rendered.copy_rgba_to_bgra(&mut self.map[..], self.stride, Point::new(0, 0))?;
-        } else {
-            frame.copy_rgba_to_bgra(&mut self.map[..], self.stride, Point::new(0, 0))?;
+            rendered.copy_rgba_to_bgra(&mut self.map[..map_len], self.stride, Point::new(0, 0))?;
+        } else if selection.is_none() {
+            frame.copy_rgba_to_bgra(&mut self.map[..map_len], self.stride, Point::new(0, 0))?;
         }
         let Some(selection) = selection else {
             if let Some(editor) = editor {
@@ -172,19 +180,36 @@ impl ShmSlot {
         }
         let selection_right = selection.right()?;
         let selection_bottom = selection.bottom()?;
-        for pixel_y in 0..self.height {
-            let logical_y = output_geometry.top() + (pixel_y / scale) as i32;
-            for pixel_x in 0..self.width {
-                let logical_x = output_geometry.left() + (pixel_x / scale) as i32;
-                let inside = logical_x >= selection.left()
-                    && logical_x < selection_right
-                    && logical_y >= selection.top()
-                    && logical_y < selection_bottom;
-                let index = pixel_y as usize * self.stride + pixel_x as usize * 4;
-                if !inside {
-                    self.map[index] /= 2;
-                    self.map[index + 1] /= 2;
-                    self.map[index + 2] /= 2;
+        if editor.is_none() {
+            if self
+                .dimmed
+                .as_ref()
+                .is_none_or(|dimmed| dimmed.len() != map_len)
+            {
+                let mut dimmed = vec![0; map_len];
+                frame.copy_rgba_to_bgra(&mut dimmed, self.stride, Point::new(0, 0))?;
+                dim_bgra(&mut dimmed, self.stride, self.width, self.height)?;
+                self.dimmed = Some(dimmed);
+            }
+            let dimmed = self.dimmed.as_ref().ok_or_else(|| {
+                VshotError::WaylandProtocol("failed to initialize dimmed SHM cache".into())
+            })?;
+            self.map[..map_len].copy_from_slice(dimmed);
+        } else {
+            for pixel_y in 0..self.height {
+                let logical_y = output_geometry.top() + (pixel_y / scale) as i32;
+                for pixel_x in 0..self.width {
+                    let logical_x = output_geometry.left() + (pixel_x / scale) as i32;
+                    let inside = logical_x >= selection.left()
+                        && logical_x < selection_right
+                        && logical_y >= selection.top()
+                        && logical_y < selection_bottom;
+                    let index = pixel_y as usize * self.stride + pixel_x as usize * 4;
+                    if !inside {
+                        self.map[index] /= 2;
+                        self.map[index + 1] /= 2;
+                        self.map[index + 2] /= 2;
+                    }
                 }
             }
         }
@@ -219,6 +244,27 @@ impl ShmSlot {
                         VshotError::WaylandProtocol("selection bottom edge overflows".into())
                     })?
                     .min(self.height);
+            if editor.is_none() && left < right && top < bottom {
+                let source_rect = Rect::new(
+                    i32::try_from(left).map_err(|_| {
+                        VshotError::WaylandProtocol("selection x is out of range".into())
+                    })?,
+                    i32::try_from(top).map_err(|_| {
+                        VshotError::WaylandProtocol("selection y is out of range".into())
+                    })?,
+                    right - left,
+                    bottom - top,
+                );
+                copy_rgba_rect_to_bgra(
+                    frame.pixels(),
+                    frame.size().width,
+                    frame.size().height,
+                    &mut self.map[..map_len],
+                    self.stride,
+                    source_rect,
+                    source_rect.origin,
+                )?;
+            }
             let thickness = scale.clamp(1, 4);
             for pixel_y in top..bottom {
                 for pixel_x in left..right {
@@ -249,6 +295,138 @@ impl ShmSlot {
         }
         Ok(())
     }
+}
+
+fn checked_buffer_len(stride: usize, width: u32, height: u32) -> Result<usize> {
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| VshotError::InvalidGeometry("SHM row is too large".into()))?;
+    if stride < row_bytes {
+        return Err(VshotError::InvalidGeometry(
+            "SHM stride is smaller than the pixel row".into(),
+        ));
+    }
+    stride
+        .checked_mul(
+            usize::try_from(height)
+                .map_err(|_| VshotError::InvalidGeometry("SHM height is too large".into()))?,
+        )
+        .ok_or_else(|| VshotError::InvalidGeometry("SHM buffer is too large".into()))
+}
+
+fn dim_bgra(map: &mut [u8], stride: usize, width: u32, height: u32) -> Result<()> {
+    let width = usize::try_from(width)
+        .map_err(|_| VshotError::InvalidGeometry("BGRA width is too large".into()))?;
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| VshotError::InvalidGeometry("BGRA row is too large".into()))?;
+    let height = usize::try_from(height)
+        .map_err(|_| VshotError::InvalidGeometry("BGRA height is too large".into()))?;
+    let required = stride
+        .checked_mul(height)
+        .ok_or_else(|| VshotError::InvalidGeometry("BGRA buffer is too large".into()))?;
+    if stride < row_bytes || required > map.len() {
+        return Err(VshotError::InvalidGeometry(
+            "BGRA buffer is too small for its dimensions".into(),
+        ));
+    }
+    for y in 0..height {
+        let row = y * stride;
+        for x in 0..width {
+            let index = row + x * 4;
+            map[index] /= 2;
+            map[index + 1] /= 2;
+            map[index + 2] /= 2;
+        }
+    }
+    Ok(())
+}
+
+fn copy_rgba_rect_to_bgra(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    destination: &mut [u8],
+    destination_stride: usize,
+    source_rect: Rect,
+    destination_origin: Point,
+) -> Result<()> {
+    if source_rect.is_empty() {
+        return Err(VshotError::InvalidGeometry(
+            "source rectangle must not be empty".into(),
+        ));
+    }
+    if source_rect.left() < 0 || source_rect.top() < 0 {
+        return Err(VshotError::InvalidGeometry(
+            "source rectangle origin must be non-negative".into(),
+        ));
+    }
+    if destination_origin.x < 0 || destination_origin.y < 0 {
+        return Err(VshotError::InvalidGeometry(
+            "destination origin must be non-negative".into(),
+        ));
+    }
+    let source_right = usize::try_from(source_rect.right()?)
+        .map_err(|_| VshotError::InvalidGeometry("source rectangle is out of range".into()))?;
+    let source_bottom = usize::try_from(source_rect.bottom()?)
+        .map_err(|_| VshotError::InvalidGeometry("source rectangle is out of range".into()))?;
+    let source_x = usize::try_from(source_rect.left())
+        .map_err(|_| VshotError::InvalidGeometry("source rectangle is out of range".into()))?;
+    let source_y = usize::try_from(source_rect.top())
+        .map_err(|_| VshotError::InvalidGeometry("source rectangle is out of range".into()))?;
+    let source_width = usize::try_from(source_width)
+        .map_err(|_| VshotError::InvalidGeometry("source width is too large".into()))?;
+    let source_height = usize::try_from(source_height)
+        .map_err(|_| VshotError::InvalidGeometry("source height is too large".into()))?;
+    let source_row_bytes = source_width
+        .checked_mul(4)
+        .ok_or_else(|| VshotError::InvalidGeometry("source row is too large".into()))?;
+    let source_len = source_row_bytes
+        .checked_mul(source_height)
+        .ok_or_else(|| VshotError::InvalidGeometry("source buffer is too large".into()))?;
+    if source_right > source_width || source_bottom > source_height || source.len() < source_len {
+        return Err(VshotError::InvalidGeometry(
+            "source rectangle is outside the source buffer".into(),
+        ));
+    }
+    let width = usize::try_from(source_rect.size.width)
+        .map_err(|_| VshotError::InvalidGeometry("source rectangle is too large".into()))?;
+    let height = usize::try_from(source_rect.size.height)
+        .map_err(|_| VshotError::InvalidGeometry("source rectangle is too large".into()))?;
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| VshotError::InvalidGeometry("copy row is too large".into()))?;
+    let destination_x = usize::try_from(destination_origin.x)
+        .map_err(|_| VshotError::InvalidGeometry("destination origin is out of range".into()))?;
+    let destination_y = usize::try_from(destination_origin.y)
+        .map_err(|_| VshotError::InvalidGeometry("destination origin is out of range".into()))?;
+    let destination_last_row = destination_y
+        .checked_add(height.saturating_sub(1))
+        .ok_or_else(|| VshotError::InvalidGeometry("destination is too large".into()))?;
+    let required = destination_last_row
+        .checked_mul(destination_stride)
+        .and_then(|row| row.checked_add(destination_x.checked_mul(4)?))
+        .and_then(|row| row.checked_add(row_bytes))
+        .ok_or_else(|| VshotError::InvalidGeometry("destination is too large".into()))?;
+    if destination_stride < row_bytes || required > destination.len() {
+        return Err(VshotError::InvalidGeometry(
+            "destination buffer is too small".into(),
+        ));
+    }
+    for row in 0..height {
+        let source_row = (source_y + row) * source_row_bytes + source_x * 4;
+        let destination_row = (destination_y + row) * destination_stride + destination_x * 4;
+        for column in 0..width {
+            let source_index = source_row + column * 4;
+            let destination_index = destination_row + column * 4;
+            destination[destination_index] = source[source_index + 2];
+            destination[destination_index + 1] = source[source_index + 1];
+            destination[destination_index + 2] = source[source_index];
+            destination[destination_index + 3] = source[source_index + 3];
+        }
+    }
+    Ok(())
 }
 
 fn map_point(point: Point, output: Rect, scale: u32) -> Result<Point> {
@@ -542,5 +720,75 @@ impl Drop for OverlaySurface {
         self.surface.commit();
         self._layer_surface.destroy();
         self.surface.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Size;
+
+    #[test]
+    fn dim_bgra_preserves_alpha_and_row_padding() {
+        let mut map = vec![
+            10, 20, 30, 40, 101, 102, 103, 104, 77, 78, 79, 80, 20, 21, 22, 23, 201, 202, 203, 204,
+            88, 89, 90, 91,
+        ];
+
+        dim_bgra(&mut map, 12, 2, 2).unwrap();
+
+        assert_eq!(
+            map,
+            vec![
+                5, 10, 15, 40, 50, 51, 51, 104, 77, 78, 79, 80, 10, 10, 11, 23, 100, 101, 101, 204,
+                88, 89, 90, 91,
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_rgba_rect_to_bgra_copies_only_requested_pixels() {
+        let frame = Frame::new(
+            Size::new(3, 2),
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24,
+            ],
+        )
+        .unwrap();
+        let mut destination = vec![0xee; 32];
+
+        copy_rgba_rect_to_bgra(
+            frame.pixels(),
+            frame.size().width,
+            frame.size().height,
+            &mut destination,
+            16,
+            Rect::new(1, 0, 2, 2),
+            Point::new(0, 0),
+        )
+        .unwrap();
+
+        assert_eq!(&destination[0..8], &[7, 6, 5, 8, 11, 10, 9, 12]);
+        assert_eq!(&destination[16..24], &[19, 18, 17, 20, 23, 22, 21, 24]);
+        assert_eq!(destination[8..16], [0xee; 8]);
+        assert_eq!(destination[24..32], [0xee; 8]);
+    }
+
+    #[test]
+    fn pixel_helpers_reject_short_buffers() {
+        assert!(dim_bgra(&mut [0; 7], 8, 2, 1).is_err());
+
+        let frame = Frame::solid(Size::new(2, 1), [1, 2, 3, 4]).unwrap();
+        assert!(copy_rgba_rect_to_bgra(
+            frame.pixels(),
+            frame.size().width,
+            frame.size().height,
+            &mut [0; 7],
+            8,
+            Rect::new(0, 0, 2, 1),
+            Point::new(0, 0),
+        )
+        .is_err());
     }
 }
