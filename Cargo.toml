@@ -1,0 +1,25 @@
+[package]
+name = "vshot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A strict-freeze Wayland screenshot CLI for wlroots compositors"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+memmap2 = "0.9.11"
+rustix = { version = "1.1.4", features = ["event"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+wayland-client = "0.31.13"
+wayland-protocols = { version = "0.32.12", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
