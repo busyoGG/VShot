@@ -5,6 +5,8 @@ mod error;
 mod geometry;
 mod model;
 mod output;
+mod pin;
+mod qt_overlay;
 mod selection;
 mod wayland;
 
@@ -15,8 +17,8 @@ use crate::geometry::{Point, Rect};
 use clap::Parser;
 
 use capture::{CompositorWindowProvider, ProcessWindowProvider, WlrCapture};
-use cli::{CaptureTarget, Cli};
-use edit::EditPipeline;
+use cli::{Action, CaptureTarget, Cli};
+use edit::{mosaic_block_size, mosaic_brush_radius, EditPipeline, ShapeMask};
 use error::{Result, VshotError};
 use model::{ImageDocument, OutputSnapshot, SceneSnapshot};
 use wayland::input::{Annotation, EditorTool};
@@ -34,7 +36,15 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let request = Cli::parse().parse_request()?;
+    let cli = Cli::parse();
+    let action = cli.parse_action()?;
+    let request = match action {
+        Action::Pin(invocation) => {
+            // Pin management talks to the daemon only; no capture, no scene.
+            return pin::run(invocation);
+        }
+        Action::Capture(request) => request,
+    };
     let mut wayland = WaylandSession::connect()?;
     let output_infos = wayland.output_infos()?;
     let mut capture = WlrCapture::connect()?;
@@ -53,7 +63,9 @@ fn run() -> Result<()> {
             scene.crop(window.geometry)
         })
         .transpose()?;
-    wayland.set_scene(scene.clone());
+    if !matches!(request.target, CaptureTarget::RegionInteractive) {
+        wayland.set_scene(scene.clone());
+    }
 
     let mut edits = EditPipeline::new();
     let frame = match &request.target {
@@ -63,11 +75,8 @@ fn run() -> Result<()> {
             frame
         }
         CaptureTarget::RegionInteractive => {
-            wayland.show_frozen(true)?;
-            let geometry = wayland.select_region()?;
+            let (geometry, annotations) = qt_overlay::select_and_edit(&scene)?;
             let geometry = selection::validate_selection(&scene, geometry)?;
-            wayland.start_editor(geometry)?;
-            let (geometry, annotations) = wayland.edit_region()?;
             let frame = scene.crop(geometry)?;
             edits = pipeline_for_annotations(annotations, geometry, scene.scale())?;
             frame
@@ -107,55 +116,61 @@ fn pipeline_for_annotations(
 ) -> Result<EditPipeline> {
     let mut pipeline = EditPipeline::new();
     for annotation in annotations {
+        let color = annotation.color();
+        let width = device_width(annotation.width(), scale)?;
+        let dash = annotation.dash();
+        let head = annotation.head();
+        let arrow_style = annotation.arrow_style();
+        let strength = annotation.strength();
         match annotation {
-            Annotation::Shape { tool, rect } => {
+            Annotation::Shape {
+                tool, rect, mask, ..
+            } => {
                 let rect = local_rect(rect, selection, scale)?;
                 match tool {
                     EditorTool::Rectangle => {
-                        pipeline =
-                            pipeline.rectangle_stroke(rect, [255, 64, 64, 255], scale.clamp(1, 4));
+                        pipeline = pipeline.rectangle_stroke(rect, color, width, dash);
                     }
                     EditorTool::Ellipse => {
-                        let radius = rect.size.width.min(rect.size.height) / 2;
-                        if radius > 0 {
-                            let center = Point::new(
-                                rect.left().saturating_add((rect.size.width / 2) as i32),
-                                rect.top().saturating_add((rect.size.height / 2) as i32),
-                            );
-                            pipeline = pipeline.circle_stroke(
-                                center,
-                                radius,
-                                [255, 64, 64, 255],
-                                scale.clamp(1, 4),
-                            );
-                        }
+                        pipeline = pipeline.ellipse_stroke(rect, color, width, dash);
+                    }
+                    EditorTool::Mosaic | EditorTool::Blur => {
+                        let block = mosaic_block_size(strength, scale);
+                        pipeline = match mask {
+                            ShapeMask::Rect => pipeline.mosaic(rect, block),
+                            ShapeMask::Ellipse => pipeline.mosaic_ellipse(rect, block),
+                        };
                     }
                     _ => {}
                 }
             }
-            Annotation::Stroke { tool, points } => {
+            Annotation::Stroke { tool, points, .. } => {
                 let points = points
                     .into_iter()
                     .map(|point| local_point(point, selection, scale))
                     .collect::<Result<Vec<_>>>()?;
-                let width = scale.clamp(1, 4);
                 match tool {
                     EditorTool::Arrow if points.len() >= 2 => {
-                        pipeline = pipeline.arrow(
+                        pipeline = pipeline.arrow_with_style(
                             points[0],
                             *points.last().ok_or_else(|| {
                                 VshotError::Selection("arrow has no endpoint".into())
                             })?,
-                            [255, 64, 64, 255],
+                            color,
                             width,
+                            dash,
+                            head,
+                            arrow_style,
                         );
                     }
                     EditorTool::Pen | EditorTool::Draw | EditorTool::Line => {
-                        pipeline = pipeline.freehand(points, [255, 64, 64, 255], width);
+                        pipeline = pipeline.freehand(points, color, width, dash);
                     }
                     EditorTool::Mosaic | EditorTool::Blur => {
-                        let bounds = points_bounds(&points)?;
-                        pipeline = pipeline.mosaic(bounds, (12_u32).saturating_mul(scale).max(1));
+                        // Freehand mosaic smears discs along the path; the
+                        // strength level scales the smear radius.
+                        let radius = mosaic_brush_radius(strength, width);
+                        pipeline = pipeline.mosaic_brush(points, radius);
                     }
                     _ => {}
                 }
@@ -164,17 +179,31 @@ fn pipeline_for_annotations(
                 origin,
                 text,
                 scale: text_scale,
+                bitmap,
+                ..
             } => {
-                pipeline = pipeline.text(
-                    local_point(origin, selection, scale)?,
-                    text,
-                    [255, 255, 255, 255],
-                    text_scale.saturating_mul(scale).max(1),
-                );
+                let origin = local_point(origin, selection, scale)?;
+                pipeline = match bitmap {
+                    // Helper-rendered with the user-selected font: composite
+                    // the device-pixel bitmap as-is.
+                    Some(bitmap) => pipeline.blit(origin, bitmap),
+                    None => {
+                        pipeline.text(origin, text, color, text_scale.saturating_mul(scale).max(1))
+                    }
+                };
             }
         }
     }
     Ok(pipeline)
+}
+
+/// Converts an annotation stroke width from logical pixels to device pixels.
+fn device_width(logical_width: u32, scale: u32) -> Result<u32> {
+    let width = logical_width
+        .max(1)
+        .checked_mul(scale)
+        .ok_or_else(|| VshotError::InvalidGeometry("annotation width overflows".into()))?;
+    Ok(width.clamp(1, 4096))
 }
 
 fn local_point(point: Point, selection: Rect, scale: u32) -> Result<Point> {
@@ -208,35 +237,6 @@ fn local_rect(rect: Rect, selection: Rect, scale: u32) -> Result<Rect> {
     ))
 }
 
-fn points_bounds(points: &[Point]) -> Result<Rect> {
-    let first = *points
-        .first()
-        .ok_or_else(|| VshotError::Selection("drawing gesture has no points".into()))?;
-    let (min_x, max_x, min_y, max_y) = points.iter().skip(1).fold(
-        (first.x, first.x, first.y, first.y),
-        |(min_x, max_x, min_y, max_y), point| {
-            (
-                min_x.min(point.x),
-                max_x.max(point.x),
-                min_y.min(point.y),
-                max_y.max(point.y),
-            )
-        },
-    );
-    let right = max_x
-        .checked_add(1)
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation right edge overflows".into()))?;
-    let bottom = max_y
-        .checked_add(1)
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation bottom edge overflows".into()))?;
-    Ok(Rect::new(
-        min_x,
-        min_y,
-        (right - min_x) as u32,
-        (bottom - min_y) as u32,
-    ))
-}
-
 fn capture_scene(
     capture: &mut WlrCapture,
     output_infos: &[OutputInfo],
@@ -264,6 +264,7 @@ fn capture_scene(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::{ArrowStyle, LineDash};
     use crate::geometry::Size;
     use crate::model::Frame;
     use crate::wayland::input::Annotation;
@@ -288,21 +289,40 @@ mod tests {
     }
 
     #[test]
-    fn annotation_pipeline_renders_text_and_mosaic() {
+    fn annotation_pipeline_renders_text_and_mosaic_brush() {
+        let mut pixels = vec![0u8; 400];
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&[0, 0, 0, 255]);
+        }
+        // A single bright pixel inside the stamp disc.
+        pixels[(3 * 10 + 3) * 4] = 255;
+        let frame = Frame::new(Size::new(10, 10), pixels).unwrap();
         let pipeline = pipeline_for_annotations(
             vec![
-                Annotation::text(Point::new(0, 0), "A", 1),
-                Annotation::stroke(EditorTool::Mosaic, vec![Point::new(2, 2), Point::new(5, 5)]),
+                Annotation::text(Point::new(8, 8), "A", 1),
+                Annotation::Stroke {
+                    tool: EditorTool::Mosaic,
+                    points: vec![Point::new(2, 2), Point::new(5, 5)],
+                    color: [255, 64, 64, 255],
+                    width: 8,
+                    dash: LineDash::Solid,
+                    head: 1,
+                    arrow_style: ArrowStyle::Open,
+                    strength: 2,
+                },
             ],
             Rect::new(0, 0, 10, 10),
             1,
         )
         .unwrap();
-        let frame = Frame::solid(Size::new(10, 10), [10, 20, 30, 255]).unwrap();
         let document = pipeline.apply(ImageDocument::new(frame)).unwrap();
-        assert_ne!(
+        // Brush radius = width/2 = 4.  The stamp walk emits centers
+        // (2,2), (3,3), (4,4), (5,5); (1, 0) is covered by the (2,2) and
+        // (3,3) discs and the later one wins, spreading the brightness of
+        // the pixel at (3, 3) as a 5/47-ish local average.
+        assert_eq!(
             document.frame().pixel(Point::new(1, 0)),
-            Some([10, 20, 30, 255])
+            Some([5, 0, 0, 255])
         );
     }
 }

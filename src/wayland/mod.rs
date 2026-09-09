@@ -10,23 +10,30 @@ use wayland_client::protocol::{
     wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::error::{Result, VshotError};
-use crate::geometry::{Point, Rect, Size};
+use crate::geometry::{Point, Rect};
 use crate::model::SceneSnapshot;
 
 use self::freeze_overlay::{
-    BufferUserData, LayerSurfaceUserData, OverlaySurface, PoolUserData, ShmSlot, SurfaceUserData,
+    release_buffer_if_current, BufferToken, BufferUserData, LayerSurfaceUserData, OverlaySurface,
+    PoolUserData, ShmSlot, SurfaceUserData,
 };
 use self::input::{
-    Annotation, EditorState, EditorTool, SelectionEvent, SelectionResult, SelectionTracker,
-    ToolbarLayout, BTN_LEFT, KEY_ESC,
+    EditorState, ResizeHandle, SelectionEvent, SelectionResult, SelectionTracker, BTN_LEFT, KEY_ESC,
 };
 use self::topology::{OutputData, OutputInfo, OutputUserData, TopologyState};
 
-const INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedrawTarget {
+    ParentSelection,
+    ParentEditor,
+}
 
 pub struct WaylandSession {
     event_queue: EventQueue<WaylandState>,
@@ -47,6 +54,7 @@ struct WaylandState {
     editor: Option<EditorState>,
     selection_outcome: Option<SelectionResult>,
     interaction_redraw_pending: bool,
+    next_buffer_id: u64,
     error: Option<VshotError>,
 }
 
@@ -65,8 +73,60 @@ impl WaylandState {
         std::mem::take(&mut self.interaction_redraw_pending)
     }
 
+    fn redraw_target(&self) -> RedrawTarget {
+        if self.editor.is_some() {
+            RedrawTarget::ParentEditor
+        } else {
+            RedrawTarget::ParentSelection
+        }
+    }
+
+    fn pointer_motion_output(&self) -> Option<u32> {
+        self.pointer_grab_output.or(self.pointer_output)
+    }
+
+    fn set_cursor_shape(&mut self, shape: wp_cursor_shape_device_v1::Shape) {
+        let Some(serial) = self.topology.cursor_enter_serial else {
+            return;
+        };
+        let Some(device) = self.topology.cursor_shape_device.clone() else {
+            return;
+        };
+        if self.topology.cursor_shape == Some(shape) {
+            return;
+        }
+        device.set_shape(serial, shape);
+        self.topology.cursor_shape = Some(shape);
+    }
+
+    fn update_cursor_shape(&mut self) {
+        let shape = self
+            .editor
+            .as_ref()
+            .and_then(|editor| {
+                editor.pointer().map(|point| {
+                    if editor.toolbar_hit_test(point).is_some() || !editor.tool().is_selection() {
+                        wp_cursor_shape_device_v1::Shape::Pointer
+                    } else {
+                        cursor_shape_for_handle(editor.hit_test_selection(point))
+                    }
+                })
+            })
+            .unwrap_or(wp_cursor_shape_device_v1::Shape::Default);
+        self.set_cursor_shape(shape);
+    }
+
+    fn selection_for_render(&self) -> Option<Rect> {
+        match self.editor.as_ref() {
+            Some(editor) => editor.selection(),
+            None => self.selection.selection(),
+        }
+    }
+
     fn clear_overlays(&mut self) {
         self.editor = None;
+        self.topology.cursor_enter_serial = None;
+        self.topology.cursor_shape = None;
         self.interaction_redraw_pending = false;
         self.keyboard_focus_output = None;
         self.overlays.clear();
@@ -89,8 +149,7 @@ impl WaylandState {
         let result = self
             .selection
             .handle(event, |output_id| origins.get(&output_id).copied());
-        let redraw =
-            self.selection.dragging() || matches!(&result, Ok(SelectionResult::Completed(_)));
+        let redraw = self.selection.dragging();
         match result {
             Ok(result) => {
                 if !matches!(result, SelectionResult::Continue) {
@@ -114,20 +173,26 @@ impl WaylandState {
         }
     }
 
-    fn redraw_all(&mut self) {
+    fn next_buffer_token(&mut self) -> Result<u64> {
+        let token = self
+            .next_buffer_id
+            .checked_add(1)
+            .ok_or_else(|| VshotError::WaylandProtocol("buffer token exhausted".into()))?;
+        self.next_buffer_id = token;
+        Ok(token)
+    }
+
+    fn redraw_editor(&mut self) {
         let Some(scene) = self.scene.clone() else {
             self.fail(VshotError::WaylandProtocol(
                 "cannot redraw an overlay before a frozen scene is installed".into(),
             ));
             return;
         };
-        let selection = self
-            .editor
-            .as_ref()
-            .and_then(EditorState::selection)
-            .or_else(|| self.selection.selection());
-        let editor_snapshot = self.editor.clone();
-        let editor = editor_snapshot.as_ref();
+        let Some(editor_snapshot) = self.editor.clone() else {
+            return;
+        };
+        let selection = self.selection_for_render();
         let scene_bounds = Some(scene.bounds());
         let output_ids = self.overlays.keys().copied().collect::<Vec<_>>();
         for output_id in output_ids {
@@ -144,7 +209,7 @@ impl WaylandState {
                 continue;
             }
             let Some(slot_index) = overlay.attach_available() else {
-                overlay.pending_redraw = true;
+                overlay.pending_parent_redraw = true;
                 continue;
             };
             if let Err(error) = overlay.slots[slot_index].render_editor(
@@ -152,13 +217,55 @@ impl WaylandState {
                 selection,
                 output.geometry,
                 output.scale,
-                editor,
+                Some(&editor_snapshot),
                 scene_bounds,
             ) {
                 self.fail(error);
                 continue;
             }
-            overlay.pending_redraw = false;
+            overlay.pending_parent_redraw = false;
+            overlay.commit_slot(slot_index);
+        }
+    }
+
+    fn redraw_selection(&mut self) {
+        let Some(scene) = self.scene.clone() else {
+            self.fail(VshotError::WaylandProtocol(
+                "cannot redraw an overlay before a frozen scene is installed".into(),
+            ));
+            return;
+        };
+        let selection = self.selection.selection();
+        let output_ids = self.overlays.keys().copied().collect::<Vec<_>>();
+        for output_id in output_ids {
+            let Some(output) = scene.output(output_id).cloned() else {
+                self.fail(VshotError::IncompleteTopology(format!(
+                    "frozen scene has no output {output_id}"
+                )));
+                continue;
+            };
+            let Some(overlay) = self.overlays.get_mut(&output_id) else {
+                continue;
+            };
+            if !overlay.configured || overlay.closed {
+                continue;
+            }
+            let Some(slot_index) = overlay.attach_available() else {
+                overlay.pending_parent_redraw = true;
+                continue;
+            };
+            if let Err(error) = overlay.slots[slot_index].render_editor(
+                &output.frame,
+                selection,
+                output.geometry,
+                output.scale,
+                None,
+                None,
+            ) {
+                self.fail(error);
+                continue;
+            }
+            overlay.pending_parent_redraw = false;
             overlay.commit_slot(slot_index);
         }
     }
@@ -166,10 +273,19 @@ impl WaylandState {
     fn handle_buffer_release(&mut self, data: BufferUserData) {
         let mut redraw = false;
         if let Some(overlay) = self.overlays.get_mut(&data.output_id) {
-            if let Some(slot) = overlay.slots.get_mut(data.slot) {
-                slot.available = true;
+            match data.token {
+                BufferToken::Parent(_) => {
+                    if let Some(slot) = overlay
+                        .slots
+                        .iter_mut()
+                        .find(|slot| slot.token == data.token)
+                    {
+                        if release_buffer_if_current(slot.token, data.token, &mut slot.available) {
+                            redraw = overlay.pending_parent_redraw;
+                        }
+                    }
+                }
             }
-            redraw = overlay.pending_redraw;
         }
         if redraw {
             self.request_interaction_redraw();
@@ -297,7 +413,7 @@ impl WaylandSession {
                     width: info.geometry.size.width,
                     height: info.geometry.size.height,
                     slots: Vec::new(),
-                    pending_redraw: false,
+                    pending_parent_redraw: false,
                 },
             );
         }
@@ -344,7 +460,13 @@ impl WaylandSession {
                 .dispatch_pending(&mut self.state)
                 .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
             if self.state.take_interaction_redraw() {
-                self.state.redraw_all();
+                match self.state.redraw_target() {
+                    RedrawTarget::ParentEditor => self.state.redraw_editor(),
+                    RedrawTarget::ParentSelection if self.state.selection_mode => {
+                        self.state.redraw_selection()
+                    }
+                    RedrawTarget::ParentSelection => {}
+                }
             }
             if let Some(error) = self.state.error.take() {
                 return Err(error);
@@ -383,119 +505,6 @@ impl WaylandSession {
             read_guard
                 .read()
                 .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
-        }
-    }
-
-    pub fn select_region(&mut self) -> Result<crate::geometry::Rect> {
-        let deadline = Instant::now() + INTERACTION_TIMEOUT;
-        loop {
-            if let Some(outcome) = self.state.selection_outcome.take() {
-                return match outcome {
-                    SelectionResult::Completed(rect) => Ok(rect),
-                    SelectionResult::Cancelled => Err(VshotError::SelectionCancelled),
-                    SelectionResult::Continue => continue,
-                };
-            }
-            if let Some(error) = self.state.error.take() {
-                return Err(error);
-            }
-            if self.state.topology.topology_changed {
-                return Err(VshotError::TopologyChanged);
-            }
-            if Instant::now() >= deadline {
-                return Err(VshotError::SelectionTimeout);
-            }
-            self.dispatch_until(deadline, VshotError::SelectionTimeout, |state| {
-                state.selection_outcome.is_some()
-            })?;
-        }
-    }
-
-    pub fn start_editor(&mut self, selection: Rect) -> Result<()> {
-        let bounds = self
-            .state
-            .scene
-            .as_ref()
-            .ok_or_else(|| VshotError::WaylandProtocol("editor requires a scene".into()))?
-            .bounds();
-        let mut editor = EditorState::with_selection(bounds, selection)?;
-        if let Some(point) = self.state.selection.current_point() {
-            editor.set_pointer(point);
-        }
-        let tools = [
-            EditorTool::Select,
-            EditorTool::Pen,
-            EditorTool::Rectangle,
-            EditorTool::Ellipse,
-            EditorTool::Arrow,
-            EditorTool::Text,
-            EditorTool::Blur,
-        ];
-        let item_size = Size::new(34, 30);
-        let toolbar_width = item_size
-            .width
-            .checked_mul(tools.len() as u32)
-            .and_then(|width| width.checked_add(6 * (tools.len() as u32 - 1)))
-            .unwrap_or(item_size.width);
-        let bounds_right = bounds.right()?;
-        let selection_bottom = selection.bottom()?;
-        let toolbar_x = selection
-            .left()
-            .max(bounds.left())
-            .min(bounds_right.saturating_sub(toolbar_width as i32));
-        let toolbar_y = if selection.top() - 38 >= bounds.top() {
-            selection.top() - 36
-        } else {
-            selection_bottom.saturating_add(6)
-        };
-        editor.set_toolbar(ToolbarLayout::horizontal(
-            Point::new(toolbar_x, toolbar_y),
-            item_size,
-            6,
-            &tools,
-        ));
-        self.state.editor = Some(editor);
-        self.state.selection_mode = false;
-        self.state.redraw_all();
-        if let Some(error) = self.state.error.take() {
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn edit_region(&mut self) -> Result<(Rect, Vec<Annotation>)> {
-        let deadline = Instant::now() + INTERACTION_TIMEOUT;
-        loop {
-            if let Some(error) = self.state.error.take() {
-                return Err(error);
-            }
-            if self.state.topology.topology_changed {
-                return Err(VshotError::TopologyChanged);
-            }
-            let Some(editor) = self.state.editor.as_ref() else {
-                return Err(VshotError::WaylandProtocol("editor is not active".into()));
-            };
-            if editor.is_confirmed() {
-                let mut editor = self.state.editor.take().ok_or_else(|| {
-                    VshotError::WaylandProtocol("editor state disappeared".into())
-                })?;
-                let selection = editor.selection().ok_or_else(|| {
-                    VshotError::Selection("cannot save an empty selection".into())
-                })?;
-                return Ok((selection, editor.take_annotations()));
-            }
-            if editor.is_cancelled() {
-                return Err(VshotError::SelectionCancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(VshotError::EditorTimeout);
-            }
-            self.dispatch_until(deadline, VshotError::EditorTimeout, |state| {
-                state
-                    .editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.is_confirmed() || editor.is_cancelled())
-            })?;
         }
     }
 
@@ -560,6 +569,35 @@ fn validate_capabilities(topology: &TopologyState) -> Result<()> {
     Ok(())
 }
 
+fn ensure_cursor_shape_device(state: &mut WaylandState, qh: &QueueHandle<WaylandState>) {
+    let Some(manager) = state.topology.cursor_shape_manager.clone() else {
+        return;
+    };
+    let Some(pointer) = state.topology.pointer.clone() else {
+        return;
+    };
+    if state.topology.cursor_shape_device.is_none() {
+        state.topology.cursor_shape_device = Some(manager.get_pointer(&pointer, qh, ()));
+    }
+}
+
+fn selection_cursor_shape() -> wp_cursor_shape_device_v1::Shape {
+    wp_cursor_shape_device_v1::Shape::Crosshair
+}
+
+fn cursor_shape_for_handle(handle: ResizeHandle) -> wp_cursor_shape_device_v1::Shape {
+    use wp_cursor_shape_device_v1::Shape;
+
+    match handle {
+        ResizeHandle::Top | ResizeHandle::Bottom => Shape::NsResize,
+        ResizeHandle::Left | ResizeHandle::Right => Shape::EwResize,
+        ResizeHandle::TopLeft | ResizeHandle::BottomRight => Shape::NwseResize,
+        ResizeHandle::TopRight | ResizeHandle::BottomLeft => Shape::NeswResize,
+        ResizeHandle::Move => Shape::Move,
+        ResizeHandle::None => Shape::Default,
+    }
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
     fn event(
         state: &mut Self,
@@ -583,6 +621,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 }
                 "zwlr_layer_shell_v1" if state.topology.layer_shell.is_none() => {
                     state.topology.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                "wp_cursor_shape_manager_v1" if state.topology.cursor_shape_manager.is_none() => {
+                    state.topology.cursor_shape_manager =
+                        Some(registry.bind(name, version.min(2), qh, ()));
+                    ensure_cursor_shape_device(state, qh);
                 }
                 "zxdg_output_manager_v1" if state.topology.xdg_output_manager.is_none() => {
                     state.topology.xdg_output_manager =
@@ -613,6 +656,30 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
             wl_registry::Event::GlobalRemove { .. } => state.topology.topology_changed = true,
             _ => {}
         }
+    }
+}
+
+impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _: wp_cursor_shape_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        _: wp_cursor_shape_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -770,6 +837,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
         } else {
             state.topology.keyboard_capability = false;
         }
+        ensure_cursor_shape_device(state, qh);
     }
 }
 
@@ -784,11 +852,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
     ) {
         match event {
             wl_pointer::Event::Enter {
+                serial,
                 surface,
                 surface_x,
                 surface_y,
                 ..
             } => {
+                state.topology.cursor_enter_serial = Some(serial);
+                state.topology.cursor_shape = None;
+                if state.selection_mode {
+                    state.set_cursor_shape(selection_cursor_shape());
+                }
                 let Some(surface_data) = surface.data::<SurfaceUserData>() else {
                     if state.selection_mode || state.editor.is_some() {
                         state.fail(VshotError::WaylandProtocol(
@@ -798,6 +872,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     return;
                 };
                 state.pointer_output = Some(surface_data.output_id);
+                if state.pointer_grab_output.is_some() {
+                    // During an implicit grab, motion coordinates remain relative to
+                    // the surface that received the button press. Do not overwrite
+                    // the drag position with coordinates from a new pointer focus.
+                    return;
+                }
                 let event = SelectionEvent::PointerMoved {
                     output_id: surface_data.output_id,
                     local_x: surface_x,
@@ -805,6 +885,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 };
                 if state.editor.is_some() {
                     state.process_editor_event(event);
+                    state.update_cursor_shape();
                     state.request_interaction_redraw();
                 } else {
                     let should_redraw = state.process_selection_event(event);
@@ -814,6 +895,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 }
             }
             wl_pointer::Event::Leave { surface, .. } => {
+                state.topology.cursor_enter_serial = None;
+                state.topology.cursor_shape = None;
                 if state.pointer_grab_output.is_none() {
                     if let Some(surface_data) = surface.data::<SurfaceUserData>() {
                         if state.pointer_output == Some(surface_data.output_id) {
@@ -827,7 +910,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 surface_y,
                 ..
             } => {
-                let Some(output_id) = state.pointer_output.or(state.pointer_grab_output) else {
+                let Some(output_id) = state.pointer_motion_output() else {
                     if state.selection_mode || state.editor.is_some() {
                         state.fail(VshotError::WaylandProtocol(
                             "wl_pointer motion has no focused or grabbed output".into(),
@@ -842,6 +925,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 };
                 if state.editor.is_some() {
                     state.process_editor_event(event);
+                    state.update_cursor_shape();
                     state.request_interaction_redraw();
                 } else {
                     let should_redraw = state.process_selection_event(event);
@@ -867,6 +951,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 };
                 if state.editor.is_some() {
                     state.process_editor_event(event);
+                    state.update_cursor_shape();
                     state.request_interaction_redraw();
                 } else {
                     let should_redraw = state.process_selection_event(event);
@@ -1017,20 +1102,29 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceUserData> f
                     return;
                 };
                 let mut slots = Vec::new();
-                for slot_index in 0..2 {
+                for _ in 0..2 {
+                    let token = match state.next_buffer_token() {
+                        Ok(token) => token,
+                        Err(error) => {
+                            state.fail(error);
+                            return;
+                        }
+                    };
                     match ShmSlot::new(
                         &shm,
                         output.frame.size().width,
                         output.frame.size().height,
-                        data.output_id,
-                        slot_index,
+                        BufferUserData {
+                            output_id: data.output_id,
+                            token: BufferToken::Parent(token),
+                        },
                         shm_format,
                         qh,
                     ) {
                         Ok(mut slot) => {
-                            if let Err(error) =
-                                slot.render(&output.frame, None, output.geometry, output.scale)
-                            {
+                            let result =
+                                slot.render(&output.frame, None, output.geometry, output.scale);
+                            if let Err(error) = result {
                                 state.fail(error);
                                 return;
                             }
@@ -1050,8 +1144,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, LayerSurfaceUserData> f
                 overlay.width = width;
                 overlay.height = height;
                 overlay.slots = slots;
+                overlay.pending_parent_redraw = false;
                 overlay.commit_slot(0);
                 state.ready_outputs.insert(data.output_id);
+                if state.selection_mode && state.selection.dragging() {
+                    state.request_interaction_redraw();
+                }
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 if let Some(overlay) = state.overlays.get_mut(&data.output_id) {
@@ -1096,9 +1194,68 @@ impl Dispatch<wl_buffer::WlBuffer, BufferUserData> for WaylandState {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_wayland_keycode, SelectionEvent, SelectionResult, WaylandState};
+    use super::{
+        cursor_shape_for_handle, decode_wayland_keycode, selection_cursor_shape, RedrawTarget,
+        SelectionEvent, SelectionResult, WaylandState,
+    };
     use crate::geometry::{Point, Rect};
-    use crate::wayland::input::{BTN_LEFT, KEY_ESC};
+    use crate::wayland::input::ResizeHandle;
+    use crate::wayland::input::{EditorState, BTN_LEFT, KEY_ESC};
+    use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
+
+    #[test]
+    fn pointer_motion_keeps_using_the_grabbed_output() {
+        let mut state = WaylandState {
+            pointer_output: Some(1),
+            pointer_grab_output: Some(2),
+            ..WaylandState::default()
+        };
+
+        assert_eq!(state.pointer_motion_output(), Some(2));
+        state.pointer_output = Some(3);
+        assert_eq!(state.pointer_motion_output(), Some(2));
+        state.pointer_grab_output = None;
+        assert_eq!(state.pointer_motion_output(), Some(3));
+    }
+
+    #[test]
+    fn selection_redraw_targets_parent_without_editor() {
+        let state = WaylandState {
+            selection_mode: true,
+            ..WaylandState::default()
+        };
+        assert_eq!(state.redraw_target(), RedrawTarget::ParentSelection);
+
+        let state = WaylandState {
+            selection_mode: false,
+            editor: Some(EditorState::new(Rect::new(0, 0, 10, 10))),
+            ..WaylandState::default()
+        };
+        assert_eq!(state.redraw_target(), RedrawTarget::ParentEditor);
+    }
+
+    #[test]
+    fn editor_selection_none_does_not_fall_back_to_tracker_selection() {
+        let mut state = WaylandState::default();
+        state.process_selection_event(SelectionEvent::GlobalPointerMoved {
+            point: Point::new(10, 10),
+            timestamp: 1,
+        });
+        state.process_selection_event(SelectionEvent::ButtonWithTimestamp {
+            button: BTN_LEFT,
+            pressed: true,
+            timestamp: 2,
+        });
+        state.process_selection_event(SelectionEvent::GlobalPointerMoved {
+            point: Point::new(20, 20),
+            timestamp: 3,
+        });
+        assert!(state.selection.selection().is_some());
+
+        state.editor = Some(EditorState::new(Rect::new(0, 0, 100, 100)));
+
+        assert_eq!(state.selection_for_render(), None);
+    }
 
     #[test]
     fn preserves_wayland_raw_keyboard_codes() {
@@ -1106,6 +1263,43 @@ mod tests {
         assert_eq!(decode_wayland_keycode(28), 28); // Enter
         assert_eq!(decode_wayland_keycode(103), 103); // Up
         assert_eq!(decode_wayland_keycode(106), 106); // Right
+    }
+
+    #[test]
+    fn selection_uses_crosshair_cursor_shape() {
+        assert_eq!(selection_cursor_shape(), Shape::Crosshair);
+    }
+
+    #[test]
+    fn resize_handles_map_to_matching_cursor_shapes() {
+        assert_eq!(cursor_shape_for_handle(ResizeHandle::Top), Shape::NsResize);
+        assert_eq!(
+            cursor_shape_for_handle(ResizeHandle::Bottom),
+            Shape::NsResize
+        );
+        assert_eq!(cursor_shape_for_handle(ResizeHandle::Left), Shape::EwResize);
+        assert_eq!(
+            cursor_shape_for_handle(ResizeHandle::Right),
+            Shape::EwResize
+        );
+        assert_eq!(
+            cursor_shape_for_handle(ResizeHandle::TopLeft),
+            Shape::NwseResize
+        );
+        assert_eq!(
+            cursor_shape_for_handle(ResizeHandle::BottomRight),
+            Shape::NwseResize
+        );
+        assert_eq!(
+            cursor_shape_for_handle(ResizeHandle::TopRight),
+            Shape::NeswResize
+        );
+        assert_eq!(
+            cursor_shape_for_handle(ResizeHandle::BottomLeft),
+            Shape::NeswResize
+        );
+        assert_eq!(cursor_shape_for_handle(ResizeHandle::Move), Shape::Move);
+        assert_eq!(cursor_shape_for_handle(ResizeHandle::None), Shape::Default);
     }
 
     #[test]
@@ -1183,13 +1377,12 @@ mod tests {
         );
         state.request_interaction_redraw();
         assert!(
-            state.process_selection_event(SelectionEvent::ButtonWithTimestamp {
+            !state.process_selection_event(SelectionEvent::ButtonWithTimestamp {
                 button: BTN_LEFT,
                 pressed: false,
                 timestamp: 4,
             })
         );
-        state.request_interaction_redraw();
 
         assert!(state.take_interaction_redraw());
         assert!(!state.take_interaction_redraw());
@@ -1200,14 +1393,18 @@ mod tests {
     }
 
     #[test]
-    fn clearing_overlays_resets_keyboard_focus() {
+    fn clearing_overlays_resets_keyboard_focus_and_cursor_focus() {
         let mut state = WaylandState {
             keyboard_focus_output: Some(7),
             ..WaylandState::default()
         };
+        state.topology.cursor_enter_serial = Some(9);
+        state.topology.cursor_shape = Some(Shape::Pointer);
 
         state.clear_overlays();
 
         assert_eq!(state.keyboard_focus_output, None);
+        assert_eq!(state.topology.cursor_enter_serial, None);
+        assert_eq!(state.topology.cursor_shape, None);
     }
 }

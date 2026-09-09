@@ -274,18 +274,16 @@ impl SelectionTracker {
 }
 
 fn global_point(origin: Point, local_x: f64, local_y: f64) -> Result<Point> {
-    if !local_x.is_finite() || !local_y.is_finite() || local_x < 0.0 || local_y < 0.0 {
+    if !local_x.is_finite() || !local_y.is_finite() {
         return Err(VshotError::Selection(
             "compositor sent invalid pointer coordinates".into(),
         ));
     }
+    let local_x = local_x.floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+    let local_y = local_y.floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
     Ok(Point::new(
-        origin
-            .x
-            .saturating_add(local_x.floor().min(i32::MAX as f64) as i32),
-        origin
-            .y
-            .saturating_add(local_y.floor().min(i32::MAX as f64) as i32),
+        origin.x.saturating_add(local_x),
+        origin.y.saturating_add(local_y),
     ))
 }
 
@@ -376,6 +374,23 @@ mod tests {
             result,
             SelectionResult::Completed(Rect::new(-90, 20, 121, 21))
         );
+    }
+
+    #[test]
+    fn accepts_negative_surface_coordinates_during_pointer_grab() {
+        let mut tracker = SelectionTracker::new();
+        tracker
+            .handle(
+                SelectionEvent::PointerMoved {
+                    output_id: 1,
+                    local_x: -5.2,
+                    local_y: -6.1,
+                },
+                |_| Some(Point::new(100, 200)),
+            )
+            .unwrap();
+
+        assert_eq!(tracker.current_point(), Some(Point::new(94, 193)));
     }
 
     #[test]

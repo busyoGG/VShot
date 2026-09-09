@@ -2,6 +2,7 @@ use super::{
     global_point, SelectionEvent, BTN_LEFT, BTN_RIGHT, KEY_CONFIRM, KEY_DOWN, KEY_ESC, KEY_LEFT,
     KEY_RIGHT, KEY_UP,
 };
+use crate::edit::{ArrowStyle, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 
@@ -189,30 +190,75 @@ impl ToolbarLayout {
 }
 
 /// A renderer-independent annotation produced by a drawing gesture.
+///
+/// `color` is RGBA8 and `width` is the stroke width in logical pixels; the
+/// renderer multiplies the width by the output scale when drawing device pixels.
+/// `dash` selects the line style, `head` scales an arrow's head and `mask`
+/// picks the filled area of mosaic shapes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Annotation {
     Stroke {
         tool: EditorTool,
         points: Vec<Point>,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+        head: u32,
+        arrow_style: ArrowStyle,
+        strength: u32,
     },
     Shape {
         tool: EditorTool,
         rect: Rect,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+        mask: ShapeMask,
+        strength: u32,
     },
     Text {
         origin: Point,
         text: String,
         scale: u32,
+        color: [u8; 4],
+        /// Font family the label was rasterized with; empty means the Qt
+        /// application default font. Informational only: the label pixels are
+        /// carried by `bitmap`.
+        font: String,
+        /// Pre-rendered label pixels from the Qt helper. `None` falls back to
+        /// the built-in 5x7 ASCII glyph renderer.
+        bitmap: Option<TextBitmap>,
     },
 }
 
+pub const DEFAULT_ANNOTATION_COLOR: [u8; 4] = [255, 64, 64, 255];
+pub const DEFAULT_TEXT_COLOR: [u8; 4] = [255, 255, 255, 255];
+pub const DEFAULT_ANNOTATION_WIDTH: u32 = 1;
+
 impl Annotation {
     pub fn stroke(tool: EditorTool, points: Vec<Point>) -> Self {
-        Self::Stroke { tool, points }
+        Self::Stroke {
+            tool,
+            points,
+            color: DEFAULT_ANNOTATION_COLOR,
+            width: DEFAULT_ANNOTATION_WIDTH,
+            dash: LineDash::Solid,
+            head: 1,
+            arrow_style: ArrowStyle::Open,
+            strength: DEFAULT_MOSAIC_STRENGTH,
+        }
     }
 
     pub fn shape(tool: EditorTool, rect: Rect) -> Self {
-        Self::Shape { tool, rect }
+        Self::Shape {
+            tool,
+            rect,
+            color: DEFAULT_ANNOTATION_COLOR,
+            width: DEFAULT_ANNOTATION_WIDTH,
+            dash: LineDash::Solid,
+            mask: ShapeMask::Rect,
+            strength: DEFAULT_MOSAIC_STRENGTH,
+        }
     }
 
     pub fn text(origin: Point, text: impl Into<String>, scale: u32) -> Self {
@@ -220,6 +266,63 @@ impl Annotation {
             origin,
             text: text.into(),
             scale,
+            color: DEFAULT_TEXT_COLOR,
+            font: String::new(),
+            bitmap: None,
+        }
+    }
+
+    pub const fn color(&self) -> [u8; 4] {
+        match self {
+            Self::Stroke { color, .. } | Self::Shape { color, .. } | Self::Text { color, .. } => {
+                *color
+            }
+        }
+    }
+
+    pub const fn width(&self) -> u32 {
+        match self {
+            Self::Stroke { width, .. } | Self::Shape { width, .. } => *width,
+            Self::Text { .. } => DEFAULT_ANNOTATION_WIDTH,
+        }
+    }
+
+    pub const fn dash(&self) -> LineDash {
+        match self {
+            Self::Stroke { dash, .. } | Self::Shape { dash, .. } => *dash,
+            Self::Text { .. } => LineDash::Solid,
+        }
+    }
+
+    /// Arrow head size multiplier; meaningful for arrow strokes only.
+    pub const fn head(&self) -> u32 {
+        match self {
+            Self::Stroke { head, .. } => *head,
+            Self::Shape { .. } | Self::Text { .. } => 1,
+        }
+    }
+
+    /// Arrow head shape; meaningful for arrow strokes only.
+    pub const fn arrow_style(&self) -> ArrowStyle {
+        match self {
+            Self::Stroke { arrow_style, .. } => *arrow_style,
+            Self::Shape { .. } | Self::Text { .. } => ArrowStyle::Open,
+        }
+    }
+
+    /// Filled-area shape of mosaic annotations.
+    pub const fn mask(&self) -> ShapeMask {
+        match self {
+            Self::Shape { mask, .. } => *mask,
+            _ => ShapeMask::Rect,
+        }
+    }
+
+    /// Mosaic strength level 1..3 (block size / smear radius factor).
+    pub const fn strength(&self) -> u32 {
+        match self {
+            Self::Stroke { strength, .. } | Self::Shape { strength, .. } => *strength,
+            Self::Text { .. } => DEFAULT_MOSAIC_STRENGTH,
         }
     }
 
@@ -238,6 +341,7 @@ impl Annotation {
                 origin,
                 text,
                 scale,
+                ..
             } => text_bounds(*origin, text, *scale),
         }
     }
@@ -255,7 +359,16 @@ impl Annotation {
                 origin,
                 text,
                 scale,
+                ..
             } => Some((text, *origin, *scale)),
+            _ => None,
+        }
+    }
+
+    /// Pre-rendered label pixels of a text annotation, if the helper sent any.
+    pub const fn text_bitmap(&self) -> Option<&TextBitmap> {
+        match self {
+            Self::Text { bitmap, .. } => bitmap.as_ref(),
             _ => None,
         }
     }
@@ -1520,6 +1633,57 @@ mod tests {
         let mut editor = EditorState::with_selection(bounds, Rect::new(-50, -40, 40, 30)).unwrap();
         drag(&mut editor, point(-50, -25), point(-99, -25), 10);
         assert_eq!(editor.selection(), Some(Rect::new(-99, -40, 89, 30)));
+    }
+
+    #[test]
+    fn hit_testing_distinguishes_edges_corners_and_outside() {
+        let mut editor =
+            EditorState::with_selection(Rect::new(0, 0, 200, 100), Rect::new(20, 20, 60, 40))
+                .unwrap();
+        editor.set_handle_distance(2);
+
+        assert_eq!(
+            editor.hit_test_selection(point(20, 20)),
+            ResizeHandle::TopLeft
+        );
+        assert_eq!(
+            editor.hit_test_selection(point(79, 20)),
+            ResizeHandle::TopRight
+        );
+        assert_eq!(
+            editor.hit_test_selection(point(20, 59)),
+            ResizeHandle::BottomLeft
+        );
+        assert_eq!(
+            editor.hit_test_selection(point(79, 59)),
+            ResizeHandle::BottomRight
+        );
+        assert_eq!(editor.hit_test_selection(point(45, 20)), ResizeHandle::Top);
+        assert_eq!(
+            editor.hit_test_selection(point(79, 40)),
+            ResizeHandle::Right
+        );
+        assert_eq!(
+            editor.hit_test_selection(point(45, 59)),
+            ResizeHandle::Bottom
+        );
+        assert_eq!(editor.hit_test_selection(point(20, 40)), ResizeHandle::Left);
+        assert_eq!(editor.hit_test_selection(point(45, 40)), ResizeHandle::Move);
+        assert_eq!(
+            editor.hit_test_selection(point(100, 80)),
+            ResizeHandle::None
+        );
+    }
+
+    #[test]
+    fn clicking_outside_selection_starts_a_new_selection() {
+        let bounds = Rect::new(0, 0, 200, 120);
+        let mut editor = EditorState::with_selection(bounds, Rect::new(20, 20, 40, 30)).unwrap();
+
+        drag(&mut editor, point(100, 80), point(140, 100), 1);
+
+        assert_eq!(editor.selection(), Some(Rect::new(100, 80, 41, 21)));
+        assert!(matches!(editor.gesture(), GestureState::Idle));
     }
 
     #[test]

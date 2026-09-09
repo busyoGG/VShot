@@ -20,6 +20,7 @@ pub fn write_frame(frame: &Frame, destination: &Destination) -> Result<()> {
                 })
         }
         Destination::Clipboard => copy_to_clipboard(&png),
+        Destination::Pin => crate::pin::pin_png(&png),
     }
 }
 

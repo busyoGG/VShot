@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
 use wayland_client::protocol::wl_output;
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
@@ -50,6 +53,10 @@ pub(crate) struct TopologyState {
     pub(crate) shm_argb8888: bool,
     pub(crate) shm_xrgb8888: bool,
     pub(crate) layer_shell: Option<wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    pub(crate) cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    pub(crate) cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+    pub(crate) cursor_enter_serial: Option<u32>,
+    pub(crate) cursor_shape: Option<wp_cursor_shape_device_v1::Shape>,
     pub(crate) xdg_output_manager: Option<wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     pub(crate) seats: Vec<wayland_client::protocol::wl_seat::WlSeat>,
     pub(crate) output_proxies: HashMap<u32, wayland_client::protocol::wl_output::WlOutput>,

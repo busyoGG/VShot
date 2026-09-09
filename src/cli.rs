@@ -11,7 +11,7 @@ use crate::geometry::{parse_geometry, Rect};
     version,
     about = "Strict-freeze Wayland screenshots for wlroots",
     group = ArgGroup::new("destination")
-        .args(["output", "clipboard"])
+        .args(["output", "clipboard", "pin"])
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,12 +24,19 @@ pub struct Cli {
         short = 'o',
         long = "output",
         global = true,
-        conflicts_with = "clipboard"
+        conflicts_with_all = ["clipboard", "pin"]
     )]
     pub output: Option<PathBuf>,
     /// Copy PNG bytes to the Wayland clipboard.
     #[arg(long, global = true, conflicts_with = "output")]
     pub clipboard: bool,
+    /// Pin the captured image on screen instead of writing it anywhere.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["output", "clipboard"]
+    )]
+    pub pin: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -56,6 +63,31 @@ pub enum Command {
         #[command(subcommand)]
         target: WindowTarget,
     },
+    /// Manage pinned images shown by the resident pin daemon. The global
+    /// --clipboard flag switches the source: pin the image currently on the
+    /// Wayland clipboard instead of image files.
+    Pin {
+        /// Image files to pin (starts the daemon when it is not running).
+        files: Vec<PathBuf>,
+        /// Flip the visibility of every pin (default when no other flag is set).
+        #[arg(long)]
+        toggle: bool,
+        /// Show all pins.
+        #[arg(long)]
+        show: bool,
+        /// Hide all pins.
+        #[arg(long)]
+        hide: bool,
+        /// Close every pin (the daemon stays resident).
+        #[arg(long = "close-all")]
+        close_all: bool,
+        /// Quit the pin daemon.
+        #[arg(long)]
+        quit: bool,
+        /// Report the pin count and visibility.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +100,7 @@ pub enum Destination {
     File(PathBuf),
     Stdout,
     Clipboard,
+    Pin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,16 +119,59 @@ pub struct Request {
     pub cursor: bool,
 }
 
+/// What `vshot` was asked to do: capture something to a destination, or drive
+/// the pin daemon. Pin management never touches the Wayland capture path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Action {
+    Capture(Request),
+    Pin(crate::pin::PinInvocation),
+}
+
 impl Cli {
-    pub fn parse_request(self) -> Result<Request> {
-        let destination = match (self.output, self.clipboard) {
-            (Some(path), false) if path.as_os_str() == "-" => Destination::Stdout,
-            (Some(path), false) => Destination::File(path),
-            (None, true) => Destination::Clipboard,
-            (None, false) => return Err(VshotError::MissingDestination),
-            (Some(_), true) => {
+    /// Splits the CLI into the two things `vshot` can do: capture to a
+    /// destination, or drive the pin daemon.
+    pub fn parse_action(self) -> Result<Action> {
+        if let Command::Pin {
+            files,
+            toggle,
+            show,
+            hide,
+            close_all,
+            quit,
+            list,
+        } = &self.command
+        {
+            // Under the pin subcommand `--clipboard` selects the clipboard as
+            // the image source; --output and --pin still make no sense here.
+            if self.output.is_some() || self.pin {
                 return Err(VshotError::InvalidDestination(
-                    "--output and --clipboard are mutually exclusive".into(),
+                    "--output and --pin do not apply to the pin subcommand".into(),
+                ));
+            }
+            return Ok(Action::Pin(crate::pin::PinInvocation::build(
+                files.clone(),
+                self.clipboard,
+                *toggle,
+                *show,
+                *hide,
+                *close_all,
+                *quit,
+                *list,
+            )?));
+        }
+        Ok(Action::Capture(self.parse_request()?))
+    }
+
+    pub fn parse_request(self) -> Result<Request> {
+        let destination = match (self.output, self.clipboard, self.pin) {
+            (Some(path), false, false) if path.as_os_str() == "-" => Destination::Stdout,
+            (Some(path), false, false) => Destination::File(path),
+            (None, true, false) => Destination::Clipboard,
+            (None, false, true) => Destination::Pin,
+            (None, false, false) => return Err(VshotError::MissingDestination),
+            _ => {
+                return Err(VshotError::InvalidDestination(
+                    "--output, --clipboard and --pin are mutually exclusive".into(),
                 ))
             }
         };
@@ -124,6 +200,11 @@ impl Cli {
             Command::Window {
                 target: WindowTarget::Active,
             } => CaptureTarget::ActiveWindow,
+            Command::Pin { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the pin subcommand is not a capture target".into(),
+                ))
+            }
         };
         Ok(Request {
             target,
@@ -143,6 +224,19 @@ impl Cli {
             VshotError::InvalidDestination(message)
         })?;
         cli.parse_request()
+    }
+
+    #[cfg(test)]
+    pub fn try_parse_action_from<I, T>(args: I) -> Result<Action>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = <Self as Parser>::try_parse_from(args).map_err(|error| {
+            let message = error.to_string();
+            VshotError::InvalidDestination(message)
+        })?;
+        cli.parse_action()
     }
 
     #[allow(dead_code)]
@@ -199,5 +293,73 @@ mod tests {
             error.to_string().contains("mutually exclusive")
                 || error.to_string().contains("cannot be used")
         );
+    }
+
+    #[test]
+    fn pin_capture_destination_parses() {
+        let request =
+            Cli::try_parse_from(["vshot", "region", "--geometry", "0,0 20x20", "--pin"]).unwrap();
+        assert_eq!(request.destination, Destination::Pin);
+    }
+
+    #[test]
+    fn pin_subcommand_maps_control_flags() {
+        let action = Cli::try_parse_action_from(["vshot", "pin", "--toggle"]).unwrap();
+        assert_eq!(
+            action,
+            Action::Pin(crate::pin::PinInvocation {
+                files: Vec::new(),
+                clipboard: false,
+                command: Some(crate::pin::PinCommand::Toggle),
+            })
+        );
+        let action = Cli::try_parse_action_from(["vshot", "pin", "a.png", "b.png"]).unwrap();
+        match action {
+            Action::Pin(invocation) => {
+                assert_eq!(invocation.command, None);
+                assert_eq!(
+                    invocation.files,
+                    vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
+                );
+            }
+            other => panic!("expected a pin action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_subcommand_accepts_clipboard_source() {
+        let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard"]).unwrap();
+        assert_eq!(
+            action,
+            Action::Pin(crate::pin::PinInvocation {
+                files: Vec::new(),
+                clipboard: true,
+                command: None,
+            })
+        );
+        let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "a.png"]).unwrap();
+        match action {
+            Action::Pin(invocation) => {
+                assert!(invocation.clipboard);
+                assert_eq!(invocation.files, vec![PathBuf::from("a.png")]);
+            }
+            other => panic!("expected a pin action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_subcommand_rejects_bad_combinations() {
+        let error = Cli::try_parse_action_from(["vshot", "pin", "--toggle", "--hide"]).unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+        let error = Cli::try_parse_action_from(["vshot", "pin", "a.png", "--quit"]).unwrap_err();
+        assert!(error.to_string().contains("control flag"), "{error}");
+        let error =
+            Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "--quit"]).unwrap_err();
+        assert!(error.to_string().contains("control flag"), "{error}");
+        let error = Cli::try_parse_action_from(["vshot", "pin"]).unwrap_err();
+        assert!(error.to_string().contains("--clipboard"), "{error}");
+        let error =
+            Cli::try_parse_action_from(["vshot", "pin", "a.png", "--output", "b.png"]).unwrap_err();
+        assert!(error.to_string().contains("do not apply"), "{error}");
     }
 }

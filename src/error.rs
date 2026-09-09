@@ -8,7 +8,9 @@ pub enum VshotError {
     InvalidGeometry(String),
     #[error("invalid output destination: {0}")]
     InvalidDestination(String),
-    #[error("no output destination supplied; use --output PATH, --output -, or --clipboard")]
+    #[error(
+        "no output destination supplied; use --output PATH, --output -, --clipboard, or --pin"
+    )]
     MissingDestination,
     #[error("--geometry and interactive region selection are mutually exclusive")]
     ConflictingRegionSelection,
@@ -40,10 +42,6 @@ pub enum VshotError {
     OverlayTimeout,
     #[error("current monitor could not be determined from pointer input before the timeout")]
     CurrentOutputTimeout,
-    #[error("interactive region selection did not finish before the timeout")]
-    SelectionTimeout,
-    #[error("interactive editor did not finish before the timeout")]
-    EditorTimeout,
     #[error("output topology is incomplete: {0}")]
     IncompleteTopology(String),
     #[error("output topology changed while taking the screenshot")]
@@ -60,6 +58,8 @@ pub enum VshotError {
     Selection(String),
     #[error("Wayland clipboard failed: {0}")]
     Clipboard(String),
+    #[error("pin failed: {0}")]
+    Pin(String),
 }
 
 pub type Result<T> = std::result::Result<T, VshotError>;

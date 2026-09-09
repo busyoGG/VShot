@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::frame::Frame;
+use crate::edit::{ArrowStyle, LineDash, TextBitmap};
 use crate::error::Result;
 use crate::geometry::{Point, Rect};
 
@@ -31,8 +32,9 @@ impl ImageDocument {
         rect: Rect,
         color: [u8; 4],
         width: u32,
+        dash: LineDash,
     ) -> Result<()> {
-        self.frame.stroke_rectangle(rect, color, width)
+        self.frame.stroke_rectangle(rect, color, width, dash)
     }
 
     pub(crate) fn stroke_circle(
@@ -45,14 +47,41 @@ impl ImageDocument {
         self.frame.stroke_circle(center, radius, color, width)
     }
 
+    pub(crate) fn stroke_ellipse(
+        &mut self,
+        rect: Rect,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+    ) -> Result<()> {
+        self.frame.stroke_ellipse(rect, color, width, dash)
+    }
+
     pub(crate) fn draw_arrow(
         &mut self,
         start: Point,
         end: Point,
         color: [u8; 4],
         width: u32,
+        dash: LineDash,
+        head: u32,
     ) -> Result<()> {
-        self.frame.draw_arrow(start, end, color, width)
+        self.draw_arrow_with_style(start, end, color, width, dash, head, ArrowStyle::Open)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_arrow_with_style(
+        &mut self,
+        start: Point,
+        end: Point,
+        color: [u8; 4],
+        width: u32,
+        dash: LineDash,
+        head: u32,
+        style: ArrowStyle,
+    ) -> Result<()> {
+        self.frame
+            .draw_arrow_with_style(start, end, color, width, dash, head, style)
     }
 
     pub(crate) fn draw_freehand(
@@ -60,8 +89,9 @@ impl ImageDocument {
         points: &[Point],
         color: [u8; 4],
         width: u32,
+        dash: LineDash,
     ) -> Result<()> {
-        self.frame.draw_freehand(points, color, width)
+        self.frame.draw_freehand(points, color, width, dash)
     }
 
     pub(crate) fn draw_text(
@@ -74,7 +104,19 @@ impl ImageDocument {
         self.frame.draw_text(origin, text, color, scale)
     }
 
+    pub(crate) fn draw_bitmap(&mut self, origin: Point, bitmap: &TextBitmap) -> Result<()> {
+        self.frame.draw_bitmap(origin, bitmap)
+    }
+
     pub(crate) fn mosaic(&mut self, rect: Rect, block_size: u32) -> Result<()> {
         self.frame.mosaic(rect, block_size)
+    }
+
+    pub(crate) fn mosaic_ellipse(&mut self, rect: Rect, block_size: u32) -> Result<()> {
+        self.frame.mosaic_ellipse(rect, block_size)
+    }
+
+    pub(crate) fn mosaic_brush(&mut self, points: &[Point], radius: u32) -> Result<()> {
+        self.frame.mosaic_brush(points, radius)
     }
 }
