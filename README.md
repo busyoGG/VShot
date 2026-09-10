@@ -70,7 +70,7 @@ vshot region --pin
 
 # pin 管理：添加图片、显隐、清空、退出 daemon
 vshot pin shot.png another.png
-vshot pin --clipboard        # pin 剪贴板里的图片（或复制的图片文件/路径）
+vshot pin --clipboard        # pin 剪贴板里的图片（或复制的图片文件/路径/文字）
 vshot pin --toggle          # 一键显示/隐藏所有 pin
 vshot pin --hide / --show
 vshot pin --close-all       # 关闭全部 pin（daemon 常驻）
@@ -107,7 +107,7 @@ vshot pin --quit            # 退出 daemon
 
 ## pin 图片浮层
 
-`vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**缩放（0.1x–8x）、**双击**关闭该图。
+`vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**缩放（0.1x–8x，光标为锚点并短暂显示倍率）、**双击**关闭该图、**点击聚焦后按 Space** 进入完整标注编辑器。
 
 pin 需要一个**常驻后台进程**（daemon）：layer-shell 浮层 surface 由创建它的进程拥有，`vshot pin x.png` 命令退出后 surface 就会消失；并且"一键显示/隐藏所有 pin""关闭其中一张"都要求一个同时持有全部浮层的进程。因此：
 
@@ -116,7 +116,7 @@ pin 需要一个**常驻后台进程**（daemon）：layer-shell 浮层 surface 
 - daemon 常驻到 `vshot pin --quit`（空闲不退出，保证绑定快捷键零延迟响应）；
 - **不要用 `pkill`/`kill -9` 结束 daemon**：它持有 layer-shell surface，被强杀时部分合成器（实测 Hyprland 0.56）会残留该 surface 与其截屏会话，导致**所有输出的 screencopy 永久阻塞**（`vshot`/`grim` 全部超时，且 `hyprctl reload`、DPMS 循环、`force_renderer_reload` 都无法恢复，只能重启会话）。请始终用 `vshot pin --quit`，它会在退出前 unmap 全部浮层；daemon 也已处理 `SIGTERM`/`SIGINT` 走同样的优雅路径；
 - socket 路径默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`（缺失时回退 `/tmp`），可用 `VSHOT_PIN_SOCKET=<绝对路径>` 覆盖，便于隔离测试多实例；
-- pin 浮层不抢键盘焦点（`KeyboardInteractivity=None`），只响应鼠标。
+- pin 浮层平时不持有键盘（`KeyboardInteractivity=OnDemand`）：点击后该 pin 获得键盘焦点（出现亮色描边），点别处自动让出。聚焦时按 **Space** 进入编辑模式。
 
 Wayland 客户端拿不到全局按键，"一键显隐"请自行绑到合成器快捷键，例如 Hyprland：
 
@@ -130,9 +130,25 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 1. 内嵌图像数据——截图工具或浏览器"复制图像"放入的位图；
 2. 复制的文件——文件管理器里复制的图片文件（URI 列表，取第一张能解码的本地文件）；
-3. 纯文本——内容为一个存在的本地图片路径。
+3. 纯文本——内容为一个存在的本地图片路径；
+4. 纯文本——其余文字渲染成一张"文字卡片"图再 pin，按内容自动选择格式：
 
-剪贴板既无图像也无可用路径时命令失败并提示，不影响已有的 pin。
+   - 剪贴板带 `text/html`（IDE/浏览器复制的代码、富文本）→ 按 HTML 渲染，**保留语法高亮配色**；
+   - 看起来是 markdown（代码围栏、标题、列表、表格、加粗、链接等特征）→ 按 GitHub 风格 markdown 渲染；
+   - 看起来是代码（分号/花括号/缩进/常见关键字等特征，启发式）→ 等宽字体深色编辑器风格卡片；
+   - 其余 → 普通文本卡片（跟随系统亮暗主题，自动换行）。
+
+   文字卡片按所在输出的像素密度渲染，HiDPI 下不模糊；超宽内容自动换行，超高内容截断。
+
+剪贴板既无图像也无可用文字时命令失败并提示，不影响已有的 pin。
+
+### pin 编辑模式（Space）
+
+聚焦某个 pin 后按 **Space**，daemon 会导出该图并拉起一个与截图相同的完整标注编辑器（工具栏、文字、马赛克、撤销/重做），编辑器窗口精确覆盖在这个 pin 上方：
+
+- 画布固定为整张图片，无需先拖选区；Esc 取消本次编辑（pin 保持原样），Enter 或工具栏 OK 确认；
+- 确认后由 Rust 渲染管线把标注合成进图像（与截图导出同一条代码路径，保证所见即所得），结果通过 socket `replace` 命令回写，pin 的屏幕位置与显示大小保持不变；
+- 一次只能有一个 pin 处于编辑会话；编辑过程中编辑器持有独占键盘。
 
 ## 图像和输出映射
 

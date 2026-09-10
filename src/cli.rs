@@ -64,8 +64,9 @@ pub enum Command {
         target: WindowTarget,
     },
     /// Manage pinned images shown by the resident pin daemon. The global
-    /// --clipboard flag switches the source: pin the image currently on the
-    /// Wayland clipboard instead of image files.
+    /// --clipboard flag switches the source: pin the clipboard image, or
+    /// render clipboard text as a card (HTML, markdown, code, or plain),
+    /// instead of image files.
     Pin {
         /// Image files to pin (starts the daemon when it is not running).
         files: Vec<PathBuf>,
@@ -87,6 +88,11 @@ pub enum Command {
         /// Report the pin count and visibility.
         #[arg(long)]
         list: bool,
+        /// Internal: run one annotation editor for a pin-edit session JSON
+        /// written by the daemon, then render the result back onto the pin.
+        /// Not for interactive use.
+        #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list"])]
+        apply: Option<PathBuf>,
     },
 }
 
@@ -125,6 +131,8 @@ pub struct Request {
 pub enum Action {
     Capture(Request),
     Pin(crate::pin::PinInvocation),
+    /// Internal: render one pin-edit session and write the result back.
+    PinApply(std::path::PathBuf),
 }
 
 impl Cli {
@@ -139,6 +147,7 @@ impl Cli {
             close_all,
             quit,
             list,
+            apply,
         } = &self.command
         {
             // Under the pin subcommand `--clipboard` selects the clipboard as
@@ -147,6 +156,9 @@ impl Cli {
                 return Err(VshotError::InvalidDestination(
                     "--output and --pin do not apply to the pin subcommand".into(),
                 ));
+            }
+            if let Some(session) = apply {
+                return Ok(Action::PinApply(session.clone()));
             }
             return Ok(Action::Pin(crate::pin::PinInvocation::build(
                 files.clone(),

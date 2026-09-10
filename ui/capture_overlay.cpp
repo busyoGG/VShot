@@ -3094,6 +3094,10 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         } else if (annotationIndex >= 0) {
             selectAnnotation(annotationIndex);
             beginAnnotationDrag(point, false);
+        } else if (pinEdit_) {
+            // The canvas is fixed in pin-edit mode: clicking empty space only
+            // clears the current annotation selection.
+            selectAnnotation(-1);
         } else {
             const int handle = hitHandle(point);
             if (selection_.has_value() && handle != 0 && handle != 9) {
@@ -3825,6 +3829,20 @@ bool OverlayController::hasValidSelection() const
            selection_->height >= kMinimumSelection;
 }
 
+void OverlayController::beginPinEdit()
+{
+    if (!pinEdit_ || finished_ || cancelled_) {
+        return;
+    }
+    // The canvas is the whole pin image: preselect everything and jump
+    // straight into the annotation editing state.
+    selection_ = LogicalRect{session_.bounds.x, session_.bounds.y, session_.bounds.width,
+                             session_.bounds.height};
+    editing_ = true;
+    toolbarOutput_ = 0;
+    showToolbar();
+}
+
 void OverlayController::confirm()
 {
     if (finished_ || cancelled_) {
@@ -4041,7 +4059,11 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     painter->save();
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
     painter->drawImage(target, output.image);
-    painter->fillRect(target, QColor(0, 0, 0, 80));
+    // The dim-out only makes sense around a selectable region: pin editing
+    // shows the image unshaded.
+    if (!pinEdit_) {
+        painter->fillRect(target, QColor(0, 0, 0, 80));
+    }
 
     if (selection_.has_value()) {
         LogicalRect visible;
@@ -4375,6 +4397,38 @@ bool CaptureOverlay::showLayerSurface()
     show();
     raise();
     activateWindow();
+    setFocus(Qt::OtherFocusReason);
+    return true;
+}
+
+bool CaptureOverlay::showLayerSurfaceAt(int globalX, int globalY, int width, int height)
+{
+    winId();
+    layerWindow_ = windowHandle();
+    if (layerWindow_ == nullptr) {
+        return false;
+    }
+    auto *layer = LayerShellQt::Window::get(layerWindow_);
+    if (layer == nullptr) {
+        return false;
+    }
+    layer->setLayer(LayerShellQt::Window::LayerOverlay);
+    // Anchor top-left only and carve the box out with margins, so the surface
+    // lands exactly on the given global rect regardless of output origin.
+    LayerShellQt::Window::Anchors anchors(LayerShellQt::Window::AnchorTop);
+    anchors |= LayerShellQt::Window::AnchorLeft;
+    layer->setAnchors(anchors);
+    layer->setExclusiveZone(-1);
+    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
+    layer->setActivateOnShow(true);
+    layer->setScope(QStringLiteral("vshot-pin-edit"));
+    layer->setDesiredSize(QSize(width, height));
+    layer->setScreen(screen_);
+    const QRect output = screen_ != nullptr ? screen_->geometry() : QRect();
+    layer->setMargins(QMargins(std::max(0, globalX - output.left()),
+                               std::max(0, globalY - output.top()), 0, 0));
+    resize(width, height);
+    show();
     setFocus(Qt::OtherFocusReason);
     return true;
 }

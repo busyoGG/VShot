@@ -173,8 +173,12 @@ impl WireRect {
 #[derive(Debug, Serialize)]
 struct QtSession<'a> {
     version: u32,
-    mode: &'static str,
+    mode: &'a str,
     bounds: WireRect,
+    // Pin-edit only: the editor surface rect (equal to `bounds`, but the
+    // helper reads it as an explicit placement hint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<WireRect>,
     outputs: Vec<QtOutput<'a>>,
 }
 
@@ -232,6 +236,138 @@ pub fn select_and_edit(scene: &SceneSnapshot) -> Result<(Rect, Vec<Annotation>)>
     parse_result(output, scene.bounds())
 }
 
+/// Pin-edit descriptor: the daemon pins one image; the helper edits it inside
+/// a window placed over the pin, and the result is rendered back onto it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PinEditSpec<'a> {
+    /// The pin's pixels at their native resolution (RGBA8).
+    pub(crate) frame: &'a crate::model::Frame,
+    /// Real compositor output the editor surface lands on.
+    pub(crate) output_name: &'a str,
+    /// Global logical rect of the editor surface (the pin's display rect).
+    pub(crate) window: Rect,
+    /// Device pixels per logical pixel between `frame` and `window`: 1 for
+    /// plain pins, the output's density for HiDPI-rendered text cards.
+    pub(crate) scale: u32,
+}
+
+/// Serializes a pin-edit session: one virtual output whose geometry is the
+/// editor window; the pin image is written raw next to the JSON.
+pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir, PathBuf)> {
+    let directory = tempfile::Builder::new()
+        .prefix("vshot-pin-edit-")
+        .tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .map_err(|error| {
+            VshotError::Pin(format!(
+                "failed to create pin-edit session directory: {error}"
+            ))
+        })?;
+    let raw_path = directory.path().join("pin.rgba");
+    write_private_file(&raw_path, spec.frame.pixels())?;
+
+    let session = QtSession {
+        version: 1,
+        mode: "pin-edit",
+        bounds: spec.window.into(),
+        window: Some(spec.window.into()),
+        outputs: vec![QtOutput {
+            id: 0,
+            name: spec.output_name,
+            x: spec.window.left(),
+            y: spec.window.top(),
+            width: spec.window.size.width,
+            height: spec.window.size.height,
+            scale: spec.scale,
+            pixel_width: spec.frame.size().width,
+            pixel_height: spec.frame.size().height,
+            path: raw_path.to_string_lossy().into_owned(),
+        }],
+    };
+    let session_path = directory.path().join("session.json");
+    let encoded = serde_json::to_vec(&session).map_err(|error| {
+        VshotError::Pin(format!("failed to encode pin-edit session JSON: {error}"))
+    })?;
+    write_private_file(&session_path, &encoded)?;
+    Ok((directory, session_path))
+}
+
+/// Runs the Qt helper against a session file and collects its stdout result.
+pub(crate) fn run_session(session_path: &Path) -> Result<Vec<u8>> {
+    let helper = helper_program()?;
+    let child = Command::new(&helper.path)
+        .arg("--pin-edit")
+        .arg(session_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                VshotError::Pin(format!(
+                    "Qt helper `{}` was not found; build it with `cmake -S . -B build-qt && \
+                     cmake --build build-qt` or point VSHOT_QT_HELPER at the executable",
+                    helper.path.display()
+                ))
+            } else {
+                VshotError::Pin(format!(
+                    "failed to start Qt helper `{}`: {error}",
+                    helper.path.display()
+                ))
+            }
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| VshotError::Pin(format!("failed to collect Qt helper output: {error}")))?;
+    if !output.status.success() {
+        let detail = compact_error(&output.stderr);
+        return Err(VshotError::Pin(if detail.is_empty() {
+            format!("Qt helper exited with {}", output.status)
+        } else {
+            format!("Qt helper exited with {}: {detail}", output.status)
+        }));
+    }
+    Ok(output.stdout)
+}
+
+/// Parses a pin-edit helper result. Selections are validated against the
+/// editor window; the status `cancelled` maps to `Ok(None)`.
+pub(crate) fn parse_edit_result(
+    bytes: Vec<u8>,
+    window: Rect,
+) -> Result<Option<(Rect, Vec<Annotation>)>> {
+    let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
+        VshotError::Pin(format!("Qt helper returned invalid result JSON: {error}"))
+    })?;
+    match result.status.as_str() {
+        "cancelled" => Ok(None),
+        "ok" => {
+            let selection = result
+                .selection
+                .ok_or_else(|| VshotError::Pin("Qt result has no selection".into()))?
+                .into_rect("Qt selection")?;
+            let selection = selection.intersection(window).ok_or_else(|| {
+                VshotError::Pin("Qt selection does not intersect the pin window".into())
+            })?;
+            if selection.size.width < 5 || selection.size.height < 5 {
+                return Err(VshotError::Pin(
+                    "Qt helper returned a pin selection smaller than 5x5".into(),
+                ));
+            }
+            let annotations = result
+                .annotations
+                .unwrap_or_default()
+                .into_iter()
+                .map(parse_annotation)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some((selection, annotations)))
+        }
+        status => Err(VshotError::Pin(format!(
+            "Qt helper returned unknown status `{status}`"
+        ))),
+    }
+}
+
 fn write_session(scene: &SceneSnapshot) -> Result<(TempDir, PathBuf)> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-qt-")
@@ -267,6 +403,7 @@ fn write_session(scene: &SceneSnapshot) -> Result<(TempDir, PathBuf)> {
         version: 1,
         mode: "region",
         bounds: scene.bounds().into(),
+        window: None,
         outputs,
     };
     let session_path = directory.path().join("session.json");

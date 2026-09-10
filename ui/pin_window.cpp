@@ -2,6 +2,8 @@
 
 #include <LayerShellQt/Window>
 
+#include <QFocusEvent>
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QRegion>
@@ -18,7 +20,12 @@ PinWindow::PinWindow(const QImage &image, QScreen *screen)
     setAttribute(Qt::WA_TranslucentBackground);
     setAttribute(Qt::WA_DeleteOnClose);
     setMouseTracking(true);
+    setFocusPolicy(Qt::ClickFocus);
     setCursor(Qt::SizeAllCursor);
+    // Text cards are rasterized at the output's pixel density; the natural
+    // zoom for every image is one device pixel per logical pixel.
+    imageRatio_ = std::clamp(source_.devicePixelRatio(), 1.0, 4.0);
+    scale_ = 1.0 / imageRatio_;
     zoomTimer_ = new QTimer(this);
     zoomTimer_->setSingleShot(true);
     connect(zoomTimer_, &QTimer::timeout, this, [this] {
@@ -52,7 +59,10 @@ bool PinWindow::showLayerSurface()
     anchors |= LayerShellQt::Window::AnchorLeft;
     anchors |= LayerShellQt::Window::AnchorRight;
     layer->setExclusiveZone(-1);
-    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+    // On-demand keyboard focus: a pin only takes the keyboard after a click,
+    // and releases it as soon as the user clicks elsewhere. This is what
+    // makes the Space edit shortcut work without a global grab.
+    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityOnDemand);
     layer->setScope(QStringLiteral("vshot-pin"));
     layer->setDesiredSize(QSize(0, 0)); // follow the anchored edges
     layer->setScreen(screen_);
@@ -67,6 +77,25 @@ void PinWindow::setPinnedVisible(bool visible)
 {
     visible_ = visible;
     setVisible(visible);
+}
+
+void PinWindow::setSourceImage(const QImage &image)
+{
+    if (image.isNull()) {
+        return;
+    }
+    // Keep what the user sees stable: preserve the on-screen size even though
+    // the pixel content changed (the edited image is 1:1 with the display).
+    const QSize display = displaySize();
+    source_ = image;
+    if (image.width() > 0) {
+        scale_ = std::clamp(static_cast<double>(display.width()) / image.width(), kMinScale,
+                            kMaxScale);
+    }
+    // Pixels changed even when the rect stays identical: applyGeometry skips
+    // the repaint in that case, so force one here.
+    applyGeometry();
+    update(paintedRect_);
 }
 
 void PinWindow::placeAt(QPoint topLeft)
@@ -145,8 +174,9 @@ void PinWindow::paintEvent(QPaintEvent *event)
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
     painter.drawImage(paintedRect_, source_);
     // A thin outline keeps the pinned image distinguishable from identical
-    // content behind it.
-    painter.setPen(QPen(QColor(0, 0, 0, 120), 1.0));
+    // content behind it; a focused pin (Space = edit) gets a bright one.
+    painter.setPen(hasFocus_ ? QPen(QColor(255, 255, 255, 200), 2.0)
+                             : QPen(QColor(0, 0, 0, 120), 1.0));
     painter.drawRect(QRectF(paintedRect_.x() + 0.5, paintedRect_.y() + 0.5,
                             paintedRect_.width() - 1.0, paintedRect_.height() - 1.0));
     if (!zoomLabel_.isEmpty()) {
@@ -176,6 +206,7 @@ void PinWindow::paintEvent(QPaintEvent *event)
 void PinWindow::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
+        setFocus(Qt::MouseFocusReason);
         dragging_ = true;
         pressGlobal_ = event->globalPosition().toPoint();
         startMargin_ = margin_;
@@ -230,11 +261,36 @@ void PinWindow::wheelEvent(QWheelEvent *event)
         applyGeometry();
     }
     // Show the resulting factor even when clamped at the limits, so the
-    // wheel always gives feedback.
-    zoomLabel_ = QString::number(qRound(scale_ * 100));
+    // wheel always gives feedback. The factor is relative to the image's
+    // native density, so a HiDPI card at natural size reads as 100%.
+    zoomLabel_ = QString::number(qRound(scale_ * imageRatio_ * 100));
     zoomTimer_->start(kZoomBadgeMs);
     update(paintedRect_);
     event->accept();
+}
+
+void PinWindow::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
+        event->accept();
+        if (editRequested_) {
+            editRequested_();
+        }
+        return;
+    }
+    QWidget::keyPressEvent(event);
+}
+
+void PinWindow::focusInEvent(QFocusEvent *event)
+{
+    hasFocus_ = true;
+    QWidget::focusInEvent(event);
+}
+
+void PinWindow::focusOutEvent(QFocusEvent *event)
+{
+    hasFocus_ = false;
+    QWidget::focusOutEvent(event);
 }
 
 void PinWindow::mouseDoubleClickEvent(QMouseEvent *event)

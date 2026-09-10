@@ -16,10 +16,14 @@ add_executable(vshot-qt-ui
     ui/capture_overlay.hpp
     ui/i18n.cpp
     ui/i18n.hpp
+    ui/pin_edit.cpp
+    ui/pin_edit.hpp
     ui/pin_window.cpp
     ui/pin_window.hpp
     ui/pin_server.cpp
     ui/pin_server.hpp
+    ui/text_card.cpp
+    ui/text_card.hpp
 )
 
 target_link_libraries(vshot-qt-ui PRIVATE

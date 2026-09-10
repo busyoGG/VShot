@@ -1,21 +1,27 @@
 #include "pin_server.hpp"
 #include "pin_window.hpp"
+#include "text_card.hpp"
 
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QDir>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMimeData>
+#include <QProcess>
 #include <QRect>
 #include <QScreen>
 #include <QSocketNotifier>
+#include <QTemporaryDir>
 #include <QUrl>
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <functional>
@@ -98,6 +104,8 @@ public:
         }
     }
 
+    void setPinId(PinWindow *pin, quint64 id) { pinIds_[pin] = id; }
+
 private:
     static QJsonObject okReply()
     {
@@ -147,6 +155,9 @@ private:
         if (command == QStringLiteral("add-clipboard")) {
             return addClipboardPin();
         }
+        if (command == QStringLiteral("replace")) {
+            return replacePin(request);
+        }
         if (command == QStringLiteral("toggle")) {
             setVisible(!allVisible_);
             return okReply();
@@ -194,7 +205,8 @@ private:
 
     // Pins the image currently on the clipboard. Resolution order: embedded
     // image data (screenshots, "copy image"), then image files referenced by
-    // a copied file (URI list), then a single plain-text local path.
+    // a copied file (URI list), then a single plain-text local path, then
+    // clipboard text rendered as a card (HTML, markdown, code, or plain).
     QJsonObject addClipboardPin()
     {
         QClipboard *clipboard = QGuiApplication::clipboard();
@@ -226,7 +238,19 @@ private:
                 return addImage(pathImage, text);
             }
         }
-        return error(QStringLiteral("the clipboard does not contain an image"));
+        if (!text.isEmpty()) {
+            QScreen *screen = QGuiApplication::primaryScreen();
+            if (screen == nullptr) {
+                return error(QStringLiteral("no screen is available to pin onto"));
+            }
+            const int ratio =
+                std::clamp(qRound(screen->devicePixelRatio()), 1, 4);
+            const QImage card = renderTextCard(mime, text, ratio);
+            if (!card.isNull()) {
+                return addImage(card, QStringLiteral("clipboard text"));
+            }
+        }
+        return error(QStringLiteral("the clipboard contains no pinnable image or text"));
     }
 
     QJsonObject addImage(const QImage &image, const QString &label)
@@ -240,19 +264,167 @@ private:
         }
         auto *pin = new PinWindow(image, screen);
         pin->setLabel(label);
+        pin->setEditCallback([this, pin] { startEdit(pin); });
+        pin->setCloseCallback([this, pin] { pinIds_.remove(pin); });
         QObject::connect(pin, &QObject::destroyed, this, [this, pin] {
             pins_.removeAll(pin);
+            pinIds_.remove(pin);
         });
         if (!pin->showLayerSurface()) {
             pin->deleteLater();
             return error(QStringLiteral("could not create a layer-shell pin surface"));
         }
         pins_.push_back(pin);
+        pinIds_[pin] = nextId_++;
         // Light cascade so repeated pins remain distinguishable.
         const int offset = static_cast<int>(pins_.size() - 1) % 6 * 28;
         pin->placeCentered(QPoint(offset, offset));
         pin->setPinnedVisible(allVisible_);
         return okReply();
+    }
+
+    // Replaces the pixels of an existing pin (pin-edit round trip).
+    QJsonObject replacePin(const QJsonObject &request)
+    {
+        bool idOk = false;
+        const quint64 id = request.value(QStringLiteral("id")).toVariant().toULongLong(&idOk);
+        const QString path = request.value(QStringLiteral("path")).toString();
+        if (!idOk || path.isEmpty()) {
+            return error(QStringLiteral("pin replace requires `id` and `path`"));
+        }
+        PinWindow *target = nullptr;
+        for (auto it = pinIds_.cbegin(); it != pinIds_.cend(); ++it) {
+            if (it.value() == id) {
+                target = it.key();
+                break;
+            }
+        }
+        if (target == nullptr) {
+            return error(QStringLiteral("pin %1 no longer exists").arg(id));
+        }
+        const QImage image(path);
+        if (image.isNull()) {
+            return error(QStringLiteral("cannot load replacement image `%1`").arg(path));
+        }
+        target->setSourceImage(image);
+        return okReply();
+    }
+
+    // One Space-triggered edit round: export the pin's pixels, describe the
+    // pin-edit session, and run `vshot pin --apply` in the background. That
+    // process shows the annotation editor, renders the result in Rust, and
+    // sends `replace` back to this daemon.
+    void startEdit(PinWindow *pin)
+    {
+        if (editingPin_ != nullptr) {
+            return; // one edit session at a time
+        }
+        const auto idIt = pinIds_.constFind(pin);
+        if (idIt == pinIds_.constEnd()) {
+            return;
+        }
+        QScreen *screen = pin->screen();
+        if (screen == nullptr) {
+            return;
+        }
+        // The directory must outlive the detached child; heap-allocate it and
+        // hand ownership to the edit session record below.
+        auto *directory = new QTemporaryDir(QDir::tempPath() +
+                                            QStringLiteral("/vshot-pin-edit-XXXXXX"));
+        directory->setAutoRemove(true);
+        if (!directory->isValid()) {
+            delete directory;
+            return;
+        }
+        const QString imagePath = directory->filePath(QStringLiteral("pin.png"));
+        if (!pin->sourceImage().save(imagePath, "PNG")) {
+            delete directory;
+            return;
+        }
+
+        const QRect display = pin->displayRect();
+        const QRect globalRect = display.translated(screen->geometry().topLeft());
+
+        // Field layout must match the Rust-written region session: the rect
+        // fields sit directly on the output object (not nested).
+        QJsonObject output;
+        output.insert(QStringLiteral("id"), 0);
+        output.insert(QStringLiteral("name"), screen->name());
+        output.insert(QStringLiteral("x"), static_cast<qint64>(globalRect.x()));
+        output.insert(QStringLiteral("y"), static_cast<qint64>(globalRect.y()));
+        output.insert(QStringLiteral("width"), static_cast<qint64>(globalRect.width()));
+        output.insert(QStringLiteral("height"), static_cast<qint64>(globalRect.height()));
+        output.insert(QStringLiteral("scale"), 1);
+        output.insert(QStringLiteral("pixel_width"),
+                      static_cast<qint64>(pin->sourceImage().width()));
+        output.insert(QStringLiteral("pixel_height"),
+                      static_cast<qint64>(pin->sourceImage().height()));
+        output.insert(QStringLiteral("path"), imagePath);
+
+        QJsonObject bounds;
+        bounds.insert(QStringLiteral("x"), static_cast<qint64>(globalRect.x()));
+        bounds.insert(QStringLiteral("y"), static_cast<qint64>(globalRect.y()));
+        bounds.insert(QStringLiteral("width"), static_cast<qint64>(globalRect.width()));
+        bounds.insert(QStringLiteral("height"), static_cast<qint64>(globalRect.height()));
+
+        QJsonObject session;
+        session.insert(QStringLiteral("version"), 1);
+        session.insert(QStringLiteral("mode"), QStringLiteral("pin-edit"));
+        session.insert(QStringLiteral("bounds"), bounds);
+        session.insert(QStringLiteral("id"), static_cast<qint64>(idIt.value()));
+        session.insert(QStringLiteral("outputs"), QJsonArray{output});
+
+        const QString sessionPath = directory->filePath(QStringLiteral("session.json"));
+        {
+            QFile file(sessionPath);
+            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                delete directory;
+                return;
+            }
+            file.write(QJsonDocument(session).toJson(QJsonDocument::Compact));
+        }
+
+        editingPin_ = pin;
+        connect(pin, &QObject::destroyed, this, [this] { editingPin_ = nullptr; });
+
+        QString cliPath = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
+        if (cliPath.isEmpty()) {
+            char buffer[4096];
+            const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+            if (length > 0) {
+                buffer[length] = '\0';
+                const QDir helperDir = QFileInfo(QString::fromLocal8Bit(buffer)).dir();
+                // The helper lives next to vshot (installed) or in build-qt/
+                // (in-tree), so look one and two levels up as well.
+                for (const QString &candidate :
+                     {helperDir.filePath(QStringLiteral("vshot")),
+                      helperDir.filePath(QStringLiteral("../vshot")),
+                      helperDir.filePath(QStringLiteral("../../vshot"))}) {
+                    if (QFileInfo::exists(candidate)) {
+                        cliPath = QFileInfo(candidate).absoluteFilePath();
+                        break;
+                    }
+                }
+            }
+        }
+        if (cliPath.isEmpty()) {
+            editingPin_ = nullptr;
+            delete directory;
+            return;
+        }
+        // Run the apply child detached (no inherited pipes), but keep a
+        // QProcess handle only as a watcher so we can drop the editing flag
+        // when it exits; the temp dir dies right after.
+        QProcess *watcher = new QProcess(this);
+        connect(watcher, &QProcess::finished, watcher, [this, watcher, directory] {
+            editingPin_ = nullptr;
+            delete directory;
+            watcher->deleteLater();
+        });
+        watcher->setProgram(cliPath);
+        watcher->setArguments({QStringLiteral("pin"), QStringLiteral("--apply"), sessionPath});
+        watcher->setStandardInputFile(QProcess::nullDevice());
+        watcher->start();
     }
 
     void setVisible(bool visible)
@@ -266,6 +438,9 @@ private:
     QLocalServer *server_;
     QHash<QLocalSocket *, QByteArray> buffer_;
     QVector<PinWindow *> pins_;
+    QHash<PinWindow *, quint64> pinIds_;
+    quint64 nextId_ = 1;
+    PinWindow *editingPin_ = nullptr;
     bool allVisible_ = true;
 };
 

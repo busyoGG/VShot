@@ -12,16 +12,13 @@ mod wayland;
 
 use std::process::ExitCode;
 
-use crate::geometry::{Point, Rect};
-
 use clap::Parser;
 
 use capture::{CompositorWindowProvider, ProcessWindowProvider, WlrCapture};
 use cli::{Action, CaptureTarget, Cli};
-use edit::{mosaic_block_size, mosaic_brush_radius, EditPipeline, ShapeMask};
+use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
 use model::{ImageDocument, OutputSnapshot, SceneSnapshot};
-use wayland::input::{Annotation, EditorTool};
 use wayland::topology::OutputInfo;
 use wayland::WaylandSession;
 
@@ -42,6 +39,10 @@ fn run() -> Result<()> {
         Action::Pin(invocation) => {
             // Pin management talks to the daemon only; no capture, no scene.
             return pin::run(invocation);
+        }
+        Action::PinApply(session) => {
+            // Internal: render a pin-edit session, no Wayland capture needed.
+            return pin::apply_edit(&session);
         }
         Action::Capture(request) => request,
     };
@@ -109,134 +110,6 @@ fn run() -> Result<()> {
     result.and(cleanup)
 }
 
-fn pipeline_for_annotations(
-    annotations: Vec<Annotation>,
-    selection: Rect,
-    scale: u32,
-) -> Result<EditPipeline> {
-    let mut pipeline = EditPipeline::new();
-    for annotation in annotations {
-        let color = annotation.color();
-        let width = device_width(annotation.width(), scale)?;
-        let dash = annotation.dash();
-        let head = annotation.head();
-        let arrow_style = annotation.arrow_style();
-        let strength = annotation.strength();
-        match annotation {
-            Annotation::Shape {
-                tool, rect, mask, ..
-            } => {
-                let rect = local_rect(rect, selection, scale)?;
-                match tool {
-                    EditorTool::Rectangle => {
-                        pipeline = pipeline.rectangle_stroke(rect, color, width, dash);
-                    }
-                    EditorTool::Ellipse => {
-                        pipeline = pipeline.ellipse_stroke(rect, color, width, dash);
-                    }
-                    EditorTool::Mosaic | EditorTool::Blur => {
-                        let block = mosaic_block_size(strength, scale);
-                        pipeline = match mask {
-                            ShapeMask::Rect => pipeline.mosaic(rect, block),
-                            ShapeMask::Ellipse => pipeline.mosaic_ellipse(rect, block),
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            Annotation::Stroke { tool, points, .. } => {
-                let points = points
-                    .into_iter()
-                    .map(|point| local_point(point, selection, scale))
-                    .collect::<Result<Vec<_>>>()?;
-                match tool {
-                    EditorTool::Arrow if points.len() >= 2 => {
-                        pipeline = pipeline.arrow_with_style(
-                            points[0],
-                            *points.last().ok_or_else(|| {
-                                VshotError::Selection("arrow has no endpoint".into())
-                            })?,
-                            color,
-                            width,
-                            dash,
-                            head,
-                            arrow_style,
-                        );
-                    }
-                    EditorTool::Pen | EditorTool::Draw | EditorTool::Line => {
-                        pipeline = pipeline.freehand(points, color, width, dash);
-                    }
-                    EditorTool::Mosaic | EditorTool::Blur => {
-                        // Freehand mosaic smears discs along the path; the
-                        // strength level scales the smear radius.
-                        let radius = mosaic_brush_radius(strength, width);
-                        pipeline = pipeline.mosaic_brush(points, radius);
-                    }
-                    _ => {}
-                }
-            }
-            Annotation::Text {
-                origin,
-                text,
-                scale: text_scale,
-                bitmap,
-                ..
-            } => {
-                let origin = local_point(origin, selection, scale)?;
-                pipeline = match bitmap {
-                    // Helper-rendered with the user-selected font: composite
-                    // the device-pixel bitmap as-is.
-                    Some(bitmap) => pipeline.blit(origin, bitmap),
-                    None => {
-                        pipeline.text(origin, text, color, text_scale.saturating_mul(scale).max(1))
-                    }
-                };
-            }
-        }
-    }
-    Ok(pipeline)
-}
-
-/// Converts an annotation stroke width from logical pixels to device pixels.
-fn device_width(logical_width: u32, scale: u32) -> Result<u32> {
-    let width = logical_width
-        .max(1)
-        .checked_mul(scale)
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation width overflows".into()))?;
-    Ok(width.clamp(1, 4096))
-}
-
-fn local_point(point: Point, selection: Rect, scale: u32) -> Result<Point> {
-    let x = (i64::from(point.x) - i64::from(selection.left()))
-        .checked_mul(i64::from(scale))
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation x overflows".into()))?;
-    let y = (i64::from(point.y) - i64::from(selection.top()))
-        .checked_mul(i64::from(scale))
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation y overflows".into()))?;
-    Ok(Point::new(
-        i32::try_from(x)
-            .map_err(|_| VshotError::InvalidGeometry("annotation x is out of range".into()))?,
-        i32::try_from(y)
-            .map_err(|_| VshotError::InvalidGeometry("annotation y is out of range".into()))?,
-    ))
-}
-
-fn local_rect(rect: Rect, selection: Rect, scale: u32) -> Result<Rect> {
-    let origin = local_point(rect.origin, selection, scale)?;
-    Ok(Rect::new(
-        origin.x,
-        origin.y,
-        rect.size
-            .width
-            .checked_mul(scale)
-            .ok_or_else(|| VshotError::InvalidGeometry("annotation width overflows".into()))?,
-        rect.size
-            .height
-            .checked_mul(scale)
-            .ok_or_else(|| VshotError::InvalidGeometry("annotation height overflows".into()))?,
-    ))
-}
-
 fn capture_scene(
     capture: &mut WlrCapture,
     output_infos: &[OutputInfo],
@@ -265,9 +138,9 @@ fn capture_scene(
 mod tests {
     use super::*;
     use crate::edit::{ArrowStyle, LineDash};
-    use crate::geometry::Size;
+    use crate::geometry::{Point, Rect, Size};
     use crate::model::Frame;
-    use crate::wayland::input::Annotation;
+    use crate::wayland::input::{Annotation, EditorTool};
 
     #[test]
     fn annotation_pipeline_maps_global_points_into_cropped_pixels() {

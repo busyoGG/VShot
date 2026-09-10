@@ -24,6 +24,10 @@ pub(crate) enum PinCommand {
     },
     #[serde(rename = "add-clipboard")]
     AddClipboard,
+    Replace {
+        id: u64,
+        path: PathBuf,
+    },
     Toggle,
     Show,
     Hide,
@@ -317,6 +321,132 @@ pub(crate) fn pin_png(png: &[u8]) -> Result<()> {
     result.map(|_| ())
 }
 
+/// One interactive pin editing round: the Qt helper edits the pinned image,
+/// and the rendered result replaces the pin via the `replace` command.
+///
+/// `session_path` points at the pin-edit session JSON the daemon wrote. The
+/// blocking flow is intentional: the daemon spawns `vshot pin --apply` in the
+/// background and simply waits for the edit to finish.
+pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
+    let payload = std::fs::read(session_path).map_err(|source| {
+        VshotError::Pin(format!(
+            "failed to read pin-edit session {}: {source}",
+            session_path.display()
+        ))
+    })?;
+    let session: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|error| VshotError::Pin(format!("invalid pin-edit session JSON: {error}")))?;
+    let window = session
+        .get("bounds")
+        .ok_or_else(|| VshotError::Pin("pin-edit session has no bounds".into()))?;
+    let window = parse_json_rect(window)?;
+    let id = session
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| VshotError::Pin("pin-edit session has no pin id".into()))?;
+    let output_name = session
+        .pointer("/outputs/0/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VshotError::Pin("pin-edit session has no output name".into()))?
+        .to_owned();
+    let image_path = session
+        .pointer("/outputs/0/path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VshotError::Pin("pin-edit session has no image path".into()))?
+        .to_owned();
+
+    // The editor session and the rendered replacement share one private
+    // directory; both are cleaned up when this function returns.
+    let directory = session_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let frame = crate::model::Frame::from_png(&std::fs::read(&image_path).map_err(|source| {
+        VshotError::Pin(format!(
+            "failed to read pinned image {image_path}: {source}"
+        ))
+    })?)?;
+
+    let scale = pin_edit_scale(frame.size().width, window.size.width);
+    let (_editor_dir, editor_session) =
+        crate::qt_overlay::write_pin_edit_session(&crate::qt_overlay::PinEditSpec {
+            frame: &frame,
+            output_name: &output_name,
+            window,
+            scale,
+        })?;
+    let output = crate::qt_overlay::run_session(&editor_session)?;
+    let Some((selection, annotations)) = crate::qt_overlay::parse_edit_result(output, window)?
+    else {
+        // Cancelled: keep the pin as it was.
+        return Ok(());
+    };
+
+    // Render the annotations over the pin's own pixels. The editor works in
+    // window-logical pixels; the ratio computed above maps them onto the
+    // pin's device pixels.
+    let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale)?;
+    let edited = pipeline.apply(crate::model::ImageDocument::new(frame))?;
+    let png = edited.frame().to_png()?;
+
+    let rendered_path = directory.join("pin-edited.png");
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        options
+            .open(&rendered_path)
+            .map_err(|source| VshotError::WriteFile {
+                path: rendered_path.clone(),
+                source,
+            })?
+    };
+    file.write_all(&png)
+        .map_err(|source| VshotError::WriteFile {
+            path: rendered_path.clone(),
+            source,
+        })?;
+    drop(file);
+
+    let reply = execute(PinCommand::Replace {
+        id,
+        path: rendered_path.clone(),
+    });
+    let _ = std::fs::remove_file(&rendered_path);
+    reply.map(|_| ())
+}
+
+/// Device pixels per logical pixel for a pin-edit round trip: the pin's
+/// native width divided by its on-screen (logical) width. Plain pins and
+/// captures are 1:1 logical; text cards render at the output's pixel
+/// density (2x on HiDPI outputs). The renderer supports 1..=4.
+fn pin_edit_scale(frame_width: u32, window_width: u32) -> u32 {
+    if window_width == 0 {
+        return 1;
+    }
+    (frame_width / window_width).clamp(1, 4)
+}
+
+fn parse_json_rect(value: &serde_json::Value) -> Result<crate::geometry::Rect> {
+    use crate::geometry::Rect;
+    let as_i64 = |key: &str| -> Result<i64> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| VshotError::Pin(format!("pin-edit rect field `{key}` is missing")))
+    };
+    let x = i32::try_from(as_i64("x")?)
+        .map_err(|_| VshotError::Pin("pin-edit rect x is out of range".into()))?;
+    let y = i32::try_from(as_i64("y")?)
+        .map_err(|_| VshotError::Pin("pin-edit rect y is out of range".into()))?;
+    let width = u32::try_from(as_i64("width")?)
+        .map_err(|_| VshotError::Pin("pin-edit rect width is out of range".into()))?;
+    let height = u32::try_from(as_i64("height")?)
+        .map_err(|_| VshotError::Pin("pin-edit rect height is out of range".into()))?;
+    Ok(Rect::new(x, y, width, height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +479,18 @@ mod tests {
         let encoded = serde_json::to_vec(&PinCommand::Toggle).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value, serde_json::json!({"cmd": "toggle"}));
+    }
+
+    #[test]
+    fn pin_edit_scale_follows_the_display_density() {
+        assert_eq!(pin_edit_scale(160, 160), 1);
+        assert_eq!(pin_edit_scale(320, 160), 2);
+        assert_eq!(pin_edit_scale(1120, 560), 2);
+        // Zoomed-in pins (screen rect larger than the image) stay at 1x.
+        assert_eq!(pin_edit_scale(80, 160), 1);
+        // Degenerate window falls back to 1x; density is capped at 4.
+        assert_eq!(pin_edit_scale(320, 0), 1);
+        assert_eq!(pin_edit_scale(4000, 500), 4);
     }
 
     #[test]

@@ -31,6 +31,7 @@ struct OutputSession {
 };
 
 struct Session {
+    QString mode;
     LogicalRect bounds;
     QVector<OutputSession> outputs;
 };

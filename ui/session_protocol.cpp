@@ -163,15 +163,17 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
     if (!jsonInteger(root.value(QStringLiteral("version")), 1, 1, &version)) {
         return fail(error, QStringLiteral("session version must be integer 1"));
     }
-    if (root.value(QStringLiteral("mode")).toString() != QStringLiteral("region")) {
-        return fail(error, QStringLiteral("session mode must be `region`"));
+
+    Session parsed;
+    parsed.mode = root.value(QStringLiteral("mode")).toString();
+    if (parsed.mode != QStringLiteral("region") && parsed.mode != QStringLiteral("pin-edit")) {
+        return fail(error, QStringLiteral("session mode must be `region` or `pin-edit`"));
     }
     const QJsonValue boundsValue = root.value(QStringLiteral("bounds"));
     if (!boundsValue.isObject()) {
         return fail(error, QStringLiteral("session bounds must be an object"));
     }
 
-    Session parsed;
     if (!jsonRect(boundsValue.toObject(), &parsed.bounds, QStringLiteral("session bounds"), error)) {
         return false;
     }

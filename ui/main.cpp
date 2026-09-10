@@ -1,5 +1,6 @@
 #include "capture_overlay.hpp"
 #include "i18n.hpp"
+#include "pin_edit.hpp"
 #include "pin_server.hpp"
 #include "session_protocol.hpp"
 
@@ -66,8 +67,20 @@ int main(int argc, char **argv)
         vshot::initUiLanguage();
         return vshot::runPinServer(socketPath);
     }
+    if (argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--pin-edit")) {
+        const QString sessionPath = QString::fromLocal8Bit(argv[2]);
+        if (!QFileInfo(sessionPath).isAbsolute()) {
+            reportError(QStringLiteral("pin-edit session path must be absolute"));
+            return 2;
+        }
+        QApplication app(argc, argv);
+        QApplication::setQuitOnLastWindowClosed(true);
+        vshot::initUiLanguage();
+        return vshot::runPinEdit(sessionPath);
+    }
     if (argc != 3 || QString::fromLocal8Bit(argv[1]) != QStringLiteral("--session")) {
         reportError(QStringLiteral("usage: vshot-qt-ui --session <absolute-json-path>\n"
+                                   "       vshot-qt-ui --pin-edit <absolute-json-path>\n"
                                    "       vshot-qt-ui --pin-server <absolute-socket-path>"));
         return 2;
     }

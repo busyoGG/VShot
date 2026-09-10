@@ -138,6 +138,13 @@ public:
 
     bool isFinished() const;
     bool isCancelled() const;
+    bool isPinEdit() const { return pinEdit_; }
+    // Pin-edit mode: the whole session bounds is the editable canvas; the
+    // selection is fixed and the toolbar shows immediately. Call before the
+    // overlay is shown.
+    void setPinEditMode(bool enabled) { pinEdit_ = enabled; }
+    // Enters editing state over the fixed canvas (shows the toolbar).
+    void beginPinEdit();
     bool hasValidSelection() const;
     const std::optional<LogicalRect> &selection() const;
     const QVector<Annotation> &annotations() const;
@@ -197,6 +204,7 @@ private:
     QVector<Annotation> styleAdjustmentSnapshot_;
     Gesture *gesture_ = nullptr;
     bool editing_ = false;
+    bool pinEdit_ = false;
     bool finished_ = false;
     bool cancelled_ = false;
     std::function<void()> terminalCallback_;
@@ -254,6 +262,9 @@ public:
     const OutputSession &output() const;
     QPointF localFromGlobal(Point point) const;
     bool showLayerSurface();
+    // Floating layer surface carved to a specific global logical rect
+    // (top-left anchored + margins): used by the pin editor.
+    bool showLayerSurfaceAt(int globalX, int globalY, int width, int height);
 
 protected:
     void paintEvent(QPaintEvent *event) override;

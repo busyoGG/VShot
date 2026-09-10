@@ -13,8 +13,8 @@ namespace vshot {
 
 // One pinned image: content painted inside a full-output transparent
 // layer-shell surface. Dragging moves it, the wheel scales it, a double-click
-// closes just this pin. It deliberately never takes keyboard focus so the
-// desktop keeps working normally; all bulk operations live in the pin server.
+// closes just this pin, and Space (after a click focuses it) opens the
+// annotation editor; all bulk operations live in the pin server.
 //
 // The surface is deliberately NOT sized to the image: layer margins are the
 // only way to position a layer surface, and every margin change costs a full
@@ -32,6 +32,19 @@ public:
         closeRequested_ = std::move(callback);
     }
 
+    // Invoked when the user presses Space while this pin has keyboard focus.
+    void setEditCallback(std::function<void()> callback)
+    {
+        editRequested_ = std::move(callback);
+    }
+
+    // True while this pin owns keyboard focus (an edit session is running).
+    bool hasKeyboardFocus() const { return hasFocus_; }
+
+    // The image's display rect in output-local logical coordinates.
+    QRect displayRect() const { return paintedRect_; }
+    QScreen *screen() const { return screen_; }
+
     // Maps the widget onto its layer-shell surface. Returns false when
     // LayerShellQt is unavailable.
     bool showLayerSurface();
@@ -46,8 +59,13 @@ public:
     // so repeated pins stay distinguishable.
     void placeCentered(QPoint cascadeOffset);
 
+    const QImage &sourceImage() const { return source_; }
     void setLabel(const QString &label) { label_ = label; }
     const QString &label() const { return label_; }
+
+    // Swaps the pin's pixels (pin-edit result) while keeping its on-screen
+    // position and apparent size.
+    void setSourceImage(const QImage &image);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -56,6 +74,9 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void focusInEvent(QFocusEvent *event) override;
+    void focusOutEvent(QFocusEvent *event) override;
 
 private:
     static constexpr double kMinScale = 0.1;
@@ -73,10 +94,15 @@ private:
     QImage source_;
     QScreen *screen_;
     std::function<void()> closeRequested_;
+    std::function<void()> editRequested_;
+    bool hasFocus_ = false;
 
     // Image top-left in output-local logical pixels.
     QPoint margin_{0, 0};
     QRect paintedRect_;
+    // Device pixels per logical pixel of `source_` (clamped 1..4): 1 for
+    // plain pins and captures, higher for cards rendered at HiDPI density.
+    qreal imageRatio_ = 1.0;
     double scale_ = 1.0;
     QString label_;
     QString zoomLabel_;
