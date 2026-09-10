@@ -83,8 +83,9 @@ constexpr int kIdleQuitMs = 500;
 // signals or slots of its own, so the build stays moc-free.
 class PinServer final : public QObject {
 public:
-    explicit PinServer(QLocalServer *server)
+    PinServer(QLocalServer *server, QString socketPath)
         : server_(server)
+        , socketPath_(std::move(socketPath))
     {
         idleQuit_ = new QTimer(this);
         idleQuit_->setSingleShot(true);
@@ -178,8 +179,8 @@ private:
         if (command == QStringLiteral("add-clipboard")) {
             return addClipboardPin();
         }
-        if (command == QStringLiteral("replace")) {
-            return replacePin(request);
+        if (command == QStringLiteral("move")) {
+            return movePin(request);
         }
         if (command == QStringLiteral("toggle")) {
             setVisible(!allVisible_);
@@ -310,14 +311,20 @@ private:
         return okReply();
     }
 
-    // Replaces the pixels of an existing pin (pin-edit round trip).
-    QJsonObject replacePin(const QJsonObject &request)
+    // Replaces the pixels of an existing pin and/or moves it. Coordinates are
+    // global logical pixels (the editor's frame of reference); the response
+    // carries the rect the pin actually landed on, after the pin window's own
+    // clamping, so the caller can follow it.
+    QJsonObject movePin(const QJsonObject &request)
     {
         bool idOk = false;
         const quint64 id = request.value(QStringLiteral("id")).toVariant().toULongLong(&idOk);
-        const QString path = request.value(QStringLiteral("path")).toString();
-        if (!idOk || path.isEmpty()) {
-            return error(QStringLiteral("pin replace requires `id` and `path`"));
+        bool xOk = false;
+        bool yOk = false;
+        const int x = request.value(QStringLiteral("x")).toVariant().toInt(&xOk);
+        const int y = request.value(QStringLiteral("y")).toVariant().toInt(&yOk);
+        if (!idOk || !xOk || !yOk) {
+            return error(QStringLiteral("pin move requires `id`, `x` and `y`"));
         }
         PinWindow *target = nullptr;
         for (auto it = pinIds_.cbegin(); it != pinIds_.cend(); ++it) {
@@ -329,12 +336,29 @@ private:
         if (target == nullptr) {
             return error(QStringLiteral("pin %1 no longer exists").arg(id));
         }
-        const QImage image(path);
-        if (image.isNull()) {
-            return error(QStringLiteral("cannot load replacement image `%1`").arg(path));
+        const QString path = request.value(QStringLiteral("path")).toString();
+        if (!path.isEmpty()) {
+            const QImage image(path);
+            if (image.isNull()) {
+                return error(QStringLiteral("cannot load replacement image `%1`").arg(path));
+            }
+            target->setSourceImage(image);
         }
-        target->setSourceImage(image);
-        return okReply();
+        QScreen *screen = target->screen();
+        if (screen == nullptr) {
+            return error(QStringLiteral("pin %1 lost its output").arg(id));
+        }
+        // placeAt works in output-local logical pixels; the caller speaks
+        // global ones.
+        const QPoint origin = screen->geometry().topLeft();
+        target->placeAt(QPoint(x, y) - origin);
+        const QRect landed = target->displayRect().translated(origin);
+        QJsonObject reply = okReply();
+        reply.insert(QStringLiteral("x"), static_cast<qint64>(landed.x()));
+        reply.insert(QStringLiteral("y"), static_cast<qint64>(landed.y()));
+        reply.insert(QStringLiteral("width"), static_cast<qint64>(landed.width()));
+        reply.insert(QStringLiteral("height"), static_cast<qint64>(landed.height()));
+        return reply;
     }
 
     // One Space-triggered edit round: export the pin's pixels, describe the
@@ -373,7 +397,8 @@ private:
         const QRect globalRect = display.translated(screen->geometry().topLeft());
 
         // Field layout must match the Rust-written region session: the rect
-        // fields sit directly on the output object (not nested).
+        // fields sit directly on the output object (not nested). `surface`
+        // repeats the pin rect here; the Rust editor widens it to the screen.
         QJsonObject output;
         output.insert(QStringLiteral("id"), 0);
         output.insert(QStringLiteral("name"), screen->name());
@@ -381,6 +406,12 @@ private:
         output.insert(QStringLiteral("y"), static_cast<qint64>(globalRect.y()));
         output.insert(QStringLiteral("width"), static_cast<qint64>(globalRect.width()));
         output.insert(QStringLiteral("height"), static_cast<qint64>(globalRect.height()));
+        QJsonObject surface;
+        surface.insert(QStringLiteral("x"), static_cast<qint64>(globalRect.x()));
+        surface.insert(QStringLiteral("y"), static_cast<qint64>(globalRect.y()));
+        surface.insert(QStringLiteral("width"), static_cast<qint64>(globalRect.width()));
+        surface.insert(QStringLiteral("height"), static_cast<qint64>(globalRect.height()));
+        output.insert(QStringLiteral("surface"), surface);
         output.insert(QStringLiteral("scale"), 1);
         output.insert(QStringLiteral("pixel_width"),
                       static_cast<qint64>(pin->sourceImage().width()));
@@ -399,6 +430,10 @@ private:
         session.insert(QStringLiteral("mode"), QStringLiteral("pin-edit"));
         session.insert(QStringLiteral("bounds"), bounds);
         session.insert(QStringLiteral("id"), static_cast<qint64>(idIt.value()));
+        // The editor drives the real pin window while editing (moving it with
+        // the pin's own code path instead of rendering a second copy of the
+        // image), which it does over this daemon socket.
+        session.insert(QStringLiteral("socket"), socketPath_);
         session.insert(QStringLiteral("outputs"), QJsonArray{output});
 
         const QString sessionPath = directory->filePath(QStringLiteral("session.json"));
@@ -421,12 +456,16 @@ private:
             if (length > 0) {
                 buffer[length] = '\0';
                 const QDir helperDir = QFileInfo(QString::fromLocal8Bit(buffer)).dir();
-                // The helper lives next to vshot (installed) or in build-qt/
-                // (in-tree), so look one and two levels up as well.
+                // The helper lives next to vshot (installed layout), in
+                // build-qt/ next to the repo root, or in a cargo target/
+                // layout; cover all of them plus the same two levels up.
                 for (const QString &candidate :
                      {helperDir.filePath(QStringLiteral("vshot")),
                       helperDir.filePath(QStringLiteral("../vshot")),
-                      helperDir.filePath(QStringLiteral("../../vshot"))}) {
+                      helperDir.filePath(QStringLiteral("../../vshot")),
+                      helperDir.filePath(QStringLiteral("../target/release/vshot")),
+                      helperDir.filePath(QStringLiteral("../../target/release/vshot")),
+                      helperDir.filePath(QStringLiteral("../../../target/release/vshot"))}) {
                     if (QFileInfo::exists(candidate)) {
                         cliPath = QFileInfo(candidate).absoluteFilePath();
                         break;
@@ -435,6 +474,12 @@ private:
             }
         }
         if (cliPath.isEmpty()) {
+            // Detached daemons have stderr discarded, but log anyway for
+            // attached runs; a silent return here looks like "Space does
+            // nothing" to the user.
+            std::fprintf(stderr, "vshot-qt-ui: cannot locate the vshot CLI for pin editing; \
+                                  set VSHOT_BIN\n");
+            std::fflush(stderr);
             editingPin_ = nullptr;
             delete directory;
             return;
@@ -463,6 +508,7 @@ private:
     }
 
     QLocalServer *server_;
+    QString socketPath_;
     QHash<QLocalSocket *, QByteArray> buffer_;
     QVector<PinWindow *> pins_;
     QHash<PinWindow *, quint64> pinIds_;
@@ -488,7 +534,7 @@ int runPinServer(const QString &socketPath)
                  socketPath.toUtf8().constData());
     std::fflush(stderr);
 
-    PinServer controller(server);
+    PinServer controller(server, socketPath);
     QObject::connect(server, &QLocalServer::newConnection, &controller,
                      &PinServer::handleNewConnection);
     // close() also removes the listening socket file; otherwise the next

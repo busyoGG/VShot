@@ -24,9 +24,14 @@ pub(crate) enum PinCommand {
     },
     #[serde(rename = "add-clipboard")]
     AddClipboard,
-    Replace {
+    /// Repositions a pin, optionally replacing its pixels in the same round
+    /// trip (pin editing writes the annotated image back where the user put it).
+    Move {
         id: u64,
-        path: PathBuf,
+        x: i32,
+        y: i32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
     },
     Toggle,
     Show,
@@ -322,7 +327,8 @@ pub(crate) fn pin_png(png: &[u8]) -> Result<()> {
 }
 
 /// One interactive pin editing round: the Qt helper edits the pinned image,
-/// and the rendered result replaces the pin via the `replace` command.
+/// the editor drives the live pin window over the daemon socket, and the
+/// rendered result lands the pin where the user left it via the `move` command.
 ///
 /// `session_path` points at the pin-edit session JSON the daemon wrote. The
 /// blocking flow is intentional: the daemon spawns `vshot pin --apply` in the
@@ -354,6 +360,13 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| VshotError::Pin("pin-edit session has no image path".into()))?
         .to_owned();
+    // The editor moves the real pin window instead of drawing its own copy, so
+    // it needs a live daemon to talk to. The daemon always stamps this.
+    let socket_path = session
+        .get("socket")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VshotError::Pin("pin-edit session has no daemon socket".into()))?
+        .to_owned();
 
     // The editor session and the rendered replacement share one private
     // directory; both are cleaned up when this function returns.
@@ -375,17 +388,24 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
             output_name: &output_name,
             window,
             scale,
+            socket: Path::new(&socket_path),
+            pin_id: id,
         })?;
     let output = crate::qt_overlay::run_session(&editor_session)?;
     let Some((selection, annotations)) = crate::qt_overlay::parse_edit_result(output, window)?
     else {
-        // Cancelled: keep the pin as it was.
+        // Cancelled. The editor moved the live pin while the user was
+        // dragging, and that move stands: cancelling drops the annotations,
+        // it does not undo where the user put the image. The pixels were
+        // never replaced, so the pin keeps its original content.
         return Ok(());
     };
 
-    // Render the annotations over the pin's own pixels. The editor works in
-    // window-logical pixels; the ratio computed above maps them onto the
-    // pin's device pixels.
+    // The editor reports the pin image's rect as the selection: the user may
+    // have dragged the image to a new spot. Render the annotations over the
+    // pin's own pixels and land the pin exactly there. The editor works in
+    // screen-logical pixels; the ratio computed above maps them onto the pin's
+    // device pixels.
     let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale)?;
     let edited = pipeline.apply(crate::model::ImageDocument::new(frame))?;
     let png = edited.frame().to_png()?;
@@ -409,9 +429,11 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         })?;
     drop(file);
 
-    let reply = execute(PinCommand::Replace {
+    let reply = execute(PinCommand::Move {
         id,
-        path: rendered_path.clone(),
+        x: selection.origin.x,
+        y: selection.origin.y,
+        path: Some(rendered_path.clone()),
     });
     let _ = std::fs::remove_file(&rendered_path);
     reply.map(|_| ())

@@ -19,6 +19,7 @@ class QSlider;
 class QSpinBox;
 class QLabel;
 class QWindow;
+class QLocalSocket;
 
 namespace vshot {
 
@@ -143,6 +144,10 @@ public:
     // selection is fixed and the toolbar shows immediately. Call before the
     // overlay is shown.
     void setPinEditMode(bool enabled) { pinEdit_ = enabled; }
+    // Pin-edit mode: the editor drives the real pin window over the daemon
+    // socket rather than drawing a second copy of the image. Call before the
+    // overlay is shown.
+    void setPinTarget(std::uint64_t pinId, const QString &socketPath);
     // Enters editing state over the fixed canvas (shows the toolbar).
     void beginPinEdit();
     bool hasValidSelection() const;
@@ -209,8 +214,28 @@ private:
     bool cancelled_ = false;
     std::function<void()> terminalCallback_;
     mutable int textBitmapIndex_ = 0;
+    // Live pin window the editor drives in pin-edit mode. The daemon answers
+    // exactly one request per connection and then closes, so each move gets a
+    // fresh socket instead of a reconnected one.
+    std::uint64_t pinId_ = 0;
+    QString pinSocketPath_;
+    QLocalSocket *pinSocket_ = nullptr;
+    QByteArray pinReplyBuffer_;
+    // Moves are coalesced: while one request is in flight the newest position
+    // waits here, since a drag produces far more motion than the daemon needs.
+    std::optional<Point> pendingPinOrigin_;
 
     Point globalPoint(CaptureOverlay *overlay, const QPointF &local) const;
+    Point unclampedGlobalPoint(CaptureOverlay *overlay, const QPointF &local) const;
+    const LogicalRect &annotationLimits() const;
+    LogicalRect selectionLimits() const;
+    void translateAnnotations(std::int32_t dx, std::int32_t dy);
+    void applySelectionMove(LogicalRect origin, Point anchor, Point current);
+    void requestPinMove(Point globalTopLeft);
+    void flushPinMove();
+    void applyPinReply(QByteArray line);
+    void consumePinReply(QLocalSocket *socket);
+    void applyPinRect(const LogicalRect &rect);
     Point clampPoint(Point point) const;
     LogicalRect selectionBetween(Point first, Point second) const;
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;

@@ -179,6 +179,12 @@ struct QtSession<'a> {
     // helper reads it as an explicit placement hint).
     #[serde(skip_serializing_if = "Option::is_none")]
     window: Option<WireRect>,
+    // Pin-edit only: daemon socket the editor talks to while moving the pin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socket: Option<String>,
+    // Pin-edit only: id of the pinned image inside the daemon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
     outputs: Vec<QtOutput<'a>>,
 }
 
@@ -190,6 +196,10 @@ struct QtOutput<'a> {
     y: i32,
     width: u32,
     height: u32,
+    // Overlay surface the helper maps onto: equal to the output rect for
+    // region capture, the whole output for pin editing (so the toolbar can
+    // float on the canvas beside the pinned image).
+    surface: WireRect,
     scale: u32,
     pixel_width: u32,
     pixel_height: u32,
@@ -236,19 +246,23 @@ pub fn select_and_edit(scene: &SceneSnapshot) -> Result<(Rect, Vec<Annotation>)>
     parse_result(output, scene.bounds())
 }
 
-/// Pin-edit descriptor: the daemon pins one image; the helper edits it inside
-/// a window placed over the pin, and the result is rendered back onto it.
+/// Pin-edit descriptor: the daemon pins one image; the helper edits it in
+/// place, driving the real pin window and the daemon socket.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PinEditSpec<'a> {
     /// The pin's pixels at their native resolution (RGBA8).
     pub(crate) frame: &'a crate::model::Frame,
     /// Real compositor output the editor surface lands on.
     pub(crate) output_name: &'a str,
-    /// Global logical rect of the editor surface (the pin's display rect).
+    /// Global logical rect of the pinned image.
     pub(crate) window: Rect,
     /// Device pixels per logical pixel between `frame` and `window`: 1 for
     /// plain pins, the output's density for HiDPI-rendered text cards.
     pub(crate) scale: u32,
+    /// Daemon socket the editor uses to move the pin live.
+    pub(crate) socket: &'a Path,
+    /// Id of this pin inside the daemon, echoed back in session JSON.
+    pub(crate) pin_id: u64,
 }
 
 /// Serializes a pin-edit session: one virtual output whose geometry is the
@@ -271,6 +285,8 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         mode: "pin-edit",
         bounds: spec.window.into(),
         window: Some(spec.window.into()),
+        socket: Some(spec.socket.to_string_lossy().into_owned()),
+        id: Some(spec.pin_id),
         outputs: vec![QtOutput {
             id: 0,
             name: spec.output_name,
@@ -278,6 +294,10 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
             y: spec.window.top(),
             width: spec.window.size.width,
             height: spec.window.size.height,
+            // The editor covers the pinned image, not the whole output: the
+            // helper widens it to the screen the pin sits on so the toolbar
+            // lives on the canvas beside the image.
+            surface: spec.window.into(),
             scale: spec.scale,
             pixel_width: spec.frame.size().width,
             pixel_height: spec.frame.size().height,
@@ -330,8 +350,9 @@ pub(crate) fn run_session(session_path: &Path) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Parses a pin-edit helper result. Selections are validated against the
-/// editor window; the status `cancelled` maps to `Ok(None)`.
+/// Parses a pin-edit helper result: the selection (the pin image, where the
+/// user left it) and the annotations drawn on it. The status `cancelled` maps
+/// to `Ok(None)`.
 pub(crate) fn parse_edit_result(
     bytes: Vec<u8>,
     window: Rect,
@@ -342,13 +363,17 @@ pub(crate) fn parse_edit_result(
     match result.status.as_str() {
         "cancelled" => Ok(None),
         "ok" => {
+            // The image may have been dragged anywhere over the screen the pin
+            // sits on; only its position changes, never its size.
             let selection = result
                 .selection
                 .ok_or_else(|| VshotError::Pin("Qt result has no selection".into()))?
                 .into_rect("Qt selection")?;
-            let selection = selection.intersection(window).ok_or_else(|| {
-                VshotError::Pin("Qt selection does not intersect the pin window".into())
-            })?;
+            if selection.size != window.size {
+                return Err(VshotError::Pin(
+                    "Qt helper resized the pin image; pin editing only moves it".into(),
+                ));
+            }
             if selection.size.width < 5 || selection.size.height < 5 {
                 return Err(VshotError::Pin(
                     "Qt helper returned a pin selection smaller than 5x5".into(),
@@ -392,6 +417,7 @@ fn write_session(scene: &SceneSnapshot) -> Result<(TempDir, PathBuf)> {
             y: output.geometry.top(),
             width: output.geometry.size.width,
             height: output.geometry.size.height,
+            surface: output.geometry.into(),
             scale: output.scale,
             pixel_width: output.frame.size().width,
             pixel_height: output.frame.size().height,
@@ -404,6 +430,8 @@ fn write_session(scene: &SceneSnapshot) -> Result<(TempDir, PathBuf)> {
         mode: "region",
         bounds: scene.bounds().into(),
         window: None,
+        socket: None,
+        id: None,
         outputs,
     };
     let session_path = directory.path().join("session.json");

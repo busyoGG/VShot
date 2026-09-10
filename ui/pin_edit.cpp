@@ -55,16 +55,32 @@ int runPinEdit(const QString &sessionPath)
         return 1;
     }
 
-    QScreen *screen = screenForRect(QRect(session.bounds.x, session.bounds.y,
-                                          static_cast<int>(session.bounds.width),
-                                          static_cast<int>(session.bounds.height)));
+    const QRect pinRect(session.bounds.x, session.bounds.y,
+                        static_cast<int>(session.bounds.width),
+                        static_cast<int>(session.bounds.height));
+    // The editor surface is the whole screen the pin sits on: the toolbar and
+    // its popups live on the transparent canvas around the pinned image,
+    // exactly like the toolbar beside a region selection.
+    QScreen *screen = screenForRect(pinRect);
     if (screen == nullptr) {
         reportError(QStringLiteral("no Qt screen matches the pin-edit window"));
         return 1;
     }
+    const QRect surface = screen->geometry();
+    // The session's own geometry is the pinned image rect; only the surface
+    // grows. Both are global logical pixels.
+    Session surfaceSession = session;
+    for (OutputSession &output : surfaceSession.outputs) {
+        output.surface = LogicalRect{surface.x(), surface.y(),
+                                     static_cast<std::uint32_t>(surface.width()),
+                                     static_cast<std::uint32_t>(surface.height())};
+    }
 
-    OverlayController controller(std::move(session));
+    OverlayController controller(std::move(surfaceSession));
     controller.setPinEditMode(true);
+    // The editor drives the real pin window over the daemon socket instead of
+    // painting a second copy of the image.
+    controller.setPinTarget(session.pinId, session.pinSocket);
     controller.setTerminalCallback([] { QCoreApplication::quit(); });
 
     QString overlayError;
@@ -75,11 +91,10 @@ int runPinEdit(const QString &sessionPath)
     }
     // A plain toplevel cannot be positioned under Wayland (the compositor
     // decides), so the editor is a layer surface anchored top-left with
-    // margins, exactly over the pin. Exclusive keyboard: the editor owns all
+    // margins, covering the output. Exclusive keyboard: the editor owns all
     // input while it is open.
-    if (!overlay->showLayerSurfaceAt(session.bounds.x, session.bounds.y,
-                                     static_cast<int>(session.bounds.width),
-                                     static_cast<int>(session.bounds.height))) {
+    if (!overlay->showLayerSurfaceAt(surface.x(), surface.y(), surface.width(),
+                                     surface.height())) {
         reportError(QStringLiteral("could not create the pin-edit surface"));
         return 1;
     }
@@ -91,6 +106,9 @@ int runPinEdit(const QString &sessionPath)
         controller.cancel();
     }
 
+    // The helper already reports the pin image's final rect as the selection:
+    // the daemon repositions the pin there and renders the annotations
+    // relative to it, so nothing needs rewriting here.
     QJsonDocument result;
     QString resultError;
     result = controller.resultDocument(QFileInfo(sessionPath).absolutePath(), &resultError);

@@ -182,6 +182,26 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         return fail(error, QStringLiteral("session outputs must be a non-empty array"));
     }
 
+    // Pin-edit sessions name the live pin and the daemon socket that owns it;
+    // the editor drives the real pin window through it. Region sessions have
+    // neither and must not carry them.
+    if (parsed.mode == QStringLiteral("pin-edit")) {
+        std::int64_t pinId = 0;
+        if (!jsonInteger(root.value(QStringLiteral("id")), 0,
+                         std::numeric_limits<std::int64_t>::max(), &pinId)) {
+            return fail(error, QStringLiteral("pin-edit session `id` must be an unsigned integer"));
+        }
+        parsed.pinId = static_cast<std::uint64_t>(pinId);
+        const QJsonValue socketValue = root.value(QStringLiteral("socket"));
+        if (!socketValue.isString() || socketValue.toString().isEmpty()) {
+            return fail(error, QStringLiteral("pin-edit session `socket` must be a non-empty string"));
+        }
+        parsed.pinSocket = socketValue.toString();
+        if (!parsed.pinSocket.startsWith(QLatin1Char('/'))) {
+            return fail(error, QStringLiteral("pin-edit session `socket` must be an absolute path"));
+        }
+    }
+
     const QJsonArray outputs = outputsValue.toArray();
     parsed.outputs.reserve(outputs.size());
     for (int index = 0; index < outputs.size(); ++index) {
@@ -202,6 +222,24 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         if (!jsonRect(object, &output.geometry, QStringLiteral("output %1 geometry").arg(index),
                       error)) {
             return false;
+        }
+        // Optional: the overlay surface rect when it is larger than the output
+        // (the pin editor puts its toolbar on the surrounding canvas). Sessions
+        // without it cover exactly their own output.
+        output.surface = output.geometry;
+        if (object.contains(QStringLiteral("surface"))) {
+            const QJsonValue surfaceValue = object.value(QStringLiteral("surface"));
+            if (!surfaceValue.isObject() ||
+                !jsonRect(surfaceValue.toObject(), &output.surface,
+                          QStringLiteral("output %1 surface").arg(index), error)) {
+                return false;
+            }
+            if (output.surface.x > output.geometry.x || output.surface.y > output.geometry.y ||
+                output.surface.right() < output.geometry.right() ||
+                output.surface.bottom() < output.geometry.bottom()) {
+                return fail(error, QStringLiteral("output %1 surface does not cover its geometry")
+                                      .arg(index));
+            }
         }
         if (!jsonUnsigned32(object, "scale", &output.scale, true) ||
             !jsonUnsigned32(object, "pixel_width", &output.pixelWidth, true) ||

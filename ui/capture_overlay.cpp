@@ -25,6 +25,7 @@
 #include <QLineEdit>
 #include <QLineF>
 #include <QListWidget>
+#include <QLocalSocket>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -95,16 +96,27 @@ LogicalRect rectFromEdges(std::int64_t left, std::int64_t top, std::int64_t righ
     return result;
 }
 
+// Surface a given output's overlay canvas covers, in global logical pixels.
+// Region capture and plain pin editing cover exactly the output; the pin
+// editor widens the surface to its whole screen, so every local<->global
+// conversion keys off this rect rather than the output geometry.
+const LogicalRect &surfaceOf(const OutputSession &output)
+{
+    return output.surface.width > 0 && output.surface.height > 0 ? output.surface
+                                                                 : output.geometry;
+}
+
 QRectF localRect(const OutputSession &output, const LogicalRect &rect, const QSize &size)
 {
-    const double sx = output.geometry.width == 0
+    const LogicalRect &surface = surfaceOf(output);
+    const double sx = surface.width == 0
         ? 1.0
-        : static_cast<double>(size.width()) / static_cast<double>(output.geometry.width);
-    const double sy = output.geometry.height == 0
+        : static_cast<double>(size.width()) / static_cast<double>(surface.width);
+    const double sy = surface.height == 0
         ? 1.0
-        : static_cast<double>(size.height()) / static_cast<double>(output.geometry.height);
-    return QRectF((static_cast<double>(rect.x) - output.geometry.x) * sx,
-                  (static_cast<double>(rect.y) - output.geometry.y) * sy,
+        : static_cast<double>(size.height()) / static_cast<double>(surface.height);
+    return QRectF((static_cast<double>(rect.x) - surface.x) * sx,
+                  (static_cast<double>(rect.y) - surface.y) * sy,
                   static_cast<double>(rect.width) * sx,
                   static_cast<double>(rect.height) * sy);
 }
@@ -121,14 +133,15 @@ QRect sourceRect(const OutputSession &output, const LogicalRect &rect)
 
 QPointF localPoint(const OutputSession &output, const Point &point, const QSize &size)
 {
-    const double sx = output.geometry.width == 0
+    const LogicalRect &surface = surfaceOf(output);
+    const double sx = surface.width == 0
         ? 1.0
-        : static_cast<double>(size.width()) / static_cast<double>(output.geometry.width);
-    const double sy = output.geometry.height == 0
+        : static_cast<double>(size.width()) / static_cast<double>(surface.width);
+    const double sy = surface.height == 0
         ? 1.0
-        : static_cast<double>(size.height()) / static_cast<double>(output.geometry.height);
-    return QPointF((static_cast<double>(point.x) - output.geometry.x) * sx,
-                   (static_cast<double>(point.y) - output.geometry.y) * sy);
+        : static_cast<double>(size.height()) / static_cast<double>(surface.height);
+    return QPointF((static_cast<double>(point.x) - surface.x) * sx,
+                   (static_cast<double>(point.y) - surface.y) * sy);
 }
 
 QString toolName(Tool tool)
@@ -2068,6 +2081,10 @@ private:
         return {};
     }
 
+    // The panel's rect in image pixels, or an empty rect when the panel is not
+    // fully covered by the pinned/frozen image. Pin editing puts the toolbar on
+    // the bare canvas beside the image, where there is nothing to sample: the
+    // frosted glass would otherwise smear a stretched crop across the panel.
     QRect backdropDeviceRect() const
     {
         const QWidget *owner = parentWidget();
@@ -2076,12 +2093,44 @@ private:
             owner->height() <= 0) {
             return {};
         }
-        const double sx = static_cast<double>(frame.width()) / owner->width();
-        const double sy = static_cast<double>(frame.height()) / owner->height();
-        const QRect device(static_cast<int>(std::round(x() * sx)),
-                           static_cast<int>(std::round(y() * sy)),
-                           static_cast<int>(std::round(width() * sx)),
-                           static_cast<int>(std::round(height() * sy)));
+        const OutputSession *output = nullptr;
+        for (int index = 0; index < controller_->overlays_.size(); ++index) {
+            if (controller_->overlays_.at(index) == owner &&
+                index < controller_->session_.outputs.size()) {
+                output = &controller_->session_.outputs.at(index);
+                break;
+            }
+        }
+        if (output == nullptr) {
+            return {};
+        }
+        const LogicalRect &surface = surfaceOf(*output);
+        const double sx = static_cast<double>(output->scale);
+        const double logicalToLocal =
+            static_cast<double>(owner->width()) / static_cast<double>(surface.width);
+        const double logicalToLocalY =
+            static_cast<double>(owner->height()) / static_cast<double>(surface.height);
+        if (logicalToLocal <= 0 || logicalToLocalY <= 0) {
+            return {};
+        }
+        // Panel local rect -> global logical -> image pixels.
+        const double left = surface.x + x() / logicalToLocal;
+        const double top = surface.y + y() / logicalToLocalY;
+        const QRect panel(static_cast<int>(std::round(left)),
+                          static_cast<int>(std::round(top)),
+                          static_cast<int>(std::round(width() / logicalToLocal)),
+                          static_cast<int>(std::round(height() / logicalToLocalY)));
+        const LogicalRect &geometry = output->geometry;
+        const QRect globalImage(geometry.x, geometry.y, static_cast<int>(geometry.width),
+                                static_cast<int>(geometry.height));
+        if (!globalImage.contains(panel)) {
+            return {};
+        }
+        const QRect device(
+            static_cast<int>(std::round((panel.x() - geometry.x) * sx)),
+            static_cast<int>(std::round((panel.y() - geometry.y) * sx)),
+            static_cast<int>(std::round(panel.width() * sx)),
+            static_cast<int>(std::round(panel.height() * sx)));
         return device.intersected(frame.rect());
     }
 
@@ -2389,6 +2438,8 @@ OverlayController::~OverlayController()
     removeTextEditor();
     delete toolbar_;
     delete gesture_;
+    // Explicit rather than parented: the controller is not a QObject.
+    delete pinSocket_;
 }
 
 int OverlayController::outputCount() const
@@ -2419,30 +2470,73 @@ CaptureOverlay *OverlayController::addOverlay(int outputIndex, QScreen *screen, 
 
 Point OverlayController::globalPoint(CaptureOverlay *overlay, const QPointF &local) const
 {
+    return clampPoint(unclampedGlobalPoint(overlay, local));
+}
+
+// Same conversion as globalPoint() but without clamping into the session
+// bounds: the pin editor needs to tell a click on the pinned image (inside the
+// bounds) from one on the surrounding canvas (outside them).
+Point OverlayController::unclampedGlobalPoint(CaptureOverlay *overlay,
+                                              const QPointF &local) const
+{
     const OutputSession &output = overlay->output();
+    const LogicalRect &surface = surfaceOf(output);
     const double sx = overlay->width() > 0
-        ? static_cast<double>(output.geometry.width) / static_cast<double>(overlay->width())
+        ? static_cast<double>(surface.width) / static_cast<double>(overlay->width())
         : 1.0;
     const double sy = overlay->height() > 0
-        ? static_cast<double>(output.geometry.height) / static_cast<double>(overlay->height())
+        ? static_cast<double>(surface.height) / static_cast<double>(overlay->height())
         : 1.0;
-    const auto x = static_cast<std::int64_t>(std::floor(output.geometry.x + local.x() * sx));
-    const auto y = static_cast<std::int64_t>(std::floor(output.geometry.y + local.y() * sy));
-    return clampPoint(Point{static_cast<std::int32_t>(std::clamp<std::int64_t>(
-                                  x, std::numeric_limits<std::int32_t>::min(),
-                                  std::numeric_limits<std::int32_t>::max())),
-                              static_cast<std::int32_t>(std::clamp<std::int64_t>(
-                                  y, std::numeric_limits<std::int32_t>::min(),
-                                  std::numeric_limits<std::int32_t>::max()))});
+    const auto x = static_cast<std::int64_t>(std::floor(surface.x + local.x() * sx));
+    const auto y = static_cast<std::int64_t>(std::floor(surface.y + local.y() * sy));
+    return Point{static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                      x, std::numeric_limits<std::int32_t>::min(),
+                      std::numeric_limits<std::int32_t>::max())),
+                 static_cast<std::int32_t>(std::clamp<std::int64_t>(
+                     y, std::numeric_limits<std::int32_t>::min(),
+                     std::numeric_limits<std::int32_t>::max()))};
 }
 
 Point OverlayController::clampPoint(Point point) const
 {
-    const std::int64_t x = std::clamp<std::int64_t>(point.x, session_.bounds.x,
-                                                     session_.bounds.right() - 1);
-    const std::int64_t y = std::clamp<std::int64_t>(point.y, session_.bounds.y,
-                                                     session_.bounds.bottom() - 1);
+    const LogicalRect &limits = annotationLimits();
+    const std::int64_t x = std::clamp<std::int64_t>(point.x, limits.x, limits.right() - 1);
+    const std::int64_t y = std::clamp<std::int64_t>(point.y, limits.y, limits.bottom() - 1);
     return Point{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)};
+}
+
+// Area the tool may paint on. Region capture paints over the whole session;
+// the pin editor confines drawing to the pinned image, which the user can drag
+// around the surrounding canvas.
+const LogicalRect &OverlayController::annotationLimits() const
+{
+    if (pinEdit_ && selection_.has_value()) {
+        return *selection_;
+    }
+    return session_.bounds;
+}
+
+// Area the selection itself may occupy. Region capture keeps it inside the
+// frozen scene; in the pin editor the image may roam over the whole output,
+// which is exactly the surface the overlay covers.
+LogicalRect OverlayController::selectionLimits() const
+{
+    if (pinEdit_ && !session_.outputs.isEmpty()) {
+        return surfaceOf(session_.outputs.constFirst());
+    }
+    return session_.bounds;
+}
+
+// Shifts every annotation by the given global delta (the image under them
+// moved).
+void OverlayController::translateAnnotations(std::int32_t dx, std::int32_t dy)
+{
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+    for (Annotation &annotation : annotations_) {
+        annotation = translatedAnnotation(annotation, dx, dy);
+    }
 }
 
 LogicalRect OverlayController::selectionBetween(Point first, Point second) const
@@ -2453,7 +2547,7 @@ LogicalRect OverlayController::selectionBetween(Point first, Point second) const
     const std::int64_t bottomEdge = std::max(first.y, second.y) + 1;
     LogicalRect candidate = rectFromEdges(left, top, rightEdge, bottomEdge);
     LogicalRect result;
-    if (intersection(candidate, session_.bounds, &result)) {
+    if (intersection(candidate, annotationLimits(), &result)) {
         return result;
     }
     return LogicalRect{};
@@ -2463,10 +2557,11 @@ LogicalRect OverlayController::moveSelection(LogicalRect origin, Point anchor, P
 {
     const std::int64_t dx = static_cast<std::int64_t>(current.x) - anchor.x;
     const std::int64_t dy = static_cast<std::int64_t>(current.y) - anchor.y;
-    const std::int64_t minX = session_.bounds.x;
-    const std::int64_t minY = session_.bounds.y;
-    const std::int64_t maxX = session_.bounds.right() - origin.width;
-    const std::int64_t maxY = session_.bounds.bottom() - origin.height;
+    const LogicalRect &limits = selectionLimits();
+    const std::int64_t minX = limits.x;
+    const std::int64_t minY = limits.y;
+    const std::int64_t maxX = std::max<std::int64_t>(limits.right() - origin.width, minX);
+    const std::int64_t maxY = std::max<std::int64_t>(limits.bottom() - origin.height, minY);
     const std::int64_t x = std::clamp<std::int64_t>(origin.x + dx, minX, maxX);
     const std::int64_t y = std::clamp<std::int64_t>(origin.y + dy, minY, maxY);
     return rectFromEdges(x, y, x + origin.width, y + origin.height);
@@ -2752,8 +2847,9 @@ bool OverlayController::annotationBounds(const Annotation &annotation, LogicalRe
 
 bool OverlayController::canDrawAt(Point point) const
 {
-    return point.x >= session_.bounds.x && point.x < session_.bounds.right() &&
-           point.y >= session_.bounds.y && point.y < session_.bounds.bottom();
+    const LogicalRect &limits = annotationLimits();
+    return point.x >= limits.x && point.x < limits.right() &&
+           point.y >= limits.y && point.y < limits.bottom();
 }
 
 void OverlayController::beginText(CaptureOverlay *overlay, Point point)
@@ -3079,6 +3175,15 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         finishText(true);
     }
     const Point point = globalPoint(overlay, local);
+    if (pinEdit_ && !canDrawAt(point)) {
+        // Outside the pinned image the surface is bare canvas: only the Select
+        // tool reacts, and only by dropping the current annotation selection.
+        if (tool_ == Tool::Select) {
+            selectAnnotation(-1);
+            updateAll();
+        }
+        return;
+    }
     if (tool_ == Tool::Text) {
         beginText(overlay, point);
         return;
@@ -3095,9 +3200,16 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
             selectAnnotation(annotationIndex);
             beginAnnotationDrag(point, false);
         } else if (pinEdit_) {
-            // The canvas is fixed in pin-edit mode: clicking empty space only
-            // clears the current annotation selection.
+            // Empty image surface: drop the current annotation selection and
+            // start dragging the image itself (which carries its annotations).
             selectAnnotation(-1);
+            if (selection_.has_value()) {
+                gesture_->anchor = point;
+                gesture_->current = point;
+                gesture_->origin = *selection_;
+                gesture_->handle = 9;
+                gesture_->type = Gesture::Type::Moving;
+            }
         } else {
             const int handle = hitHandle(point);
             if (selection_.has_value() && handle != 0 && handle != 9) {
@@ -3135,6 +3247,14 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
     const Point point = globalPoint(overlay, local);
     pointer_ = point;
     pointerOutput_ = overlay->outputIndex();
+    const bool insideImage = canDrawAt(point);
+    if (pinEdit_ && !insideImage && buttons == Qt::NoButton &&
+        gesture_->type == Gesture::Type::None) {
+        // Bare canvas around the pin image: the toolbar lives there, so the
+        // canvas keeps a neutral pointer and no crosshair.
+        overlay->setCursor(Qt::ArrowCursor);
+        return;
+    }
     if (buttons != Qt::NoButton) {
         // The shape must match the gesture in progress: move for drags, the
         // handle's resize arrow, cross for drawing.
@@ -3151,6 +3271,10 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
             overlay->setCursor(Qt::CrossCursor);
             break;
         }
+    } else if (pinEdit_) {
+        // Inside the image the pointer announces the drag that moves it;
+        // anywhere else with a drawing tool it is the crosshair.
+        overlay->setCursor(insideImage ? Qt::SizeAllCursor : Qt::ArrowCursor);
     } else if (tool_ == Tool::Select && selection_.has_value() && editing_) {
         // Handles map to resize arrows; anywhere else inside the selection
         // (hitHandle returns 9) means the selection itself can be dragged.
@@ -3159,7 +3283,7 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
     if (gesture_->type == Gesture::Type::Selecting) {
         updateSelection(point);
     } else if (gesture_->type == Gesture::Type::Moving) {
-        selection_ = moveSelection(gesture_->origin, gesture_->anchor, clampPoint(point));
+        applySelectionMove(gesture_->origin, gesture_->anchor, point);
     } else if (gesture_->type == Gesture::Type::Resizing) {
         selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point));
     } else if (gesture_->type == Gesture::Type::MovingAnnotation ||
@@ -3187,7 +3311,7 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         finishSelection(point);
         break;
     case Gesture::Type::Moving:
-        selection_ = moveSelection(gesture_->origin, gesture_->anchor, clampPoint(point));
+        applySelectionMove(gesture_->origin, gesture_->anchor, point);
         gesture_->type = Gesture::Type::None;
         showToolbar();
         break;
@@ -3221,7 +3345,7 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
         startTextEditor(overlay, index, annotations_.at(index).origin);
         return;
     }
-    if (selection_.has_value() && hitHandle(point) != 0) {
+    if (selection_.has_value() && !pinEdit_ && hitHandle(point) != 0) {
         confirm();
     }
 }
@@ -3264,6 +3388,11 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     if (!selection_.has_value() || !editing_ || gesture_->type != Gesture::Type::None) {
         return;
     }
+    if (pinEdit_) {
+        // The pin editor's selection is the image itself: it moves with the
+        // image (drag or arrow keys) and never resizes.
+        return;
+    }
     const int step = (modifiers & Qt::ShiftModifier) ? 10 : 1;
     int dx = 0;
     int dy = 0;
@@ -3285,7 +3414,163 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     }
     const Point anchor{selection_->x, selection_->y};
     const Point current{selection_->x + dx, selection_->y + dy};
-    selection_ = moveSelection(*selection_, anchor, clampPoint(current));
+    applySelectionMove(*selection_, anchor, current);
+    updateAll();
+}
+
+// Moves the selection — the pinned image, in pin-edit mode — to follow the
+// pointer, carrying its annotations along. Annotations are stored in global
+// coordinates and the renderer anchors them to the returned selection, so
+// translating them keeps the preview and the rendered result in step.
+//
+// In pin-edit mode the moving is delegated outright: the daemon repositions
+// the real pin window with its own clamp, and the reply lands back here as the
+// authoritative rect. The editor never paints the image itself, so there is
+// nothing to keep in sync but the annotations.
+void OverlayController::applySelectionMove(LogicalRect origin, Point anchor, Point current)
+{
+    const LogicalRect moved = moveSelection(origin, anchor, current);
+    if (pinEdit_ && selection_.has_value()) {
+        // Image and marks travel together: shifting both by the same delta
+        // keeps every mark on the image pixel it was drawn on.
+        translateAnnotations(moved.x - selection_->x, moved.y - selection_->y);
+        // The daemon does the actual moving (its pin window is the one on
+        // screen) and answers with the rect it clamped to; applyPinRect
+        // corrects this optimistic position when the two disagree.
+        requestPinMove(Point{moved.x, moved.y});
+    }
+    selection_ = moved;
+}
+
+void OverlayController::setPinTarget(std::uint64_t pinId, const QString &socketPath)
+{
+    pinId_ = pinId;
+    pinSocketPath_ = socketPath;
+}
+
+// Opens one short-lived connection, sends the pin's new top-left (global
+// logical pixels) and applies whatever comes back. The daemon serves exactly
+// one request per connection — it writes the reply and disconnects — so a
+// fresh socket per move mirrors the CLI's own client and avoids any
+// reconnect bookkeeping.
+void OverlayController::requestPinMove(Point globalTopLeft)
+{
+    if (pinSocketPath_.isEmpty() || pinId_ == 0) {
+        return;
+    }
+    pendingPinOrigin_ = globalTopLeft;
+    flushPinMove();
+}
+
+void OverlayController::flushPinMove()
+{
+    if (pinSocket_ != nullptr || !pendingPinOrigin_.has_value()) {
+        return;
+    }
+    if (pinSocketPath_.isEmpty() || pinId_ == 0) {
+        pendingPinOrigin_.reset();
+        return;
+    }
+    const Point origin = *pendingPinOrigin_;
+    pendingPinOrigin_.reset();
+
+    auto *socket = new QLocalSocket;
+    pinSocket_ = socket;
+    const auto ownsSocket = [this, socket] { return pinSocket_ == socket; };
+    QObject::connect(socket, &QLocalSocket::connected, socket, [this, socket, origin, ownsSocket] {
+        if (!ownsSocket()) {
+            return;
+        }
+        QJsonObject request;
+        request.insert(QStringLiteral("cmd"), QStringLiteral("move"));
+        request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
+        request.insert(QStringLiteral("x"), static_cast<qint64>(origin.x));
+        request.insert(QStringLiteral("y"), static_cast<qint64>(origin.y));
+        QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+        line.append('\n');
+        socket->write(line);
+        socket->flush();
+    });
+    QObject::connect(socket, &QLocalSocket::readyRead, socket,
+                     [this, socket, ownsSocket] {
+                         if (ownsSocket()) {
+                             consumePinReply(socket);
+                         }
+                     });
+    // A refused or dropped connection is not fatal: the editor keeps working,
+    // it just cannot move the live pin. A later move retries from scratch.
+    QObject::connect(socket, &QLocalSocket::errorOccurred, socket,
+                     [this, socket, ownsSocket](QLocalSocket::LocalSocketError) {
+                         if (ownsSocket()) {
+                             consumePinReply(socket);
+                         }
+                     });
+    // The daemon closes the connection right after replying, so the reply must
+    // be drained here too.
+    QObject::connect(socket, &QLocalSocket::disconnected, socket,
+                     [this, socket, ownsSocket] {
+                         if (ownsSocket()) {
+                             consumePinReply(socket);
+                         }
+                     });
+    socket->connectToServer(pinSocketPath_);
+}
+
+// Drains the daemon's answer, applies it and retires this request's socket.
+// Called from every terminal signal; the owner check upstream makes repeats
+// harmless.
+void OverlayController::consumePinReply(QLocalSocket *socket)
+{
+    pinReplyBuffer_ += socket->readAll();
+    const qsizetype newline = pinReplyBuffer_.indexOf('\n');
+    QByteArray line;
+    if (newline >= 0) {
+        line = pinReplyBuffer_.left(newline);
+    }
+    pinReplyBuffer_.clear();
+    // Cleared before deleteLater() so the guard in every handler above stops
+    // this socket from being treated as the live one while it is queued away.
+    pinSocket_ = nullptr;
+    socket->deleteLater();
+    if (!line.isEmpty()) {
+        applyPinReply(line);
+    }
+    flushPinMove();
+}
+
+void OverlayController::applyPinReply(QByteArray line)
+{
+    const QJsonDocument document = QJsonDocument::fromJson(line);
+    const QJsonObject reply = document.object();
+    if (!reply.value(QStringLiteral("ok")).toBool()) {
+        // The daemon refused (pin gone, bad request): keep editing locally.
+        return;
+    }
+    LogicalRect landed;
+    landed.x = static_cast<std::int32_t>(reply.value(QStringLiteral("x")).toInteger());
+    landed.y = static_cast<std::int32_t>(reply.value(QStringLiteral("y")).toInteger());
+    landed.width = static_cast<std::uint32_t>(reply.value(QStringLiteral("width")).toInteger());
+    landed.height = static_cast<std::uint32_t>(reply.value(QStringLiteral("height")).toInteger());
+    if (landed.width > 0 && landed.height > 0) {
+        applyPinRect(landed);
+    }
+}
+
+// Adopts the rect the daemon clamped the pin to. The pin stays the same size,
+// so only a positional correction can come back; the marks were already moved
+// to the requested spot, so they get the same correction.
+void OverlayController::applyPinRect(const LogicalRect &rect)
+{
+    if (!selection_.has_value()) {
+        return;
+    }
+    const std::int32_t dx = rect.x - selection_->x;
+    const std::int32_t dy = rect.y - selection_->y;
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+    selection_ = LogicalRect{rect.x, rect.y, selection_->width, selection_->height};
+    translateAnnotations(dx, dy);
     updateAll();
 }
 
@@ -3834,8 +4119,9 @@ void OverlayController::beginPinEdit()
     if (!pinEdit_ || finished_ || cancelled_) {
         return;
     }
-    // The canvas is the whole pin image: preselect everything and jump
-    // straight into the annotation editing state.
+    // The editable canvas is the whole pin image: the session bounds (the
+    // pinned image) is preselected, and the surface around it stays bare so
+    // the toolbar can sit beside the image like a region-capture toolbar.
     selection_ = LogicalRect{session_.bounds.x, session_.bounds.y, session_.bounds.width,
                              session_.bounds.height};
     editing_ = true;
@@ -4056,26 +4342,38 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
 {
     const OutputSession &output = overlay->output();
     const QRectF target(0, 0, overlay->width(), overlay->height());
+    // The editor shows the session bounds (the image) at the selection, which
+    // the pin editor lets the user drag around; region capture pins the
+    // selection onto the frozen output, so the two coincide there.
+    const LogicalRect imageArea =
+        pinEdit_ && selection_.has_value() ? *selection_ : output.geometry;
+    const QRectF imageRect = localRect(output, imageArea, overlay->size());
     painter->save();
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
-    painter->drawImage(target, output.image);
-    // The dim-out only makes sense around a selectable region: pin editing
-    // shows the image unshaded.
+    // In pin-edit mode the pinned window itself shows the image: the editor
+    // only draws the marks on top, so there is exactly one copy on screen.
     if (!pinEdit_) {
+        painter->drawImage(imageRect, output.image);
+        // The dim-out only makes sense around a selectable region.
         painter->fillRect(target, QColor(0, 0, 0, 80));
-    }
-
-    if (selection_.has_value()) {
-        LogicalRect visible;
-        if (intersection(*selection_, output.geometry, &visible)) {
-            painter->drawImage(localRect(output, visible, overlay->size()), output.image,
-                               sourceRect(output, visible));
+        if (selection_.has_value()) {
+            LogicalRect visible;
+            if (intersection(*selection_, output.geometry, &visible)) {
+                painter->drawImage(localRect(output, visible, overlay->size()), output.image,
+                                   sourceRect(output, visible));
+            }
         }
     }
 
     painter->setRenderHint(QPainter::Antialiasing, true);
     const QRectF outputBounds = target;
     painter->setClipRect(outputBounds);
+    // Annotations are clipped to the image: dragging the pin around must not
+    // leave marks floating on the transparent canvas, and the renderer only
+    // ever composites them onto the image.
+    if (pinEdit_) {
+        painter->setClipRect(imageRect, Qt::IntersectClip);
+    }
     painter->setBrush(Qt::NoBrush);
     auto drawAnnotation = [this, &output, overlay, painter](const Annotation &annotation) {
         const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
@@ -4223,7 +4521,10 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
-    if (selection_.has_value()) {
+    if (selection_.has_value() && !pinEdit_) {
+        // Pin editing selects the whole image by construction: drawing the
+        // selection rect and its handles would ring the pin with chrome the
+        // user cannot act on.
         LogicalRect visible;
         if (intersection(*selection_, output.geometry, &visible)) {
             painter->setPen(QPen(Qt::white, 2.0, Qt::SolidLine));
@@ -4254,7 +4555,7 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
-    if (selection_.has_value() &&
+    if (selection_.has_value() && !pinEdit_ &&
         (gesture_->type == Gesture::Type::Selecting || editing_)) {
         const QString dimensions =
             QStringLiteral("%1 × %2").arg(selection_->width).arg(selection_->height);
@@ -4349,7 +4650,8 @@ CaptureOverlay::CaptureOverlay(int outputIndex, OverlayController *controller, Q
     setMouseTracking(true);
     setCursor(Qt::CrossCursor);
     setAcceptDrops(false);
-    resize(static_cast<int>(output().geometry.width), static_cast<int>(output().geometry.height));
+    const LogicalRect &surface = surfaceOf(output());
+    resize(static_cast<int>(surface.width), static_cast<int>(surface.height));
 }
 
 CaptureOverlay::~CaptureOverlay() = default;
