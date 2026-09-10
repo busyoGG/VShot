@@ -50,20 +50,28 @@ fn run() -> Result<()> {
     let output_infos = wayland.output_infos()?;
     let mut capture = WlrCapture::connect()?;
 
-    let active_window = if matches!(request.target, CaptureTarget::ActiveWindow) {
-        Some(ProcessWindowProvider.active_window()?)
-    } else {
-        None
-    };
+    // Metadata lookup is cheap and happens before the capture; a failure is
+    // not fatal yet — the pixel fallback runs on the captured scene.
+    let pixel_detect = matches!(
+        request.target,
+        CaptureTarget::ActiveWindow { pixel_detect: true }
+    );
+    let mut metadata_error = None;
+    let metadata_window =
+        if matches!(request.target, CaptureTarget::ActiveWindow { .. }) && !pixel_detect {
+            match ProcessWindowProvider.active_window() {
+                Ok(window) => Some(window),
+                Err(error) => {
+                    metadata_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
-    let active_window_frame = active_window
-        .as_ref()
-        .map(|window| {
-            selection::validate_selection(&scene, window.geometry)?;
-            scene.crop(window.geometry)
-        })
-        .transpose()?;
+
     if !matches!(request.target, CaptureTarget::RegionInteractive) {
         wayland.set_scene(scene.clone());
     }
@@ -96,11 +104,34 @@ fn run() -> Result<()> {
             wayland.show_frozen(false)?;
             scene.frame().clone()
         }
-        CaptureTarget::ActiveWindow => {
+        CaptureTarget::ActiveWindow { .. } => {
+            let geometry = match metadata_window {
+                Some(window) => {
+                    wayland.show_frozen(false)?;
+                    window.geometry
+                }
+                None => {
+                    // The overlay surfaces must be mapped before the
+                    // compositor routes pointer events to this client, so
+                    // show the frozen scene before reading the pointer.
+                    wayland.show_frozen(false)?;
+                    let cursor = wayland.pointer_position().unwrap_or(None);
+                    match capture::detect_active_window(&scene, cursor) {
+                        Ok(window) => window.geometry,
+                        Err(pixel_error) => {
+                            return Err(match metadata_error {
+                                Some(metadata_error) => VshotError::ActiveWindowUnavailable(
+                                    format!("{metadata_error}; pixel fallback also failed: {pixel_error}"),
+                                ),
+                                None => pixel_error,
+                            });
+                        }
+                    }
+                }
+            };
+            let geometry = selection::validate_selection(&scene, geometry)?;
             wayland.show_frozen(false)?;
-            active_window_frame.ok_or_else(|| {
-                VshotError::ActiveWindowUnavailable("active window capture was not produced".into())
-            })?
+            scene.crop(geometry)?
         }
     };
 

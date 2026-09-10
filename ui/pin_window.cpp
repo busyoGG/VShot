@@ -12,6 +12,20 @@
 
 namespace vshot {
 
+namespace {
+
+// The focused outline's 2px pen is centered on the rect edge and paints up
+// to ~2px outside paintedRect_; every repaint region must include that
+// bleed, or stale border pixels survive at the previous position.
+constexpr int kOutlineBleedPx = 3;
+
+QRect expandOutline(const QRect &rect)
+{
+    return rect.adjusted(-kOutlineBleedPx, -kOutlineBleedPx, kOutlineBleedPx, kOutlineBleedPx);
+}
+
+} // namespace
+
 PinWindow::PinWindow(const QImage &image, QScreen *screen)
     : QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint)
     , source_(image)
@@ -93,9 +107,9 @@ void PinWindow::setSourceImage(const QImage &image)
                             kMaxScale);
     }
     // Pixels changed even when the rect stays identical: applyGeometry skips
-    // the repaint in that case, so force one here.
+    // the repaint in that case, so force one here (widened for the outline).
     applyGeometry();
-    update(paintedRect_);
+    update(expandOutline(paintedRect_));
 }
 
 void PinWindow::placeAt(QPoint topLeft)
@@ -156,8 +170,13 @@ void PinWindow::applyGeometry()
     if (!surfaceReady_ || nextRect == previous) {
         return;
     }
-    // Repaint the old image area (clearing it) plus the new one.
-    update(previous.isNull() ? nextRect : previous.united(nextRect));
+    // Repaint the old image area (clearing it) plus the new one, widened by
+    // the outline bleed: the focused pen is 2px wide and centered on the
+    // rect edge, so it paints up to ~2px outside paintedRect_. Without the
+    // margin, dragging a focused pin leaves a border-shaped ghost at the
+    // old rect's right/bottom edges.
+    update(previous.isNull() ? expandOutline(nextRect)
+                             : expandOutline(previous.united(nextRect)));
 }
 
 void PinWindow::paintEvent(QPaintEvent *event)
@@ -284,12 +303,16 @@ void PinWindow::keyPressEvent(QKeyEvent *event)
 void PinWindow::focusInEvent(QFocusEvent *event)
 {
     hasFocus_ = true;
+    // The outline style depends on focus; repaint the ring explicitly so the
+    // change never waits for an unrelated repaint to piggyback on.
+    update(expandOutline(paintedRect_));
     QWidget::focusInEvent(event);
 }
 
 void PinWindow::focusOutEvent(QFocusEvent *event)
 {
     hasFocus_ = false;
+    update(expandOutline(paintedRect_));
     QWidget::focusOutEvent(event);
 }
 

@@ -19,6 +19,7 @@
 #include <QScreen>
 #include <QSocketNotifier>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QUrl>
 
 #include <algorithm>
@@ -72,6 +73,11 @@ void respond(QLocalSocket *socket, const QJsonObject &payload)
     socket->disconnectFromServer();
 }
 
+// After the last pin is gone the daemon owns no surfaces, so it exits and
+// lets the next pin command spawn a fresh daemon. The grace period serves a
+// concurrent add (or a reply still in flight) before quitting.
+constexpr int kIdleQuitMs = 500;
+
 // Owns every pinned surface and dispatches daemon commands. It inherits
 // QObject only to reuse the functor-based connect() lifetime; it declares no
 // signals or slots of its own, so the build stays moc-free.
@@ -80,6 +86,14 @@ public:
     explicit PinServer(QLocalServer *server)
         : server_(server)
     {
+        idleQuit_ = new QTimer(this);
+        idleQuit_->setSingleShot(true);
+        connect(idleQuit_, &QTimer::timeout, this, [this] {
+            // addImage stops the timer, so a timeout really means empty.
+            if (pins_.isEmpty()) {
+                QCoreApplication::quit();
+            }
+        });
     }
 
     void handleNewConnection()
@@ -110,6 +124,15 @@ private:
     static QJsonObject okReply()
     {
         return QJsonObject{{QStringLiteral("ok"), true}};
+    }
+
+    // Arms the idle quit when no pins are left. Called after the last pin's
+    // destroyed signal and when an add fails on an empty daemon.
+    void armIdleQuit()
+    {
+        if (pins_.isEmpty()) {
+            idleQuit_->start(kIdleQuitMs);
+        }
     }
 
     static QJsonObject error(const QString &message)
@@ -256,10 +279,12 @@ private:
     QJsonObject addImage(const QImage &image, const QString &label)
     {
         if (image.isNull()) {
+            armIdleQuit();
             return error(QStringLiteral("cannot pin an empty image"));
         }
         QScreen *screen = QGuiApplication::primaryScreen();
         if (screen == nullptr) {
+            armIdleQuit();
             return error(QStringLiteral("no screen is available to pin onto"));
         }
         auto *pin = new PinWindow(image, screen);
@@ -269,6 +294,7 @@ private:
         QObject::connect(pin, &QObject::destroyed, this, [this, pin] {
             pins_.removeAll(pin);
             pinIds_.remove(pin);
+            armIdleQuit();
         });
         if (!pin->showLayerSurface()) {
             pin->deleteLater();
@@ -276,6 +302,7 @@ private:
         }
         pins_.push_back(pin);
         pinIds_[pin] = nextId_++;
+        idleQuit_->stop();
         // Light cascade so repeated pins remain distinguishable.
         const int offset = static_cast<int>(pins_.size() - 1) % 6 * 28;
         pin->placeCentered(QPoint(offset, offset));
@@ -442,6 +469,7 @@ private:
     quint64 nextId_ = 1;
     PinWindow *editingPin_ = nullptr;
     bool allVisible_ = true;
+    class QTimer *idleQuit_ = nullptr;
 };
 
 } // namespace

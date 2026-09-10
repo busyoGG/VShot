@@ -25,7 +25,8 @@ use self::freeze_overlay::{
     PoolUserData, ShmSlot, SurfaceUserData,
 };
 use self::input::{
-    EditorState, ResizeHandle, SelectionEvent, SelectionResult, SelectionTracker, BTN_LEFT, KEY_ESC,
+    global_point, EditorState, ResizeHandle, SelectionEvent, SelectionResult, SelectionTracker,
+    BTN_LEFT, KEY_ESC,
 };
 use self::topology::{OutputData, OutputInfo, OutputUserData, TopologyState};
 
@@ -48,6 +49,10 @@ struct WaylandState {
     ready_outputs: HashSet<u32>,
     pointer_output: Option<u32>,
     pointer_grab_output: Option<u32>,
+    // (output id, surface-local logical x/y) of the last pointer focus; the
+    // compositor only routes pointer events to mapped surfaces, so this is
+    // populated once the frozen overlays exist.
+    pointer_position: Option<(u32, f64, f64)>,
     keyboard_focus_output: Option<u32>,
     selection: SelectionTracker,
     selection_mode: bool,
@@ -444,6 +449,31 @@ impl WaylandSession {
         self.state
             .pointer_output
             .ok_or(VshotError::CurrentOutputTimeout)
+    }
+
+    /// Global pointer position in logical coordinates, if known. The
+    /// compositor only routes pointer events to this client once the frozen
+    /// overlay surfaces are mapped, so call this after `show_frozen`; the
+    /// short event wait makes the first pointer enter/motion visible. A
+    /// timeout is not fatal and simply yields `None`.
+    pub fn pointer_position(&mut self) -> Result<Option<Point>> {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let _ = self.dispatch_until(deadline, VshotError::CurrentOutputTimeout, |state| {
+            state.pointer_position.is_some()
+        });
+        let Some((output_id, local_x, local_y)) = self.state.pointer_position else {
+            return Ok(None);
+        };
+        let Some(output) = self
+            .state
+            .topology
+            .output_infos()?
+            .into_iter()
+            .find(|info| info.global_id == output_id)
+        else {
+            return Ok(None);
+        };
+        global_point(output.geometry.origin, local_x, local_y).map(Some)
     }
 
     fn dispatch_until<F>(
@@ -872,6 +902,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     return;
                 };
                 state.pointer_output = Some(surface_data.output_id);
+                state.pointer_position = Some((surface_data.output_id, surface_x, surface_y));
                 if state.pointer_grab_output.is_some() {
                     // During an implicit grab, motion coordinates remain relative to
                     // the surface that received the button press. Do not overwrite
@@ -902,6 +933,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                         if state.pointer_output == Some(surface_data.output_id) {
                             state.pointer_output = None;
                         }
+                        if state
+                            .pointer_position
+                            .as_ref()
+                            .map(|(output_id, _, _)| *output_id)
+                            == Some(surface_data.output_id)
+                        {
+                            state.pointer_position = None;
+                        }
                     }
                 }
             }
@@ -918,6 +957,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                     }
                     return;
                 };
+                state.pointer_position = Some((output_id, surface_x, surface_y));
                 let event = SelectionEvent::PointerMoved {
                     output_id,
                     local_x: surface_x,

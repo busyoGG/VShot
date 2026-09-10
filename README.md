@@ -73,7 +73,7 @@ vshot pin shot.png another.png
 vshot pin --clipboard        # pin 剪贴板里的图片（或复制的图片文件/路径/文字）
 vshot pin --toggle          # 一键显示/隐藏所有 pin
 vshot pin --hide / --show
-vshot pin --close-all       # 关闭全部 pin（daemon 常驻）
+vshot pin --close-all       # 关闭全部 pin（无 pin 后 daemon 自动退出）
 vshot pin --list            # 打印数量与可见状态
 vshot pin --quit            # 退出 daemon
 ```
@@ -98,12 +98,16 @@ vshot pin --quit            # 退出 daemon
 
 ## active window
 
-通用 Wayland 没有标准的 active-window geometry API。`window active` 在 overlay 显示前依次尝试：
+通用 Wayland 没有标准的 active-window geometry API。`window active` 依次尝试：
 
 1. Hyprland：`hyprctl activewindow -j` 的 `at`/`size`；
-2. Sway：`swaymsg -t get_tree` 中递归查找 focused node 的 `rect`。
+2. Sway：`swaymsg -t get_tree` 中递归查找 focused node 的 `rect`；
+3. KDE Plasma：优先 `kdotool`（若安装），否则一次性 KWin scripting 探针——通过 `org.kde.kwin.Scripting`（gdbus/dbus-send）加载读取 `workspace.activeWindow`/`activeClient` 的 `frameGeometry`（分别对应 Plasma 6/5），从用户 journal 轮询标记行取回；探针每次独立加载并在结束后卸载；
+4. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测焦点窗口——先拟合"焦点描边"（平铺合成器给焦点窗口画的高亮边框，闭合同色矩形轮廓），失败再做背景泛洪分割（从帧边缘追踪壁纸/阴影，无边框窗口靠 gaps、阴影或壁纸分离，已知光标位置时用于消歧）。
 
-解析不到可靠的非空 geometry 时明确失败。目标 geometry 会从已经捕获的冻结场景中裁剪；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
+`vshot window active --pixel` 跳过 compositor 元数据，直接走像素识别——用于测试检测器，也可用于完全没有元数据接口的合成器。像素识别在降采样的分析帧上运行，4K 场景开销可忽略；**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
+
+目标 geometry 会从已经捕获的冻结场景中裁剪；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
 
 ## pin 图片浮层
 
@@ -113,7 +117,7 @@ pin 需要一个**常驻后台进程**（daemon）：layer-shell 浮层 surface 
 
 - 复用 Qt 二进制：`vshot-qt-ui --pin-server <socket>` 即 daemon，首次 `vshot pin` 连不上 socket 时自动分离式拉起（不占终端）；
 - CLI 是瘦客户端，通过 Unix socket 发送单行 JSON 请求（见下条路径规则）；
-- daemon 常驻到 `vshot pin --quit`（空闲不退出，保证绑定快捷键零延迟响应）；
+- daemon 存续到最后一个 pin 关闭：关闭最后一张 pin（或 `--close-all`）约 0.5s 后 daemon 自动退出（新来的 add 会先被服务并取消退出）；下次 pin 命令自动重新拉起。`vshot pin --quit` 仍可随时手动退出；
 - **不要用 `pkill`/`kill -9` 结束 daemon**：它持有 layer-shell surface，被强杀时部分合成器（实测 Hyprland 0.56）会残留该 surface 与其截屏会话，导致**所有输出的 screencopy 永久阻塞**（`vshot`/`grim` 全部超时，且 `hyprctl reload`、DPMS 循环、`force_renderer_reload` 都无法恢复，只能重启会话）。请始终用 `vshot pin --quit`，它会在退出前 unmap 全部浮层；daemon 也已处理 `SIGTERM`/`SIGINT` 走同样的优雅路径；
 - socket 路径默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`（缺失时回退 `/tmp`），可用 `VSHOT_PIN_SOCKET=<绝对路径>` 覆盖，便于隔离测试多实例；
 - pin 浮层平时不持有键盘（`KeyboardInteractivity=OnDemand`）：点击后该 pin 获得键盘焦点（出现亮色描边），点别处自动让出。聚焦时按 **Space** 进入编辑模式。
@@ -163,7 +167,7 @@ Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 l
 ## 已知限制
 
 - 当前只实现 `wlr-screencopy-unstable-v1` 的 wl_shm 路径（协议版本 1 至 3）；没有实现 PipeWire、Portal ScreenCast、DMA-BUF 或 ext-image-copy-capture。
-- Portal active-window backend 尚未实现；active window 仅支持上述 Hyprland/Sway 命令行接口。
+- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway 命令行接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。
 - 编辑结果使用 RGBA8 软件绘制，线宽和坐标按截图 logical scale 转换；Qt 文本框接受任意 Unicode 文本（含通过输入法提交的 CJK）。交互式文本由 Qt 按所选系统字体栅格化为 RGBA 位图后由 Rust 合成（见「交互式 overlay」）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体渲染，该回退路径仅支持可打印 ASCII。
 - 交互式 `region` 的键盘和鼠标事件由 Qt/LayerShellQt 处理；不依赖 Hyprland 插件或私有输入接口。
 - 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射会拒绝执行。

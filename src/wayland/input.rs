@@ -273,7 +273,7 @@ impl SelectionTracker {
     }
 }
 
-fn global_point(origin: Point, local_x: f64, local_y: f64) -> Result<Point> {
+pub(crate) fn global_point(origin: Point, local_x: f64, local_y: f64) -> Result<Point> {
     if !local_x.is_finite() || !local_y.is_finite() {
         return Err(VshotError::Selection(
             "compositor sent invalid pointer coordinates".into(),

@@ -98,7 +98,15 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum WindowTarget {
-    Active,
+    /// Capture the currently focused window: compositor metadata when
+    /// available, otherwise pixel detection on the captured frame.
+    Active {
+        /// Skip compositor metadata and detect the focused window from the
+        /// captured pixels (accent outline, then background segmentation).
+        /// For testing the detector and for compositors without metadata.
+        #[arg(long)]
+        pixel: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +123,10 @@ pub enum CaptureTarget {
     RegionInteractive,
     Monitor(String),
     All,
-    ActiveWindow,
+    ActiveWindow {
+        /// Detect the window from pixels instead of compositor metadata.
+        pixel_detect: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,8 +221,10 @@ impl Cli {
             }
             Command::All => CaptureTarget::All,
             Command::Window {
-                target: WindowTarget::Active,
-            } => CaptureTarget::ActiveWindow,
+                target: WindowTarget::Active { pixel },
+            } => CaptureTarget::ActiveWindow {
+                pixel_detect: pixel,
+            },
             Command::Pin { .. } => {
                 return Err(VshotError::InvalidDestination(
                     "the pin subcommand is not a capture target".into(),
@@ -305,6 +318,32 @@ mod tests {
             error.to_string().contains("mutually exclusive")
                 || error.to_string().contains("cannot be used")
         );
+    }
+
+    #[test]
+    fn window_active_parses_the_pixel_flag() {
+        let action =
+            Cli::try_parse_action_from(["vshot", "window", "active", "--clipboard"]).unwrap();
+        assert_eq!(
+            action,
+            Action::Capture(Request {
+                target: CaptureTarget::ActiveWindow {
+                    pixel_detect: false
+                },
+                destination: Destination::Clipboard,
+                cursor: false,
+            })
+        );
+        let action =
+            Cli::try_parse_action_from(["vshot", "window", "active", "--pixel", "--clipboard"])
+                .unwrap();
+        assert!(matches!(
+            action,
+            Action::Capture(Request {
+                target: CaptureTarget::ActiveWindow { pixel_detect: true },
+                ..
+            })
+        ));
     }
 
     #[test]
