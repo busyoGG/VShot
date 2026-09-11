@@ -39,16 +39,27 @@ impl OutputCommand {
             args: &["-t", "get_outputs"],
         }
     }
+
+    /// niri's IPC answers with the focused output directly. It is only
+    /// reachable through `$NIRI_SOCKET`, which a session sets for its own
+    /// clients, so the probe fails fast anywhere else.
+    fn niri_focused_output() -> Self {
+        Self {
+            program: "niri",
+            args: &["msg", "--json", "focused-output"],
+        }
+    }
 }
 
 /// All probes in the order they are tried; the first one that succeeds wins.
 /// Hyprland advertises its outputs to Sway's IPC as well, so the Hyprland
 /// probe has to be decisive: its "no monitor is focused" answer is a real
 /// answer, not a reason to try something else.
-fn probes() -> [OutputCommand; 2] {
+fn probes() -> [OutputCommand; 3] {
     [
         OutputCommand::hyprland_monitors(),
         OutputCommand::sway_outputs(),
+        OutputCommand::niri_focused_output(),
     ]
 }
 
@@ -67,7 +78,8 @@ pub fn active_output() -> Option<Rect> {
         }
         let parsed = match probe.program {
             "hyprctl" => hyprland_output(&output.stdout, cursor_position()),
-            _ => parse_sway_outputs(&output.stdout),
+            "swaymsg" => parse_sway_outputs(&output.stdout),
+            _ => parse_niri_output(&output.stdout),
         };
         if parsed.is_some() {
             return parsed;
@@ -172,6 +184,24 @@ fn parse_sway_outputs(bytes: &[u8]) -> Option<Rect> {
     let y = geometry.get("y").and_then(Value::as_i64)?;
     let width = geometry.get("width").and_then(Value::as_u64)?;
     let height = geometry.get("height").and_then(Value::as_u64)?;
+    rect(x, y, width, height)
+}
+
+/// Reads the focused output's logical geometry out of `niri msg --json
+/// focused-output`.
+///
+/// niri reports the geometry it uses for layout in `logical`, which is already
+/// in the same logical space as a pointer position or a Qt screen geometry, so
+/// unlike Hyprland nothing has to be divided by the scale. The scale is
+/// deliberately left out of the rect for that reason. A disabled output has no
+/// `logical` geometry and is rejected rather than guessed at.
+fn parse_niri_output(bytes: &[u8]) -> Option<Rect> {
+    let output: Value = serde_json::from_slice(bytes).ok()?;
+    let logical = output.get("logical")?;
+    let x = logical.get("x").and_then(Value::as_i64)?;
+    let y = logical.get("y").and_then(Value::as_i64)?;
+    let width = logical.get("width").and_then(Value::as_u64)?;
+    let height = logical.get("height").and_then(Value::as_u64)?;
     rect(x, y, width, height)
 }
 
@@ -288,10 +318,16 @@ mod tests {
     #[test]
     fn hyprland_scale_is_applied_and_fractional_scales_survive() {
         let json = br#"[{"x":0,"y":0,"width":2560,"height":1440,"scale":1.25,"focused":true}]"#;
-        assert_eq!(parse_hyprland_monitors(json), Some(Rect::new(0, 0, 2048, 1152)));
+        assert_eq!(
+            parse_hyprland_monitors(json),
+            Some(Rect::new(0, 0, 2048, 1152))
+        );
         // A missing scale means an unscaled output.
         let json = br#"[{"x":0,"y":0,"width":800,"height":600,"focused":true}]"#;
-        assert_eq!(parse_hyprland_monitors(json), Some(Rect::new(0, 0, 800, 600)));
+        assert_eq!(
+            parse_hyprland_monitors(json),
+            Some(Rect::new(0, 0, 800, 600))
+        );
         // A nonsensical scale is not worth guessing at.
         let json = br#"[{"x":0,"y":0,"width":800,"height":600,"scale":0,"focused":true}]"#;
         assert_eq!(parse_hyprland_monitors(json), None);
@@ -309,7 +345,10 @@ mod tests {
             {"name":"HDMI-A-1","focused":false,"rect":{"x":0,"y":0,"width":1920,"height":1080}},
             {"name":"DP-1","focused":true,"rect":{"x":-1600,"y":0,"width":1600,"height":900}}
         ]"#;
-        assert_eq!(parse_sway_outputs(json), Some(Rect::new(-1600, 0, 1600, 900)));
+        assert_eq!(
+            parse_sway_outputs(json),
+            Some(Rect::new(-1600, 0, 1600, 900))
+        );
     }
 
     #[test]
@@ -327,5 +366,42 @@ mod tests {
         assert_eq!(probes[0].args, ["monitors", "-j"]);
         assert_eq!(probes[1].program, "swaymsg");
         assert_eq!(probes[1].args, ["-t", "get_outputs"]);
+        assert_eq!(probes[2].program, "niri");
+        assert_eq!(probes[2].args, ["msg", "--json", "focused-output"]);
+    }
+
+    #[test]
+    fn finds_the_focused_niri_output() {
+        // `niri msg --json focused-output` for a 4K output at scale 2: `logical`
+        // already holds the layout geometry, so its 1920-wide rect is used as
+        // it stands rather than being worked out from the 3840x2160 mode.
+        let json = br#"{
+            "name":"DP-2","make":"Dell","model":"X","serial":null,
+            "modes":[{"width":3840,"height":2160,"refresh_rate":60000,
+                      "is_preferred":true}],
+            "current_mode":0,"is_custom_mode":false,"vrr_supported":false,
+            "vrr_enabled":false,
+            "logical":{"x":1920,"y":0,"width":1920,"height":1080,"scale":2.0,
+                       "transform":"Normal"}
+        }"#;
+        assert_eq!(
+            parse_niri_output(json),
+            Some(Rect::new(1920, 0, 1920, 1080))
+        );
+    }
+
+    #[test]
+    fn a_disabled_niri_output_is_not_an_answer() {
+        // niri leaves `logical` unset when an output is disabled, and there is
+        // no geometry to pin onto in that case.
+        let json = br#"{"name":"DP-2","logical":null,"current_mode":null}"#;
+        assert_eq!(parse_niri_output(json), None);
+        assert_eq!(parse_niri_output(b""), None);
+        assert_eq!(parse_niri_output(b"not json"), None);
+        // A fractional scale is carried in `logical.scale` and deliberately
+        // plays no part in the rect: `logical` is already logical.
+        let json = br#"{"logical":{"x":0,"y":0,"width":1280,"height":720,
+                                   "scale":1.5,"transform":"Normal"}}"#;
+        assert_eq!(parse_niri_output(json), Some(Rect::new(0, 0, 1280, 720)));
     }
 }

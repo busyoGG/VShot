@@ -1304,6 +1304,7 @@ mod tests {
             7559
         );
         assert_eq!(encoded[phys + 12], 1); // metre, not the unspecified unit
+
         // 96 DPI (a density of 1) is deliberately not what an undeclared PNG
         // gets: Qt reports that default itself, and the pin side filters it out.
         let single = frame.to_png_with_density(1).unwrap();

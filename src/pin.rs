@@ -251,10 +251,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         })?;
     }
     if clipboard {
-        execute(PinCommand::AddClipboard {
-            density,
-            output,
-        })?;
+        execute(PinCommand::AddClipboard { density, output })?;
     }
     Ok(())
 }

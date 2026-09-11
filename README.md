@@ -106,7 +106,7 @@ vshot pin --quit            # 退出 daemon
 3. KDE Plasma：优先 `kdotool`（若安装），否则一次性 KWin scripting 探针——通过 `org.kde.kwin.Scripting`（gdbus/dbus-send）加载读取 `workspace.activeWindow`/`activeClient` 的 `frameGeometry`（分别对应 Plasma 6/5），从用户 journal 轮询标记行取回；探针每次独立加载并在结束后卸载；
 4. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测焦点窗口——先拟合"焦点描边"（平铺合成器给焦点窗口画的高亮边框，闭合同色矩形轮廓），失败再做背景泛洪分割（从帧边缘追踪壁纸/阴影，无边框窗口靠 gaps、阴影或壁纸分离，已知光标位置时用于消歧）。
 
-`vshot window active --pixel` 跳过 compositor 元数据，直接走像素识别——用于测试检测器，也可用于完全没有元数据接口的合成器。像素识别在降采样的分析帧上运行，4K 场景开销可忽略；**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
+`vshot window active --pixel` 跳过 compositor 元数据，直接走像素识别——用于测试检测器，也可用于完全没有元数据接口的合成器（**niri** 就是其一：它没有输出焦点窗口几何的接口，`focused-window` 只给 tile 布局信息，全局坐标要靠 output 与 column 自己推算）。像素识别在降采样的分析帧上运行，4K 场景开销可忽略；**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
 
 目标 geometry 会从已经捕获的冻结场景中裁剪；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
 
@@ -114,7 +114,7 @@ vshot pin --quit            # 退出 daemon
 
 `vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**缩放（0.1x–8x，光标为锚点并短暂显示倍率）、**双击**关闭该图、**点击聚焦后按 Space** 进入完整标注编辑器。
 
-新 pin 落在**激活的输出**上：**指针所在的那块屏优先**（`hyprctl cursorpos` 查询并按其逻辑矩形命中显示器），指针读不到时退回**键盘焦点所在**的输出（Hyprland `hyprctl monitors -j`、Sway `swaymsg -t get_outputs` 中标记 `focused` 的输出），都没有则回退主输出。这样"在哪块屏幕就在哪块屏幕 pin"才成立；daemon 自己拿不到这个信息（无窗口进程只能看到指针在 (0,0)）。Hyprland 上报的 `width`/`height` 是原生分辨率而 `x`/`y` 是逻辑坐标，所以要按 `scale` 换算后才能与 Qt 屏幕几何或指针位置比较。一个 layer-shell surface 只能属于一块输出，所以每张 pin 由 daemon 为**每一块输出各持有一个渲染面**：pin 的图像、缩放与全局位置由 daemon 统一持有，各屏的面只画它与自己重叠的部分，因此拖拽可以**跨越显示器**——手势始终由拖起它的那个面持有，另一块屏上的副本同步跟随。完全落在别块屏幕上的面会把输入区域移到该面之外（Wayland 没有"无输入区域"的请求，未设置反而等于整面可点），不挡住那里的点击。显示器热插拔时 daemon 会为新输出补面、为移除的输出收面（并把 pin 收回可视区域）。
+新 pin 落在**激活的输出**上：**指针所在的那块屏优先**（`hyprctl cursorpos` 查询并按其逻辑矩形命中显示器），指针读不到时退回**键盘焦点所在**的输出（Hyprland `hyprctl monitors -j`、Sway `swaymsg -t get_outputs`、niri `niri msg --json focused-output` 中标记 focused 的输出），都没有则回退主输出。这样"在哪块屏幕就在哪块屏幕 pin"才成立；daemon 自己拿不到这个信息（无窗口进程只能看到指针在 (0,0)）。Hyprland 上报的 `width`/`height` 是原生分辨率而 `x`/`y` 是逻辑坐标，所以要按 `scale` 换算后才能与 Qt 屏幕几何或指针位置比较。一个 layer-shell surface 只能属于一块输出，所以每张 pin 由 daemon 为**每一块输出各持有一个渲染面**：pin 的图像、缩放与全局位置由 daemon 统一持有，各屏的面只画它与自己重叠的部分，因此拖拽可以**跨越显示器**——手势始终由拖起它的那个面持有，另一块屏上的副本同步跟随。完全落在别块屏幕上的面会把输入区域移到该面之外（Wayland 没有"无输入区域"的请求，未设置反而等于整面可点），不挡住那里的点击。显示器热插拔时 daemon 会为新输出补面、为移除的输出收面（并把 pin 收回可视区域）。
 
 pin 的**尺寸按图片的来源密度来定**，默认不需要任何参数。图片来源密度按以下顺序确定：
 
