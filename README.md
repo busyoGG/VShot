@@ -1,6 +1,6 @@
 # vshot
 
-`vshot` 是面向 wlroots compositor 的 Rust Wayland 截图 CLI。非交互截图采用严格冻结流程：先用 Rust 原生 `wlr-screencopy-unstable-v1` 捕获所有输出，再用 Rust 原生 `wlr-layer-shell-unstable-v1` + `wl_shm` 将这些静态帧显示为全屏父 layer overlay。交互式 `region` 由 Qt helper 负责 overlay 和编辑，始终只处理已经捕获的静态帧。
+`vshot` 是 Rust 写的 Wayland 截图 CLI，支持 wlroots 系与 KWin/Plasma 两类合成器。非交互截图采用严格冻结流程：先捕获所有输出——wlroots 系走 Rust 原生 `wlr-screencopy-unstable-v1`，KWin/Plasma 走它私有的 `org.kde.KWin.ScreenShot2` D-Bus 服务——再用 Rust 原生 `wlr-layer-shell-unstable-v1` + `wl_shm` 将这些静态帧显示为全屏父 layer overlay。交互式 `region` 由 Qt helper 负责 overlay 和编辑，始终只处理已经捕获的静态帧。
 
 ## 构建
 
@@ -31,7 +31,7 @@ Qt 交互界面支持中/英双语：默认跟随系统语言（`QLocale::system
 - `wl_compositor`、`wl_shm`（包含 `XRGB8888` 或 `ARGB8888`）、至少一个 `wl_output` 和 `wl_seat`；
 - `zxdg_output_manager_v1`，用于 overlay 的输出名称和 logical topology；
 - `zwlr_layer_shell_v1`，用于 Rust 非交互冻结 overlay；
-- `zwlr_screencopy_manager_v1`（版本 1 至 3），用于原生帧捕获；
+- `zwlr_screencopy_manager_v1`（版本 1 至 3），用于 wlroots 系的原生帧捕获——**KWin 没有这个协议**，此时改用 KWin 的 D-Bus 截图服务（见下）；
 - `wl_output` 的名称事件（版本 4）用于按名称选择捕获输出；
 - `vshot-qt-ui` 需要 Qt6 Core/Gui/Widgets/Network 和 LayerShellQt；
 - 可选 `wp_cursor_shape_manager_v1`（仅保留的 Rust editor path 使用）；
@@ -195,6 +195,23 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 内部帧统一为 RGBA8、top-left origin。PNG 输入由 `image` 解码，最终 sink 前重新编码 PNG。多输出合成支持负 logical origin 和输出间空隙；场景画布使用最高输出 scale，较低 scale 的输出使用 nearest-neighbor 放大。当前仍要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。
 
+## 截图后端
+
+启动时探测一次，之后与后端无关：
+
+1. 先连 `wlr-screencopy-unstable-v1`。只有它以「缺少 `zwlr_screencopy_manager_v1`」失败时才说明「这不是 wlroots 系合成器」，此时才转后端 2；其它失败（连接不上、缺 `wl_shm`、没有输出等）原样上报，不会被伪装成 KDE 问题。
+2. **KWin ScreenShot2**：`org.kde.KWin.ScreenShot2` 是 KWin 的私有会话总线服务（对象路径 `/org/kde/KWin/ScreenShot2`）。vshot 传入一根管道的写端，调用 `CaptureScreen(name, options, pipe)`，KWin 把像素写进管道、在回复的 `a{sv}` 里给出 `width`/`height`/`stride`/`format`/`scale`/`type`，`stride * height` 正是管道上收到的字节数。管道在另一线程里读到底，否则整帧放不进内核管道缓冲区时会与合成器互相等待。
+
+   像素是**预乘 alpha 的 BGRA**（`format = 6`，即 `QImage::Format_ARGB32_Premultiplied`）：vshot 反预乘、丢掉行尾补白、交换到 RGBA，并把 alpha 一律归一为 255——截图代表屏幕上的合成结果，物理上不透明；输出里没有被合成内容覆盖的区域（原始 `0,0,0,0`）因此表现为黑，而不是透明。`format` 不是 6、或缺 `width`/`height`/`stride` 时明确报错，不会按已知布局硬解读。
+
+   两个后端都不可用时，错误信息同时说明「没有 wlr-screencopy」和「KWin ScreenShot2 也不可用」以及 KWin 那一侧的具体原因，便于区分「合成器不支持」与「会话没配好」。
+
+### KDE 授权
+
+Plasma 会话里首次截图时 KWin 会弹权限对话框，**只有用户确认后**本次调用才会拿到像素；未确认时返回 `org.kde.KWin.ScreenShot2.Error.NoAuthorized`，vshot 会把它翻译成如何获得授权的说明，而不是只抛原始 D-Bus 字符串。无头或非 Plasma 会话没有可应答的对话框，因此永远拿不到授权。合成器侧的环境变量 `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1` 可以关掉这个检查，**仅供开发/测试**。
+
+`include-cursor` 选项按 KDE 文档传入；它是否真的把光标画进图像**尚未验证**——无头 `--virtual` 输出上没有指针可画。
+
 ## 冻结、编辑与资源生命周期
 
 Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 layer surface。收到 layer-surface configure 后，程序 ack configure，使用 Unix SHM/mmap 创建两个有效的父层 `wl_buffer`，将首次捕获的冻结 raw frame 写入两个 slot，并提交 slot 0；该路径只使用父 layer surface 与 `wl_shm`。overlay、layer surface、buffer 和临时 SHM 映射由 RAII 清理，冻结期间不会再次读取桌面。
@@ -203,8 +220,9 @@ Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 l
 
 ## 已知限制
 
-- 当前只实现 `wlr-screencopy-unstable-v1` 的 wl_shm 路径（协议版本 1 至 3）；没有实现 PipeWire、Portal ScreenCast、DMA-BUF 或 ext-image-copy-capture。
-- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway 命令行接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。
+- 截图后端：wlroots 系走 `wlr-screencopy-unstable-v1` 的 wl_shm 路径（协议版本 1 至 3）；**KWin/Plasma Wayland 改走 `org.kde.KWin.ScreenShot2`**（见「截图后端」），因为 KWin 根本没有 screencopy，也没有 `ext-image-copy-capture`（实测 KWin 6.7.5 的 global 列表与 `libkwin.so.6` 里都找不到这两个接口名）。两者都没有实现 PipeWire、Portal ScreenCast 或 DMA-BUF。**不要以为"grim 能在 KDE 跑所以 vshot 也应该能"**：grim 只带 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`，在 KDE 上两个都不可用（实测报 "compositor doesn't support the screen capture protocol"），KDE 只能走它私有的 D-Bus 服务。GNOME/Mutter 三者都不提供，连 layer-shell 也没有。
+- KWin 那条路的**冻结 overlay 仍然依赖 `zwlr_layer_shell_v1`**（KWin 提供它），但合成器侧授权对话框必须由用户在 Plasma 会话里确认；非 Plasma/无头会话会一直返回 `NoAuthorized`。
+- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway/KWin 的接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。
 - 编辑结果使用 RGBA8 软件绘制，线宽和坐标按截图 logical scale 转换；Qt 文本框接受任意 Unicode 文本（含通过输入法提交的 CJK）。交互式文本由 Qt 按所选系统字体栅格化为 RGBA 位图后由 Rust 合成（见「交互式 overlay」）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体渲染，该回退路径仅支持可打印 ASCII。
 - 交互式 `region` 的键盘和鼠标事件由 Qt/LayerShellQt 处理；不依赖 Hyprland 插件或私有输入接口。
 - 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射会拒绝执行。
@@ -221,3 +239,17 @@ cargo test --locked
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
+
+KWin 的 D-Bus 路径另有两个默认**不执行**的集成测试（需要真在跑 KWin 的会话），它们真的调用一次 `CaptureScreen` 并断言帧尺寸与不透明性，以及一次真实的后端选择。起一个无头 KWin 即可跑：
+
+```sh
+mkdir -p /tmp/kwin-e2e/{cfg,data,cache}
+KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 XDG_CONFIG_HOME=/tmp/kwin-e2e/cfg \
+  XDG_DATA_HOME=/tmp/kwin-e2e/data XDG_CACHE_HOME=/tmp/kwin-e2e/cache \
+  kwin_wayland --virtual --socket wayland-ke2e --no-lockscreen \
+  --no-global-shortcuts --no-kactivities &
+XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-ke2e \
+  cargo test -- --ignored --nocapture
+```
+
+无头 KWin 的虚拟输出名是 `Virtual-0`，尺寸 1024x768；可用 `WAYLAND_DISPLAY=wayland-ke2e wayland-info` 确认。它没有 pointer capability，所以完整流程（需要 `WaylandSession::connect()` 的 seat pointer 检查）在无头环境必然失败——这是预期的，集成测试因此只覆盖到 D-Bus 采集这一层。`VSHOT_KWIN_E2E_OUTPUT` / `_WIDTH` / `_HEIGHT` / `_COLOR=R,G,B` 可覆盖默认的输出名、尺寸与中心像素颜色断言。

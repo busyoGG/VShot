@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use capture::{CompositorWindowProvider, ProcessWindowProvider, WlrCapture};
+use capture::{Capturer, CompositorWindowProvider, ProcessWindowProvider};
 use cli::{Action, CaptureTarget, Cli};
 use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
@@ -48,7 +48,7 @@ fn run() -> Result<()> {
     };
     let mut wayland = WaylandSession::connect()?;
     let output_infos = wayland.output_infos()?;
-    let mut capture = WlrCapture::connect()?;
+    let mut capture = Capturer::connect()?;
 
     // Metadata lookup is cheap and happens before the capture; a failure is
     // not fatal yet — the pixel fallback runs on the captured scene.
@@ -153,7 +153,7 @@ fn run() -> Result<()> {
 }
 
 fn capture_scene(
-    capture: &mut WlrCapture,
+    capture: &mut Capturer,
     output_infos: &[OutputInfo],
     cursor: bool,
 ) -> Result<SceneSnapshot> {

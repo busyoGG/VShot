@@ -13,7 +13,7 @@ memmap2 = "0.9.11"
 # The `image` encoder cannot state a pixel density, so PNGs that have to carry
 # one are encoded directly; already in the graph via `image`.
 png = "0.18"
-rustix = { version = "1.1.4", features = ["event", "process"] }
+rustix = { version = "1.1.4", features = ["event", "pipe", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
@@ -21,6 +21,11 @@ thiserror = "2.0.20"
 wayland-client = "0.31.13"
 wayland-protocols = { version = "0.32.12", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+# KWin has no wlr-screencopy and exposes screenshots only over its private
+# ScreenShot2 D-Bus service, so the KDE backend needs a bus client.  The
+# default features pull in `async-io` + `blocking-api`; tokio is deliberately
+# not involved.
+zbus = "5.19.0"
 
 [profile.release]
 lto = "thin"

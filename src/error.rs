@@ -36,6 +36,14 @@ pub enum VshotError {
     MissingCapability(String),
     #[error("Wayland protocol error: {0}")]
     WaylandProtocol(String),
+    /// No capture backend can serve the request.  The message is a complete
+    /// sentence because both backends' diagnoses are composed into it.
+    #[error("no usable screen capture backend: {0}")]
+    NoCaptureBackend(String),
+    #[error("KWin ScreenShot2 failed: {0}")]
+    KwinScreenShot(String),
+    #[error("KDE denied the screenshot: {0}")]
+    ScreenshotDenied(String),
     #[error("screen capture timed out before the compositor returned a frame")]
     CaptureTimeout,
     #[error("frozen overlay was not ready before the timeout")]
