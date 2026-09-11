@@ -2528,14 +2528,31 @@ LogicalRect OverlayController::selectionLimits() const
 }
 
 // Shifts every annotation by the given global delta (the image under them
-// moved).
+// moved). Deliberately unclamped: the image and its marks travel as one rigid
+// body, so a mark sitting on the image's edge must move with it rather than
+// being pinned back to the edge it started on.
 void OverlayController::translateAnnotations(std::int32_t dx, std::int32_t dy)
 {
     if (dx == 0 && dy == 0) {
         return;
     }
     for (Annotation &annotation : annotations_) {
-        annotation = translatedAnnotation(annotation, dx, dy);
+        switch (annotation.kind) {
+        case Annotation::Kind::Shape:
+            annotation.rect.x = static_cast<std::int32_t>(annotation.rect.x + dx);
+            annotation.rect.y = static_cast<std::int32_t>(annotation.rect.y + dy);
+            break;
+        case Annotation::Kind::Stroke:
+            for (Point &point : annotation.points) {
+                point.x = static_cast<std::int32_t>(point.x + dx);
+                point.y = static_cast<std::int32_t>(point.y + dy);
+            }
+            break;
+        case Annotation::Kind::Text:
+            annotation.origin.x = static_cast<std::int32_t>(annotation.origin.x + dx);
+            annotation.origin.y = static_cast<std::int32_t>(annotation.origin.y + dy);
+            break;
+        }
     }
 }
 
@@ -2569,10 +2586,14 @@ LogicalRect OverlayController::moveSelection(LogicalRect origin, Point anchor, P
 
 LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, Point current) const
 {
-    const std::int64_t boundsLeft = session_.bounds.x;
-    const std::int64_t boundsTop = session_.bounds.y;
-    const std::int64_t boundsRight = session_.bounds.right();
-    const std::int64_t boundsBottom = session_.bounds.bottom();
+    // Region capture resizes the selection inside the frozen scene; in the pin
+    // editor the same helper resizes a mark inside the image (which may have
+    // been dragged), so the limit follows the drawing area, not the scene.
+    const LogicalRect &limits = annotationLimits();
+    const std::int64_t boundsLeft = limits.x;
+    const std::int64_t boundsTop = limits.y;
+    const std::int64_t boundsRight = limits.right();
+    const std::int64_t boundsBottom = limits.bottom();
     std::int64_t left = origin.x;
     std::int64_t top = origin.y;
     std::int64_t rightEdge = origin.right();
@@ -4054,13 +4075,24 @@ Annotation OverlayController::translatedAnnotation(const Annotation &original, i
     int clampedDx = dx;
     int clampedDy = dy;
     LogicalRect bounds;
+    // The mark may only travel inside the area it is drawn on. In pin-edit
+    // mode that is the image, which moves with the user's drags — clamping
+    // against the session bounds there would yank every mark back toward the
+    // image's original position, which reads as the mark vanishing.
+    const LogicalRect &limits = annotationLimits();
     if (annotationBounds(original, &bounds)) {
-        const std::int64_t minDx = session_.bounds.x - bounds.x;
-        const std::int64_t maxDx = session_.bounds.right() - bounds.right();
-        const std::int64_t minDy = session_.bounds.y - bounds.y;
-        const std::int64_t maxDy = session_.bounds.bottom() - bounds.bottom();
-        clampedDx = static_cast<int>(std::clamp<std::int64_t>(dx, minDx, std::max(minDx, maxDx)));
-        clampedDy = static_cast<int>(std::clamp<std::int64_t>(dy, minDy, std::max(minDy, maxDy)));
+        const std::int64_t minDx = limits.x - bounds.x;
+        const std::int64_t maxDx = limits.right() - bounds.right();
+        const std::int64_t minDy = limits.y - bounds.y;
+        const std::int64_t maxDy = limits.bottom() - bounds.bottom();
+        // A mark wider or taller than the area it sits on cannot be confined
+        // to it: move it freely rather than snapping it to one edge.
+        if (minDx <= maxDx) {
+            clampedDx = static_cast<int>(std::clamp<std::int64_t>(dx, minDx, maxDx));
+        }
+        if (minDy <= maxDy) {
+            clampedDy = static_cast<int>(std::clamp<std::int64_t>(dy, minDy, maxDy));
+        }
     }
     Annotation result = original;
     switch (original.kind) {
@@ -4731,6 +4763,11 @@ bool CaptureOverlay::showLayerSurfaceAt(int globalX, int globalY, int width, int
                                std::max(0, globalY - output.top()), 0, 0));
     resize(width, height);
     show();
+    raise();
+    // Exclusive keyboard interactivity only takes effect once the surface is
+    // actually activated; without activateWindow() the compositor never routes
+    // key events here and Escape/Enter/arrow keys are all silently dead.
+    activateWindow();
     setFocus(Qt::OtherFocusReason);
     return true;
 }

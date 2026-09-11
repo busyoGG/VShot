@@ -7,8 +7,11 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QRegion>
+#include <QScreen>
 #include <QTimer>
 #include <QWheelEvent>
+
+#include <algorithm>
 
 namespace vshot {
 
@@ -24,22 +27,37 @@ QRect expandOutline(const QRect &rect)
     return rect.adjusted(-kOutlineBleedPx, -kOutlineBleedPx, kOutlineBleedPx, kOutlineBleedPx);
 }
 
+// Wayland has no "no input here" request: an unset input region means the
+// whole surface is interactive, and Qt sends no request at all for an empty
+// mask, which is exactly that default. A region parked outside the surface is
+// the portable way to say "click straight through": the compositor
+// intersects it with the surface and nothing is ever hit. Without this, a pin
+// image sitting on another output leaves this output's surface eating every
+// click on that screen.
+const QRegion &clickThroughInputRegion()
+{
+    static const QRegion region(QRect(-8, -8, 1, 1));
+    return region;
+}
+
 } // namespace
 
-PinWindow::PinWindow(const QImage &image, QScreen *screen)
+PinWindow::PinWindow(const QImage &image, int density, QScreen *screen)
     : QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint)
     , source_(image)
     , screen_(screen)
+    , density_(std::clamp(density, 1, 4))
 {
     setAttribute(Qt::WA_TranslucentBackground);
     setAttribute(Qt::WA_DeleteOnClose);
     setMouseTracking(true);
     setFocusPolicy(Qt::ClickFocus);
     setCursor(Qt::SizeAllCursor);
-    // Text cards are rasterized at the output's pixel density; the natural
-    // zoom for every image is one device pixel per logical pixel.
-    imageRatio_ = std::clamp(source_.devicePixelRatio(), 1.0, 4.0);
-    scale_ = 1.0 / imageRatio_;
+    // Natural zoom: one source pixel per logical pixel of an output with the
+    // same density as the image, so a 4K capture takes the same room on screen
+    // it did where it was taken. The daemon sets the scale right after
+    // construction; this only avoids a wrong first frame.
+    scale_ = 1.0 / density_;
     zoomTimer_ = new QTimer(this);
     zoomTimer_->setSingleShot(true);
     connect(zoomTimer_, &QTimer::timeout, this, [this] {
@@ -98,37 +116,56 @@ void PinWindow::setSourceImage(const QImage &image)
     if (image.isNull()) {
         return;
     }
-    // Keep what the user sees stable: preserve the on-screen size even though
-    // the pixel content changed (the edited image is 1:1 with the display).
-    const QSize display = displaySize();
     source_ = image;
-    if (image.width() > 0) {
-        scale_ = std::clamp(static_cast<double>(display.width()) / image.width(), kMinScale,
-                            kMaxScale);
-    }
     // Pixels changed even when the rect stays identical: applyGeometry skips
     // the repaint in that case, so force one here (widened for the outline).
     applyGeometry();
     update(expandOutline(paintedRect_));
 }
 
-void PinWindow::placeAt(QPoint topLeft)
+void PinWindow::setGlobalOrigin(QPoint topLeft)
 {
-    margin_ = clampMargin(topLeft);
+    globalOrigin_ = topLeft;
     applyGeometry();
 }
 
-void PinWindow::placeCentered(QPoint cascadeOffset)
+void PinWindow::setScale(double scale)
 {
-    if (screen_ == nullptr) {
-        placeAt(cascadeOffset);
+    if (scale == scale_) {
         return;
     }
-    const QRect bounds = screen_->geometry();
-    const QSize size = displaySize();
-    const QPoint center((bounds.width() - size.width()) / 2,
-                        (bounds.height() - size.height()) / 2);
-    placeAt(center + cascadeOffset);
+    scale_ = scale;
+    applyGeometry();
+}
+
+QSize PinWindow::deviceTargetSize() const
+{
+    const qreal ratio = std::max<qreal>(1.0, devicePixelRatioF());
+    return QSize(std::max(1, qRound(paintedRect_.width() * ratio)),
+                 std::max(1, qRound(paintedRect_.height() * ratio)));
+}
+
+const QImage &PinWindow::renderSource()
+{
+    if (source_.isNull()) {
+        return source_;
+    }
+    const QSize target = deviceTargetSize();
+    if (target == source_.size()) {
+        // Already one device pixel per device pixel: a plain 1:1 blit.
+        return source_;
+    }
+    if (!render_.isNull() && renderKey_ == source_.cacheKey() && renderTarget_ == target) {
+        return render_;
+    }
+    render_ = source_.scaled(target, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    if (render_.isNull()) {
+        // Out of memory: fall back to letting the painter resample.
+        return source_;
+    }
+    renderKey_ = source_.cacheKey();
+    renderTarget_ = target;
+    return render_;
 }
 
 QSize PinWindow::displaySize() const
@@ -137,35 +174,45 @@ QSize PinWindow::displaySize() const
                  std::max(1, qRound(source_.height() * scale_)));
 }
 
-QPoint PinWindow::clampMargin(QPoint candidate) const
+QRect PinWindow::localDisplayRect() const
 {
-    const QSize size = displaySize();
-    if (screen_ == nullptr) {
-        return candidate;
-    }
-    const QSize outputSize = screen_->geometry().size();
-    // Keep at least kGrabMargin logical pixels of the image reachable so a
-    // pin can never be dragged off-screen for good.
-    const int minX = std::min(0, outputSize.width() - kGrabMargin - size.width());
-    const int minY = std::min(0, outputSize.height() - kGrabMargin - size.height());
-    const int maxX = std::max(minX, outputSize.width() - kGrabMargin);
-    const int maxY = std::max(minY, outputSize.height() - kGrabMargin);
-    return QPoint(std::clamp(candidate.x(), minX, maxX),
-                  std::clamp(candidate.y(), minY, maxY));
+    const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
+    return QRect(globalOrigin_ - origin, displaySize());
+}
+
+QRect PinWindow::globalDisplayRect() const
+{
+    return QRect(globalOrigin_, displaySize());
 }
 
 void PinWindow::applyGeometry()
 {
-    const QRect nextRect(margin_, displaySize());
+    const QRect nextRect = localDisplayRect();
     const QRect previous = paintedRect_;
     paintedRect_ = nextRect;
     // The input mask always follows the image so the rest of the output
     // keeps receiving clicks. It must be set on the QWindow, not the widget:
     // QWidget::setMask also tells Qt to stop repainting outside the mask,
     // which on Wayland (input region only, pixels still composited) leaves
-    // stale pixels behind as ghosting when the image moves.
+    // stale pixels behind as ghosting when the image moves. An image that is
+    // entirely on another output gets the click-through region above.
     if (QWindow *window = windowHandle()) {
-        window->setMask(QRegion(nextRect));
+        QRegion mask = QRegion(nextRect.intersected(QRect(QPoint(0, 0), size())));
+        if (mask.isEmpty()) {
+            if (dragging_) {
+                // A drag that carries the image onto another output empties
+                // this surface's region while this is still the surface
+                // holding the pointer grab. Widen it for the rest of the
+                // gesture: an empty input region is exactly the state that
+                // can drop the grab, and while a button is held no other
+                // client can receive input anyway. The release recomputes
+                // the region.
+                mask = QRegion(rect());
+            } else {
+                mask = clickThroughInputRegion();
+            }
+        }
+        window->setMask(mask);
     }
     if (!surfaceReady_ || nextRect == previous) {
         return;
@@ -179,6 +226,15 @@ void PinWindow::applyGeometry()
                              : expandOutline(previous.united(nextRect)));
 }
 
+void PinWindow::showZoomBadge()
+{
+    // The factor is relative to the image's native density, so a 4K capture
+    // pinned at its natural size on a 4K output reads as 100%.
+    zoomLabel_ = QString::number(qRound(scale_ * density_ * 100));
+    zoomTimer_->start(kZoomBadgeMs);
+    update(paintedRect_);
+}
+
 void PinWindow::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
@@ -190,8 +246,14 @@ void PinWindow::paintEvent(QPaintEvent *event)
     painter.setCompositionMode(QPainter::CompositionMode_Source);
     painter.fillRect(rect(), Qt::transparent);
     painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    if (!paintedRect_.intersects(rect())) {
+        // Every visible pixel of the image lives on another output.
+        return;
+    }
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
-    painter.drawImage(paintedRect_, source_);
+    // renderSource() is already at this surface's device resolution when the
+    // source is denser or coarser than the output, so this is a 1:1 blit then.
+    painter.drawImage(paintedRect_, renderSource());
     // A thin outline keeps the pinned image distinguishable from identical
     // content behind it; a focused pin (Space = edit) gets a bright one.
     painter.setPen(hasFocus_ ? QPen(QColor(255, 255, 255, 200), 2.0)
@@ -199,9 +261,9 @@ void PinWindow::paintEvent(QPaintEvent *event)
     painter.drawRect(QRectF(paintedRect_.x() + 0.5, paintedRect_.y() + 0.5,
                             paintedRect_.width() - 1.0, paintedRect_.height() - 1.0));
     if (!zoomLabel_.isEmpty()) {
-        // Transient zoom badge pinned to the image's bottom-right corner.
-        // The font size is fixed: the badge reports the factor, it must not
-        // grow with the image itself.
+        // Transient zoom badge pinned to the image's bottom-right corner that
+        // is still on this output. The font size is fixed: the badge reports
+        // the factor, it must not grow with the image itself.
         QFont font = painter.font();
         font.setPixelSize(16);
         font.setBold(true);
@@ -211,14 +273,17 @@ void PinWindow::paintEvent(QPaintEvent *event)
         const QRect textRect = metrics.boundingRect(text);
         const int pad = metrics.height() / 3;
         QRect badge = textRect.adjusted(-pad, -pad / 2, pad, pad / 2);
-        badge.moveBottomRight(paintedRect_.bottomRight() - QPoint(pad, pad));
+        const QRect corner = paintedRect_.intersected(rect());
+        badge.moveBottomRight(corner.bottomRight() - QPoint(pad, pad));
         // A pin may hang partially off-screen; keep the badge readable.
         badge = badge.intersected(rect().adjusted(0, 0, -1, -1));
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(QColor(0, 0, 0, 160));
-        painter.drawRoundedRect(badge, 6, 6);
-        painter.setPen(Qt::white);
-        painter.drawText(badge, Qt::AlignCenter, text);
+        if (badge.width() > 0 && badge.height() > 0) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(0, 0, 0, 160));
+            painter.drawRoundedRect(badge, 6, 6);
+            painter.setPen(Qt::white);
+            painter.drawText(badge, Qt::AlignCenter, text);
+        }
     }
 }
 
@@ -228,7 +293,7 @@ void PinWindow::mousePressEvent(QMouseEvent *event)
         setFocus(Qt::MouseFocusReason);
         dragging_ = true;
         pressGlobal_ = event->globalPosition().toPoint();
-        startMargin_ = margin_;
+        pressOrigin_ = globalOrigin_;
         event->accept();
         return;
     }
@@ -239,10 +304,12 @@ void PinWindow::mouseMoveEvent(QMouseEvent *event)
 {
     if (dragging_) {
         // Global deltas are frame-independent, so they map straight onto the
-        // output-local image offset.
-        const QPoint delta = event->globalPosition().toPoint() - pressGlobal_;
-        margin_ = clampMargin(startMargin_ + delta);
-        applyGeometry();
+        // shared global position. The daemon applies the move to every
+        // surface of this pin, so dragging across outputs keeps working: the
+        // pointer stays grabbed by the surface the drag started on.
+        if (dragMoved_) {
+            dragMoved_(pressOrigin_ + event->globalPosition().toPoint() - pressGlobal_);
+        }
         event->accept();
         return;
     }
@@ -253,6 +320,10 @@ void PinWindow::mouseReleaseEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton && dragging_) {
         dragging_ = false;
+        // The drag widened the input region past the image; put it back now
+        // that the pointer is free again (full-surface repaint clears it).
+        applyGeometry();
+        update();
         event->accept();
         return;
     }
@@ -267,24 +338,13 @@ void PinWindow::wheelEvent(QWheelEvent *event)
         return;
     }
     // 10% per notch, multiplicative so zooming feels even at any scale, and
-    // keep the point under the cursor stationary while zooming.
+    // keep the point under the cursor stationary while zooming. The daemon
+    // anchors the zoom and rescales every surface at once.
     const double factor = steps.y() > 0 ? 1.1 : 1.0 / 1.1;
-    const double next = std::clamp(scale_ * factor, kMinScale, kMaxScale);
-    if (next != scale_) {
-        const QPoint cursor = event->position().toPoint();
-        const double ratio = next / scale_;
-        const QPoint anchor = cursor - margin_;
-        margin_ += anchor - QPoint(qRound(anchor.x() * ratio), qRound(anchor.y() * ratio));
-        scale_ = next;
-        margin_ = clampMargin(margin_);
-        applyGeometry();
+    if (zoomRequested_) {
+        zoomRequested_(factor, event->globalPosition().toPoint());
     }
-    // Show the resulting factor even when clamped at the limits, so the
-    // wheel always gives feedback. The factor is relative to the image's
-    // native density, so a HiDPI card at natural size reads as 100%.
-    zoomLabel_ = QString::number(qRound(scale_ * imageRatio_ * 100));
-    zoomTimer_->start(kZoomBadgeMs);
-    update(paintedRect_);
+    showZoomBadge();
     event->accept();
 }
 
@@ -323,7 +383,6 @@ void PinWindow::mouseDoubleClickEvent(QMouseEvent *event)
         if (closeRequested_) {
             closeRequested_();
         }
-        close();
         return;
     }
     QWidget::mouseDoubleClickEvent(event);

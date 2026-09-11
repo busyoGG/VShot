@@ -21,9 +21,27 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) enum PinCommand {
     Add {
         path: PathBuf,
+        /// Device pixels per logical pixel of the image, when it came from a
+        /// capture: the scale of the output it was taken on. A pin shows the
+        /// image at the logical size it had there. Bare files and clipboard
+        /// images leave this out and the daemon works it out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        density: Option<u32>,
+        /// Global logical rect of the output the user is on, when the
+        /// compositor reports one. The daemon cannot work this out itself: a
+        /// windowless process sees the pointer at (0, 0).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<WireOutputRect>,
     },
     #[serde(rename = "add-clipboard")]
-    AddClipboard,
+    AddClipboard {
+        /// `vshot region --pin` styles the clipboard the same way: the capture
+        /// brings its source density, everything else lets the daemon decide.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        density: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<WireOutputRect>,
+    },
     /// Repositions a pin, optionally replacing its pixels in the same round
     /// trip (pin editing writes the annotated image back where the user put it).
     Move {
@@ -39,6 +57,26 @@ pub(crate) enum PinCommand {
     Close,
     Quit,
     List,
+}
+
+/// An output's global logical rect on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WireOutputRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl From<crate::geometry::Rect> for WireOutputRect {
+    fn from(rect: crate::geometry::Rect) -> Self {
+        Self {
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -72,6 +110,29 @@ pub(crate) struct PinInvocation {
     pub files: Vec<PathBuf>,
     pub clipboard: bool,
     pub command: Option<PinCommand>,
+    /// Device density to stamp on the pinned images, overriding what the
+    /// daemon would work out for itself. `None` leaves it to the daemon.
+    pub density: Option<u32>,
+}
+
+/// Environment fallback for `--density`, so a screenshot hotkey can hand the
+/// source output's scale to every invocation without repeating the flag.
+const DENSITY_ENV: &str = "VSHOT_PIN_DENSITY";
+
+fn density_from_env() -> Result<Option<u32>> {
+    let Some(raw) = std::env::var_os(DENSITY_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy().trim().to_owned();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match raw.parse::<u32>() {
+        Ok(value) if (1..=4).contains(&value) => Ok(Some(value)),
+        _ => Err(VshotError::InvalidDestination(format!(
+            "{DENSITY_ENV} must be a device density between 1 and 4, got `{raw}`"
+        ))),
+    }
 }
 
 impl PinInvocation {
@@ -85,6 +146,7 @@ impl PinInvocation {
         close_all: bool,
         quit: bool,
         list: bool,
+        density: Option<u32>,
     ) -> Result<Self> {
         let selected = [toggle, show, hide, close_all, quit, list]
             .into_iter()
@@ -102,11 +164,23 @@ impl PinInvocation {
                 "cannot combine image files or --clipboard with a pin control flag".into(),
             ));
         }
+        if selected == 1 && density.is_some() {
+            return Err(VshotError::InvalidDestination(
+                "--density only applies to images being pinned, not to a pin control flag".into(),
+            ));
+        }
         if selected == 0 && files.is_empty() && !clipboard {
             return Err(VshotError::InvalidDestination(
                 "pin requires image files, --clipboard, or a control flag such as --toggle".into(),
             ));
         }
+        // The flag wins over the environment; the environment is the fallback
+        // for a hotkey that cannot pass flags.
+        let density = match density {
+            Some(value) => Some(value),
+            None if !files.is_empty() || clipboard => density_from_env()?,
+            None => None,
+        };
         let command = if !files.is_empty() || clipboard {
             None
         } else if quit {
@@ -126,6 +200,7 @@ impl PinInvocation {
             files,
             clipboard,
             command,
+            density,
         })
     }
 }
@@ -136,6 +211,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         files,
         clipboard,
         command,
+        density,
     } = invocation;
     if let Some(command) = command {
         let list = matches!(command, PinCommand::List);
@@ -153,6 +229,11 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         }
         return Ok(());
     }
+    // Resolved once per invocation, and only when something is actually being
+    // pinned: the probes are subprocesses, and a control flag does not need
+    // them. `None` just lets the daemon pick, which is what happens on
+    // compositors without a probe.
+    let output = crate::capture::active_output::active_output().map(WireOutputRect::from);
     for file in &files {
         let absolute = if file.is_absolute() {
             file.clone()
@@ -161,10 +242,19 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
                 .map_err(|error| VshotError::Pin(format!("failed to resolve cwd: {error}")))?
                 .join(file)
         };
-        execute(PinCommand::Add { path: absolute })?;
+        // The override, when one was given, rides along; otherwise the daemon
+        // sizes the image from what it can find out about it.
+        execute(PinCommand::Add {
+            path: absolute,
+            density,
+            output,
+        })?;
     }
     if clipboard {
-        execute(PinCommand::AddClipboard)?;
+        execute(PinCommand::AddClipboard {
+            density,
+            output,
+        })?;
     }
     Ok(())
 }
@@ -292,8 +382,10 @@ fn read_reply(stream: &mut UnixStream) -> Result<PinReply> {
 
 /// Pins freshly encoded PNG bytes: written to a private temp file, handed to
 /// the daemon (which loads them into memory), then unlinked right away, so a
-/// `--pin` capture never leaves a file on the user's disk.
-pub(crate) fn pin_png(png: &[u8]) -> Result<()> {
+/// `--pin` capture never leaves a file on the user's disk. `density` is the
+/// capture's device pixels per logical pixel — the scale of the output it was
+/// taken on — so the pin reappears at the size it had there.
+pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let directory = tempfile::Builder::new()
@@ -319,7 +411,13 @@ pub(crate) fn pin_png(png: &[u8]) -> Result<()> {
             source,
         })?;
     drop(file);
-    let result = execute(PinCommand::Add { path: path.clone() });
+    let result = execute(PinCommand::Add {
+        path: path.clone(),
+        density: Some(density.clamp(1, 4)),
+        // A capture is pinned where the user just made the selection; the
+        // compositor still knows which output is focused.
+        output: crate::capture::active_output::active_output().map(WireOutputRect::from),
+    });
     // The daemon has copied the pixels by the time it replied; the temp file
     // is ours to remove even when the reply said no.
     let _ = std::fs::remove_file(&path);
@@ -490,14 +588,43 @@ mod tests {
     fn add_command_encodes_the_wire_shape() {
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
+            density: None,
+            output: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value["cmd"], "add");
         assert_eq!(value["path"], "/tmp/x.png");
-        let encoded = serde_json::to_vec(&PinCommand::AddClipboard).unwrap();
+        // No probe result means no field at all: the daemon then picks.
+        assert!(value.get("output").is_none(), "{value}");
+        assert!(value.get("density").is_none(), "{value}");
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            density: Some(2),
+            output: Some(WireOutputRect::from(crate::geometry::Rect::new(
+                1920, 0, 3840, 2160,
+            ))),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["output"]["x"], 1920);
+        assert_eq!(value["output"]["width"], 3840);
+        assert_eq!(value["density"], 2);
+        let encoded = serde_json::to_vec(&PinCommand::AddClipboard {
+            density: None,
+            output: None,
+        })
+        .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value, serde_json::json!({"cmd": "add-clipboard"}));
+        let encoded = serde_json::to_vec(&PinCommand::AddClipboard {
+            density: Some(2),
+            output: None,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["cmd"], "add-clipboard");
+        assert_eq!(value["density"], 2);
         let encoded = serde_json::to_vec(&PinCommand::Toggle).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value, serde_json::json!({"cmd": "toggle"}));
@@ -513,6 +640,73 @@ mod tests {
         // Degenerate window falls back to 1x; density is capped at 4.
         assert_eq!(pin_edit_scale(320, 0), 1);
         assert_eq!(pin_edit_scale(4000, 500), 4);
+    }
+
+    #[test]
+    fn the_manual_density_overrides_and_the_environment_backs_it_up() {
+        let build = |density| {
+            PinInvocation::build(
+                vec![PathBuf::from("a.png")],
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                density,
+            )
+        };
+        // Nothing stated: the daemon works the density out for itself.
+        assert_eq!(build(None).unwrap().density, None);
+        // The flag is the answer when given.
+        assert_eq!(build(Some(3)).unwrap().density, Some(3));
+        // The environment stands in for a hotkey that cannot pass flags.
+        std::env::set_var("VSHOT_PIN_DENSITY", "2");
+        assert_eq!(build(None).unwrap().density, Some(2));
+        // ... but never over the flag.
+        assert_eq!(build(Some(4)).unwrap().density, Some(4));
+        // A control flag neither needs nor accepts a density.
+        let error = PinInvocation::build(
+            Vec::new(),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--density"), "{error}");
+        // A malformed value is reported, not silently ignored.
+        std::env::set_var("VSHOT_PIN_DENSITY", "banana");
+        let error = build(None).unwrap_err();
+        assert!(error.to_string().contains("VSHOT_PIN_DENSITY"), "{error}");
+        std::env::remove_var("VSHOT_PIN_DENSITY");
+    }
+
+    #[test]
+    fn a_capture_brings_its_source_density_and_files_leave_it_open() {
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            density: Some(2),
+            output: None,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["density"], 2);
+        // No density stated: the field is absent and the daemon sizes the
+        // image from what it can find out about it.
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            density: None,
+            output: None,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(value.get("density").is_none(), "{value}");
     }
 
     #[test]

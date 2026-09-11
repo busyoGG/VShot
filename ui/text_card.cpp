@@ -20,7 +20,6 @@ namespace {
 // device pixels per logical pixel so text stays crisp on HiDPI outputs.
 constexpr qreal kPadding = 12.0;
 constexpr qreal kBorder = 1.0;
-constexpr qreal kCornerRadius = 8.0;
 constexpr qreal kMaxContentWidth = 560.0;
 constexpr qreal kMaxContentHeight = 1200.0;
 
@@ -182,7 +181,7 @@ QImage renderTextCard(const QMimeData *mime, const QString &text, int pixelRatio
         painter.setPen(QPen(QColor(0, 0, 0, 50), kBorder));
         painter.setBrush(QGuiApplication::palette().color(QPalette::Base));
     }
-    painter.drawRoundedRect(cardRect, kCornerRadius, kCornerRadius);
+    painter.drawRect(cardRect);
     painter.translate(kPadding + kBorder, kPadding + kBorder);
     // drawContents clips to the exposed rect, which caps absurdly tall
     // payloads at kMaxContentHeight.

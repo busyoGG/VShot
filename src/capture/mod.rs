@@ -1,3 +1,4 @@
+pub mod active_output;
 pub mod window;
 pub mod window_pixel;
 pub mod wlr;

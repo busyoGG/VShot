@@ -77,32 +77,41 @@ fn run() -> Result<()> {
     }
 
     let mut edits = EditPipeline::new();
-    let frame = match &request.target {
+    // Device pixels per logical pixel of the frame, carried next to it: the
+    // scene composes every output at the highest scale, but a monitor capture
+    // keeps that output's own pixels, so the density follows the source.
+    let (frame, density) = match &request.target {
         CaptureTarget::RegionFixed(geometry) => {
             let frame = selection::crop_fixed(&scene, *geometry)?;
             wayland.show_frozen(false)?;
-            frame
+            (frame, scene.scale())
         }
         CaptureTarget::RegionInteractive => {
             let (geometry, annotations) = qt_overlay::select_and_edit(&scene)?;
             let geometry = selection::validate_selection(&scene, geometry)?;
             let frame = scene.crop(geometry)?;
             edits = pipeline_for_annotations(annotations, geometry, scene.scale())?;
-            frame
+            (frame, scene.scale())
         }
         CaptureTarget::Monitor(name) if name == "current" => {
             wayland.show_frozen(false)?;
             let output_id = wayland.wait_for_current_output()?;
-            selection::crop_output(&scene, output_id)?
+            let density = scene
+                .output(output_id)
+                .map_or(scene.scale(), |output| output.scale);
+            (selection::crop_output(&scene, output_id)?, density)
         }
         CaptureTarget::Monitor(name) => {
             let frame = selection::crop_monitor(&scene, name)?;
             wayland.show_frozen(false)?;
-            frame
+            let density = scene
+                .output_by_name(name)
+                .map_or(scene.scale(), |output| output.scale);
+            (frame, density)
         }
         CaptureTarget::All => {
             wayland.show_frozen(false)?;
-            scene.frame().clone()
+            (scene.frame().clone(), scene.scale())
         }
         CaptureTarget::ActiveWindow { .. } => {
             let geometry = match metadata_window {
@@ -131,12 +140,14 @@ fn run() -> Result<()> {
             };
             let geometry = selection::validate_selection(&scene, geometry)?;
             wayland.show_frozen(false)?;
-            scene.crop(geometry)?
+            // The crop comes out of the composed scene, so the pixels are at
+            // the scene's scale — same as a region capture.
+            (scene.crop(geometry)?, scene.scale())
         }
     };
 
     let document = edits.apply(ImageDocument::new(frame))?;
-    let result = output::write_frame(document.frame(), &request.destination);
+    let result = output::write_frame(document.frame(), &request.destination, density);
     let cleanup = wayland.destroy_overlays();
     result.and(cleanup)
 }

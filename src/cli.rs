@@ -88,10 +88,17 @@ pub enum Command {
         /// Report the pin count and visibility.
         #[arg(long)]
         list: bool,
+        /// Device pixels per logical pixel of the pinned image (1-4), e.g. 2
+        /// for a screenshot taken on a 2x output. vshot works this out by
+        /// itself from the capture, the image's own PNG density, the
+        /// screenshot tool's record, or the image size; this overrides all of
+        /// that when the answer is wrong or unknown.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+        density: Option<u32>,
         /// Internal: run one annotation editor for a pin-edit session JSON
         /// written by the daemon, then render the result back onto the pin.
         /// Not for interactive use.
-        #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list"])]
+        #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list", "density"])]
         apply: Option<PathBuf>,
     },
 }
@@ -158,6 +165,7 @@ impl Cli {
             close_all,
             quit,
             list,
+            density,
             apply,
         } = &self.command
         {
@@ -180,6 +188,7 @@ impl Cli {
                 *close_all,
                 *quit,
                 *list,
+                *density,
             )?));
         }
         Ok(Action::Capture(self.parse_request()?))
@@ -362,6 +371,7 @@ mod tests {
                 files: Vec::new(),
                 clipboard: false,
                 command: Some(crate::pin::PinCommand::Toggle),
+                density: None,
             })
         );
         let action = Cli::try_parse_action_from(["vshot", "pin", "a.png", "b.png"]).unwrap();
@@ -386,6 +396,7 @@ mod tests {
                 files: Vec::new(),
                 clipboard: true,
                 command: None,
+                density: None,
             })
         );
         let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "a.png"]).unwrap();

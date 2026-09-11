@@ -5,6 +5,7 @@
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QJsonArray>
@@ -14,6 +15,7 @@
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMimeData>
+#include <QPointer>
 #include <QProcess>
 #include <QRect>
 #include <QScreen>
@@ -26,6 +28,7 @@
 #include <csignal>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -78,6 +81,275 @@ void respond(QLocalSocket *socket, const QJsonObject &payload)
 // concurrent add (or a reply still in flight) before quitting.
 constexpr int kIdleQuitMs = 500;
 
+constexpr double kMinScale = 0.1;
+constexpr double kMaxScale = 8.0;
+// Keep this many logical pixels of the image on some output so a pin can
+// never be dragged out of reach.
+constexpr int kGrabMargin = 32;
+
+// Fallback output when nothing better is known: Qt's primary screen. The
+// daemon cannot see the pointer (a windowless process reports it at 0,0), so
+// the CLI resolves the focused output with compositor metadata and passes the
+// rect along; see `src/capture/active_output.rs`.
+QScreen *fallbackScreen()
+{
+    return QGuiApplication::primaryScreen();
+}
+
+// The Qt screen matching the output rect the CLI reported, if any. A
+// compositor whose rect does not line up with Qt's screens simply gets the
+// fallback.
+QScreen *screenFromRequest(const QJsonObject &request)
+{
+    const QJsonValue value = request.value(QStringLiteral("output"));
+    if (!value.isObject()) {
+        return nullptr;
+    }
+    const QJsonObject rect = value.toObject();
+    bool xOk = false;
+    bool yOk = false;
+    bool widthOk = false;
+    bool heightOk = false;
+    const int x = rect.value(QStringLiteral("x")).toVariant().toInt(&xOk);
+    const int y = rect.value(QStringLiteral("y")).toVariant().toInt(&yOk);
+    const int width = rect.value(QStringLiteral("width")).toVariant().toInt(&widthOk);
+    const int height = rect.value(QStringLiteral("height")).toVariant().toInt(&heightOk);
+    if (!xOk || !yOk || !widthOk || !heightOk || width <= 0 || height <= 0) {
+        return nullptr;
+    }
+    const QRect wanted(x, y, width, height);
+    for (QScreen *screen : QGuiApplication::screens()) {
+        if (screen != nullptr && screen->geometry() == wanted) {
+            return screen;
+        }
+    }
+    return nullptr;
+}
+
+// One pinned image. Image, scale and global position live here rather than in
+// a widget: a pin may span several outputs, and every surface has to render
+// the same shared state.
+struct Pin {
+    quint64 id = 0;
+    QImage image;
+    // Device pixels per logical pixel of `image`. A capture brings its own
+    // (the scale of the output it came from); a bare file falls back to the
+    // density of the output it lands on, i.e. one image pixel per device pixel.
+    int density = 1;
+    // Logical pixels per source pixel: the natural size, 1/density, times the
+    // user's zoom factor.
+    double scale = 1.0;
+    // Global logical top-left of the image.
+    QPoint origin;
+    QString label;
+    // One surface per output the daemon renders on; normally all of them.
+    // QPointer: a surface can be dismissed by the compositor on its own (an
+    // output going away), which would leave a bare pointer behind.
+    QHash<QScreen *, QPointer<PinWindow>> surfaces;
+
+    QSize displaySize() const
+    {
+        return QSize(std::max(1, qRound(image.width() * scale)),
+                     std::max(1, qRound(image.height() * scale)));
+    }
+
+    QSize naturalSize() const
+    {
+        return QSize(std::max(1, qRound(image.width() / static_cast<double>(density))),
+                     std::max(1, qRound(image.height() / static_cast<double>(density))));
+    }
+
+    QRect globalRect() const { return QRect(origin, displaySize()); }
+};
+
+// Device pixels per logical pixel of an output.
+int screenDensity(QScreen *screen)
+{
+    if (screen == nullptr) {
+        return 1;
+    }
+    return std::clamp(qRound(screen->devicePixelRatio()), 1, 4);
+}
+
+// Native pixel size of an output: its logical geometry times its density.
+QSize screenNativeSize(QScreen *screen)
+{
+    if (screen == nullptr) {
+        return QSize();
+    }
+    return screen->geometry().size() * screenDensity(screen);
+}
+
+// A density is a whole number of device pixels per logical pixel. A record may
+// write it either way ("2" as well as "2.0"), so it is read as a number; a
+// fractional output scale is not expressible as a device density and is left
+// to the other sources.
+bool densityValue(const QString &token, int *out)
+{
+    bool ok = false;
+    const double value = token.toDouble(&ok);
+    if (!ok) {
+        return false;
+    }
+    const int rounded = qRound(value);
+    if (rounded < 1 || rounded > 4 || qAbs(value - rounded) > 0.05) {
+        return false;
+    }
+    *out = rounded;
+    return true;
+}
+
+// Density an image declares about itself. PNG carries it as pixels per metre
+// (the `pHYs` chunk). This is only consulted for a genuine multi-pixel
+// declaration: Qt reports 3780 dots per metre (96 DPI) for a PNG that declares
+// nothing at all, and that default would otherwise mask the real source. A
+// print resolution is not a device density either, so the value has to be a
+// near-exact multiple of 96 DPI.
+int declaredDensity(const QImage &image)
+{
+    const int dotsPerMeter = image.dotsPerMeterX();
+    if (dotsPerMeter <= 0) {
+        return 0;
+    }
+    const double ratio = dotsPerMeter * 0.0254 / 96.0;
+    const int rounded = qRound(ratio);
+    if (rounded < 2 || rounded > 4 || qAbs(ratio - rounded) > 0.05) {
+        return 0;
+    }
+    return rounded;
+}
+
+// Where a screenshot tool records the output it last captured. Such a tool is
+// the only party that knows which screen an image came from — grim, satty and
+// spectacle write no density into the image — so this record is how the source
+// is recovered. Overridable for a different layout or an isolated test.
+QString sourceRecordPath()
+{
+    const QByteArray override = qgetenv("VSHOT_PIN_SOURCE_FILE");
+    if (!override.isEmpty()) {
+        return QString::fromLocal8Bit(override);
+    }
+    return QStringLiteral("/tmp/screenshot-path");
+}
+
+QString readSmallFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    // A record file holds a line or two; anything bigger is not one.
+    if (file.size() > 64 * 1024) {
+        return QString();
+    }
+    return QString::fromUtf8(file.readAll());
+}
+
+// Reads a density out of a record file. A bare number stands on its own; a
+// `<path> <density>` pair is only used when the path names the image being
+// pinned, so an older capture's scale is never applied to this one.
+bool parseRecordedDensity(const QString &text, const QString &wanted, int *out)
+{
+    const QStringList lines = text.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    for (const QString &line : lines) {
+        const QStringList fields = line.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (fields.isEmpty()) {
+            continue;
+        }
+        if (fields.size() == 1) {
+            continue; // a bare number only means something in a per-image file
+        }
+        if (wanted.isEmpty() || QFileInfo(fields.at(0)).absoluteFilePath() != wanted) {
+            continue;
+        }
+        if (densityValue(fields.at(1), out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The scale the image's producer recorded, if any: a `<image>.scale` sidecar
+// holding one number, else the screenshot tool's record of its last capture.
+int recordedDensity(const QString &sourcePath)
+{
+    if (sourcePath.isEmpty()) {
+        return 0;
+    }
+    int value = 0;
+    const QString sidecar = readSmallFile(sourcePath + QStringLiteral(".scale"));
+    if (!sidecar.isEmpty()) {
+        const QStringList fields =
+            sidecar.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (!fields.isEmpty() && densityValue(fields.last(), &value)) {
+            return value;
+        }
+    }
+    const QString wanted = QFileInfo(sourcePath).absoluteFilePath();
+    const QString record = sourceRecordPath();
+    if (!record.isEmpty() && parseRecordedDensity(readSmallFile(record), wanted, &value)) {
+        return value;
+    }
+    return 0;
+}
+
+// Density to assume for an image that does not state one.
+//
+// An image cannot hold more pixels than the screen it was captured on, so an
+// image that does not fit the target's native resolution was not captured
+// there: it came from a bigger or denser output. Pinning it one-to-one would
+// make it larger than it ever was on screen, so the density of the screen that
+// could have produced it is used instead — the smallest one that still holds
+// every pixel. An image that does fit keeps the target's density, which is
+// exactly one image pixel per screen pixel.
+int inferDensity(const QImage &image, QScreen *target)
+{
+    const int targetDensity = screenDensity(target);
+    if (image.isNull() || target == nullptr) {
+        return targetDensity;
+    }
+    const QSize targetNative = screenNativeSize(target);
+    if (image.width() <= targetNative.width() && image.height() <= targetNative.height()) {
+        return targetDensity;
+    }
+    int inferred = 0;
+    qint64 smallest = std::numeric_limits<qint64>::max();
+    for (QScreen *screen : QGuiApplication::screens()) {
+        const QSize native = screenNativeSize(screen);
+        if (native.isEmpty() || image.width() > native.width() ||
+            image.height() > native.height()) {
+            continue;
+        }
+        const qint64 pixels = static_cast<qint64>(native.width()) * native.height();
+        if (pixels < smallest) {
+            smallest = pixels;
+            inferred = screenDensity(screen);
+        }
+    }
+    return inferred > 0 ? inferred : targetDensity;
+}
+
+// Device pixels per logical pixel of the image being pinned, so the pin takes
+// the same room on screen it had where it came from. In order: what vshot's own
+// capture stated, what the image declares, what the producer recorded, and else
+// what the image's size and the target output imply.
+int resolveDensity(const QJsonObject &request, QScreen *target, const QImage &image,
+                   const QString &sourcePath)
+{
+    bool ok = false;
+    const int stated = request.value(QStringLiteral("density")).toVariant().toInt(&ok);
+    if (ok && stated > 0) {
+        return std::clamp(stated, 1, 4);
+    }
+    if (const int declared = declaredDensity(image); declared > 0) {
+        return declared;
+    }
+    if (const int recorded = recordedDensity(sourcePath); recorded > 0) {
+        return recorded;
+    }
+    return inferDensity(image, target);
+}
+
 // Owns every pinned surface and dispatches daemon commands. It inherits
 // QObject only to reuse the functor-based connect() lifetime; it declares no
 // signals or slots of its own, so the build stays moc-free.
@@ -106,20 +378,39 @@ public:
         }
     }
 
+    // Keeps every pin rendering on every output. The compositor can add or
+    // remove outputs at any time, and a surface belongs to exactly one of
+    // them, so the mapping has to follow.
+    void watchScreens()
+    {
+        connect(qApp, &QGuiApplication::screenAdded, this, [this](QScreen *screen) {
+            for (Pin *pin : pins_) {
+                addSurface(pin, screen);
+                syncGeometry(pin);
+            }
+        });
+        connect(qApp, &QGuiApplication::screenRemoved, this, [this](QScreen *screen) {
+            for (Pin *pin : pins_) {
+                dropSurface(pin, screen);
+                pin->origin = clampOrigin(*pin, pin->origin);
+                syncGeometry(pin);
+            }
+        });
+    }
+
     // Unmaps every surface before the process goes away. Leaving a mapped
     // layer surface behind can wedge the compositor's output frames.
     void shutdownAll()
     {
-        const QVector<PinWindow *> pins = pins_;
+        const QVector<Pin *> pins = pins_;
         pins_.clear();
-        for (PinWindow *pin : pins) {
-            pin->setPinnedVisible(false);
-            pin->hide();
-            pin->close();
+        byId_.clear();
+        editingPin_ = nullptr;
+        for (Pin *pin : pins) {
+            destroySurfaces(pin);
+            delete pin;
         }
     }
-
-    void setPinId(PinWindow *pin, quint64 id) { pinIds_[pin] = id; }
 
 private:
     static QJsonObject okReply()
@@ -127,8 +418,8 @@ private:
         return QJsonObject{{QStringLiteral("ok"), true}};
     }
 
-    // Arms the idle quit when no pins are left. Called after the last pin's
-    // destroyed signal and when an add fails on an empty daemon.
+    // Arms the idle quit when no pins are left. Called after the last pin is
+    // gone and when an add fails on an empty daemon.
     void armIdleQuit()
     {
         if (pins_.isEmpty()) {
@@ -163,7 +454,14 @@ private:
         const QJsonObject request = document.object();
         const bool quit =
             request.value(QStringLiteral("cmd")).toString() == QStringLiteral("quit");
-        respond(socket, dispatch(request));
+        const QJsonObject reply = dispatch(request);
+        respond(socket, reply);
+        // A daemon that owns nothing has no reason to stay resident, and a
+        // failed first add (an empty clipboard, an unreadable file) would
+        // otherwise leave one running forever with nothing pinned.
+        if (!reply.value(QStringLiteral("ok")).toBool(true)) {
+            armIdleQuit();
+        }
         if (quit) {
             shutdownAll();
             QCoreApplication::quit();
@@ -177,7 +475,7 @@ private:
             return addPin(request);
         }
         if (command == QStringLiteral("add-clipboard")) {
-            return addClipboardPin();
+            return addClipboardPin(request);
         }
         if (command == QStringLiteral("move")) {
             return movePin(request);
@@ -195,11 +493,16 @@ private:
             return okReply();
         }
         if (command == QStringLiteral("close")) {
-            const QVector<PinWindow *> pins = pins_;
+            const QVector<Pin *> pins = pins_;
             pins_.clear();
-            for (PinWindow *pin : pins) {
-                pin->close(); // WA_DeleteOnClose destroys the surface
+            byId_.clear();
+            editingPin_ = nullptr;
+            for (Pin *pin : pins) {
+                destroySurfaces(pin);
+                delete pin;
             }
+            // Nothing is pinned any more, so the daemon has no reason to live.
+            armIdleQuit();
             return okReply();
         }
         if (command == QStringLiteral("quit")) {
@@ -224,22 +527,25 @@ private:
         if (image.isNull()) {
             return error(QStringLiteral("cannot load pin image `%1`").arg(path));
         }
-        return addImage(image, path);
+        return addImage(image, path, path, screenFromRequest(request), request);
     }
 
     // Pins the image currently on the clipboard. Resolution order: embedded
     // image data (screenshots, "copy image"), then image files referenced by
     // a copied file (URI list), then a single plain-text local path, then
     // clipboard text rendered as a card (HTML, markdown, code, or plain).
-    QJsonObject addClipboardPin()
+    QJsonObject addClipboardPin(const QJsonObject &request)
     {
+        QScreen *target = screenFromRequest(request);
         QClipboard *clipboard = QGuiApplication::clipboard();
         if (clipboard == nullptr) {
             return error(QStringLiteral("no clipboard is available"));
         }
         const QImage image = clipboard->image();
         if (!image.isNull()) {
-            return addImage(image, QStringLiteral("clipboard"));
+            // Raw image data carries no path, so only its own declaration can
+            // name a source; the record file cannot be matched.
+            return addImage(image, QStringLiteral("clipboard"), QString(), target, request);
         }
         const QMimeData *mime = clipboard->mimeData();
         if (mime != nullptr) {
@@ -251,7 +557,7 @@ private:
                 const QString path = url.toLocalFile();
                 const QImage fileImage(path);
                 if (!fileImage.isNull()) {
-                    return addImage(fileImage, path);
+                    return addImage(fileImage, path, path, target, request);
                 }
             }
         }
@@ -259,62 +565,87 @@ private:
         if (!text.isEmpty() && !text.contains(QLatin1Char('\n')) && QFileInfo::exists(text)) {
             const QImage pathImage(text);
             if (!pathImage.isNull()) {
-                return addImage(pathImage, text);
+                return addImage(pathImage, text, text, target, request);
             }
         }
         if (!text.isEmpty()) {
-            QScreen *screen = QGuiApplication::primaryScreen();
+            // Cards are rasterized for the density the pin will use, so both
+            // the target output and a stated density have to be resolved
+            // before rendering; otherwise text would be resampled.
+            QScreen *screen = target != nullptr ? target : fallbackScreen();
             if (screen == nullptr) {
                 return error(QStringLiteral("no screen is available to pin onto"));
             }
-            const int ratio =
-                std::clamp(qRound(screen->devicePixelRatio()), 1, 4);
-            const QImage card = renderTextCard(mime, text, ratio);
+            const int density = resolveDensity(request, screen, QImage(), QString());
+            const QImage card = renderTextCard(mime, text, density);
             if (!card.isNull()) {
-                return addImage(card, QStringLiteral("clipboard text"));
+                return addImage(card, QStringLiteral("clipboard text"), QString(), target,
+                                request);
             }
         }
         return error(QStringLiteral("the clipboard contains no pinnable image or text"));
     }
 
-    QJsonObject addImage(const QImage &image, const QString &label)
+    // `sourcePath` is where the pixels came from, empty for data with no file
+    // behind it: it is what lets a recorded capture scale be matched.
+    QJsonObject addImage(const QImage &image, const QString &label, const QString &sourcePath,
+                         QScreen *requested, const QJsonObject &request)
     {
         if (image.isNull()) {
             armIdleQuit();
             return error(QStringLiteral("cannot pin an empty image"));
         }
-        QScreen *screen = QGuiApplication::primaryScreen();
+        QScreen *screen = requested != nullptr ? requested : fallbackScreen();
         if (screen == nullptr) {
             armIdleQuit();
             return error(QStringLiteral("no screen is available to pin onto"));
         }
-        auto *pin = new PinWindow(image, screen);
-        pin->setLabel(label);
-        pin->setEditCallback([this, pin] { startEdit(pin); });
-        pin->setCloseCallback([this, pin] { pinIds_.remove(pin); });
-        QObject::connect(pin, &QObject::destroyed, this, [this, pin] {
-            pins_.removeAll(pin);
-            pinIds_.remove(pin);
+        auto *pin = new Pin;
+        pin->id = nextId_++;
+        pin->image = image;
+        pin->label = label;
+        pin->density = resolveDensity(request, screen, image, sourcePath);
+        // Natural size: one image pixel per logical pixel of an output with
+        // the same density, so a 4K capture takes the room it did on the 4K
+        // output even when it lands on a 1080p one.
+        pin->scale = 1.0 / pin->density;
+        // Whatever the density, the opening size must fit the output entirely
+        // (never upscaling past the natural one) so a pin always arrives fully
+        // visible; the wheel zooms from there.
+        const QSize boundsSize = screen->geometry().size();
+        if (!boundsSize.isEmpty()) {
+            const double fit = std::min(
+                static_cast<double>(boundsSize.width()) / pin->image.width(),
+                static_cast<double>(boundsSize.height()) / pin->image.height());
+            pin->scale = std::min(pin->scale, fit);
+        }
+
+        // Land on the output the user is looking at, one cascade step apart
+        // from the pins already there so repeated pins stay distinguishable.
+        const int offset = static_cast<int>(pins_.size() % 6) * 28;
+        const QRect bounds = screen->geometry();
+        pin->origin = QPoint((bounds.width() - pin->displaySize().width()) / 2,
+                             (bounds.height() - pin->displaySize().height()) / 2) +
+                      bounds.topLeft() + QPoint(offset, offset);
+        pin->origin = clampOrigin(*pin, pin->origin);
+
+        buildSurfaces(pin);
+        if (pin->surfaces.isEmpty()) {
+            delete pin;
             armIdleQuit();
-        });
-        if (!pin->showLayerSurface()) {
-            pin->deleteLater();
             return error(QStringLiteral("could not create a layer-shell pin surface"));
         }
         pins_.push_back(pin);
-        pinIds_[pin] = nextId_++;
+        byId_.insert(pin->id, pin);
         idleQuit_->stop();
-        // Light cascade so repeated pins remain distinguishable.
-        const int offset = static_cast<int>(pins_.size() - 1) % 6 * 28;
-        pin->placeCentered(QPoint(offset, offset));
-        pin->setPinnedVisible(allVisible_);
+        syncGeometry(pin);
         return okReply();
     }
 
     // Replaces the pixels of an existing pin and/or moves it. Coordinates are
     // global logical pixels (the editor's frame of reference); the response
-    // carries the rect the pin actually landed on, after the pin window's own
-    // clamping, so the caller can follow it.
+    // carries the rect the pin actually landed on, after clamping, so the
+    // caller can follow it.
     QJsonObject movePin(const QJsonObject &request)
     {
         bool idOk = false;
@@ -326,14 +657,8 @@ private:
         if (!idOk || !xOk || !yOk) {
             return error(QStringLiteral("pin move requires `id`, `x` and `y`"));
         }
-        PinWindow *target = nullptr;
-        for (auto it = pinIds_.cbegin(); it != pinIds_.cend(); ++it) {
-            if (it.value() == id) {
-                target = it.key();
-                break;
-            }
-        }
-        if (target == nullptr) {
+        Pin *pin = byId_.value(id, nullptr);
+        if (pin == nullptr) {
             return error(QStringLiteral("pin %1 no longer exists").arg(id));
         }
         const QString path = request.value(QStringLiteral("path")).toString();
@@ -342,17 +667,23 @@ private:
             if (image.isNull()) {
                 return error(QStringLiteral("cannot load replacement image `%1`").arg(path));
             }
-            target->setSourceImage(image);
+            // Keep the on-screen size the user arranged, even though the new
+            // pixels may have a different density.
+            const QSize display = pin->displaySize();
+            pin->image = image;
+            if (image.width() > 0) {
+                pin->scale = std::clamp(static_cast<double>(display.width()) / image.width(),
+                                        kMinScale, kMaxScale);
+            }
+            for (const QPointer<PinWindow> &surface : pin->surfaces) {
+                if (surface != nullptr) {
+                    surface->setSourceImage(image);
+                }
+            }
         }
-        QScreen *screen = target->screen();
-        if (screen == nullptr) {
-            return error(QStringLiteral("pin %1 lost its output").arg(id));
-        }
-        // placeAt works in output-local logical pixels; the caller speaks
-        // global ones.
-        const QPoint origin = screen->geometry().topLeft();
-        target->placeAt(QPoint(x, y) - origin);
-        const QRect landed = target->displayRect().translated(origin);
+        pin->origin = clampOrigin(*pin, QPoint(x, y));
+        syncGeometry(pin);
+        const QRect landed = pin->globalRect();
         QJsonObject reply = okReply();
         reply.insert(QStringLiteral("x"), static_cast<qint64>(landed.x()));
         reply.insert(QStringLiteral("y"), static_cast<qint64>(landed.y()));
@@ -364,17 +695,17 @@ private:
     // One Space-triggered edit round: export the pin's pixels, describe the
     // pin-edit session, and run `vshot pin --apply` in the background. That
     // process shows the annotation editor, renders the result in Rust, and
-    // sends `replace` back to this daemon.
-    void startEdit(PinWindow *pin)
+    // sends `move` back to this daemon.
+    void startEdit(Pin *pin)
     {
         if (editingPin_ != nullptr) {
             return; // one edit session at a time
         }
-        const auto idIt = pinIds_.constFind(pin);
-        if (idIt == pinIds_.constEnd()) {
-            return;
+        const QRect globalRect = pin->globalRect();
+        QScreen *screen = QGuiApplication::screenAt(globalRect.center());
+        if (screen == nullptr) {
+            screen = pin->surfaces.isEmpty() ? fallbackScreen() : pin->surfaces.constBegin().key();
         }
-        QScreen *screen = pin->screen();
         if (screen == nullptr) {
             return;
         }
@@ -388,13 +719,10 @@ private:
             return;
         }
         const QString imagePath = directory->filePath(QStringLiteral("pin.png"));
-        if (!pin->sourceImage().save(imagePath, "PNG")) {
+        if (!pin->image.save(imagePath, "PNG")) {
             delete directory;
             return;
         }
-
-        const QRect display = pin->displayRect();
-        const QRect globalRect = display.translated(screen->geometry().topLeft());
 
         // Field layout must match the Rust-written region session: the rect
         // fields sit directly on the output object (not nested). `surface`
@@ -414,9 +742,9 @@ private:
         output.insert(QStringLiteral("surface"), surface);
         output.insert(QStringLiteral("scale"), 1);
         output.insert(QStringLiteral("pixel_width"),
-                      static_cast<qint64>(pin->sourceImage().width()));
+                      static_cast<qint64>(pin->image.width()));
         output.insert(QStringLiteral("pixel_height"),
-                      static_cast<qint64>(pin->sourceImage().height()));
+                      static_cast<qint64>(pin->image.height()));
         output.insert(QStringLiteral("path"), imagePath);
 
         QJsonObject bounds;
@@ -429,7 +757,7 @@ private:
         session.insert(QStringLiteral("version"), 1);
         session.insert(QStringLiteral("mode"), QStringLiteral("pin-edit"));
         session.insert(QStringLiteral("bounds"), bounds);
-        session.insert(QStringLiteral("id"), static_cast<qint64>(idIt.value()));
+        session.insert(QStringLiteral("id"), static_cast<qint64>(pin->id));
         // The editor drives the real pin window while editing (moving it with
         // the pin's own code path instead of rendering a second copy of the
         // image), which it does over this daemon socket.
@@ -447,7 +775,6 @@ private:
         }
 
         editingPin_ = pin;
-        connect(pin, &QObject::destroyed, this, [this] { editingPin_ = nullptr; });
 
         QString cliPath = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
         if (cliPath.isEmpty()) {
@@ -499,21 +826,189 @@ private:
         watcher->start();
     }
 
+    // Global logical top-left that keeps the image reachable: at least
+    // kGrabMargin of it must stay on the output it overlaps most. When the
+    // image is on no output at all, the nearest one is used, so a drag that
+    // overshoots lands back at that output's edge instead of being lost.
+    QPoint clampOrigin(const Pin &pin, QPoint candidate) const
+    {
+        const QSize size = pin.displaySize();
+        const QRect rect(candidate, size);
+        const QList<QScreen *> screens = QGuiApplication::screens();
+        QRect best;
+        qint64 bestScore = std::numeric_limits<qint64>::min();
+        for (QScreen *screen : screens) {
+            if (screen == nullptr) {
+                continue;
+            }
+            const QRect bounds = screen->geometry();
+            const QRect visible = bounds.intersected(rect);
+            const qint64 area = static_cast<qint64>(std::max(0, visible.width())) *
+                                std::max(0, visible.height());
+            // Overlap decides first; with no overlap anywhere, the smallest
+            // gap wins. Any overlap (positive) beats any gap (negative).
+            const qint64 score = area > 0 ? area : -chebyshevGap(bounds, rect);
+            if (score > bestScore) {
+                bestScore = score;
+                best = bounds;
+            }
+        }
+        if (best.isNull()) {
+            return candidate;
+        }
+        const int minX = std::min(best.left() - size.width() + kGrabMargin,
+                                  best.right() + 1 - kGrabMargin);
+        const int maxX = std::max(best.left() - size.width() + kGrabMargin,
+                                  best.right() + 1 - kGrabMargin);
+        const int minY = std::min(best.top() - size.height() + kGrabMargin,
+                                  best.bottom() + 1 - kGrabMargin);
+        const int maxY = std::max(best.top() - size.height() + kGrabMargin,
+                                  best.bottom() + 1 - kGrabMargin);
+        return QPoint(std::clamp(candidate.x(), minX, maxX),
+                      std::clamp(candidate.y(), minY, maxY));
+    }
+
+    // How far apart two rects are along their worst axis; 0 when they touch.
+    static int chebyshevGap(const QRect &a, const QRect &b)
+    {
+        const int dx = std::max(0, std::max(a.left() - b.right(), b.left() - a.right()));
+        const int dy = std::max(0, std::max(a.top() - b.bottom(), b.top() - a.bottom()));
+        return std::max(dx, dy);
+    }
+
+    void addSurface(Pin *pin, QScreen *screen)
+    {
+        if (screen == nullptr || pin->surfaces.contains(screen)) {
+            return;
+        }
+        auto *surface = new PinWindow(pin->image, pin->density, screen);
+        surface->setLabel(pin->label);
+        surface->setScale(pin->scale);
+        surface->setGlobalOrigin(pin->origin);
+        surface->setCloseCallback([this, pin] { removePin(pin); });
+        surface->setEditCallback([this, pin] { startEdit(pin); });
+        // Both gestures belong to the pin, not to the surface that caught
+        // them: the daemon moves and rescales every surface at once.
+        surface->setDragCallback([this, pin](QPoint topLeft) {
+            pin->origin = clampOrigin(*pin, topLeft);
+            syncGeometry(pin);
+        });
+        surface->setZoomCallback([this, pin, surface](double factor, QPoint cursor) {
+            zoomPin(pin, surface, factor, cursor);
+        });
+        if (!surface->showLayerSurface()) {
+            delete surface;
+            return;
+        }
+        pin->surfaces.insert(screen, surface);
+        QObject::connect(surface, &QObject::destroyed, this, [this, pin, screen] {
+            pin->surfaces.remove(screen);
+        });
+    }
+
+    void buildSurfaces(Pin *pin)
+    {
+        for (QScreen *screen : QGuiApplication::screens()) {
+            addSurface(pin, screen);
+        }
+    }
+
+    // Retires one surface and breaks every connection into the daemon first:
+    // the widget is destroyed asynchronously (WA_DeleteOnClose), and by then
+    // the pin it references may already be gone.
+    void detachSurface(PinWindow *surface)
+    {
+        if (surface == nullptr) {
+            return;
+        }
+        surface->setCloseCallback({});
+        surface->setEditCallback({});
+        surface->setDragCallback({});
+        surface->setZoomCallback({});
+        QObject::disconnect(surface, nullptr, this, nullptr);
+        surface->setPinnedVisible(false);
+        surface->hide();
+        surface->close();
+    }
+
+    void dropSurface(Pin *pin, QScreen *screen)
+    {
+        detachSurface(pin->surfaces.take(screen).data());
+    }
+
+    void destroySurfaces(Pin *pin)
+    {
+        const QList<QPointer<PinWindow>> surfaces = pin->surfaces.values();
+        pin->surfaces.clear();
+        for (const QPointer<PinWindow> &surface : surfaces) {
+            detachSurface(surface.data());
+        }
+    }
+
+    void removePin(Pin *pin)
+    {
+        if (editingPin_ == pin) {
+            editingPin_ = nullptr;
+        }
+        pins_.removeAll(pin);
+        if (byId_.value(pin->id, nullptr) == pin) {
+            byId_.remove(pin->id);
+        }
+        // Surfaces first: their destroyed handlers still look at the pin.
+        destroySurfaces(pin);
+        delete pin;
+        armIdleQuit();
+    }
+
+    // Applies the pin's shared state to every surface it renders on.
+    void syncGeometry(Pin *pin)
+    {
+        for (auto it = pin->surfaces.cbegin(); it != pin->surfaces.cend(); ++it) {
+            PinWindow *surface = it.value();
+            if (surface == nullptr) {
+                continue;
+            }
+            surface->setScale(pin->scale);
+            surface->setGlobalOrigin(pin->origin);
+            surface->setPinnedVisible(allVisible_);
+        }
+    }
+
+    // Multiplicative zoom anchored on the cursor: the point under the pointer
+    // stays put. Only the surface that reported the gesture shows the badge.
+    void zoomPin(Pin *pin, PinWindow *source, double factor, QPoint globalCursor)
+    {
+        const double next = std::clamp(pin->scale * factor, kMinScale, kMaxScale);
+        if (next == pin->scale) {
+            return;
+        }
+        const QPoint anchor = globalCursor - pin->origin;
+        const double ratio = next / pin->scale;
+        pin->scale = next;
+        pin->origin = clampOrigin(*pin,
+                                  globalCursor - QPoint(qRound(anchor.x() * ratio),
+                                                        qRound(anchor.y() * ratio)));
+        syncGeometry(pin);
+        if (source != nullptr) {
+            source->showZoomBadge();
+        }
+    }
+
     void setVisible(bool visible)
     {
         allVisible_ = visible;
-        for (PinWindow *pin : pins_) {
-            pin->setPinnedVisible(visible);
+        for (Pin *pin : pins_) {
+            syncGeometry(pin);
         }
     }
 
     QLocalServer *server_;
     QString socketPath_;
     QHash<QLocalSocket *, QByteArray> buffer_;
-    QVector<PinWindow *> pins_;
-    QHash<PinWindow *, quint64> pinIds_;
+    QVector<Pin *> pins_;
+    QHash<quint64, Pin *> byId_;
     quint64 nextId_ = 1;
-    PinWindow *editingPin_ = nullptr;
+    Pin *editingPin_ = nullptr;
     bool allVisible_ = true;
     class QTimer *idleQuit_ = nullptr;
 };
@@ -544,6 +1039,7 @@ int runPinServer(const QString &socketPath)
         controller.shutdownAll();
         server->close();
     });
+    controller.watchScreens();
     // A signal-killed client can leave a mapped layer surface behind, which
     // is fatal for the compositor's frame loop, so SIGTERM/SIGINT unmap first.
     installTerminateNotifier(&controller, [] { QCoreApplication::quit(); });

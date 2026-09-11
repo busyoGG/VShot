@@ -10,6 +10,9 @@ license = "MIT"
 clap = { version = "4.6.6", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 memmap2 = "0.9.11"
+# The `image` encoder cannot state a pixel density, so PNGs that have to carry
+# one are encoded directly; already in the graph via `image`.
+png = "0.18"
 rustix = { version = "1.1.4", features = ["event", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

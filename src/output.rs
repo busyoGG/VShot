@@ -7,20 +7,25 @@ use crate::cli::Destination;
 use crate::error::{Result, VshotError};
 use crate::model::Frame;
 
-pub fn write_frame(frame: &Frame, destination: &Destination) -> Result<()> {
-    let png = frame.to_png()?;
+/// Writes a captured frame to `destination`. `density` is the frame's device
+/// pixels per logical pixel (the scale of the output it came from); every PNG
+/// written to a file, stdout or the clipboard carries it as its physical
+/// resolution, and the pin destination states it in the request, so the
+/// on-screen size and the sharpness of the capture survive wherever the image
+/// goes next.
+pub fn write_frame(frame: &Frame, destination: &Destination, density: u32) -> Result<()> {
     match destination {
-        Destination::File(path) => write_file(path, &png),
-        Destination::Stdout => {
-            io::stdout()
-                .write_all(&png)
-                .map_err(|source| VshotError::WriteFile {
-                    path: "stdout".into(),
-                    source,
-                })
-        }
-        Destination::Clipboard => copy_to_clipboard(&png),
-        Destination::Pin => crate::pin::pin_png(&png),
+        Destination::File(path) => write_file(path, &frame.to_png_with_density(density)?),
+        Destination::Stdout => io::stdout()
+            .write_all(&frame.to_png_with_density(density)?)
+            .map_err(|source| VshotError::WriteFile {
+                path: "stdout".into(),
+                source,
+            }),
+        Destination::Clipboard => copy_to_clipboard(&frame.to_png_with_density(density)?),
+        // The daemon is told the density outright, so the bytes it loads need
+        // no declaration of their own (the temp file is unlinked right after).
+        Destination::Pin => crate::pin::pin_png(&frame.to_png()?, density),
     }
 }
 

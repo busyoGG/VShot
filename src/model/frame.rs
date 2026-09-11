@@ -69,6 +69,38 @@ impl Frame {
         Ok(bytes.into_inner())
     }
 
+    /// Like [`to_png`](Self::to_png), but also declares `density` — the frame's
+    /// device pixels per logical pixel, i.e. the scale of the output it was
+    /// captured on — as the PNG's physical resolution. The image then says
+    /// which output it came from on its own, so pinning the file elsewhere
+    /// needs no side record; a 2x capture declares 192 DPI.
+    pub fn to_png_with_density(&self, density: u32) -> Result<Vec<u8>> {
+        let width = self.size.width;
+        let height = self.size.height;
+        let pixels_per_meter = density_to_pixels_per_meter(density);
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_pixel_dims(Some(png::PixelDimensions {
+                xppu: pixels_per_meter,
+                yppu: pixels_per_meter,
+                unit: png::Unit::Meter,
+            }));
+            let mut writer = encoder
+                .write_header()
+                .map_err(|error| VshotError::PngEncode(error.to_string()))?;
+            writer
+                .write_image_data(&self.pixels)
+                .map_err(|error| VshotError::PngEncode(error.to_string()))?;
+            writer
+                .finish()
+                .map_err(|error| VshotError::PngEncode(error.to_string()))?;
+        }
+        Ok(bytes)
+    }
+
     pub const fn size(&self) -> Size {
         self.size
     }
@@ -1025,6 +1057,14 @@ impl Frame {
     }
 }
 
+/// A device density as PNG physical resolution: 96 DPI per density step, which
+/// is the convention Qt reports back as dots per metre, so a 2x capture reads
+/// as 192 DPI on the other side. Clamped to the densities the renderer knows.
+fn density_to_pixels_per_meter(density: u32) -> u32 {
+    let dpi = 96.0 * f64::from(density.clamp(1, 4));
+    (dpi / 0.0254).round() as u32
+}
+
 fn checked_rect_bounds(rect: Rect) -> Result<(i64, i64, i64, i64)> {
     if rect.is_empty() {
         return Err(VshotError::InvalidGeometry(
@@ -1242,6 +1282,39 @@ mod tests {
         let frame = Frame::solid(Size::new(2, 1), [10, 20, 30, 255]).unwrap();
         let encoded = frame.to_png().unwrap();
         assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn png_with_density_declares_its_physical_resolution() {
+        let frame = Frame::solid(Size::new(2, 1), [10, 20, 30, 255]).unwrap();
+        let encoded = frame.to_png_with_density(2).unwrap();
+        // A declared density doubles as the DPI the pin side reads back, and
+        // the file still has to be an ordinary PNG.
+        assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
+        let phys = encoded
+            .windows(4)
+            .position(|chunk| chunk == &b"pHYs"[..])
+            .expect("a density-declaring PNG carries a pHYs chunk");
+        assert_eq!(
+            u32::from_be_bytes(encoded[phys + 4..phys + 8].try_into().unwrap()),
+            7559 // 192 DPI in pixels per metre
+        );
+        assert_eq!(
+            u32::from_be_bytes(encoded[phys + 8..phys + 12].try_into().unwrap()),
+            7559
+        );
+        assert_eq!(encoded[phys + 12], 1); // metre, not the unspecified unit
+        // 96 DPI (a density of 1) is deliberately not what an undeclared PNG
+        // gets: Qt reports that default itself, and the pin side filters it out.
+        let single = frame.to_png_with_density(1).unwrap();
+        let phys = single
+            .windows(4)
+            .position(|chunk| chunk == &b"pHYs"[..])
+            .expect("a density of 1 is still a declaration");
+        assert_eq!(
+            u32::from_be_bytes(single[phys + 4..phys + 8].try_into().unwrap()),
+            3780
+        );
     }
 
     #[test]
