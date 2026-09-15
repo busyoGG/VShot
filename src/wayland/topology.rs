@@ -102,6 +102,13 @@ impl TopologyState {
         }
     }
 
+    /// The outputs, as the compositor describes them.
+    ///
+    /// This asks nothing of the seat: reading the output list is not reading a
+    /// pointer.  The compositors that offer no pointer at all — a nested KWin
+    /// under another session advertises a keyboard-only seat — can still
+    /// describe their outputs, and every capture that only reads pixels has to
+    /// keep working there.
     pub(crate) fn output_infos(&self) -> Result<Vec<OutputInfo>> {
         if self.output_proxies.is_empty() {
             return Err(VshotError::IncompleteTopology(
@@ -117,12 +124,6 @@ impl TopologyState {
             return Err(VshotError::IncompleteTopology(
                 "not every wl_output has an xdg-output object".into(),
             ));
-        }
-        if !self.pointer_capability {
-            return Err(VshotError::MissingCapability("seat pointer".into()));
-        }
-        if !self.keyboard_capability {
-            return Err(VshotError::MissingCapability("seat keyboard".into()));
         }
 
         let mut ids = self.output_proxies.keys().copied().collect::<Vec<_>>();

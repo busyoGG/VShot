@@ -308,19 +308,14 @@ fn map_dbus_error(error: &zbus::Error, screen: &str) -> VshotError {
 
 /// Turns a `ScreenShot2` error name into something the user can act on.  KDE's
 /// authorization reply is the one a real session will hit, and the raw string
-/// ("The process is not authorized to take a screenshot") says nothing about
-/// what to do next.
+/// ("The process is not authorized to take a screenshot") reads like a prompt
+/// waiting to be approved.  KWin has no such prompt, so the hint spells out the
+/// desktop-file rule instead.
 fn map_method_error(name: &str, detail: Option<&str>, screen: &str) -> VshotError {
     match name {
-        "org.kde.KWin.ScreenShot2.Error.NoAuthorized" => VshotError::ScreenshotDenied(
-            "KWin only lets a client capture after the user has approved the permission \
-             prompt it shows in the Plasma session; approve that prompt and run vshot \
-             again.  A session without a prompt to answer (headless, or not Plasma) \
-             cannot grant it at all — the compositor's \
-             KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 disables the check and is meant for \
-             development only."
-                .into(),
-        ),
+        "org.kde.KWin.ScreenShot2.Error.NoAuthorized" => {
+            VshotError::ScreenshotDenied(not_authorized_hint())
+        }
         "org.kde.KWin.ScreenShot2.Error.InvalidScreen" => VshotError::IncompleteTopology(format!(
             "KWin ScreenShot2 does not know the screen `{screen}`"
         )),
@@ -329,6 +324,30 @@ fn map_method_error(name: &str, detail: Option<&str>, screen: &str) -> VshotErro
             VshotError::KwinScreenShot(format!("{name}: {detail}"))
         }
     }
+}
+
+/// Explains KWin's authorization reply.  `ScreenShotDBusInterface2::
+/// checkPermissions` resolves the caller's pid to the executable behind
+/// `/proc/<pid>/exe`, looks up the installed desktop file whose `Exec=` starts
+/// with that path, and requires it to declare the restricted interface — there
+/// is nothing for the user to click, which is why a session that only ever sees
+/// this error cannot be talked into granting it.  Naming the running executable
+/// keeps the desktop file to write unambiguous.
+fn not_authorized_hint() -> String {
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "the vshot executable".to_string());
+    format!(
+        "KWin shows no permission prompt: it authorizes the ScreenShot2 interface \
+         only for a client whose desktop file declares \
+         `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`.  This binary \
+         is `{executable}`.  Installing the package provides such a desktop file \
+         for `/usr/bin/vshot`; a build run straight out of `target/` needs its own \
+         desktop file whose `Exec=` starts with `{executable}` plus that key, and \
+         then `kbuildsycoca6 --noincremental`.  The compositor-side \
+         KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 disables the check and is meant \
+         for development only."
+    )
 }
 
 #[cfg(test)]
@@ -525,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_capture_explains_how_to_get_permission() {
+    fn a_denied_capture_names_the_desktop_file_requirement() {
         let error = map_method_error(
             "org.kde.KWin.ScreenShot2.Error.NoAuthorized",
             Some("The process is not authorized to take a screenshot"),
@@ -534,11 +553,21 @@ mod tests {
         let VshotError::ScreenshotDenied(hint) = error else {
             panic!("NoAuthorized has to map to the permission error");
         };
-        assert!(hint.contains("Plasma"), "{hint}");
+        assert!(
+            hint.contains("X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2"),
+            "{hint}"
+        );
+        assert!(hint.contains("kbuildsycoca6"), "{hint}");
         assert!(
             hint.contains("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS"),
             "{hint}"
         );
+        // The desktop file rule is keyed on the caller's own executable, so the
+        // hint has to carry that path rather than a generic instruction.
+        let executable = std::env::current_exe().unwrap();
+        assert!(hint.contains(&executable.display().to_string()), "{hint}");
+        // KWin shows no dialog, so promising one would send the user looking for it.
+        assert!(!hint.contains("prompt it shows"), "{hint}");
     }
 
     #[test]

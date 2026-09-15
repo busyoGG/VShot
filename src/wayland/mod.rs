@@ -325,11 +325,39 @@ impl WaylandSession {
         self.state.topology.output_infos()
     }
 
+    /// What the operations that read the pointer ask for, in the place they
+    /// ask for it: a compositor can advertise a seat without a pointer — a
+    /// nested KWin under another session advertises a keyboard-only one — and
+    /// every capture that only reads pixels still has to work there.
+    fn require_seat_pointer(&self) -> Result<()> {
+        if !self.state.topology.pointer_capability || self.state.topology.pointer.is_none() {
+            return Err(VshotError::MissingCapability("seat pointer".into()));
+        }
+        Ok(())
+    }
+
+    /// Selecting on the frozen scene needs both halves of the seat: the pointer
+    /// to draw with and the keyboard to finish or cancel.
+    fn require_seat_interaction(&self) -> Result<()> {
+        self.require_seat_pointer()?;
+        if !self.state.topology.keyboard_capability || self.state.topology.keyboard.is_none() {
+            return Err(VshotError::MissingCapability("seat keyboard".into()));
+        }
+        Ok(())
+    }
+
     pub fn set_scene(&mut self, scene: SceneSnapshot) {
         self.state.scene = Some(scene);
     }
 
+    /// Freezes the scene on screen.  A plain freeze asks nothing of the seat —
+    /// it is a picture and the capture follows — while `selection_mode` draws
+    /// on it with the pointer and finishes from the keyboard, so that one needs
+    /// both.
     pub fn show_frozen(&mut self, selection_mode: bool) -> Result<()> {
+        if selection_mode {
+            self.require_seat_interaction()?;
+        }
         let scene = self.state.scene.clone().ok_or_else(|| {
             VshotError::WaylandProtocol("cannot show an overlay without a scene snapshot".into())
         })?;
@@ -437,7 +465,10 @@ impl WaylandSession {
         Ok(())
     }
 
+    /// The output the pointer is on: the one thing here that needs a pointer,
+    /// so it is asked for here rather than at connect.
     pub fn wait_for_current_output(&mut self) -> Result<u32> {
+        self.require_seat_pointer()?;
         self.dispatch_until(
             Instant::now() + Duration::from_secs(5),
             VshotError::CurrentOutputTimeout,
@@ -455,8 +486,12 @@ impl WaylandSession {
     /// compositor only routes pointer events to this client once the frozen
     /// overlay surfaces are mapped, so call this after `show_frozen`; the
     /// short event wait makes the first pointer enter/motion visible. A
-    /// timeout is not fatal and simply yields `None`.
+    /// timeout is not fatal and simply yields `None`, as does a seat without a
+    /// pointer — there is nothing to wait for in either case.
     pub fn pointer_position(&mut self) -> Result<Option<Point>> {
+        if self.state.topology.pointer.is_none() {
+            return Ok(None);
+        }
         let deadline = Instant::now() + Duration::from_millis(300);
         let _ = self.dispatch_until(deadline, VshotError::CurrentOutputTimeout, |state| {
             state.pointer_position.is_some()
@@ -562,6 +597,15 @@ fn decode_wayland_keycode(key: u32) -> u32 {
     key
 }
 
+/// What the session needs before it can freeze the desktop and draw on it.
+///
+/// Only the drawing side is required here.  The seat is deliberately left out:
+/// a compositor can offer a seat without a pointer — a nested KWin under
+/// another session advertises a keyboard only — and everything vshot does with
+/// pixels (capturing an output, a region, the whole scene) still works there.
+/// The pointer and keyboard are asked for by the operations that read them:
+/// [`WaylandSession::wait_for_current_output`], [`WaylandSession::show_frozen`]
+/// in selection mode.
 fn validate_capabilities(topology: &TopologyState) -> Result<()> {
     if topology.compositor.is_none() {
         return Err(VshotError::MissingCapability("wl_compositor".into()));
@@ -586,15 +630,6 @@ fn validate_capabilities(topology: &TopologyState) -> Result<()> {
         return Err(VshotError::MissingCapability(
             "at least one wl_output".into(),
         ));
-    }
-    if topology.seats.is_empty() {
-        return Err(VshotError::MissingCapability("wl_seat".into()));
-    }
-    if !topology.pointer_capability || topology.pointer.is_none() {
-        return Err(VshotError::MissingCapability("seat pointer".into()));
-    }
-    if !topology.keyboard_capability || topology.keyboard.is_none() {
-        return Err(VshotError::MissingCapability("seat keyboard".into()));
     }
     Ok(())
 }

@@ -1,0 +1,14 @@
+[Desktop Entry]
+# KWin has no permission prompt for its ScreenShot2 D-Bus interface: it
+# authorizes a caller only when the desktop file whose Exec= names the caller's
+# executable declares the interface below.  Spectacle carries the same line in
+# /usr/share/applications/org.kde.spectacle.desktop.  Change Exec= and the
+# authorization is gone, so it has to name the packaged binary exactly.
+Type=Application
+Name=VShot
+Comment=Strict-freeze Wayland screenshot CLI
+Exec=/usr/bin/vshot
+Terminal=true
+NoDisplay=true
+Categories=Graphics;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

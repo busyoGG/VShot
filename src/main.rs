@@ -22,7 +22,8 @@ use capture::{Capturer, CompositorWindowProvider, ProcessWindowProvider, WindowC
 use cli::{Action, CaptureTarget, Cli};
 use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
-use model::{ImageDocument, OutputSnapshot, SceneSnapshot};
+use geometry::Rect;
+use model::{Frame, ImageDocument, OutputSnapshot, SceneSnapshot};
 use wayland::topology::OutputInfo;
 use wayland::WaylandSession;
 
@@ -38,6 +39,15 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("vshot: {error}");
+            // A compositor failure is only readable next to the display it came
+            // from: with several compositors on one runtime directory, "no such
+            // capability" may well describe a display the user is not looking
+            // at (see `error::wayland_display_note`).
+            if error.is_display_failure() {
+                if let Some(note) = error::wayland_display_note() {
+                    eprintln!("vshot: {note}");
+                }
+            }
             ExitCode::from(1)
         }
     }
@@ -156,9 +166,10 @@ fn run() -> Result<()> {
             };
             let geometry = selection::validate_selection(&scene, geometry)?;
             wayland.show_frozen(false)?;
-            // The crop comes out of the composed scene, so the pixels are at
-            // the scene's scale — same as a region capture.
-            (scene.crop(geometry)?, scene.scale())
+            // The window's own pixels at its own output's density — cropping the
+            // composed scene would hand back a nearest-upscale of a window that
+            // sits on a lower-density monitor.
+            crop_window(&scene, geometry)?
         }
         CaptureTarget::WindowPick { pixel_detect } => {
             // Compose the candidate set first: the compositor's window list
@@ -219,9 +230,9 @@ fn run() -> Result<()> {
                 .unwrap_or(picked.rect);
             let (geometry, annotations) = qt_overlay::edit_selection(&scene, geometry)?;
             let geometry = selection::validate_selection(&scene, geometry)?;
-            let frame = scene.crop(geometry)?;
-            edits = pipeline_for_annotations(annotations, geometry, scene.scale())?;
-            (frame, scene.scale())
+            let (frame, density) = crop_window(&scene, geometry)?;
+            edits = pipeline_for_annotations(annotations, geometry, density)?;
+            (frame, density)
         }
         CaptureTarget::LongShot {
             region,
@@ -302,6 +313,16 @@ fn capture_scene(
         )?);
     }
     SceneSnapshot::from_outputs(outputs)
+}
+
+/// Crops a window rect at the resolution its pixels were captured at: straight
+/// out of the one output that holds it whole, out of the composed scene only
+/// when the window straddles a monitor seam.
+fn crop_window(scene: &SceneSnapshot, geometry: Rect) -> Result<(Frame, u32)> {
+    Ok(match scene.crop_output_region(geometry)? {
+        Some(cropped) => cropped,
+        None => (scene.crop(geometry)?, scene.scale()),
+    })
 }
 
 #[cfg(test)]

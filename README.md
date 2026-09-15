@@ -4,7 +4,7 @@
 
 ## 安装（Arch Linux）
 
-仓库根目录的 `PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次 `pacman -U` 同时提供 `/usr/bin/vshot` 与 `/usr/bin/vshot-qt-ui`：
+仓库根目录的 `PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次 `pacman -U` 同时提供 `/usr/bin/vshot`、`/usr/bin/vshot-qt-ui` 与给 KWin 授权用的 `/usr/share/applications/vshot.desktop`（见「KDE 授权」）：
 
 ```sh
 ./scripts/build-arch-package.sh
@@ -41,7 +41,7 @@ Qt 交互界面支持中/英双语：默认跟随系统语言（`QLocale::system
 运行时需要：
 
 - Wayland 会话；
-- `wl_compositor`、`wl_shm`（包含 `XRGB8888` 或 `ARGB8888`）、至少一个 `wl_output` 和 `wl_seat`；
+- `wl_compositor`、`wl_shm`（包含 `XRGB8888` 或 `ARGB8888`）、至少一个 `wl_output`；
 - `zxdg_output_manager_v1`，用于 overlay 的输出名称和 logical topology；
 - `zwlr_layer_shell_v1`，用于 Rust 非交互冻结 overlay；
 - `zwlr_screencopy_manager_v1`（版本 1 至 3），用于 wlroots 系的原生帧捕获——**KWin 没有这个协议**，此时改用 KWin 的 D-Bus 截图服务（见下）；
@@ -51,7 +51,7 @@ Qt 交互界面支持中/英双语：默认跟随系统语言（`QLocale::system
 - 使用交互式 `region` 时需要可执行的 `vshot-qt-ui`，也可通过 `VSHOT_QT_HELPER` 指定；
 - 文件输出、`--clipboard` 和 `vshot pin --clipboard` 需要可执行的 `wl-copy`。
 
-当前实现严格要求 seat 同时具有 pointer 和 keyboard capability。缺少上述任一能力时会以非零状态和明确错误退出，不会假称截图已经冻结。
+**seat 只在真正读它的时候才要求**。只读像素的操作——`monitor <名字>`、`all`、`window active`、`region --geometry`——不碰 seat，因此一个只有 keyboard 的 seat 也照样能截图：KWin 6.7.5 的嵌套与 `--virtual` 会话对外部客户端就只 advertise keyboard（实测，两处都是），而它的截图路径本来也不需要指针。要读 seat 的是两类操作：`monitor current`（指针在哪块屏）和交互式框选（指针画、键盘收尾），缺哪个能力就以非零状态退出并指名是 `seat pointer` 还是 `seat keyboard`，不会假称截图已经冻结。
 
 ## 用法
 
@@ -138,11 +138,11 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 1. Hyprland：`hyprctl activewindow -j` 的 `at`/`size`；
 2. Sway：`swaymsg -t get_tree` 中递归查找 focused node 的 `rect`；
 3. KDE Plasma：优先 `kdotool`（若安装），否则一次性 KWin scripting 探针——通过 `org.kde.kwin.Scripting`（gdbus/dbus-send）加载读取 `workspace.activeWindow`/`activeClient` 的 `frameGeometry`（分别对应 Plasma 6/5），从用户 journal 轮询标记行取回；探针每次独立加载并在结束后卸载；
-4. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测焦点窗口——先拟合"焦点描边"（平铺合成器给焦点窗口画的高亮边框，闭合同色矩形轮廓），失败再做背景泛洪分割（从帧边缘追踪壁纸/阴影，无边框窗口靠 gaps、阴影或壁纸分离，已知光标位置时用于消歧）。
+4. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测窗口。分析**逐个输出进行，用该输出自己那份原生像素**，不在合成场景上做——场景会把低 scale 的输出放大，从场景边缘出发的泛洪还会跨过显示器接缝，把"整块桌面"当成一个候选。每个输出内部的候选按可信度分四级，高一级有结果就只用这一级：`Ring`（边框带）→ `Segment`（泛洪分割）→ `Outline`（闭合描边轮廓）→ `WholeOutput`（整块输出，只在该输出基本均匀时）。**Ring 优先**，但只认**有颜色**的那条边：合成器给焦点窗口描的边是画面里唯一明确指向"焦点窗口"的信号。它找"薄而恒定的横带"（两侧跳变 ≥ 20、内部变化 < 10、厚度 ≤ 8 设备像素），把这些带拼成长线，要求**上下两条横线各自找到的左右竖线完全一致**、四条边闭合成环，环的高度/宽度还要够窗口尺寸；两条横线各自去找角点是为了排除"两窗共享同一行边框"的假环——那种情况下横线会一直延伸过邻居的边界。侧边还必须是**一条完整的边**（跨度 ≥ 环高的 60%）：实测一个 kitty 窗口的左右边框各占环高的 95%/96%，而它内部的一条滚动条只占 13%，曾经把那条滚动条当成右边框，让裁剪少了 14 个逻辑像素。环上采到的平均饱和度 ≥ 48 才算"焦点描边"，**灰色的环只按 `Segment` 那级参与竞争**（它可能是 `col.inactive_border`，也可能是壁纸里随便一个方框，两者在像素上无法区分），免得闲置屏上的一个壁纸方框压过指针所在屏上的真窗口。**每条路径给出的都是窗口本来的样子，包含合成器画的那条边框**：`Ring` 取环带的外沿，`Segment` 也不再往里缩掉四周的同色边带（那一步曾被用来和 compositor 元数据对齐，现在裁剪以"画面里看到的窗口"为准）。`Segment` 是原路径（从输出边缘泛洪追踪壁纸与阴影，无边框窗口靠 gaps、阴影或壁纸分离）；`Outline` 是"闭合同色矩形轮廓"，且必须覆盖该输出的足够比例才算窗口——网页内容里到处都是同色矩形，不设这道门槛就会截到某人页面中的一块卡片。一个输出最多保留 32 个环、每个环的饱和度只沿四条边各取 64 个采样点：整个帧本身就是一张网格状图片时（屏幕的照片、满屏嵌套面板），边线两两配对能凑出上千个矩形，这两道闸把开销和候选数都压成常数。
 
-`vshot window active --pixel` 跳过 compositor 元数据，直接走像素识别——用于测试检测器，也可用于完全没有元数据接口的合成器（**niri** 就是其一：它没有输出焦点窗口几何的接口，`focused-window` 只给 tile 布局信息，全局坐标要靠 output 与 column 自己推算）。像素识别在降采样的分析帧上运行，4K 场景开销可忽略；**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
+`vshot window active --pixel` 跳过 compositor 元数据，直接走像素识别——用于测试检测器，也可用于完全没有元数据接口的合成器（**niri** 就是其一：它没有输出焦点窗口几何的接口，`focused-window` 只给 tile 布局信息，全局坐标要靠 output 与 column 自己推算）。分析帧按**面积**上限降采样（1080p 逐像素、4K 约 1/2），因为分隔窗口的 gaps 与描边只有几个设备像素宽：按长边压到 1024 会让 4K 场景里的 3px 边框整条消失，实测焦点描边检测在那样的分析帧上一个候选都给不出来。窗口截图**按所在输出原生裁剪**（`SceneSnapshot::crop_output_region`）：混合 DPI 时一块 scale-1 屏上的窗口若从合成场景裁剪，会得到放大一倍且发虚的图，现在直接从那块屏自己的帧裁，PNG 写的密度也是那块屏的；只有跨接缝的窗口才回落到合成场景。像素识别在 release 下两屏共约 0.1 s。**没有焦点描边时按指针判**：合成器若给焦点窗口描一条有颜色的边（Hyprland 的 `col.active_border` 甚至可以是渐变），那条边就是判据；若它描的是纯灰（本机焦点在无边框全屏窗口上时实测四周都是 `#464646` 灰边，平均饱和度 0.8，而有色焦点描边实测 162~175），画面里就没有任何东西能区分"焦点窗口"与"指针下的窗口"，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是**你指着的那个窗口**，与 `hyprctl activewindow` 可能不一致。`VSHOT_PIXEL_DEBUG=1` 把每个输出的分析尺寸、找到的每个环（含饱和度、是否判为焦点描边）以及每一级的答案打到 stderr，用来查一次错误裁剪到底是哪一级给出来的。**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。在保存下来的那张 4K 帧（3830x2156 设备像素，scale 2，右边半屏是焦点 kitty）上实测：边框带把 kitty 精确读成逻辑 (962, 54) 起的 **941x1014** 内容矩形，它的边框是 3 逻辑像素宽，于是裁剪用的矩形是 (959, 51) 起的 947x1020 —— 窗口连同边框；同一帧上泛洪分割给出的却是把并排两窗连成一片的 927..1914 宽一整块，而这条路径早先给出的是 3832x1072——两块屏拼起来的整个桌面。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
 
-目标 geometry 会从已经捕获的冻结场景中裁剪；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
+目标 geometry 从已经捕获的冻结画面裁剪——窗口路径优先从**所在输出自己那份帧**裁剪（原生分辨率与原生密度，见上），只有跨输出的 geometry 才用合成场景；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
 
 ## 选择窗口
 
@@ -160,7 +160,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 2. Sway：`swaymsg -t get_tree` 的全部叶子节点（隐藏 workspace 下的除外），标题用 `app_id`（X11 用 `window_properties.class`）加 `name`；
 3. KDE Plasma：同一套 KWin scripting 探针的 `list` 模式，遍历 `workspace.windowList()`/`clientList()`，跳过 `deleted`/`hidden`/`minimized` 与非 `normalWindow` 的项；探针只报几何、不带标题，所以提示条只显示尺寸；
 
-指针命中的候选取**包含指针的最小矩形**——窗口重叠时选中的是靠里/更小的那个。窗口列表筛完之后为空（或查询本身失败）时会自动落到像素识别，不会直接报错。`vshot window pick --pixel` 跳过窗口列表，直接在冻结帧上做像素识别（先拟合焦点描边，再做背景泛洪分割），把找到的所有候选交给用户挑；这条路径用于没有窗口列表查询的 compositor，也用于测试检测器。纯像素识别只能看到帧里**可分离**的窗口：无缝无边框平铺（无 gaps、无阴影）以及完全均匀的桌面没有像素信号，此时候选为空并如实报错，不会给出一个猜出来的裁剪。点击后的重新解析同样用窗口列表（`--pixel` 或列表不可用时退回挑选阶段给出的矩形），所以 `--pixel` 这条路径在工作区切换后可能仍停在旧矩形上。
+指针命中的候选取**包含指针的最小矩形**——窗口重叠时选中的是靠里/更小的那个。窗口列表筛完之后为空（或查询本身失败）时会自动落到像素识别，不会直接报错。`vshot window pick --pixel` 跳过窗口列表，直接在冻结帧上做像素识别（与 `window active --pixel` 同一套逐输出、原生分辨率的分析：边框带、泛洪分割、闭合描边轮廓一起上，把所有候选交给用户），把找到的所有候选交给用户挑；这条路径用于没有窗口列表查询的 compositor，也用于测试检测器。纯像素识别只能看到帧里**可分离**的窗口：无缝无边框平铺（无 gaps、无阴影）以及完全均匀的桌面没有像素信号，此时候选为空并如实报错，不会给出一个猜出来的裁剪。点击后的重新解析同样用窗口列表（`--pixel` 或列表不可用时退回挑选阶段给出的矩形），所以 `--pixel` 这条路径在工作区切换后可能仍停在旧矩形上。
 
 ## 长截图（滚动截图）
 
@@ -276,7 +276,7 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 ## 图像和输出映射
 
-内部帧统一为 RGBA8、top-left origin。PNG 输入由 `image` 解码，最终 sink 前重新编码 PNG。多输出合成支持负 logical origin 和输出间空隙；场景画布使用最高输出 scale，较低 scale 的输出使用 nearest-neighbor 放大。当前仍要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。
+内部帧统一为 RGBA8、top-left origin。PNG 输入由 `image` 解码，最终 sink 前重新编码 PNG。多输出合成支持负 logical origin 和输出间空隙；场景画布使用最高输出 scale，较低 scale 的输出使用 nearest-neighbor 放大。当前仍要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。窗口截图（`window active`、`window pick`）与像素识别都尽量绕开这层放大：落在单个输出内的矩形从那个输出自己的帧裁剪、用它的 scale 写密度，像素识别也逐输出分析。
 
 ## 截图后端
 
@@ -291,7 +291,25 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 ### KDE 授权
 
-Plasma 会话里首次截图时 KWin 会弹权限对话框，**只有用户确认后**本次调用才会拿到像素；未确认时返回 `org.kde.KWin.ScreenShot2.Error.NoAuthorized`，vshot 会把它翻译成如何获得授权的说明，而不是只抛原始 D-Bus 字符串。无头或非 Plasma 会话没有可应答的对话框，因此永远拿不到授权。合成器侧的环境变量 `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1` 可以关掉这个检查，**仅供开发/测试**。
+KWin 的 `org.kde.KWin.ScreenShot2` 是**受限 D-Bus 接口，而且它不弹任何对话框**——没有可点的"允许"。`ScreenShotDBusInterface2::checkPermissions`（KWin 6.7.5，`src/plugins/screenshot/screenshotdbusinterface2.cpp`）做三件事：由调用方 pid 取 `/proc/<pid>/exe` 指向的可执行文件，在已安装的 desktop file 里找 `Exec=` 第一个词与该路径 canonical 一致的那一份，然后要求它声明：
+
+```ini
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+```
+
+Spectacle 正是这样被授权的（`/usr/share/applications/org.kde.spectacle.desktop` 里就有这行）。不满足时返回 `org.kde.KWin.ScreenShot2.Error.NoAuthorized`，vshot 会把它翻译成"要写哪份 desktop file、`Exec=` 该写哪个路径、要不要跑 `kbuildsycoca6`"，而不是复述 KWin 那句容易被误读成"去点个确认框"的措辞。由此推出：
+
+- **装包安装的 vshot 不需要任何额外操作**：`/usr/share/applications/vshot.desktop` 的 `Exec=/usr/bin/vshot` 且声明了上面那个 key。若装完包 KWin 仍拒绝，跑一次 `kbuildsycoca6 --noincremental`（kservice 靠 ksycoca 数据库查 desktop file）。
+- **直接从 `target/release/vshot` 跑的开发构建拿不到授权**——没有任何 desktop file 的 `Exec=` 指向那个路径。加上一份即可，用不着装包（`Exec=` 写当前二进制的绝对路径，vshot 报错时会把这个路径打出来）：
+
+  ```sh
+  printf '[Desktop Entry]\nType=Application\nName=VShot\nExec=/path/to/vshot\nNoDisplay=true\nX-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\n' \
+    > ~/.local/share/applications/vshot.desktop
+  kbuildsycoca6 --noincremental
+  ```
+- 不影响授权的因素（均实测）：`NoDisplay=true`、`Exec=` 后面带参数（只有第一个词参与匹配）、desktop file 放在用户数据目录（`~/.local/share/applications`）还是系统数据目录（`/usr/share/applications`——KWin 查的是整条 `XDG_DATA_DIRS`）。能影响的是 `Exec=` 指向的二进制——换了路径就重新授权不了。
+- 合成器侧的 `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1` 跳过整个检查，**仅供开发/测试**。
+- 这套授权**只覆盖"允许调用"**：抓像素本身跟其它后端一样，就是向合成器要一帧。
 
 `include-cursor` 选项按 KDE 文档传入；它是否真的把光标画进图像**尚未验证**——无头 `--virtual` 输出上没有指针可画。
 
@@ -306,8 +324,8 @@ Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 l
 ## 已知限制
 
 - 截图后端：wlroots 系走 `wlr-screencopy-unstable-v1` 的 wl_shm 路径（协议版本 1 至 3）；**KWin/Plasma Wayland 改走 `org.kde.KWin.ScreenShot2`**（见「截图后端」），因为 KWin 根本没有 screencopy，也没有 `ext-image-copy-capture`（实测 KWin 6.7.5 的 global 列表与 `libkwin.so.6` 里都找不到这两个接口名）。两者都没有实现 PipeWire、Portal ScreenCast 或 DMA-BUF。**不要以为"grim 能在 KDE 跑所以 vshot 也应该能"**：grim 只带 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`，在 KDE 上两个都不可用（实测报 "compositor doesn't support the screen capture protocol"），KDE 只能走它私有的 D-Bus 服务。GNOME/Mutter 三者都不提供，连 layer-shell 也没有。
-- KWin 那条路的**冻结 overlay 仍然依赖 `zwlr_layer_shell_v1`**（KWin 提供它），但合成器侧授权对话框必须由用户在 Plasma 会话里确认；非 Plasma/无头会话会一直返回 `NoAuthorized`。
-- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway/KWin 的接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。`window pick` 的候选同样来自这三家：没有窗口列表查询的合成器要靠 `--pixel`，无缝无边框平铺与均匀桌面下没有任何候选，只能报错。候选列表在挑选期间**跟着指针刷新**（见「选择窗口」），所以切换工作区或移动窗口后，悬停高亮与最终截到的窗口都是实时的；只有 `--pixel` 那条路径没有可复查的窗口列表，会一直用挑选开始时的候选。
+- KWin 那条路的**冻结 overlay 仍然依赖 `zwlr_layer_shell_v1`**（KWin 提供它）。授权不是对话框：KWin 只认调用方那个可执行文件对应的 desktop file 里声明的受限接口（见「KDE 授权」），所以从 `target/` 里直接跑的构建会一直拿到 `NoAuthorized`，装上包再用 `/usr/bin/vshot` 才行。**同一个 `XDG_RUNTIME_DIR` 下可以同时存在多个合成器**（例如 tty 里另起的 KDE 占 `wayland-0`、Hyprland 落在 `wayland-1`），而 `WAYLAND_DISPLAY` 未设置时 libwayland 会用默认的 `wayland-0`——tty 或 ssh 里的 shell 就是这种情况，于是命令会连到"另一个合成器"上去。凡是跟合成器有关的失败，vshot 都会额外打印一行说明这次连的是哪个 display、以及本机还有哪些 display。
+- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway/KWin 的接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。像素识别**逐输出**在原生帧上跑，结果只会是某一块屏上的一个窗口，不会横跨接缝；但当合成器不给焦点窗口描有色的边时，它答的是"指针下的窗口"，不是"焦点窗口"（见「截取活动窗口」）。`window pick` 的候选同样来自这三家：没有窗口列表查询的合成器要靠 `--pixel`，无缝无边框平铺与均匀桌面下没有任何候选，只能报错。候选列表在挑选期间**跟着指针刷新**（见「选择窗口」），所以切换工作区或移动窗口后，悬停高亮与最终截到的窗口都是实时的；只有 `--pixel` 那条路径没有可复查的窗口列表，会一直用挑选开始时的候选。
 - 编辑结果使用 RGBA8 软件绘制，线宽和坐标按截图 logical scale 转换；Qt 文本框接受任意 Unicode 文本（含通过输入法提交的 CJK）。交互式文本由 Qt 按所选系统字体栅格化为 RGBA 位图后由 Rust 合成（见「交互式 overlay」）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体渲染，该回退路径仅支持可打印 ASCII。
 - 交互式 `region` 的键盘和鼠标事件由 Qt/LayerShellQt 处理；不依赖 Hyprland 插件或私有输入接口。
 - 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射会拒绝执行。

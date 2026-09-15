@@ -85,6 +85,12 @@ the system locale)."
         interactive: bool,
     },
     /// Capture one monitor by name, or the monitor under the pointer with `current`.
+    #[command(
+        after_help = "The output is named from the frozen overlay's topology, so every capture \
+needs an output that answers `zxdg_output_manager_v1`. `current` reads the pointer and therefore \
+needs a seat with a pointer capability, which a nested or virtual KWin does not offer; naming the \
+output works there."
+    )]
     Monitor {
         /// Output name, or `current` for the output under the pointer.
         #[arg(default_value = "current")]
@@ -218,13 +224,14 @@ pub enum WindowTarget {
     /// available, otherwise pixel detection on the captured frame.
     #[command(
         after_help = "The window is read from the compositor's metadata (Hyprland, Sway, \
-KWin/Plasma); --pixel skips that and segments the captured frame instead, which is also what \
-happens when no window list is available at all. Borderless tiling with no gaps or shadows \
-has no pixel signal and is reported as such rather than guessed."
+KWin/Plasma); --pixel skips that and reads the border stroke off the captured frame instead, \
+falling back to background segmentation, which is also what happens when no window list is \
+available at all. Borderless tiling with no gaps or shadows has no pixel signal and is \
+reported as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
     )]
     Active {
         /// Skip compositor metadata and detect the focused window from the
-        /// captured pixels (accent outline, then background segmentation).
+        /// captured pixels (border bands, then background segmentation).
         /// For testing the detector and for compositors without metadata.
         #[arg(long)]
         pixel: bool,
@@ -239,7 +246,7 @@ window list unless --pixel is given."
     )]
     Pick {
         /// Skip the compositor's window list and take the candidates from the
-        /// captured pixels (accent outlines, then background segmentation).
+        /// captured pixels (border bands, then background segmentation).
         /// For compositors without a window-list query and for testing the
         /// detector; borderless tiling with no gaps or shadows has no pixel
         /// signal and is reported as such.

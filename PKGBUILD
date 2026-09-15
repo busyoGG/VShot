@@ -24,5 +24,7 @@ package() {
     cd "$startdir"
     install -Dm755 target/release/vshot "$pkgdir/usr/bin/vshot"
     install -Dm755 build-qt/vshot-qt-ui "$pkgdir/usr/bin/vshot-qt-ui"
+    # Authorizes the CLI for KWin's restricted ScreenShot2 D-Bus interface.
+    install -Dm644 "$startdir/vshot.desktop" "$pkgdir/usr/share/applications/vshot.desktop"
     install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
