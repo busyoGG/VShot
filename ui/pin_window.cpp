@@ -337,12 +337,11 @@ void PinWindow::wheelEvent(QWheelEvent *event)
         QWidget::wheelEvent(event);
         return;
     }
-    // 10% per notch, multiplicative so zooming feels even at any scale, and
-    // keep the point under the cursor stationary while zooming. The daemon
-    // anchors the zoom and rescales every surface at once.
+    // 10% per notch, multiplicative so zooming feels even at any scale. The
+    // daemon keeps the image center fixed and rescales every surface at once.
     const double factor = steps.y() > 0 ? 1.1 : 1.0 / 1.1;
     if (zoomRequested_) {
-        zoomRequested_(factor, event->globalPosition().toPoint());
+        zoomRequested_(factor);
     }
     showZoomBadge();
     event->accept();

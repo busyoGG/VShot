@@ -109,6 +109,19 @@ const QHash<QString, QString> &chineseTable()
         // Accessible name templates.
         {QStringLiteral("Annotation color %1"), QString::fromUtf8("标注颜色 %1")},
         {QStringLiteral("Tool: %1"), QString::fromUtf8("工具：%1")},
+
+        // Scrolling-capture hint overlay.
+        {QStringLiteral("frames"), QString::fromUtf8("帧")},
+        {QStringLiteral("Enter finish · Esc cancel"),
+         QString::fromUtf8("Enter 完成 · Esc 取消")},
+        // Why a scrolling capture stopped, as the CLI reports it.
+        {QStringLiteral("the page ended"), QString::fromUtf8("已到页面末尾")},
+        {QStringLiteral("height limit reached"), QString::fromUtf8("已达高度上限")},
+        {QStringLiteral("frame limit reached"), QString::fromUtf8("已达帧数上限")},
+        {QStringLiteral("time limit reached"), QString::fromUtf8("已超时")},
+        {QStringLiteral("stopped by the user"), QString::fromUtf8("已手动结束")},
+        {QStringLiteral("the hint overlay went away"),
+         QString::fromUtf8("提示条已关闭")},
     };
     return table;
 }

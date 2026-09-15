@@ -1,11 +1,12 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::capture::WindowCandidate;
 use crate::edit::{ArrowStyle, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
@@ -13,9 +14,12 @@ use crate::model::SceneSnapshot;
 use crate::wayland::input::{
     Annotation, EditorTool, DEFAULT_ANNOTATION_COLOR, DEFAULT_ANNOTATION_WIDTH, DEFAULT_TEXT_COLOR,
 };
+use crate::wayland::topology::OutputInfo;
 
 const MAX_HELPER_ERROR_BYTES: usize = 512;
 const HELPER_NAME: &str = "vshot-qt-ui";
+/// What the picker asks for on its stdout when it wants a fresh candidate list.
+const CANDIDATE_REQUEST: &str = "candidates";
 
 /// Where the helper may live relative to the `vshot` executable: next to it
 /// (installed layouts) or in `build-qt/` one and two levels up (in-tree
@@ -80,6 +84,36 @@ pub(crate) fn helper_program() -> Result<HelperLookup> {
     })
 }
 
+fn helper_spawn_error(helper: &HelperLookup, error: std::io::Error) -> VshotError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        let searched = if helper.searched.is_empty() {
+            String::new()
+        } else {
+            format!(" (searched {})", helper.searched.join(", "))
+        };
+        VshotError::Selection(format!(
+            "Qt helper `{}` was not found next to vshot, in `build-qt/`, or on \
+             PATH{searched}; build it with `cmake -S . -B build-qt && cmake --build \
+             build-qt` or point VSHOT_QT_HELPER at the executable",
+            helper.path.display()
+        ))
+    } else {
+        VshotError::Selection(format!(
+            "failed to start Qt helper `{}`: {error}",
+            helper.path.display()
+        ))
+    }
+}
+
+fn helper_exit_error(status: std::process::ExitStatus, stderr: &[u8]) -> VshotError {
+    let detail = compact_error(stderr);
+    VshotError::Selection(if detail.is_empty() {
+        format!("Qt helper exited with {status}")
+    } else {
+        format!("Qt helper exited with {status}: {detail}")
+    })
+}
+
 fn run_helper(helper: &HelperLookup, session_path: &Path) -> Result<Vec<u8>> {
     let child = Command::new(&helper.path)
         .arg("--session")
@@ -88,39 +122,94 @@ fn run_helper(helper: &HelperLookup, session_path: &Path) -> Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                let searched = if helper.searched.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (searched {})", helper.searched.join(", "))
-                };
-                VshotError::Selection(format!(
-                    "Qt helper `{}` was not found next to vshot, in `build-qt/`, or on \
-                     PATH{searched}; build it with `cmake -S . -B build-qt && cmake --build \
-                     build-qt` or point VSHOT_QT_HELPER at the executable",
-                    helper.path.display()
-                ))
-            } else {
-                VshotError::Selection(format!(
-                    "failed to start Qt helper `{}`: {error}",
-                    helper.path.display()
-                ))
-            }
-        })?;
+        .map_err(|error| helper_spawn_error(helper, error))?;
 
     let output = child.wait_with_output().map_err(|error| {
         VshotError::Selection(format!("failed to collect Qt helper output: {error}"))
     })?;
     if !output.status.success() {
-        let detail = compact_error(&output.stderr);
-        return Err(VshotError::Selection(if detail.is_empty() {
-            format!("Qt helper exited with {}", output.status)
-        } else {
-            format!("Qt helper exited with {}: {detail}", output.status)
-        }));
+        return Err(helper_exit_error(output.status, &output.stderr));
     }
     Ok(output.stdout)
+}
+
+/// Dialogue with a picking session: the helper writes one JSON object per line
+/// to its stdout — `{"request":"candidates"}` when it wants the windows it
+/// should highlight, and the session's own result at the end — and this
+/// answers on its stdin.  A picking session is the only one that talks back,
+/// because it is the only one running against a live desktop.
+///
+/// The answer to a refresh is the fresh window list, or nothing at all (`{}`)
+/// when there is no source for one: the pixel fallback has no window list to
+/// re-read, and keeping the picker's own list beats replacing it with
+/// something the user did not ask for.
+fn run_pick_helper(
+    helper: &HelperLookup,
+    session_path: &Path,
+    refresh: &impl Fn() -> Option<Vec<WindowCandidate>>,
+) -> Result<Vec<u8>> {
+    let mut child = Command::new(&helper.path)
+        .arg("--session")
+        .arg(session_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| helper_spawn_error(helper, error))?;
+    let mut requests = child
+        .stdin
+        .take()
+        .ok_or_else(|| VshotError::Selection("the Qt helper has no request pipe".into()))?;
+    let responses = child
+        .stdout
+        .take()
+        .ok_or_else(|| VshotError::Selection("the Qt helper has no answer pipe".into()))?;
+    let mut responses = BufReader::new(responses);
+
+    let mut result = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = responses.read_line(&mut line).map_err(|error| {
+            VshotError::Selection(format!("failed to read the Qt helper's answer: {error}"))
+        })?;
+        if read == 0 {
+            // The helper went away without answering.
+            break;
+        }
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let request: serde_json::Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if request.get("request").and_then(serde_json::Value::as_str) != Some(CANDIDATE_REQUEST) {
+            result = Some(text.as_bytes().to_vec());
+            break;
+        }
+        let reply = CandidateReply {
+            candidates: refresh()
+                .map(|candidates| candidates.iter().map(QtCandidate::from).collect()),
+        };
+        let encoded = serde_json::to_string(&reply).map_err(|error| {
+            VshotError::Selection(format!("failed to encode the candidate reply: {error}"))
+        })?;
+        writeln!(requests, "{encoded}")
+            .and_then(|()| requests.flush())
+            .map_err(|error| {
+                VshotError::Selection(format!("failed to answer the Qt helper: {error}"))
+            })?;
+    }
+
+    let output = child.wait_with_output().map_err(|error| {
+        VshotError::Selection(format!("failed to collect Qt helper output: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(helper_exit_error(output.status, &output.stderr));
+    }
+    result.ok_or_else(|| VshotError::Selection("the Qt helper closed without a result".into()))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -185,7 +274,47 @@ struct QtSession<'a> {
     // Pin-edit only: id of the pinned image inside the daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
+    // Window-pick only: what the pointer may snap to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidates: Option<Vec<QtCandidate>>,
+    // Region only: a selection the user has already made (the picker resolved
+    // one), which the session opens in editing state instead of waiting for a
+    // drag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection: Option<WireRect>,
     outputs: Vec<QtOutput<'a>>,
+}
+
+/// One pickable window: the helper highlights the smallest candidate under the
+/// pointer and shows its label in the size pill.
+#[derive(Debug, Serialize)]
+struct QtCandidate {
+    x: i64,
+    y: i64,
+    width: u64,
+    height: u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    label: String,
+}
+
+/// The answer to the picker's refresh request: a fresh window list, or an
+/// empty object when there is nothing to say.
+#[derive(Debug, Serialize)]
+struct CandidateReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidates: Option<Vec<QtCandidate>>,
+}
+
+impl From<&WindowCandidate> for QtCandidate {
+    fn from(candidate: &WindowCandidate) -> Self {
+        Self {
+            x: i64::from(candidate.geometry.left()),
+            y: i64::from(candidate.geometry.top()),
+            width: u64::from(candidate.geometry.size.width),
+            height: u64::from(candidate.geometry.size.height),
+            label: candidate.label.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +339,9 @@ struct QtOutput<'a> {
 struct QtResult {
     status: String,
     selection: Option<WireRect>,
+    // Window-pick only: where the pointer was when the click committed, so the
+    // caller can resolve the click against the windows that exist by then.
+    point: Option<WirePoint>,
     annotations: Option<Vec<QtAnnotation>>,
 }
 
@@ -240,10 +372,258 @@ struct QtAnnotation {
 }
 
 pub fn select_and_edit(scene: &SceneSnapshot) -> Result<(Rect, Vec<Annotation>)> {
-    let (_directory, session_path) = write_session(scene)?;
+    let (_directory, session_path) = write_session(scene, "region", &[], None)?;
     let helper = helper_program()?;
     let output = run_helper(&helper, &session_path)?;
     parse_result(output, scene.bounds())
+}
+
+/// What a picking session reported: the window the click landed on, as the
+/// candidate list it started with saw it, plus where the pointer was.  The
+/// caller resolves the click against the windows that exist by capture time,
+/// because the picker runs on a live desktop.
+pub(crate) struct PickedWindow {
+    pub(crate) rect: Rect,
+    pub(crate) point: Option<Point>,
+}
+
+/// Interactive window picking.  The helper keeps the desktop live, highlights
+/// the smallest candidate under the pointer, and the first click ends the
+/// session: picking only decides *what* to capture, never the pixels.
+///
+/// `refresh` is asked while the session is open for the windows to highlight,
+/// because the desktop it runs on can change under it (a workspace switch, a
+/// window that moved).  Returning `None` means "no fresh source", which leaves
+/// the picker with the list it started from.
+pub fn pick_window(
+    scene: &SceneSnapshot,
+    candidates: &[WindowCandidate],
+    refresh: impl Fn() -> Option<Vec<WindowCandidate>>,
+) -> Result<PickedWindow> {
+    let (_directory, session_path) = write_session(scene, "window-pick", candidates, None)?;
+    let helper = helper_program()?;
+    let output = run_pick_helper(&helper, &session_path, &refresh)?;
+    parse_picked_window(output, scene.bounds())
+}
+
+/// Re-opens a captured scene for annotation with `selection` already made, so
+/// the window the user picked is edited on the frame that was captured after
+/// the pick — not on the one the picking itself started from.
+pub fn edit_selection(scene: &SceneSnapshot, selection: Rect) -> Result<(Rect, Vec<Annotation>)> {
+    let (_directory, session_path) = write_session(scene, "region", &[], Some(selection.into()))?;
+    let helper = helper_program()?;
+    let output = run_helper(&helper, &session_path)?;
+    parse_result(output, scene.bounds())
+}
+
+/// Asks for a region without offering to annotate it.  Scrolling capture is
+/// what this is for: the frame that gets stitched does not exist yet, so there
+/// is nothing to mark up at selection time.
+pub fn select_region(scene: &SceneSnapshot) -> Result<Rect> {
+    let (_directory, session_path) = write_session(scene, "region-only", &[], None)?;
+    let helper = helper_program()?;
+    let output = run_helper(&helper, &session_path)?;
+    let (selection, _annotations) = parse_result(output, scene.bounds())?;
+    Ok(selection)
+}
+
+/// What the hint overlay of a scrolling capture said.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HintEvent {
+    /// Enter: keep what has been stitched.
+    Done,
+    /// Esc (or the cancel button): throw it away.
+    Cancelled,
+    /// The helper went away without saying anything.
+    Closed,
+}
+
+/// The overlay a scrolling capture keeps on screen while it works: it shows
+/// how far the stitch has come and turns Esc/Enter into an answer.
+///
+/// It is deliberately not a full-screen session — the desktop stays live and
+/// the CLI keeps grabbing real frames — and it has to stay outside the region
+/// being captured, or the overlay itself would end up in the stitched image.
+pub(crate) struct HintSession {
+    child: Child,
+    stdin: ChildStdin,
+    events: std::sync::mpsc::Receiver<HintEvent>,
+    _directory: TempDir,
+}
+
+impl HintSession {
+    /// Pushes a progress update.  Failures are reported: a hint overlay that
+    /// silently stopped updating means the user lost their way to stop the
+    /// capture.
+    pub(crate) fn status(&mut self, height: u32, frames: u32, note: &str) -> Result<()> {
+        let status = QtHintStatus {
+            height,
+            frames,
+            note,
+        };
+        let encoded = serde_json::to_string(&status).map_err(|error| {
+            VshotError::Selection(format!("failed to encode the hint status: {error}"))
+        })?;
+        match writeln!(self.stdin, "{encoded}").and_then(|()| self.stdin.flush()) {
+            Ok(()) => Ok(()),
+            // The overlay may already be gone — the user just pressed Esc or
+            // Enter — and every write after that fails with a broken pipe.
+            // The answer itself is already on its way through the reader, so
+            // this is an ending, not a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(error) => Err(VshotError::Selection(format!(
+                "failed to update the hint overlay: {error}"
+            ))),
+        }
+    }
+
+    /// Non-blocking: `None` means the user has not answered yet.
+    pub(crate) fn poll(&self) -> Option<HintEvent> {
+        self.events.try_recv().ok()
+    }
+
+    /// Waits for the overlay to leave the screen, so the caller can finish
+    /// with the desktop without a stray surface in the way.
+    pub(crate) fn close(self) -> Result<()> {
+        // Closing the status pipe is the helper's cue that nothing else is
+        // coming, so it can leave the screen before this returns.
+        let HintSession { child, stdin, .. } = self;
+        drop(stdin);
+        let output = child.wait_with_output().map_err(|error| {
+            VshotError::Selection(format!(
+                "failed to collect the hint overlay's output: {error}"
+            ))
+        })?;
+        if !output.status.success() {
+            return Err(helper_exit_error(output.status, &output.stderr));
+        }
+        Ok(())
+    }
+}
+
+/// One progress update, as the helper reads it.
+#[derive(Debug, Serialize)]
+struct QtHintStatus<'a> {
+    height: u32,
+    frames: u32,
+    /// Short note for the overlay: empty while scrolling, `done` at the end.
+    note: &'a str,
+}
+
+/// The helper's answer to a hint session: one of the two flags, then it exits.
+#[derive(Debug, Deserialize)]
+struct QtHintReply {
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    cancelled: bool,
+}
+
+/// Non-image session description for the hint overlay: the region being
+/// captured (which the overlay must stay clear of) and where the outputs are
+/// (so it can pick a corner to live in).
+#[derive(Debug, Serialize)]
+struct QtHintSession<'a> {
+    version: u32,
+    mode: &'a str,
+    bounds: WireRect,
+    outputs: Vec<QtHintOutput<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct QtHintOutput<'a> {
+    id: u32,
+    name: &'a str,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    surface: WireRect,
+    scale: u32,
+}
+
+/// Starts the hint overlay of a scrolling capture.
+pub(crate) fn start_hint_session(region: Rect, outputs: &[OutputInfo]) -> Result<HintSession> {
+    let directory = tempfile::Builder::new()
+        .prefix("vshot-long-")
+        .tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .map_err(|error| {
+            VshotError::Selection(format!(
+                "failed to create the scroll session directory: {error}"
+            ))
+        })?;
+    let session = QtHintSession {
+        version: 1,
+        mode: "long-shot",
+        bounds: region.into(),
+        outputs: outputs
+            .iter()
+            .map(|output| QtHintOutput {
+                id: output.global_id,
+                name: &output.name,
+                x: output.geometry.left(),
+                y: output.geometry.top(),
+                width: output.geometry.size.width,
+                height: output.geometry.size.height,
+                surface: output.geometry.into(),
+                scale: output.scale,
+            })
+            .collect(),
+    };
+    let session_path = directory.path().join("session.json");
+    let encoded = serde_json::to_vec(&session).map_err(|error| {
+        VshotError::Selection(format!("failed to encode the hint session JSON: {error}"))
+    })?;
+    write_private_file(&session_path, &encoded)?;
+
+    let helper = helper_program()?;
+    let mut child = Command::new(&helper.path)
+        .arg("--session")
+        .arg(&session_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| helper_spawn_error(&helper, error))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| VshotError::Selection("the hint overlay has no status pipe".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| VshotError::Selection("the hint overlay has no answer pipe".into()))?;
+
+    // The answer arrives whenever the user presses a key, which is not
+    // something the scrolling loop can wait on: a thread watches the helper's
+    // stdout and the loop polls the channel.
+    let (sender, events) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let Ok(reply) = serde_json::from_str::<QtHintReply>(line.trim()) else {
+                continue;
+            };
+            if reply.done {
+                let _ = sender.send(HintEvent::Done);
+                return;
+            }
+            if reply.cancelled {
+                let _ = sender.send(HintEvent::Cancelled);
+                return;
+            }
+        }
+        let _ = sender.send(HintEvent::Closed);
+    });
+
+    Ok(HintSession {
+        child,
+        stdin,
+        events,
+        _directory: directory,
+    })
 }
 
 /// Pin-edit descriptor: the daemon pins one image; the helper edits it in
@@ -287,6 +667,8 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         window: Some(spec.window.into()),
         socket: Some(spec.socket.to_string_lossy().into_owned()),
         id: Some(spec.pin_id),
+        candidates: None,
+        selection: None,
         outputs: vec![QtOutput {
             id: 0,
             name: spec.output_name,
@@ -393,7 +775,12 @@ pub(crate) fn parse_edit_result(
     }
 }
 
-fn write_session(scene: &SceneSnapshot) -> Result<(TempDir, PathBuf)> {
+fn write_session(
+    scene: &SceneSnapshot,
+    mode: &str,
+    candidates: &[WindowCandidate],
+    selection: Option<WireRect>,
+) -> Result<(TempDir, PathBuf)> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-qt-")
         .tempdir_in("/dev/shm")
@@ -427,11 +814,14 @@ fn write_session(scene: &SceneSnapshot) -> Result<(TempDir, PathBuf)> {
 
     let session = QtSession {
         version: 1,
-        mode: "region",
+        mode,
         bounds: scene.bounds().into(),
         window: None,
         socket: None,
         id: None,
+        candidates: (!candidates.is_empty())
+            .then(|| candidates.iter().map(QtCandidate::from).collect()),
+        selection,
         outputs,
     };
     let session_path = directory.path().join("session.json");
@@ -511,6 +901,34 @@ fn parse_result(bytes: Vec<u8>, bounds: Rect) -> Result<(Rect, Vec<Annotation>)>
     }
 }
 
+/// A picking session's answer: the window it took and where the click landed.
+/// Annotations never come back from one — picking only chooses.
+fn parse_picked_window(bytes: Vec<u8>, bounds: Rect) -> Result<PickedWindow> {
+    let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
+        VshotError::Selection(format!("Qt helper returned invalid result JSON: {error}"))
+    })?;
+    match result.status.as_str() {
+        "cancelled" => Err(VshotError::SelectionCancelled),
+        "ok" => {
+            let rect = result
+                .selection
+                .ok_or_else(|| VshotError::Selection("Qt result has no selection".into()))?
+                .into_rect("Qt selection")?;
+            let rect = rect.intersection(bounds).ok_or_else(|| {
+                VshotError::Selection("Qt selection does not intersect the captured desktop".into())
+            })?;
+            let point = result
+                .point
+                .map(|point| parse_point(point, "picked point"))
+                .transpose()?;
+            Ok(PickedWindow { rect, point })
+        }
+        status => Err(VshotError::Selection(format!(
+            "Qt helper returned unknown status `{status}`"
+        ))),
+    }
+}
+
 fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
     let tool_name = annotation.tool.as_deref().unwrap_or_default();
     match annotation.kind.as_str() {
@@ -536,7 +954,7 @@ fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
                 .points
                 .ok_or_else(|| VshotError::Selection("stroke annotation has no points".into()))?
                 .into_iter()
-                .map(parse_point)
+                .map(|point| parse_point(point, "annotation point"))
                 .collect::<Result<Vec<_>>>()?;
             if points.is_empty() {
                 return Err(VshotError::Selection(
@@ -578,7 +996,7 @@ fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
                 }
             };
             Ok(Annotation::Text {
-                origin: parse_point(origin)?,
+                origin: parse_point(origin, "annotation origin")?,
                 text,
                 scale,
                 color: parse_color(annotation.color.as_deref(), DEFAULT_TEXT_COLOR)?,
@@ -699,12 +1117,12 @@ fn parse_mask(value: Option<&str>) -> Result<ShapeMask> {
     })
 }
 
-fn parse_point(point: WirePoint) -> Result<Point> {
+fn parse_point(point: WirePoint, label: &str) -> Result<Point> {
     Ok(Point::new(
         i32::try_from(point.x)
-            .map_err(|_| VshotError::Selection("annotation x is out of range".into()))?,
+            .map_err(|_| VshotError::Selection(format!("{label} x is out of range")))?,
         i32::try_from(point.y)
-            .map_err(|_| VshotError::Selection("annotation y is out of range".into()))?,
+            .map_err(|_| VshotError::Selection(format!("{label} y is out of range")))?,
     ))
 }
 

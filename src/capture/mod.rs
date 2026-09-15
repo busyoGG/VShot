@@ -4,11 +4,12 @@ pub mod window;
 pub mod window_pixel;
 pub mod wlr;
 
-pub use window::{CompositorWindowProvider, ProcessWindowProvider};
-pub use window_pixel::detect_active_window;
+pub use window::{CompositorWindowProvider, ProcessWindowProvider, WindowCandidate};
+pub use window_pixel::{detect_active_window, detect_window_candidates};
 pub use wlr::WlrCapture;
 
 use crate::error::{Result, VshotError};
+use crate::geometry::Rect;
 use crate::model::Frame;
 
 /// The compositor families vshot can capture from.
@@ -53,6 +54,47 @@ impl Capturer {
             Self::Kwin(capture) => capture.capture_output(name, cursor),
         }
     }
+
+    /// Captures one rectangle of an output, given in output-local logical
+    /// coordinates.
+    ///
+    /// wlroots copies just that rectangle, which is what makes a scrolled
+    /// capture cheap enough to follow a page that is still moving.  KWin's
+    /// ScreenShot2 does have an area method, but it is private API with no
+    /// version to negotiate and its argument order could not be checked against
+    /// a running KWin from here, so that backend copies the whole screen and
+    /// cuts the rectangle out of it — the same pixels, only slower.  `scale` is
+    /// what that cutting needs.
+    pub fn capture_region(
+        &mut self,
+        name: &str,
+        region: Rect,
+        scale: u32,
+        cursor: bool,
+    ) -> Result<Frame> {
+        match self {
+            Self::Wlr(capture) => capture.capture_region(name, region, cursor),
+            Self::Kwin(capture) => {
+                let full = capture.capture_output(name, cursor)?;
+                full.crop(scaled_region(region, scale))
+            }
+        }
+    }
+}
+
+/// A logical rectangle inside an output, as the rectangle of that output's
+/// pixels the full-screen backends have to cut out: a logical pixel covers
+/// `scale` device pixels.  A scale of zero counts as one, so a nonsensical
+/// output description cannot collapse the rectangle to nothing.
+fn scaled_region(region: Rect, scale: u32) -> Rect {
+    let scale = scale.max(1);
+    let origin_scale = i32::try_from(scale).unwrap_or(i32::MAX);
+    Rect::new(
+        region.origin.x.saturating_mul(origin_scale),
+        region.origin.y.saturating_mul(origin_scale),
+        region.size.width.saturating_mul(scale),
+        region.size.height.saturating_mul(scale),
+    )
 }
 
 /// Does this failure mean "this compositor does not speak wlr-screencopy"?  It
@@ -96,6 +138,16 @@ mod tests {
                 "{unrelated} must not select the KWin fallback"
             );
         }
+    }
+
+    #[test]
+    fn the_fallback_region_is_cut_in_output_pixels() {
+        // A logical rectangle relative to its output's corner, on a 2x output.
+        let region = Rect::new(10, 20, 100, 50);
+        assert_eq!(scaled_region(region, 2), Rect::new(20, 40, 200, 100));
+        // A scale of zero is not a scale: treating it as one keeps the
+        // rectangle instead of collapsing it to nothing.
+        assert_eq!(scaled_region(region, 0), region);
     }
 
     #[test]

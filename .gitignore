@@ -2,3 +2,6 @@
 /rust_out
 /build-qt/
 /.zcode/
+/dist/
+/pkg/
+/*.pkg.tar.*

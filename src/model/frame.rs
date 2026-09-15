@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 
-use std::io::Cursor;
-
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use image::{DynamicImage, ImageFormat};
 
 use crate::edit::{ArrowStyle, LineDash, TextBitmap};
 use crate::error::{Result, VshotError};
@@ -59,35 +57,35 @@ impl Frame {
         Self::new(Size::new(width, height), rgba.into_raw())
     }
 
+    /// Encodes the frame as a PNG at the default compression level.
     pub fn to_png(&self) -> Result<Vec<u8>> {
-        let image = RgbaImage::from_raw(self.size.width, self.size.height, self.pixels.clone())
-            .ok_or_else(|| VshotError::PngEncode("invalid RGBA frame dimensions".into()))?;
-        let mut bytes = Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(image)
-            .write_to(&mut bytes, ImageFormat::Png)
-            .map_err(|error| VshotError::PngEncode(error.to_string()))?;
-        Ok(bytes.into_inner())
+        self.encode_png(None, PngCompression::default())
     }
 
-    /// Like [`to_png`](Self::to_png), but also declares `density` — the frame's
-    /// device pixels per logical pixel, i.e. the scale of the output it was
-    /// captured on — as the PNG's physical resolution. The image then says
-    /// which output it came from on its own, so pinning the file elsewhere
-    /// needs no side record; a 2x capture declares 192 DPI.
-    pub fn to_png_with_density(&self, density: u32) -> Result<Vec<u8>> {
+    /// Encodes the frame as a PNG. `density` — the frame's device pixels per
+    /// logical pixel, i.e. the scale of the output it was captured on — is
+    /// declared as the PNG's physical resolution when given. The image then
+    /// says which output it came from on its own, so pinning the file
+    /// elsewhere needs no side record; a 2x capture declares 192 DPI.
+    /// `compression` picks how hard the encoder works: the levels are all
+    /// lossless and differ only in the time they cost and the size they buy.
+    pub fn encode_png(&self, density: Option<u32>, compression: PngCompression) -> Result<Vec<u8>> {
         let width = self.size.width;
         let height = self.size.height;
-        let pixels_per_meter = density_to_pixels_per_meter(density);
         let mut bytes = Vec::new();
         {
             let mut encoder = png::Encoder::new(&mut bytes, width, height);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
-            encoder.set_pixel_dims(Some(png::PixelDimensions {
-                xppu: pixels_per_meter,
-                yppu: pixels_per_meter,
-                unit: png::Unit::Meter,
-            }));
+            encoder.set_compression(compression.into());
+            if let Some(density) = density {
+                let pixels_per_meter = density_to_pixels_per_meter(density);
+                encoder.set_pixel_dims(Some(png::PixelDimensions {
+                    xppu: pixels_per_meter,
+                    yppu: pixels_per_meter,
+                    unit: png::Unit::Meter,
+                }));
+            }
             let mut writer = encoder
                 .write_header()
                 .map_err(|error| VshotError::PngEncode(error.to_string()))?;
@@ -1057,6 +1055,58 @@ impl Frame {
     }
 }
 
+/// How hard the PNG encoder works to shrink the file. Every level is
+/// lossless: they trade encoding time for size only.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PngCompression {
+    /// No DEFLATE and no row filtering. The largest files, written about as
+    /// fast as the pixels can be copied.
+    None,
+    /// fdeflate with a single fixed row filter: almost as fast as `None` and
+    /// a little smaller.
+    Fastest,
+    /// fdeflate with adaptive row filtering. Nearly as fast as `Fastest` and
+    /// noticeably smaller, which is why it is the default — a 4K frame is
+    /// still written in tens of milliseconds.
+    #[default]
+    Fast,
+    /// DEFLATE level 6 with adaptive filtering, the level most PNG writers
+    /// default to: roughly a quarter smaller than `Fast` and an order of
+    /// magnitude slower.
+    Balanced,
+    /// DEFLATE level 9: the smallest files, at several times `Balanced`'s cost
+    /// and for almost no additional gain.
+    High,
+}
+
+impl PngCompression {
+    /// Parses the `--png-compression` value.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "fastest" => Ok(Self::Fastest),
+            "fast" => Ok(Self::Fast),
+            "balanced" => Ok(Self::Balanced),
+            "high" => Ok(Self::High),
+            other => Err(VshotError::InvalidDestination(format!(
+                "`--png-compression {other}` is not one of none, fastest, fast, balanced, high"
+            ))),
+        }
+    }
+}
+
+impl From<PngCompression> for png::Compression {
+    fn from(value: PngCompression) -> Self {
+        match value {
+            PngCompression::None => Self::NoCompression,
+            PngCompression::Fastest => Self::Fastest,
+            PngCompression::Fast => Self::Fast,
+            PngCompression::Balanced => Self::Balanced,
+            PngCompression::High => Self::High,
+        }
+    }
+}
+
 /// A device density as PNG physical resolution: 96 DPI per density step, which
 /// is the convention Qt reports back as dots per metre, so a 2x capture reads
 /// as 192 DPI on the other side. Clamped to the densities the renderer knows.
@@ -1287,7 +1337,9 @@ mod tests {
     #[test]
     fn png_with_density_declares_its_physical_resolution() {
         let frame = Frame::solid(Size::new(2, 1), [10, 20, 30, 255]).unwrap();
-        let encoded = frame.to_png_with_density(2).unwrap();
+        let encoded = frame
+            .encode_png(Some(2), PngCompression::default())
+            .unwrap();
         // A declared density doubles as the DPI the pin side reads back, and
         // the file still has to be an ordinary PNG.
         assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
@@ -1307,7 +1359,9 @@ mod tests {
 
         // 96 DPI (a density of 1) is deliberately not what an undeclared PNG
         // gets: Qt reports that default itself, and the pin side filters it out.
-        let single = frame.to_png_with_density(1).unwrap();
+        let single = frame
+            .encode_png(Some(1), PngCompression::default())
+            .unwrap();
         let phys = single
             .windows(4)
             .position(|chunk| chunk == &b"pHYs"[..])
@@ -1316,6 +1370,52 @@ mod tests {
             u32::from_be_bytes(single[phys + 4..phys + 8].try_into().unwrap()),
             3780
         );
+    }
+
+    #[test]
+    fn png_compression_levels_trade_size_for_time() {
+        // A gradient with a little noise on top: compressible, but not so
+        // regular that every level lands on the same size.
+        let mut pixels = Vec::with_capacity(64 * 64 * 4);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                pixels.extend_from_slice(&[
+                    (x * 4) as u8,
+                    (y * 4) as u8,
+                    (x * y % 256) as u8,
+                    255u8.wrapping_sub(((x * 7 + y * 13) % 5) as u8),
+                ]);
+            }
+        }
+        let frame = Frame::new(Size::new(64, 64), pixels).unwrap();
+
+        let sizes: Vec<usize> = [
+            PngCompression::None,
+            PngCompression::Fastest,
+            PngCompression::Fast,
+            PngCompression::Balanced,
+        ]
+        .into_iter()
+        .map(|compression| {
+            let encoded = frame.encode_png(None, compression).unwrap();
+            // Every level still has to be an ordinary PNG of the same pixels.
+            assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
+            encoded.len()
+        })
+        .collect();
+
+        // Uncompressed is the biggest, DEFLATE level 6 the smallest.
+        assert!(sizes[0] > sizes[1], "{sizes:?}");
+        assert!(sizes[2] > sizes[3], "{sizes:?}");
+    }
+
+    #[test]
+    fn png_compression_parses_its_levels() {
+        assert_eq!(PngCompression::default(), PngCompression::Fast);
+        assert_eq!(PngCompression::parse("fast").unwrap(), PngCompression::Fast);
+        assert_eq!(PngCompression::parse("high").unwrap(), PngCompression::High);
+        let error = PngCompression::parse("slowest").unwrap_err();
+        assert!(error.to_string().contains("is not one of"), "{error}");
     }
 
     #[test]

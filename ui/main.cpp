@@ -1,4 +1,5 @@
 #include "capture_overlay.hpp"
+#include "hint_window.hpp"
 #include "i18n.hpp"
 #include "pin_edit.hpp"
 #include "pin_server.hpp"
@@ -102,6 +103,30 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // A scrolling capture's overlay is not a capture surface: it draws no
+    // frozen frame, leaves the desktop live, and only reports progress and
+    // takes the two keys that end the capture.  That is its own small window
+    // rather than the full-screen region editor.
+    if (session.mode == QStringLiteral("long-shot")) {
+        vshot::HintWindow hint(session);
+        hint.setTerminalCallback([&app] { app.quit(); });
+        if (!hint.showLayerSurface()) {
+            reportError(QStringLiteral("could not initialize the LayerShellQt hint overlay"));
+            return 1;
+        }
+        app.exec();
+        const bool cancelled = hint.isCancelled();
+        QJsonObject reply;
+        reply.insert(QStringLiteral("done"), !cancelled);
+        reply.insert(QStringLiteral("cancelled"), cancelled);
+        const QByteArray encodedReply = QJsonDocument(reply).toJson(QJsonDocument::Compact);
+        std::fwrite(encodedReply.constData(), 1, static_cast<std::size_t>(encodedReply.size()),
+                    stdout);
+        std::fputc('\n', stdout);
+        std::fflush(stdout);
+        return 0;
+    }
+
     QJsonDocument result;
     int exitCode = 0;
     QVector<vshot::CaptureOverlay *> overlays;
@@ -139,6 +164,13 @@ int main(int argc, char **argv)
             }
         }
         if (exitCode == 0) {
+            // A region session may arrive with its selection already made (the
+            // window picker resolved one): open with the toolbar up instead of
+            // waiting for a drag that will never come.  A picking session, in
+            // turn, keeps asking the CLI for the windows it should highlight,
+            // because the desktop it runs on is live.
+            controller.beginPresetEdit();
+            controller.enableCandidateRefresh();
             app.exec();
             if (!controller.isFinished()) {
                 controller.cancel();

@@ -1,10 +1,12 @@
 #pragma once
 
 #include <QImage>
+#include <QJsonObject>
 #include <QString>
 #include <QVector>
 
 #include <cstdint>
+#include <optional>
 
 namespace vshot {
 
@@ -35,10 +37,24 @@ struct OutputSession {
     QImage image;
 };
 
+// One window the pointer may snap to in `window-pick` mode. The label is what
+// the helper shows in the size pill; it is empty when the source (the pixel
+// fallback, or a compositor that reports no titles) has none.
+struct WindowCandidate {
+    LogicalRect rect;
+    QString label;
+};
+
 struct Session {
     QString mode;
     LogicalRect bounds;
     QVector<OutputSession> outputs;
+    // `window-pick` only: the pickable windows.
+    QVector<WindowCandidate> candidates;
+    // `region` only: a selection that is already made, so the session opens in
+    // editing state instead of waiting for a drag. Window picking resolves a
+    // window, then hands the frame it captured to an editing session this way.
+    std::optional<LogicalRect> selection;
     // Pin-edit only: id of the pinned image inside the daemon and the daemon
     // socket to reach it. The editor moves the real pin window through this
     // socket instead of drawing a second copy of the image.
@@ -47,5 +63,11 @@ struct Session {
 };
 
 bool loadSession(const QString &sessionPath, Session *session, QString *error);
+
+// Parses one `{x,y,width,height[,label]}` candidate object. Shared by the
+// session reader and the picker's live candidate refresh, which receives the
+// same shape from the CLI while it is open.
+bool parseWindowCandidate(const QJsonObject &object, const QString &label,
+                          WindowCandidate *candidate, QString *error);
 
 } // namespace vshot

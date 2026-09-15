@@ -3,24 +3,35 @@ mod cli;
 mod edit;
 mod error;
 mod geometry;
+mod inject;
+mod longshot;
 mod model;
 mod output;
 mod pin;
 mod qt_overlay;
 mod selection;
+mod stitch;
 mod wayland;
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 
-use capture::{Capturer, CompositorWindowProvider, ProcessWindowProvider};
+use capture::{Capturer, CompositorWindowProvider, ProcessWindowProvider, WindowCandidate};
 use cli::{Action, CaptureTarget, Cli};
 use edit::{pipeline_for_annotations, EditPipeline};
 use error::{Result, VshotError};
 use model::{ImageDocument, OutputSnapshot, SceneSnapshot};
 use wayland::topology::OutputInfo;
 use wayland::WaylandSession;
+
+/// How long `window pick` waits for the picker's layer surfaces to leave the
+/// screen before capturing the frame the user is looking at.  The helper hides
+/// its surfaces before it exits, so this only covers the compositor processing
+/// that unmap — measured at well under a frame, with an order of magnitude of
+/// slack for a busy session.  It is invisible: the editing overlay follows.
+const PICK_SETTLE: Duration = Duration::from_millis(200);
 
 fn main() -> ExitCode {
     match run() {
@@ -72,7 +83,12 @@ fn run() -> Result<()> {
 
     let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
 
-    if !matches!(request.target, CaptureTarget::RegionInteractive) {
+    if !matches!(
+        request.target,
+        CaptureTarget::RegionInteractive
+            | CaptureTarget::WindowPick { .. }
+            | CaptureTarget::LongShot { .. }
+    ) {
         wayland.set_scene(scene.clone());
     }
 
@@ -144,10 +160,122 @@ fn run() -> Result<()> {
             // the scene's scale — same as a region capture.
             (scene.crop(geometry)?, scene.scale())
         }
+        CaptureTarget::WindowPick { pixel_detect } => {
+            // Compose the candidate set first: the compositor's window list
+            // when it has one, the frozen frame's own signals otherwise.  The
+            // picking overlay needs no pointer position up front — it takes
+            // the candidates and asks the user.
+            let mut metadata_error = None;
+            let mut candidates = Vec::new();
+            if !pixel_detect {
+                match ProcessWindowProvider.windows() {
+                    Ok(windows) => candidates = windows,
+                    Err(error) => metadata_error = Some(error),
+                }
+            }
+            if candidates.is_empty() {
+                candidates = capture::detect_window_candidates(&scene)
+                    .into_iter()
+                    .map(|geometry| WindowCandidate {
+                        geometry,
+                        label: String::new(),
+                    })
+                    .collect();
+            }
+            if candidates.is_empty() {
+                return Err(match metadata_error {
+                    Some(metadata_error) => VshotError::WindowPickUnavailable(format!(
+                        "{metadata_error}; the pixel fallback found no window either"
+                    )),
+                    None => VshotError::WindowPickUnavailable(
+                        "the pixel fallback found no window in the frozen frame \
+                         (seamless borderless tiling and uniform desktops carry no \
+                         pixel signal)"
+                            .into(),
+                    ),
+                });
+            }
+            let picked = qt_overlay::pick_window(&scene, &candidates, || {
+                // The picker re-lists the windows as the pointer travels:
+                // picking runs on a live desktop, and a workspace switch or a
+                // moved window would otherwise leave the highlight pointing at
+                // where a window used to be.  The pixel fallback has no window
+                // list to re-read, so it keeps what it started with.
+                if *pixel_detect {
+                    return None;
+                }
+                ProcessWindowProvider.windows().ok()
+            })?;
+            // Picking runs on the live desktop and only decides *what* to
+            // capture, so the pixels have to come from now: wait for the
+            // compositor to drop the picker's surfaces (they are hidden, but
+            // the request travels), capture again, and resolve the click
+            // against the windows that exist at this point in time.
+            std::thread::sleep(PICK_SETTLE);
+            let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
+            let geometry = picked
+                .point
+                .and_then(|point| ProcessWindowProvider.window_at(point))
+                .unwrap_or(picked.rect);
+            let (geometry, annotations) = qt_overlay::edit_selection(&scene, geometry)?;
+            let geometry = selection::validate_selection(&scene, geometry)?;
+            let frame = scene.crop(geometry)?;
+            edits = pipeline_for_annotations(annotations, geometry, scene.scale())?;
+            (frame, scene.scale())
+        }
+        CaptureTarget::LongShot {
+            region,
+            options,
+            inject,
+        } => {
+            // The region to scroll: the one asked for, or one picked off the
+            // frozen desktop.  Either way it has to sit inside a single output
+            // — a scroll container never spans two monitors.
+            let region = match region {
+                Some(region) => *region,
+                None => qt_overlay::select_region(&scene)?,
+            };
+            let region = selection::validate_selection(&scene, region)?;
+            let desktop = longshot::desktop_bounds(&output_infos)?;
+            let mut injector = inject::Injector::open(desktop, *inject)?;
+            let result =
+                longshot::run(&mut capture, &output_infos, region, &mut injector, options)?;
+            eprintln!(
+                "vshot: stitched {} frames into {}x{} pixels ({}, wheel through {})",
+                result.frames,
+                result.frame.size().width,
+                result.frame.size().height,
+                longshot::stop_reason(result.stop),
+                injector.backend_name()
+            );
+            if result.appended == 0 {
+                // Not one scroll moved anything: the picture is a single frame.
+                // Say so, and say where the wheel was aimed, because the two
+                // causes look identical otherwise — a region that cannot
+                // scroll (a panel, a bar, a window with nothing to scroll) and
+                // a window that ignores synthetic wheel events.
+                eprintln!(
+                    "vshot: nothing scrolled, so the result is a single frame of {}x{}: the \
+wheel was sent to the region centre ({}, {}) on {} — a region that has nothing to scroll \
+and a window that ignores synthetic wheel events look the same from here",
+                    result.frame.size().width,
+                    result.frame.size().height,
+                    region.origin.x + (region.size.width / 2) as i32,
+                    region.origin.y + (region.size.height / 2) as i32,
+                    result.output,
+                );
+            }
+            (result.frame, result.density)
+        }
     };
 
     let document = edits.apply(ImageDocument::new(frame))?;
-    let result = output::write_frame(document.frame(), &request.destination, density);
+    let result = output::write_frame(
+        document.frame(),
+        &request.destination,
+        density,
+        request.compression,
+    );
     let cleanup = wayland.destroy_overlays();
     result.and(cleanup)
 }

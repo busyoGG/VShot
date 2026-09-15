@@ -16,6 +16,8 @@ add_executable(vshot-qt-ui
     ui/capture_overlay.hpp
     ui/i18n.cpp
     ui/i18n.hpp
+    ui/hint_window.cpp
+    ui/hint_window.hpp
     ui/pin_edit.cpp
     ui/pin_edit.hpp
     ui/pin_window.cpp

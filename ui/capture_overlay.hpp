@@ -3,6 +3,7 @@
 #include "session_protocol.hpp"
 
 #include <QColor>
+#include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QPointF>
 #include <QRect>
@@ -20,6 +21,8 @@ class QSpinBox;
 class QLabel;
 class QWindow;
 class QLocalSocket;
+class QSocketNotifier;
+class QTimer;
 
 namespace vshot {
 
@@ -150,6 +153,20 @@ public:
     void setPinTarget(std::uint64_t pinId, const QString &socketPath);
     // Enters editing state over the fixed canvas (shows the toolbar).
     void beginPinEdit();
+    // Region sessions that arrive with a selection (window picking resolved
+    // one) start in editing state with the toolbar up.  Call after the overlay
+    // is shown; sessions without a selection are left alone.
+    void beginPresetEdit();
+    // Window-pick only: let the picker ask the CLI for a fresh candidate list
+    // over the session pipes.  Picking runs on a live desktop, so the list it
+    // started with goes stale as soon as the user switches workspace or a
+    // window moves; the pointer asks again as it travels.  Call after the
+    // overlay is shown, before the event loop runs.
+    void enableCandidateRefresh();
+    // Asks for that fresh list, at most every `kCandidateRefreshIntervalMs` and
+    // never with a request already in flight.  A no-op unless the refresh was
+    // enabled; the CLI may answer with nothing, which keeps the current list.
+    void requestCandidateRefresh();
     bool hasValidSelection() const;
     const std::optional<LogicalRect> &selection() const;
     const QVector<Annotation> &annotations() const;
@@ -168,6 +185,20 @@ private:
     InlineTextEdit *textEdit_ = nullptr;
     std::optional<LogicalRect> selection_;
     QVector<Annotation> annotations_;
+    // Window picking: the session's candidate windows are what the pointer may
+    // snap to, so the first click replaces the free-hand drag that region
+    // capture starts with.
+    bool pickMode_ = false;
+    QVector<WindowCandidate> candidates_;
+    int hoveredCandidate_ = -1;
+    // Live candidate refresh: the picker's stdin carries fresh lists from the
+    // CLI, and one request may be in flight at a time.
+    QSocketNotifier *candidateReader_ = nullptr;
+    QTimer *candidateTimer_ = nullptr;
+    QByteArray candidateReplies_;
+    QElapsedTimer candidateClock_;
+    bool candidateRefreshEnabled_ = false;
+    bool candidateRefreshPending_ = false;
     QVector<QVector<Annotation>> undoStack_;
     QVector<QVector<Annotation>> redoStack_;
     std::optional<Annotation> cancelledText_;
@@ -210,6 +241,10 @@ private:
     Gesture *gesture_ = nullptr;
     bool editing_ = false;
     bool pinEdit_ = false;
+    /// `region-only`: a finished drag ends the session with the rectangle
+    /// instead of opening the editor.  Scrolling capture asks for this, since
+    /// the pixels it will annotate do not exist until the stitch is done.
+    bool selectOnly_ = false;
     bool finished_ = false;
     bool cancelled_ = false;
     std::function<void()> terminalCallback_;
@@ -227,6 +262,9 @@ private:
 
     Point globalPoint(CaptureOverlay *overlay, const QPointF &local) const;
     Point unclampedGlobalPoint(CaptureOverlay *overlay, const QPointF &local) const;
+    // Index of the output whose geometry holds the middle of `rect`, for
+    // placing the toolbar next to a selection nobody dragged.
+    int outputContaining(const LogicalRect &rect) const;
     const LogicalRect &annotationLimits() const;
     LogicalRect selectionLimits() const;
     void translateAnnotations(std::int32_t dx, std::int32_t dy);
@@ -237,6 +275,13 @@ private:
     void consumePinReply(QLocalSocket *socket);
     void applyPinRect(const LogicalRect &rect);
     Point clampPoint(Point point) const;
+    int candidateIndexAt(Point point) const;
+    QString candidatePillText() const;
+    bool applyCandidateHover(Point point, CaptureOverlay *overlay);
+    // Replaces the candidate list with a fresh one and points the hover at
+    // whatever the (unmoved) pointer is over now.
+    void applyCandidates(QVector<WindowCandidate> candidates);
+    void readCandidateReplies();
     LogicalRect selectionBetween(Point first, Point second) const;
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;
     LogicalRect resizeSelection(LogicalRect origin, int handle, Point current) const;

@@ -2,6 +2,19 @@
 
 `vshot` 是 Rust 写的 Wayland 截图 CLI，支持 wlroots 系与 KWin/Plasma 两类合成器。非交互截图采用严格冻结流程：先捕获所有输出——wlroots 系走 Rust 原生 `wlr-screencopy-unstable-v1`，KWin/Plasma 走它私有的 `org.kde.KWin.ScreenShot2` D-Bus 服务——再用 Rust 原生 `wlr-layer-shell-unstable-v1` + `wl_shm` 将这些静态帧显示为全屏父 layer overlay。交互式 `region` 由 Qt helper 负责 overlay 和编辑，始终只处理已经捕获的静态帧。
 
+## 安装（Arch Linux）
+
+仓库根目录的 `PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次 `pacman -U` 同时提供 `/usr/bin/vshot` 与 `/usr/bin/vshot-qt-ui`：
+
+```sh
+./scripts/build-arch-package.sh
+sudo pacman -U dist/vshot-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+脚本把当前工作树（含未提交改动）快照到临时目录后调用 `makepkg`，产物写到 `dist/`；也可以直接 `makepkg -si`。运行时依赖 `glibc`、`wayland`（vshot 通过 dlopen 使用 `libwayland-client`）、`qt6-base`、`layer-shell-qt`；文件输出、`--clipboard` 和 `vshot pin --clipboard` 都需要可选依赖 `wl-clipboard`。
+
+其它发行版请按下面的源码方式自行构建。
+
 ## 构建
 
 Rust 后端：
@@ -36,7 +49,7 @@ Qt 交互界面支持中/英双语：默认跟随系统语言（`QLocale::system
 - `vshot-qt-ui` 需要 Qt6 Core/Gui/Widgets/Network 和 LayerShellQt；
 - 可选 `wp_cursor_shape_manager_v1`（仅保留的 Rust editor path 使用）；
 - 使用交互式 `region` 时需要可执行的 `vshot-qt-ui`，也可通过 `VSHOT_QT_HELPER` 指定；
-- 仅在使用 `--clipboard` 时需要 `wl-copy`。
+- 文件输出、`--clipboard` 和 `vshot pin --clipboard` 需要可执行的 `wl-copy`。
 
 当前实现严格要求 seat 同时具有 pointer 和 keyboard capability。缺少上述任一能力时会以非零状态和明确错误退出，不会假称截图已经冻结。
 
@@ -62,11 +75,21 @@ vshot all --output desktop.png
 # 捕获 active window
 vshot window active --output window.png
 
+# 在实时桌面上挑选一个窗口：悬停高亮；点击后重新抓帧并进入编辑，其余与区域截图一致
+vshot window pick --output window.png
+vshot window pick --clipboard
+vshot window pick --pixel        # 跳过 compositor 窗口列表，用像素识别找候选
+
 # stdout 输出纯 PNG bytes；日志只写 stderr
 vshot all --output - > desktop.png
 
 # 截图直接 pin 到屏幕（不落盘）
 vshot region --pin
+
+# 长截图：框选一块会滚动的内容，vshot 自动滚动并拼成一张长图
+vshot long --output long.png
+vshot long --geometry '100,200 900x700' --output long.png   # 固定区域，不做交互选择
+vshot long --ignore-top 48 --clipboard   # 顶部 48 行是滚动中才出现的固定条时，强制忽略
 
 # pin 管理：添加图片、显隐、清空、退出 daemon
 vshot pin shot.png another.png
@@ -81,11 +104,22 @@ vshot pin --quit            # 退出 daemon
 
 `region` 的 `--geometry` 与 `--interactive` 互斥；未给出 geometry 时默认进入交互选择。输出 destination 必须且只能是 `--output PATH`、`--output -`、`--clipboard` 或 `--pin` 之一。`--cursor` 会请求 screencopy compositor 将光标合成到每个输出帧。
 
+`--output PATH` 支持 `strftime` 时间格式，前缀和后缀可以任意组合。截图写入后，vshot 会把生成文件的绝对 `file://` URI 复制到剪贴板；这与 `--clipboard` 的 `image/png` 图像数据剪贴板不同。例如：
+
+```sh
+vshot region --output "$HOME/Pictures/vshot-%Y-%m-%d_%H-%M-%S.png"
+vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
+```
+
+其中 `%Y`、`%m`、`%d`、`%H`、`%M`、`%S` 分别表示年、月、日、时、分、秒，`%%` 表示字面 `%`。文件输出和剪贴板输出都需要 `wl-copy`。
+
+`--png-compression LEVEL` 控制写文件、stdout 和剪贴板的 PNG 压缩等级，取值 `none`、`fastest`、`fast`（默认）、`balanced`、`high`。所有等级都是无损的，区别只在耗时与体积：`fast`/`fastest` 走 fdeflate，4K 帧只要几十毫秒；`balanced`（DEFLATE level 6，多数 PNG 工具的默认档）慢一个数量级，换来约四分之一更小的文件；`none` 完全不压缩，文件最大但几乎不花时间。`--pin` 不落盘，PNG 只经临时文件送到 daemon，因此该参数对 `--pin` 无效。
+
 ## 交互式 overlay
 
 `vshot region`（未给出 `--geometry` 时）冻结桌面后交给 `vshot-qt-ui` 全屏 layer overlay，交互流程参考 HyprCapture：
 
-- 冻结画面铺满每个输出；选区之外覆盖半透明暗色遮罩；
+- 冻结画面铺满每个输出；选区之外覆盖半透明暗色遮罩（该 surface 被冻结帧填满、每像素不透明，所以合成器的 layer blur 规则不会透过它把桌面糊掉）；
 - 拖拽画出矩形选区；选区四周出现 8 个方向手柄，拖动边缘/角落调整大小，拖动选区内部移动位置，方向键微调（Shift 加速为 10 逻辑像素）；
 - 拖拽或调整选区时，光标旁显示放大镜（光标处 8x 像素放大和原生像素坐标），选区左上角显示 `宽 × 高` 尺寸指示；
 - Enter、双击选区或工具栏 OK 确认；Esc 或右键取消整次截图；文本框内的 Esc 只关闭文本框；
@@ -110,9 +144,58 @@ vshot pin --quit            # 退出 daemon
 
 目标 geometry 会从已经捕获的冻结场景中裁剪；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
 
+## 选择窗口
+
+`vshot window pick` 分两步：先在**实时桌面**上挑窗口——**移动指针**高亮指针下的窗口，其余部分**压暗**，左上角的提示条给出窗口标题与将要截取的尺寸；**左键点击**结束挑选阶段（点在没有窗口的位置不选中任何东西，Esc 取消）。然后程序**重新捕获一帧**、把点击位置在**当前的窗口列表**上重新解析成窗口矩形，并以那一帧开一个编辑会话（工具栏、标注、Enter 确认、Esc 取消都与区域截图一致）。所以挑选期间切换工作区、移动窗口都不会让结果停在旧的画面上：裁剪用的是点击那一刻的画面，标注也画在同一帧上。
+
+压暗就是一层半透明黑罩（alpha 80，和编辑阶段选区内外的压暗同一档）。Hyprland 如果给所有 layer namespace 打开了 blur（本机配置就是 `namespace = ".*"` + `blur = true`），这层罩子会让合成器把底下的桌面一起模糊掉——观感上就是"没选中的窗口失焦"（本机实测压暗区的高频能量只剩基线的 0.4%）。overlay 的 layer namespace 是 `vshot-qt-ui`，给它单独关掉 blur 就能得到干净的压暗。
+
+挑窗口阶段本身不画冻结帧（桌面照常更新，压暗靠那层黑罩），而且点击时会把提示描边和罩子先撤下屏幕（合成器是异步销毁这些 surface 的，留着就会被打进紧随其后的那一帧）。点击到编辑会话出现之间有一段重新捕获的等待（200 ms 上限，实测只是一帧量级），这段时间里屏幕回到实时桌面。
+
+挑选期间候选列表**跟着指针刷新**：指针每移动一次（150 ms 内最多一次）helper 就通过 session 的管道向 CLI 要一份新的窗口列表，CLI 现查 compositor 后回答；指针完全不动时也每 300 ms 问一次，免得别处（另一个屏幕切换工作区、窗口被挪走）的变化让高亮停在旧位置上。CLI 没有可复查的来源时（纯像素识别那条路径）会回答「无可奉告」，helper 就继续用它手里那份；回答和手里那份一样时不会重绘。
+
+候选来自 compositor 的窗口列表，依次尝试：
+
+1. Hyprland：把 `hyprctl clients -j` 和 `hyprctl monitors -j` 一起看。Hyprland 会列出**所有**工作区的客户端，而且 `visible` 对隐藏工作区的窗口同样为真、其 `at` 还是上次布局留下的过期值（实测：一个 12 窗口的会话里真正在屏幕上的只有 2 个），所以这里不靠标志位而是按结构筛选——客户端的工作区必须正是它所在显示器当前显示的那个（激活工作区，或已激活的 special workspace；pinned 窗口跨工作区常驻，始终保留），且矩形必须落在该显示器逻辑范围内（过期坐标通常指向另一块屏，正是被这条挡下的）。标题用 `class — title`；
+2. Sway：`swaymsg -t get_tree` 的全部叶子节点（隐藏 workspace 下的除外），标题用 `app_id`（X11 用 `window_properties.class`）加 `name`；
+3. KDE Plasma：同一套 KWin scripting 探针的 `list` 模式，遍历 `workspace.windowList()`/`clientList()`，跳过 `deleted`/`hidden`/`minimized` 与非 `normalWindow` 的项；探针只报几何、不带标题，所以提示条只显示尺寸；
+
+指针命中的候选取**包含指针的最小矩形**——窗口重叠时选中的是靠里/更小的那个。窗口列表筛完之后为空（或查询本身失败）时会自动落到像素识别，不会直接报错。`vshot window pick --pixel` 跳过窗口列表，直接在冻结帧上做像素识别（先拟合焦点描边，再做背景泛洪分割），把找到的所有候选交给用户挑；这条路径用于没有窗口列表查询的 compositor，也用于测试检测器。纯像素识别只能看到帧里**可分离**的窗口：无缝无边框平铺（无 gaps、无阴影）以及完全均匀的桌面没有像素信号，此时候选为空并如实报错，不会给出一个猜出来的裁剪。点击后的重新解析同样用窗口列表（`--pixel` 或列表不可用时退回挑选阶段给出的矩形），所以 `--pixel` 这条路径在工作区切换后可能仍停在旧矩形上。
+
+## 长截图（滚动截图）
+
+`vshot long` 把一块**会滚动的内容**拼成一张长图：框选区域后，vshot 自己按节拍发滚轮、连续抓帧、按内容对齐、把新增的部分接到长图底部，直到页面到底、达到上限或用户结束。结束时按既有输出路径写出（`--output` / `--clipboard` / `--pin`）；结果**不经过标注编辑器**，想标注就先 pin 一下再用 pin 的编辑功能。
+
+流程：
+
+1. 抓一帧冻结桌面并框选（与区域截图同一套选区交互，但确定选区后**不会**进入编辑工具栏——那一刻还没有可标注的像素）。`--geometry` 可直接给定区域，跳过选择。
+2. 屏幕角落出现一个提示条，报告已拼接的高度与帧数，并接收 **Enter**（保留当前结果）和 **Esc**（丢弃）。
+3. 循环：**滚轮按固定节拍发**（默认每 120 ms 一批，`--notches` 决定每批发几档），**抓帧不等画面停下**（按约 50 fps 的上限连拍），每帧与**上一帧**对齐，位移大于 0 就把新增行接到长图底部。滚轮量从第一帧到最后一帧**不变**——一档滚轮在一张页面里走多远是应用自己的事，测量结果只用来决定要不要缩小，不用来改速度。应用本身会给滚轮做动画，所以抓到的多半是**正在移动中的画面**：相邻两帧重叠很大，位移小到几十像素，这正是对齐最可靠的情形。
+4. 停止条件：**连续 6 次滚轮都没有产生任何位移**（到底）、`--max-height`、`--max-frames`、`--timeout`，或用户按键。判据是"滚了几次没动"而不是"多久没动"：大区域匹配一帧要花掉大半秒，用时间窗会在页面还没开始动的时候就到期。单帧没动不会收工：懒加载卡顿、应用的动画还没启动、指针被移出选区（滚轮发给了别的窗口）看起来和"到底"一模一样。另一种例外是**一帧的位移超出能测的范围**（对不上），此时把滚轮对半缩小（下限 1 档）；连续多次仍对不上，说明一档都太快，才停止并如实报告。提示条上的原因会停留一下再消失，不会一闪而过。
+
+对齐只取帧里**属于页面**的行：顶部与底部连续不动的行（标题栏、固定工具栏、状态栏）是 chrome，不进探针——它们本来就在原地，拿它们对齐会在偏移 0 处得到完美匹配，把真实滚动读成"没动"。这些行也不会每帧重复：顶部 chrome 只出现在长图最上面，底部 chrome 只出现在最下面，中间的帧只贡献新出现的页面行。一帧要被当成「在滚动」，它**变化的行数得够组成一个探针**，而不是占视口的某个比例：页面滚到最后一行以下时（编辑器的 scrollBeyondLastLine、页脚之后的大片留白），视口里大半是背景，页面自身的空白行也不随滚动变化，按比例衡量就会把"还在滚"读成"没动"，而丢掉的正是该追加的那几行。探针取页内最上面的 `min(96, 视口高/4)` 行，在上一帧里做灰度 SAD 全搜索，逐行早停剪枝。**探针按长度依次询问，第一个能看全这次滚动的说了算**：更短的探针（一半、四分之一，窗口更大）只在它顶到窗口尽头时才接手，此后只能否决——如果它把页面放到了别处，那多半是巧合，宁可这一帧不采纳。反之，最长的、看得全的探针**明确找不到对齐**时，还不能断言页面没动：页面在几百行以下还有一模一样的一段内容时（表格、聊天记录、一串相同的列表项），比那段重复更短的探针会把两处匹配得一样好，看着就是歧义。这时用一次**更长的探针复核**（至多两倍长，并止于帧底之前，好把搜索窗口留给被复核的那个位移），跨过重复之后两处就分开了；复核仍不明确，才断言页面没动——一帧只在原地重绘（光标、动画、视频）时，几十行的短探针很容易在远处凑出一个比真相还低的匹配分，信了它就会往长图里塞进几百行从没出现过的内容。每帧只与**上一帧**比较，不与已拼好的长图比较，所以误差不会累积。
+
+新增行是**从页面底边往上数**的，而这条边**跨帧保留、只降不升**：页面到哪一行为止是窗口给的（底栏多高在一次滚动里不变），而一帧底部有一段内容与上方重复时（大片同色、缓慢渐变的背景、空白的尾部），那段行会被读成"没变化"、把边读高，从那条边往上数出的"新增行"其实是长图里已经有的行——接缝上就出现一段重复。所以只在读数比已知的边更低时才采纳它。
+
+滚动注入有三条路，`--inject auto`（默认）按"打扰最少"的顺序挑：
+
+1. `wlr`：compositor 的 `zwlr_virtual_pointer_manager_v1`，Hyprland / sway / niri 都提供。不需要设备权限，也不调用任何外部程序。
+2. `portal`：XDG RemoteDesktop portal（KDE Plasma、GNOME），走 session bus，compositor 弹一次授权；KWin 侧是它自带的 EIS 服务端。**本机是 Hyprland，这条路径没有经过真机验证**（Hyprland 的 portal 不实现 RemoteDesktop），需要在 KDE 上验收。
+3. `uinput`：内核虚拟鼠标（`/dev/uinput`）。任何桌面都能用，但需要设备写权限——把用户加进 `input` 组，或给设备一条 `TAG+="uaccess"` 的 udev 规则（发行版的 udev 默认往往不给 `/dev/uinput` 任何权限；本机可用是因为 ydotool 包提供 `GROUP="input", MODE="0660"`、game-devices-udev 提供 uaccess ACL）。运行 vshot 本身仍然不需要 root。
+
+提示条是一个**固定尺寸**的 layer surface，故意不做全屏：桌面在滚动期间是活的，而且它必须待在选区**之外**，否则会被拼进长图。边角都被选区占满时（极端情况）它会缩成看不见的一小块，只保留键盘，Enter/Esc 仍然有效。
+
+已知限制：
+
+- 固定顶栏和底栏靠"这些行在帧里没动"来识别：它们会正确地只出现在长图的头/尾，但一个**滚动到某处才出现**的固定条（浮出的工具条）仍会被当成页面内容。`--ignore-top N` 可以把顶部 N 行强制排除在匹配之外。
+- 惯性滚动、动画、视频：画面在动的时候，每一帧的位移就是应用的动画速度，能测到就接上去；对不上的帧不会被采纳，**滚轮也不会退回去**——下一帧仍然和最后一张被采纳的画面比对，所以那一段内容会在下一次成功对齐时一起补进长图；连续多帧都对不上则整个停止并报告原因。滚动因此永远是单向的，不会上下抖。
+- 懒加载页面在滚动中新增内容，可能重复或缺失少量行。
+- 选区必须完全落在一块屏幕内——滚动内容是单个滚动容器，跨屏没有意义。
+- 抓屏花的时间会限制抓帧率：wlroots 只拷贝选区（`capture_output_region`），KDE 上则走 KWin 的 D-Bus 服务抓整屏再裁，且没有走区域抓取（KWin 的 `CaptureArea` 是私有 API，参数顺序未在本机核实），所以 KDE 的帧率明显低于 wlroots。对齐本身也不便宜，而且随区域面积线性增长——一帧的开销里九成是跨位移范围的全搜索。实测（同机、同代码，客户端 CPU，不含合成器往返）：4K（scale 2）上 1800x1400 的区域每帧 **release 约 6.7 ms**（对齐 5.2 + 像素转换 1.5），1080p 上 900x667 约 **2.3 ms**；**debug 构建慢一个数量级**（4K 每帧约 0.7 s）。所以长截图请用 release：`cargo build --release`，然后跑 `target/release/vshot`。没动的那一帧不付对齐的钱（提前返回，release 下 <1 ms）。
+
 ## pin 图片浮层
 
-`vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**缩放（0.1x–8x，光标为锚点并短暂显示倍率）、**双击**关闭该图、**点击聚焦后按 Space** 进入完整标注编辑器。
+`vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**以图片中心缩放（0.1x–8x，并短暂显示倍率）、**双击**关闭该图、**点击聚焦后按 Space** 进入完整标注编辑器。
 
 新 pin 落在**激活的输出**上：**指针所在的那块屏优先**（`hyprctl cursorpos` 查询并按其逻辑矩形命中显示器），指针读不到时退回**键盘焦点所在**的输出（Hyprland `hyprctl monitors -j`、Sway `swaymsg -t get_outputs`、niri `niri msg --json focused-output` 中标记 focused 的输出），都没有则回退主输出。这样"在哪块屏幕就在哪块屏幕 pin"才成立；daemon 自己拿不到这个信息（无窗口进程只能看到指针在 (0,0)）。Hyprland 上报的 `width`/`height` 是原生分辨率而 `x`/`y` 是逻辑坐标，所以要按 `scale` 换算后才能与 Qt 屏幕几何或指针位置比较。一个 layer-shell surface 只能属于一块输出，所以每张 pin 由 daemon 为**每一块输出各持有一个渲染面**：pin 的图像、缩放与全局位置由 daemon 统一持有，各屏的面只画它与自己重叠的部分，因此拖拽可以**跨越显示器**——手势始终由拖起它的那个面持有，另一块屏上的副本同步跟随。完全落在别块屏幕上的面会把输入区域移到该面之外（Wayland 没有"无输入区域"的请求，未设置反而等于整面可点），不挡住那里的点击。显示器热插拔时 daemon 会为新输出补面、为移除的输出收面（并把 pin 收回可视区域）。
 
@@ -124,7 +207,7 @@ pin 的**尺寸按图片的来源密度来定**，默认不需要任何参数。
 4. **产出图片的工具留下的记录**：截图工具才是唯一知道图片来自哪块屏的一方（grim、satty、spectacle 都不往图里写密度），所以按约定读取
    - `<图片路径>.scale` 文件里单独一个数字，或
    - `$VSHOT_PIN_SOURCE_FILE`（默认 `/tmp/screenshot-path`）里的一行 `<图片路径> <缩放>`，路径与正在 pin 的图一致才采用，因此不会串用上一张截图的倍率；
-5. 都没有时，**按图片尺寸与落点输出推断**：图片像素数放得进该输出的原生分辨率时按 1 图素 = 1 屏幕素；放不进时说明它不可能来自这块屏，取"能容纳它的最小的那块屏"的缩放。两种情况下都再按输出尺寸收缩一次上限，保证初始 pin 完整可见，滚轮从这里继续缩放。
+5. 都没有时，**按图片尺寸与落点输出推断**：图片像素数放得进该输出的原生分辨率时按 1 图素 = 1 屏幕素；放不进时说明它不可能来自这块屏，取"能容纳它的最小的那块屏"的缩放。最后再**按输出宽度**收一次上限（不放大、也不因为图比屏幕高而缩小），所以初始 pin 一定是可读的自然尺寸：长截图这类本来就比屏幕高的图保持自然宽度、顶边对齐落到屏幕上，超出屏幕的部分垂在下方，滚轮再从这里缩放。
 
 第 4 条要生效，截图脚本在保存图片后写下记录即可，例如 Hyprland (Lua)：
 
@@ -216,18 +299,21 @@ Plasma 会话里首次截图时 KWin 会弹权限对话框，**只有用户确�
 
 Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 layer surface。收到 layer-surface configure 后，程序 ack configure，使用 Unix SHM/mmap 创建两个有效的父层 `wl_buffer`，将首次捕获的冻结 raw frame 写入两个 slot，并提交 slot 0；该路径只使用父 layer surface 与 `wl_shm`。overlay、layer surface、buffer 和临时 SHM 映射由 RAII 清理，冻结期间不会再次读取桌面。
 
-交互式 `region` 不调用 Rust Wayland editor，而是由 `vshot-qt-ui` Qt helper 负责交互 overlay、选择和编辑。Rust 通过私有 session 将已捕获的静态帧交给 helper；helper 返回选择区域和标注后，Rust 在最终输出阶段应用标注。
+交互式 `region` 不调用 Rust Wayland editor，而是由 `vshot-qt-ui` Qt helper 负责交互 overlay、选择和编辑。Rust 通过私有 session 将已捕获的静态帧交给 helper；helper 返回选择区域和标注后，Rust 在最终输出阶段应用标注。`region` 一开始就把这帧铺满屏幕（所见即所裁）。
+
+`window pick` 用**两次** helper 会话：第一次是 `window-pick` 模式，session 携带候选窗口列表（`candidates`，含标题）但 helper 不画帧、桌面保持实时；这次会话是双向的——helper 把 `{"request":"candidates"}` 按行写在 stdout 上，CLI 在 stdin 上回一份新的窗口列表（没有可复查来源时回空的 `{}`），所以候选跟着指针刷新。点击即返回（结果里带上点击位置）；Rust 随后重新捕获一帧，把点击位置重新解析成窗口矩形，再以 `region` 模式开第二次会话，session 里带上已确定的 `selection`，helper 收到后直接进入编辑状态（工具栏就位，帧就是刚才捕获的那一帧）。挑窗口期间桌面是实时的，所以这一步的帧与候选列表都可能过期——刷新、重新捕获与重新解析就是为它准备的。
 
 ## 已知限制
 
 - 截图后端：wlroots 系走 `wlr-screencopy-unstable-v1` 的 wl_shm 路径（协议版本 1 至 3）；**KWin/Plasma Wayland 改走 `org.kde.KWin.ScreenShot2`**（见「截图后端」），因为 KWin 根本没有 screencopy，也没有 `ext-image-copy-capture`（实测 KWin 6.7.5 的 global 列表与 `libkwin.so.6` 里都找不到这两个接口名）。两者都没有实现 PipeWire、Portal ScreenCast 或 DMA-BUF。**不要以为"grim 能在 KDE 跑所以 vshot 也应该能"**：grim 只带 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`，在 KDE 上两个都不可用（实测报 "compositor doesn't support the screen capture protocol"），KDE 只能走它私有的 D-Bus 服务。GNOME/Mutter 三者都不提供，连 layer-shell 也没有。
 - KWin 那条路的**冻结 overlay 仍然依赖 `zwlr_layer_shell_v1`**（KWin 提供它），但合成器侧授权对话框必须由用户在 Plasma 会话里确认；非 Plasma/无头会话会一直返回 `NoAuthorized`。
-- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway/KWin 的接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。
+- Portal active-window backend 尚未实现；active window 优先使用 Hyprland/Sway/KWin 的接口，缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。`window pick` 的候选同样来自这三家：没有窗口列表查询的合成器要靠 `--pixel`，无缝无边框平铺与均匀桌面下没有任何候选，只能报错。候选列表在挑选期间**跟着指针刷新**（见「选择窗口」），所以切换工作区或移动窗口后，悬停高亮与最终截到的窗口都是实时的；只有 `--pixel` 那条路径没有可复查的窗口列表，会一直用挑选开始时的候选。
 - 编辑结果使用 RGBA8 软件绘制，线宽和坐标按截图 logical scale 转换；Qt 文本框接受任意 Unicode 文本（含通过输入法提交的 CJK）。交互式文本由 Qt 按所选系统字体栅格化为 RGBA 位图后由 Rust 合成（见「交互式 overlay」）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体渲染，该回退路径仅支持可打印 ASCII。
 - 交互式 `region` 的键盘和鼠标事件由 Qt/LayerShellQt 处理；不依赖 Hyprland 插件或私有输入接口。
 - 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射会拒绝执行。
 - `monitor current` 依赖 overlay 上收到 pointer enter/motion；通用 Wayland 没有可读取的全局鼠标坐标，因此不会用第一个 output 猜测结果。
 - 需要 compositor 实际支持 layer-shell、SHM、xdg-output 及相应 seat capability。原生 screencopy 等待 compositor 返回帧最多 10 秒，超时会返回错误而不是永久阻塞。没有 Wayland 环境时，连接阶段会返回 `Wayland connection failed`；非交互父层和 Qt helper 需要分别在相应环境中验证。
+- 长截图的滚动注入按 compositor 选路（见「长截图」）：Hyprland / sway / niri 用 `zwlr_virtual_pointer_manager_v1`（无需任何权限），KDE / GNOME 用 XDG RemoteDesktop portal（一次授权），都不行时才退到 `/dev/uinput`（需要 `/dev/uinput` 写权限）。无头 compositor 既没有指针也没有可滚动的内容，这条路径只能在真实会话里验证。
 
 ## 验证
 
@@ -253,3 +339,16 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-ke2e \
 ```
 
 无头 KWin 的虚拟输出名是 `Virtual-0`，尺寸 1024x768；可用 `WAYLAND_DISPLAY=wayland-ke2e wayland-info` 确认。它没有 pointer capability，所以完整流程（需要 `WaylandSession::connect()` 的 seat pointer 检查）在无头环境必然失败——这是预期的，集成测试因此只覆盖到 D-Bus 采集这一层。`VSHOT_KWIN_E2E_OUTPUT` / `_WIDTH` / `_HEIGHT` / `_COLOR=R,G,B` 可覆盖默认的输出名、尺寸与中心像素颜色断言。
+
+长截图需要真实会话：无头 compositor 既没有指针也没有可滚动的内容。排查时可以把每一帧和每一次判定落盘，再和产出的长图逐段比对：
+
+```sh
+VSHOT_LONG_DEBUG_DIR=/tmp/long-debug \
+  target/debug/vshot long --geometry '2100,200 900x700' --output /tmp/long.png --max-frames 40
+```
+
+`/tmp/long-debug` 会留下 `grab-NNNN.png`（每次抓帧）与 `steps.log`（每帧的判定与位移）。不设置这个变量时不会有任何落盘。
+
+## 许可证
+
+MIT（见 `LICENSE`）。

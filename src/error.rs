@@ -60,6 +60,10 @@ pub enum VshotError {
     UnsupportedText(String),
     #[error("active window is unavailable: {0}")]
     ActiveWindowUnavailable(String),
+    /// Interactive window picking found nothing to offer: no compositor
+    /// reported any window and the pixel fallback saw no window either.
+    #[error("no window could be picked: {0}")]
+    WindowPickUnavailable(String),
     #[error("interactive selection cancelled")]
     SelectionCancelled,
     #[error("interactive selection failed: {0}")]
@@ -68,6 +72,17 @@ pub enum VshotError {
     Clipboard(String),
     #[error("pin failed: {0}")]
     Pin(String),
+    /// Scrolling capture: the frames could not be stitched, or what was asked
+    /// of the stitcher makes no sense (a region too small, an ignore-top that
+    /// covers the whole frame).
+    #[error("long screenshot failed: {0}")]
+    LongShotStitch(String),
+    /// Scrolling capture: no way to drive the wheel on this compositor.
+    #[error("long screenshot cannot scroll the page: {0}")]
+    LongShotInjection(String),
+    /// Scrolling capture: the selection is not usable for a long screenshot.
+    #[error("long screenshot region is unusable: {0}")]
+    LongShotRegion(String),
 }
 
 pub type Result<T> = std::result::Result<T, VshotError>;

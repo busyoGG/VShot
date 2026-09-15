@@ -7,6 +7,7 @@ description = "A strict-freeze Wayland screenshot CLI for wlroots compositors"
 license = "MIT"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 memmap2 = "0.9.11"

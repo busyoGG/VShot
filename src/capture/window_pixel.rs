@@ -19,6 +19,10 @@
 //! A cursor position, when known, disambiguates multiple candidates; the
 //! largest candidate wins otherwise. Truly seamless borderless tiling with
 //! several windows carries no pixel signal and ends in a clear error.
+//!
+//! Interactive window picking runs the same detectors but keeps every
+//! candidate instead of the best one ([`detect_window_candidates`]), so the
+//! user can hover the window they mean.
 
 use std::collections::VecDeque;
 
@@ -71,6 +75,37 @@ pub fn detect_active_window(scene: &SceneSnapshot, cursor: Option<Point>) -> Res
             )
         })?;
     map_to_logical(scene, factor, rect)
+}
+
+/// Every window candidate both detectors can see, in global logical
+/// coordinates, largest first.
+///
+/// Interactive picking shows these while the pointer moves, so it wants the
+/// whole set rather than one detector's best guess — the user, not the
+/// heuristic, decides between overlapping candidates.  An empty result means
+/// the scene carries no window signal at all (seamless borderless tiling).
+pub fn detect_window_candidates(scene: &SceneSnapshot) -> Vec<Rect> {
+    let frame = scene.frame();
+    let size = frame.size();
+    let factor = size
+        .width
+        .max(size.height)
+        .div_ceil(MAX_ANALYSIS_DIM)
+        .max(1);
+    let analysis = AnalysisFrame::sample(frame, factor);
+
+    let segments = segment_components(&analysis);
+    let mut candidates = outline_candidates(&analysis);
+    candidates.extend(segments.candidates);
+    candidates.extend(segments.minor);
+
+    let mut logical: Vec<Rect> = candidates
+        .into_iter()
+        .filter_map(|rect| map_rect_to_logical(scene, factor, rect))
+        .collect();
+    logical.sort_by_key(|rect| std::cmp::Reverse(area(*rect)));
+    logical.dedup();
+    logical
 }
 
 /// Downscaled RGBA copy of the composed scene frame. Pixel `(x, y)` samples
@@ -151,6 +186,19 @@ fn to_analysis(scene: &SceneSnapshot, factor: u32, point: Point) -> Option<Point
 
 /// Converts an analysis-space rect back to global logical coordinates.
 fn map_to_logical(scene: &SceneSnapshot, factor: u32, rect: Rect) -> Result<ActiveWindow> {
+    Ok(ActiveWindow {
+        geometry: map_rect_to_logical(scene, factor, rect).ok_or_else(|| {
+            VshotError::ActiveWindowUnavailable(
+                "pixel fallback geometry fell outside the scene".into(),
+            )
+        })?,
+        source: WindowSource::Pixel,
+    })
+}
+
+/// Converts an analysis-space rect into global logical coordinates, clamped to
+/// the scene; `None` when nothing usable survives the clamping.
+fn map_rect_to_logical(scene: &SceneSnapshot, factor: u32, rect: Rect) -> Option<Rect> {
     let bounds = scene.bounds();
     let scale = i64::from(scene.scale());
     let frame_device_width = i64::from(bounds.size.width) * scale;
@@ -167,18 +215,11 @@ fn map_to_logical(scene: &SceneSnapshot, factor: u32, rect: Rect) -> Result<Acti
         round_div(device_height.min(frame_device_height)).max(1) as u32,
     );
     // Keep the crop inside the scene even after rounding.
-    geometry = geometry.clamp_to(bounds).ok_or_else(|| {
-        VshotError::ActiveWindowUnavailable("pixel fallback geometry fell outside the scene".into())
-    })?;
+    geometry = geometry.clamp_to(bounds)?;
     if geometry.is_empty() {
-        return Err(VshotError::ActiveWindowUnavailable(
-            "pixel fallback produced an empty window rectangle".into(),
-        ));
+        return None;
     }
-    Ok(ActiveWindow {
-        geometry,
-        source: WindowSource::Pixel,
-    })
+    Some(geometry)
 }
 
 /// Ranks candidates: a candidate containing the cursor always wins, the
@@ -198,18 +239,18 @@ fn pick_candidate(candidates: Vec<Rect>, cursor: Option<Point>) -> Option<Rect> 
 /// Phase 1: find a closed rectangle outline drawn in one consistent accent
 /// color and return the window rect inside it.
 fn detect_outline(frame: &AnalysisFrame, cursor: Option<Point>) -> Option<Rect> {
+    pick_candidate(outline_candidates(frame), cursor)
+}
+
+/// Every closed accent outline the frame yields, across all plausible border
+/// colors.
+fn outline_candidates(frame: &AnalysisFrame) -> Vec<Rect> {
     let histogram = Histogram::collect_edge_colors(frame);
     let mut fits: Vec<Rect> = Vec::new();
     for color in histogram.take_candidates(8) {
-        if let Some(rect) = fit_outline_for_color(frame, color, cursor) {
-            // A candidate containing the cursor ends the search immediately.
-            if cursor.is_some_and(|point| rect.contains(point)) {
-                return Some(rect);
-            }
-            fits.push(rect);
-        }
+        fits.extend(fit_outlines_for_color(frame, color));
     }
-    pick_candidate(fits, cursor)
+    fits
 }
 
 /// Quantized-color histogram over edge pixels; both pixels of every differing
@@ -294,13 +335,9 @@ fn bucket_of(pixel: [u8; 4]) -> usize {
         | (usize::from(pixel[2]) >> 4)
 }
 
-/// Builds the color mask and scans its connected components for a fitted
-/// outline. Returns the best fit, preferring cursor containment then area.
-fn fit_outline_for_color(
-    frame: &AnalysisFrame,
-    color: [u8; 4],
-    cursor: Option<Point>,
-) -> Option<Rect> {
+/// Builds the color mask and scans its connected components for every fitted
+/// outline of that border color, in scan order.
+fn fit_outlines_for_color(frame: &AnalysisFrame, color: [u8; 4]) -> Vec<Rect> {
     let mask: Vec<bool> = frame
         .pixels
         .iter()
@@ -328,14 +365,11 @@ fn fit_outline_for_color(
                 continue;
             }
             if let Some(rect) = fit_outline_in_bbox(frame, &mask, bbox) {
-                if cursor.is_some_and(|point| rect.contains(point)) {
-                    return Some(rect);
-                }
                 fits.push(rect);
             }
         }
     }
-    pick_candidate(fits, cursor)
+    fits
 }
 
 /// 4-connected bounding box of the `mask` component containing `(x, y)`;
@@ -445,6 +479,54 @@ fn fit_outline_in_bbox(frame: &AnalysisFrame, mask: &[bool], bbox: Rect) -> Opti
 /// growth so gradient wallpapers and soft shadows are absorbed), then treat
 /// large non-background components as windows.
 fn detect_segment(frame: &AnalysisFrame, cursor: Option<Point>) -> Option<Rect> {
+    let segments = segment_components(frame);
+    // Selection ladder: threshold-passing windows first (cursor-containing
+    // wins, largest otherwise), then a lone minor component (one small
+    // floating window; several need the cursor to disambiguate), then the
+    // degraded whole-frame cases, otherwise an honest None.
+    if let Some(rect) = pick_candidate(segments.candidates.clone(), cursor) {
+        return Some(rect);
+    }
+    segments
+        .lone_minor(cursor)
+        .or_else(|| segments.degraded_whole_frame(frame))
+}
+
+/// What the background flood fill left over, split by confidence.
+struct Segments {
+    /// Components that pass the size thresholds.
+    candidates: Vec<Rect>,
+    /// Smaller components: a lone one is still a window, several are ambiguous.
+    minor: Vec<Rect>,
+    /// Percentage of the frame the flood fill reached from its edges.
+    background_percent: u64,
+    /// The frame reads as one uniform surface, with no internal seams.
+    uniform: bool,
+}
+
+impl Segments {
+    fn lone_minor(&self, cursor: Option<Point>) -> Option<Rect> {
+        match self.minor.len() {
+            1 => self.minor.first().copied(),
+            0 => None,
+            _ => cursor
+                .and_then(|point| self.minor.iter().copied().find(|rect| rect.contains(point))),
+        }
+    }
+
+    /// The whole frame, but only for an essentially uniform one: one
+    /// fullscreen window or a bare desktop.  Internal edges — a seam between
+    /// seamlessly tiled windows, text — mean several windows we cannot split,
+    /// and guessing "everything" there would crop unrelated windows together.
+    fn degraded_whole_frame(&self, frame: &AnalysisFrame) -> Option<Rect> {
+        ((self.background_percent > 97 && self.uniform) || self.background_percent < 50)
+            .then(|| Rect::new(0, 0, frame.width, frame.height))
+    }
+}
+
+/// Runs the background flood fill and groups what it left into window
+/// candidates.
+fn segment_components(frame: &AnalysisFrame) -> Segments {
     let total = frame.pixels.len();
     let mut background = vec![false; total];
     let mut queue = VecDeque::new();
@@ -517,37 +599,18 @@ fn detect_segment(frame: &AnalysisFrame, cursor: Option<Point>) -> Option<Rect> 
             candidates.push(bbox);
         }
     }
-    // Selection ladder: threshold-passing windows first (cursor-containing
-    // wins, largest otherwise), then a lone minor component (one small
-    // floating window; several need the cursor to disambiguate), then the
-    // degraded whole-frame cases, otherwise an honest None.
-    match pick_candidate(candidates, cursor) {
-        Some(rect) => Some(rect),
-        None => {
-            let minor_pick = match minor.len() {
-                1 => minor.first().copied(),
-                0 => None,
-                _ => {
-                    cursor.and_then(|point| minor.iter().copied().find(|rect| rect.contains(point)))
-                }
-            };
-            minor_pick.or_else(|| {
-                let background_fraction = background_pixels as u64 * 100 / total as u64;
-                // The whole-frame degradation only makes sense for an
-                // essentially uniform frame (one fullscreen window or a bare
-                // desktop). Internal edges — a seam between seamlessly tiled
-                // windows, text — mean several windows we cannot split.
-                let edge_pairs = Histogram::collect_edge_colors(frame)
-                    .counts
-                    .iter()
-                    .map(|count| u64::from(*count))
-                    .sum::<u64>()
-                    / 2;
-                let uniform = edge_pairs * 1000 < u64::from(frame.width) * u64::from(frame.height);
-                ((background_fraction > 97 && uniform) || background_fraction < 50)
-                    .then(|| Rect::new(0, 0, frame.width, frame.height))
-            })
-        }
+
+    let edge_pairs = Histogram::collect_edge_colors(frame)
+        .counts
+        .iter()
+        .map(|count| u64::from(*count))
+        .sum::<u64>()
+        / 2;
+    Segments {
+        candidates,
+        minor,
+        background_percent: background_pixels as u64 * 100 / total as u64,
+        uniform: edge_pairs * 1000 < u64::from(frame.width) * u64::from(frame.height),
     }
 }
 
@@ -685,6 +748,27 @@ mod tests {
         canvas.fill(200, 0, 200, 300, [200, 200, 200, 255]);
         let error = detect_active_window(&canvas.scene(), None).unwrap_err();
         assert!(error.to_string().contains("pixel fallback"), "{error}");
+    }
+
+    #[test]
+    fn candidates_cover_every_window_for_picking() {
+        let mut canvas = Canvas::new(400, 300, [30, 30, 30, 255]);
+        canvas.fill(150, 60, 210, 180, [220, 220, 220, 255]);
+        canvas.fill(10, 10, 90, 90, [90, 90, 90, 255]);
+        // Largest first, so hovering can simply take the last candidate that
+        // contains the pointer (the innermost window wins).
+        assert_eq!(
+            detect_window_candidates(&canvas.scene()),
+            vec![Rect::new(150, 60, 210, 180), Rect::new(10, 10, 90, 90)]
+        );
+    }
+
+    #[test]
+    fn candidates_stay_empty_without_a_pixel_signal() {
+        // Seamless borderless tiling: nothing to offer, honestly empty.
+        let mut canvas = Canvas::new(400, 300, [100, 100, 100, 255]);
+        canvas.fill(200, 0, 200, 300, [200, 200, 200, 255]);
+        assert!(detect_window_candidates(&canvas.scene()).is_empty());
     }
 
     #[test]

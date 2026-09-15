@@ -128,6 +128,17 @@ bool loadRawImage(OutputSession *output, QString *error)
 
 } // namespace
 
+bool parseWindowCandidate(const QJsonObject &object, const QString &label,
+                          WindowCandidate *candidate, QString *error)
+{
+    if (!jsonRect(object, &candidate->rect, label, error)) {
+        return false;
+    }
+    // Optional: the pixels/geometry may name what this window is.
+    candidate->label = object.value(QStringLiteral("label")).toString();
+    return true;
+}
+
 std::int64_t LogicalRect::right() const
 {
     return static_cast<std::int64_t>(x) + static_cast<std::int64_t>(width);
@@ -166,9 +177,16 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
 
     Session parsed;
     parsed.mode = root.value(QStringLiteral("mode")).toString();
-    if (parsed.mode != QStringLiteral("region") && parsed.mode != QStringLiteral("pin-edit")) {
-        return fail(error, QStringLiteral("session mode must be `region` or `pin-edit`"));
+    if (parsed.mode != QStringLiteral("region") && parsed.mode != QStringLiteral("region-only") &&
+        parsed.mode != QStringLiteral("pin-edit") && parsed.mode != QStringLiteral("window-pick") &&
+        parsed.mode != QStringLiteral("long-shot")) {
+        return fail(error,
+                    QStringLiteral("session mode must be `region`, `region-only`, `pin-edit`, "
+                                   "`window-pick` or `long-shot`"));
     }
+    // A hint session is the small overlay a scrolling capture keeps on screen;
+    // it draws no image at all, so its outputs carry geometry only.
+    const bool hintSession = parsed.mode == QStringLiteral("long-shot");
     const QJsonValue boundsValue = root.value(QStringLiteral("bounds"));
     if (!boundsValue.isObject()) {
         return fail(error, QStringLiteral("session bounds must be an object"));
@@ -200,6 +218,52 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         if (!parsed.pinSocket.startsWith(QLatin1Char('/'))) {
             return fail(error, QStringLiteral("pin-edit session `socket` must be an absolute path"));
         }
+    }
+
+    // Window picking needs something to pick: the candidates come from the
+    // compositor's window list or the pixel fallback, and an empty list would
+    // leave the user staring at a frozen screen with nothing to click.
+    if (parsed.mode == QStringLiteral("window-pick")) {        const QJsonValue candidatesValue = root.value(QStringLiteral("candidates"));
+        if (!candidatesValue.isArray() || candidatesValue.toArray().isEmpty()) {
+            return fail(error, QStringLiteral("window-pick session needs a non-empty `candidates` array"));
+        }
+        const QJsonArray candidates = candidatesValue.toArray();
+        parsed.candidates.reserve(candidates.size());
+        for (int index = 0; index < candidates.size(); ++index) {
+            const QJsonValue value = candidates.at(index);
+            if (!value.isObject()) {
+                return fail(error, QStringLiteral("candidate %1 must be an object").arg(index));
+            }
+            WindowCandidate candidate;
+            if (!parseWindowCandidate(value.toObject(),
+                                      QStringLiteral("candidate %1").arg(index), &candidate,
+                                      error)) {
+                return false;
+            }
+            parsed.candidates.push_back(std::move(candidate));
+        }
+    }
+
+    // A region session may arrive with the selection already made — window
+    // picking resolves a window, then hands the frame it captured to an
+    // editing session this way, so the user edits the pixels that will be
+    // saved. Pin-edit sessions select their whole canvas by construction, and
+    // the picker itself never makes a selection, so neither carries one.
+    if (parsed.mode == QStringLiteral("region") && root.contains(QStringLiteral("selection"))) {
+        const QJsonValue selectionValue = root.value(QStringLiteral("selection"));
+        if (!selectionValue.isObject()) {
+            return fail(error, QStringLiteral("session selection must be an object"));
+        }
+        LogicalRect selection;
+        if (!jsonRect(selectionValue.toObject(), &selection,
+                      QStringLiteral("session selection"), error)) {
+            return false;
+        }
+        if (selection.right() <= parsed.bounds.x || selection.x >= parsed.bounds.right() ||
+            selection.bottom() <= parsed.bounds.y || selection.y >= parsed.bounds.bottom()) {
+            return fail(error, QStringLiteral("session selection is outside the session bounds"));
+        }
+        parsed.selection = selection;
     }
 
     const QJsonArray outputs = outputsValue.toArray();
@@ -241,33 +305,44 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
                                       .arg(index));
             }
         }
-        if (!jsonUnsigned32(object, "scale", &output.scale, true) ||
-            !jsonUnsigned32(object, "pixel_width", &output.pixelWidth, true) ||
-            !jsonUnsigned32(object, "pixel_height", &output.pixelHeight, true)) {
-            return fail(error, QStringLiteral("output %1 scale/pixel dimensions are invalid").arg(index));
-        }
-        if (!object.value(QStringLiteral("path")).isString() ||
-            object.value(QStringLiteral("path")).toString().isEmpty()) {
-            return fail(error, QStringLiteral("output %1 path must be a non-empty string").arg(index));
-        }
-        output.path = object.value(QStringLiteral("path")).toString();
+        // A hint overlay draws nothing, so it has no image to load and no
+        // pixel dimensions to agree with: scale and path stay optional there.
+        // Every other session draws the frozen frame it was handed.
+        if (!hintSession) {
+            if (!jsonUnsigned32(object, "scale", &output.scale, true) ||
+                !jsonUnsigned32(object, "pixel_width", &output.pixelWidth, true) ||
+                !jsonUnsigned32(object, "pixel_height", &output.pixelHeight, true)) {
+                return fail(error, QStringLiteral("output %1 scale/pixel dimensions are invalid").arg(index));
+            }
+            if (!object.value(QStringLiteral("path")).isString() ||
+                object.value(QStringLiteral("path")).toString().isEmpty()) {
+                return fail(error, QStringLiteral("output %1 path must be a non-empty string").arg(index));
+            }
+            output.path = object.value(QStringLiteral("path")).toString();
 
-        const std::uint64_t expectedWidth = static_cast<std::uint64_t>(output.geometry.width) * output.scale;
-        const std::uint64_t expectedHeight = static_cast<std::uint64_t>(output.geometry.height) * output.scale;
-        if (expectedWidth != output.pixelWidth || expectedHeight != output.pixelHeight) {
-            return fail(error, QStringLiteral("output %1 pixel dimensions do not match logical size and scale")
-                                  .arg(index));
-        }
-        if (!loadRawImage(&output, error)) {
-            return false;
+            const std::uint64_t expectedWidth = static_cast<std::uint64_t>(output.geometry.width) * output.scale;
+            const std::uint64_t expectedHeight = static_cast<std::uint64_t>(output.geometry.height) * output.scale;
+            if (expectedWidth != output.pixelWidth || expectedHeight != output.pixelHeight) {
+                return fail(error, QStringLiteral("output %1 pixel dimensions do not match logical size and scale")
+                                      .arg(index));
+            }
+            if (!loadRawImage(&output, error)) {
+                return false;
+            }
         }
         parsed.outputs.push_back(std::move(output));
     }
 
-    for (const OutputSession &output : parsed.outputs) {
-        if (output.geometry.right() <= parsed.bounds.x || output.geometry.x >= parsed.bounds.right() ||
-            output.geometry.bottom() <= parsed.bounds.y || output.geometry.y >= parsed.bounds.bottom()) {
-            return fail(error, QStringLiteral("output %1 does not intersect session bounds").arg(output.name));
+    // Every drawn session shows one frame per output, so each output has to
+    // meet the session bounds.  A hint overlay draws nothing: its `bounds` is
+    // the region being captured, and the outputs are merely the places it may
+    // live, so they do not have to touch that region at all.
+    if (!hintSession) {
+        for (const OutputSession &output : parsed.outputs) {
+            if (output.geometry.right() <= parsed.bounds.x || output.geometry.x >= parsed.bounds.right() ||
+                output.geometry.bottom() <= parsed.bounds.y || output.geometry.y >= parsed.bounds.bottom()) {
+                return fail(error, QStringLiteral("output %1 does not intersect session bounds").arg(output.name));
+            }
         }
     }
     *session = std::move(parsed);

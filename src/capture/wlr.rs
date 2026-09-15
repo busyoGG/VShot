@@ -12,7 +12,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 };
 
 use crate::error::{Result, VshotError};
-use crate::geometry::Size;
+use crate::geometry::{Rect, Size};
 use crate::model::Frame;
 
 #[derive(Debug)]
@@ -155,25 +155,34 @@ fn convert_shm_pixels(
         .and_then(|area| area.checked_mul(4))
         .ok_or_else(|| VshotError::WaylandProtocol("capture frame is too large".into()))?;
     let mut pixels = vec![0u8; pixel_count];
-    for destination_y in 0..height {
+    // The pixel format is BGRA in memory and vshot works in RGBA — the same
+    // four bytes with the red and blue ends swapped.  Swapping them as whole
+    // 32-bit words instead of one byte at a time is what lets the loop go
+    // several times faster: it moves the same pixels with a fraction of the
+    // memory traffic, which matters because this runs once per grabbed frame.
+    let alpha = match format {
+        wl_shm::Format::Argb8888 => None,
+        wl_shm::Format::Xrgb8888 => Some(0xFF00_0000),
+        _ => unreachable!("unsupported format was rejected above"),
+    };
+    let row_bytes = width * 4;
+    for (destination_y, destination_row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
         let source_y = if y_invert {
             height - 1 - destination_y
         } else {
             destination_y
         };
-        let source_row = source_y * stride;
-        let destination_row = destination_y * width * 4;
-        for x in 0..width {
-            let source = source_row + x * 4;
-            let destination = destination_row + x * 4;
-            pixels[destination] = map[source + 2];
-            pixels[destination + 1] = map[source + 1];
-            pixels[destination + 2] = map[source];
-            pixels[destination + 3] = match format {
-                wl_shm::Format::Argb8888 => map[source + 3],
-                wl_shm::Format::Xrgb8888 => 255,
-                _ => unreachable!("unsupported format was rejected above"),
-            };
+        let source_row = &map[source_y * stride..source_y * stride + row_bytes];
+        for (destination, source) in destination_row
+            .chunks_exact_mut(4)
+            .zip(source_row.chunks_exact(4))
+        {
+            let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
+            let swapped = (word & 0x0000_00FF) << 16
+                | (word & 0x00FF_0000) >> 16
+                | (word & 0xFF00_FF00)
+                | alpha.unwrap_or(word & 0xFF00_0000);
+            destination.copy_from_slice(&swapped.to_le_bytes());
         }
     }
     Frame::new(Size::new(width as u32, height as u32), pixels)
@@ -256,6 +265,23 @@ impl WlrCapture {
     }
 
     pub fn capture_output(&mut self, name: &str, cursor: bool) -> Result<Frame> {
+        self.capture(name, None, cursor)
+    }
+
+    /// Captures one rectangle of an output, given in *output-local logical*
+    /// coordinates — the space `capture_output_region` is defined in, and the
+    /// space the region picker works in.
+    ///
+    /// Only that rectangle is rendered into the buffer and converted, so a
+    /// scrolled capture of a small region costs a fraction of a full-screen
+    /// grab.  That is what lets frames be taken fast enough to keep up with a
+    /// page that is still moving.  The compositor clips the rectangle to the
+    /// output's extents.
+    pub fn capture_region(&mut self, name: &str, region: Rect, cursor: bool) -> Result<Frame> {
+        self.capture(name, Some(region), cursor)
+    }
+
+    fn capture(&mut self, name: &str, region: Option<Rect>, cursor: bool) -> Result<Frame> {
         if self.state.pending.is_some() {
             return Err(VshotError::WaylandProtocol(
                 "a capture is already in progress".into(),
@@ -279,7 +305,14 @@ impl WlrCapture {
                 VshotError::MissingCapability("zwlr_screencopy_manager_v1".into())
             })?;
         let qh = self.event_queue.handle();
-        let frame = manager.capture_output(if cursor { 1 } else { 0 }, &output, &qh, ());
+        let overlay_cursor = if cursor { 1 } else { 0 };
+        let frame = match region {
+            Some(region) => {
+                let (x, y, width, height) = region_arguments(region)?;
+                manager.capture_output_region(overlay_cursor, &output, x, y, width, height, &qh, ())
+            }
+            None => manager.capture_output(overlay_cursor, &output, &qh, ()),
+        };
         self.state.pending = Some(PendingCapture {
             _frame: frame,
             buffer: None,
@@ -348,6 +381,18 @@ impl WlrCapture {
                 .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
         }
     }
+}
+
+/// The four integers `capture_output_region` takes, in its own order, checked:
+/// a rectangle that will not fit them is not something to send a compositor.
+fn region_arguments(region: Rect) -> Result<(i32, i32, i32, i32)> {
+    let width = i32::try_from(region.size.width).map_err(|_| {
+        VshotError::WaylandProtocol("the capture region is too wide to ask for".into())
+    })?;
+    let height = i32::try_from(region.size.height).map_err(|_| {
+        VshotError::WaylandProtocol("the capture region is too tall to ask for".into())
+    })?;
+    Ok((region.origin.x, region.origin.y, width, height))
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {

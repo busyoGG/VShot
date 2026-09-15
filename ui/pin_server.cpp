@@ -609,24 +609,32 @@ private:
         // the same density, so a 4K capture takes the room it did on the 4K
         // output even when it lands on a 1080p one.
         pin->scale = 1.0 / pin->density;
-        // Whatever the density, the opening size must fit the output entirely
-        // (never upscaling past the natural one) so a pin always arrives fully
-        // visible; the wheel zooms from there.
-        const QSize boundsSize = screen->geometry().size();
-        if (!boundsSize.isEmpty()) {
-            const double fit = std::min(
-                static_cast<double>(boundsSize.width()) / pin->image.width(),
-                static_cast<double>(boundsSize.height()) / pin->image.height());
+        // Whatever the density, the opening width must fit the output (never
+        // upscaling past the natural one), so a pin arrives readable rather
+        // than running off the sides; the wheel zooms from there. The height
+        // is deliberately not fitted: a stitched long capture is legitimately
+        // taller than any screen, and shrinking it until it fits would
+        // override the density the size came from and render the whole thing
+        // unreadably small.
+        const QRect bounds = screen->geometry();
+        if (!bounds.isEmpty()) {
+            const double fit =
+                static_cast<double>(bounds.width()) / pin->image.width();
             pin->scale = std::min(pin->scale, fit);
         }
 
         // Land on the output the user is looking at, one cascade step apart
         // from the pins already there so repeated pins stay distinguishable.
         const int offset = static_cast<int>(pins_.size() % 6) * 28;
-        const QRect bounds = screen->geometry();
-        pin->origin = QPoint((bounds.width() - pin->displaySize().width()) / 2,
-                             (bounds.height() - pin->displaySize().height()) / 2) +
-                      bounds.topLeft() + QPoint(offset, offset);
+        const QSize size = pin->displaySize();
+        // Vertically centred while the pin fits; an image taller than the
+        // output opens at its top edge, so a long capture starts at its
+        // beginning instead of showing its middle.
+        const int top = size.height() > bounds.height()
+                            ? bounds.top()
+                            : bounds.top() + (bounds.height() - size.height()) / 2;
+        pin->origin = QPoint(bounds.left() + (bounds.width() - size.width()) / 2, top) +
+                      QPoint(offset, offset);
         pin->origin = clampOrigin(*pin, pin->origin);
 
         buildSurfaces(pin);
@@ -893,8 +901,8 @@ private:
             pin->origin = clampOrigin(*pin, topLeft);
             syncGeometry(pin);
         });
-        surface->setZoomCallback([this, pin, surface](double factor, QPoint cursor) {
-            zoomPin(pin, surface, factor, cursor);
+        surface->setZoomCallback([this, pin, surface](double factor) {
+            zoomPin(pin, surface, factor);
         });
         if (!surface->showLayerSurface()) {
             delete surface;
@@ -974,20 +982,20 @@ private:
         }
     }
 
-    // Multiplicative zoom anchored on the cursor: the point under the pointer
-    // stays put. Only the surface that reported the gesture shows the badge.
-    void zoomPin(Pin *pin, PinWindow *source, double factor, QPoint globalCursor)
+    // Multiplicative zoom keeps the image center in place. Only the surface
+    // that reported the gesture shows the badge.
+    void zoomPin(Pin *pin, PinWindow *source, double factor)
     {
         const double next = std::clamp(pin->scale * factor, kMinScale, kMaxScale);
         if (next == pin->scale) {
             return;
         }
-        const QPoint anchor = globalCursor - pin->origin;
-        const double ratio = next / pin->scale;
+        const QRect previous(pin->origin, pin->displaySize());
+        const QPoint center = previous.center();
         pin->scale = next;
-        pin->origin = clampOrigin(*pin,
-                                  globalCursor - QPoint(qRound(anchor.x() * ratio),
-                                                        qRound(anchor.y() * ratio)));
+        const QSize resized = pin->displaySize();
+        pin->origin = clampOrigin(
+            *pin, center - QPoint(resized.width() / 2, resized.height() / 2));
         syncGeometry(pin);
         if (source != nullptr) {
             source->showZoomBadge();

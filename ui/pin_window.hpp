@@ -53,7 +53,7 @@ public:
     {
         dragMoved_ = std::move(callback);
     }
-    void setZoomCallback(std::function<void(double, QPoint)> callback)
+    void setZoomCallback(std::function<void(double)> callback)
     {
         zoomRequested_ = std::move(callback);
     }
@@ -132,7 +132,7 @@ private:
     std::function<void()> closeRequested_;
     std::function<void()> editRequested_;
     std::function<void(QPoint)> dragMoved_;
-    std::function<void(double, QPoint)> zoomRequested_;
+    std::function<void(double)> zoomRequested_;
     bool hasFocus_ = false;
 
     // Image top-left in global logical pixels.

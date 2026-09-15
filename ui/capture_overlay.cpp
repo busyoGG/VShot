@@ -38,20 +38,38 @@
 #include <QSpinBox>
 #include <QStyle>
 #include <QStyledItemDelegate>
+#include <QTimer>
 #include <QToolButton>
 #include <QStringList>
 #include <QWindow>
+#include <QSocketNotifier>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <fcntl.h>
 #include <functional>
 #include <limits>
+#include <unistd.h>
 
 namespace vshot {
 namespace {
 
 constexpr int kHandleRadius = 6;
 constexpr int kMinimumSelection = 5;
+// Widest window label the picker's size pill shows before eliding it.
+constexpr int kPickerLabelWidth = 360;
+// How often the picker may ask the CLI for a fresh candidate list while the
+// pointer travels.  Fast enough that a workspace switch is reflected by the
+// time the pointer reaches the window it is heading for, slow enough that a
+// drag across the screen does not turn into a stream of compositor queries.
+constexpr int kCandidateRefreshIntervalMs = 150;
+// And how often it asks when the pointer is not moving at all: a window can
+// move, or another monitor's workspace can be switched, without this surface
+// seeing an event, and the highlight must not keep describing what used to be
+// there.  Only the picker's lifetime pays for this.
+constexpr int kCandidateRefreshPollMs = 300;
 constexpr std::uint32_t kTextScale = 2;
 constexpr int kMaxUndoSteps = 100;
 constexpr int kLoupeRadius = 7;
@@ -2431,6 +2449,15 @@ OverlayController::OverlayController(Session session)
     : session_(std::move(session))
     , gesture_(new Gesture)
 {
+    // Window picking is driven by the session's candidate list instead of a
+    // free-hand drag: the pointer highlights a candidate and a click takes it.
+    if (session_.mode == QStringLiteral("window-pick")) {
+        pickMode_ = true;
+        candidates_ = session_.candidates;
+    }
+    // Scrolling capture wants a rectangle, not an editor: the pixels it will
+    // annotate only exist once the page has been scrolled and stitched.
+    selectOnly_ = session_.mode == QStringLiteral("region-only");
 }
 
 OverlayController::~OverlayController()
@@ -2440,6 +2467,8 @@ OverlayController::~OverlayController()
     delete gesture_;
     // Explicit rather than parented: the controller is not a QObject.
     delete pinSocket_;
+    delete candidateReader_;
+    delete candidateTimer_;
 }
 
 int OverlayController::outputCount() const
@@ -2683,6 +2712,210 @@ int OverlayController::hitHandle(Point point) const
     return 0;
 }
 
+/// Smallest candidate window containing `point`, or -1.  Smallest so that
+/// pointing at overlapping windows takes the topmost-looking inner one, which
+/// is what the user means by pointing at that spot.
+int OverlayController::candidateIndexAt(Point point) const
+{
+    int best = -1;
+    qint64 bestArea = 0;
+    for (int index = 0; index < candidates_.size(); ++index) {
+        const LogicalRect &rect = candidates_.at(index).rect;
+        if (point.x < rect.x || point.y < rect.y || point.x >= rect.right() ||
+            point.y >= rect.bottom()) {
+            continue;
+        }
+        const qint64 candidateArea = static_cast<qint64>(rect.width) * rect.height;
+        if (best < 0 || candidateArea < bestArea) {
+            best = index;
+            bestArea = candidateArea;
+        }
+    }
+    return best;
+}
+
+/// What the size pill reads while a candidate is hovered: the window's label
+/// when it has one, always followed by the size the capture would have.
+QString OverlayController::candidatePillText() const
+{
+    const QString dimensions =
+        QStringLiteral("%1 × %2").arg(selection_->width).arg(selection_->height);
+    if (hoveredCandidate_ < 0 || hoveredCandidate_ >= candidates_.size()) {
+        return dimensions;
+    }
+    const QString label = candidates_.at(hoveredCandidate_).label.trimmed();
+    if (label.isEmpty()) {
+        return dimensions;
+    }
+    // The pill is single-line and drawn at the window's corner, so a long
+    // title is elided rather than pushed across the screen.
+    const QFontMetrics metrics(pillFont());
+    const QString elided = metrics.elidedText(label, Qt::ElideRight, kPickerLabelWidth);
+    return QStringLiteral("%1  %2").arg(elided, dimensions);
+}
+
+/// Moves the hover highlight to the candidate under the pointer.  Returns true
+/// when the highlight actually changed, so the caller can skip the repaint.
+bool OverlayController::applyCandidateHover(Point point, CaptureOverlay *overlay)
+{
+    const int index = candidateIndexAt(point);
+    overlay->setCursor(index >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
+    if (index == hoveredCandidate_ && selection_.has_value() == (index >= 0)) {
+        return false;
+    }
+    hoveredCandidate_ = index;
+    if (index >= 0) {
+        selection_ = candidates_.at(index).rect;
+    } else {
+        selection_.reset();
+    }
+    return true;
+}
+
+void OverlayController::enableCandidateRefresh()
+{
+    if (!pickMode_ || candidateRefreshEnabled_) {
+        return;
+    }
+    candidateRefreshEnabled_ = true;
+    // The CLI answers on the same pipe the session path came in on.  It is a
+    // pipe, so this never blocks on a terminal: drain what is there, and let
+    // the notifier wake the controller when more arrives.
+    const int flags = ::fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    }
+    candidateReader_ = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read);
+    QObject::connect(candidateReader_, &QSocketNotifier::activated, candidateReader_, [this] {
+        readCandidateReplies();
+    });
+    // The pointer asks as it travels; this asks when it does not, so a desktop
+    // that changed without an event here still catches up.
+    candidateClock_.restart();
+    candidateTimer_ = new QTimer();
+    candidateTimer_->setInterval(kCandidateRefreshPollMs);
+    QObject::connect(candidateTimer_, &QTimer::timeout, candidateTimer_, [this] {
+        requestCandidateRefresh();
+    });
+    candidateTimer_->start();
+}
+
+void OverlayController::requestCandidateRefresh()
+{
+    if (!candidateRefreshEnabled_ || candidateRefreshPending_ || finished_ || cancelled_) {
+        return;
+    }
+    if (candidateClock_.elapsed() < kCandidateRefreshIntervalMs) {
+        return;
+    }
+    candidateClock_.restart();
+    const QByteArray request = QByteArrayLiteral("{\"request\":\"candidates\"}\n");
+    if (std::fwrite(request.constData(), 1, static_cast<std::size_t>(request.size()), stdout) !=
+        static_cast<std::size_t>(request.size())) {
+        return;
+    }
+    std::fflush(stdout);
+    candidateRefreshPending_ = true;
+}
+
+/// Reads whatever the CLI has answered so far: one JSON object per line, a
+/// `candidates` array being a fresh list.  Anything without one (an empty
+/// object, or a CLI that has no window list to offer) leaves the current list
+/// alone, so a picker that cannot be refreshed still highlights something.
+void OverlayController::readCandidateReplies()
+{
+    char buffer[4096];
+    while (true) {
+        const ssize_t got = ::read(STDIN_FILENO, buffer, sizeof(buffer));
+        if (got > 0) {
+            candidateReplies_.append(buffer, static_cast<int>(got));
+            continue;
+        }
+        if (got == 0) {
+            // The CLI closed the pipe (it is on its way out): stop listening.
+            candidateReader_->setEnabled(false);
+            return;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+        candidateReader_->setEnabled(false);
+        return;
+    }
+
+    int newline = candidateReplies_.indexOf('\n');
+    while (newline >= 0) {
+        const QByteArray line = candidateReplies_.left(newline);
+        candidateReplies_.remove(0, newline + 1);
+        newline = candidateReplies_.indexOf('\n');
+        candidateRefreshPending_ = false;
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            continue;
+        }
+        const QJsonValue value = document.object().value(QStringLiteral("candidates"));
+        if (!value.isArray()) {
+            continue;
+        }
+        const QJsonArray array = value.toArray();
+        QVector<WindowCandidate> candidates;
+        candidates.reserve(array.size());
+        bool valid = true;
+        for (int index = 0; index < array.size(); ++index) {
+            QString reason;
+            WindowCandidate candidate;
+            if (!array.at(index).isObject() ||
+                !parseWindowCandidate(array.at(index).toObject(),
+                                      QStringLiteral("candidate %1").arg(index), &candidate,
+                                      &reason)) {
+                valid = false;
+                break;
+            }
+            candidates.push_back(std::move(candidate));
+        }
+        if (valid) {
+            applyCandidates(std::move(candidates));
+        }
+    }
+}
+
+/// Replaces the candidate list with a fresh one and points the hover at
+/// whatever the (unmoved) pointer is over now.  The picker polls, so most
+/// answers are the list it already has: comparing first keeps the veil from
+/// being repainted three times a second for nothing.
+void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
+{
+    const bool sameList = candidates.size() == candidates_.size() &&
+        std::equal(candidates.cbegin(), candidates.cend(), candidates_.cbegin(),
+                   [](const WindowCandidate &first, const WindowCandidate &second) {
+                       return first.rect.x == second.rect.x && first.rect.y == second.rect.y &&
+                           first.rect.width == second.rect.width &&
+                           first.rect.height == second.rect.height &&
+                           first.label == second.label;
+                   });
+    if (sameList) {
+        return;
+    }
+    candidates_ = std::move(candidates);
+    // The pointer has not moved, but what sits under it may have: re-point the
+    // hover at the new list instead of keeping a highlight that no longer
+    // describes anything on screen.
+    hoveredCandidate_ = candidateIndexAt(pointer_);
+    if (hoveredCandidate_ >= 0) {
+        selection_ = candidates_.at(hoveredCandidate_).rect;
+    } else {
+        selection_.reset();
+    }
+    for (CaptureOverlay *overlay : overlays_) {
+        overlay->setCursor(hoveredCandidate_ >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
+    }
+    updateAll();
+}
+
 void OverlayController::startSelection(Point point)
 {
     gesture_->type = Gesture::Type::Selecting;
@@ -2704,10 +2937,19 @@ void OverlayController::finishSelection(Point point)
 {
     updateSelection(point);
     gesture_->type = Gesture::Type::None;
-    if (selection_.has_value()) {
-        editing_ = true;
-        showToolbar();
+    if (!selection_.has_value()) {
+        return;
     }
+    if (selectOnly_) {
+        // A drag that lands on something usable ends the session right there;
+        // a stray click leaves the surface alone so the user can try again.
+        if (hasValidSelection()) {
+            terminal(false);
+        }
+        return;
+    }
+    editing_ = true;
+    showToolbar();
 }
 
 void OverlayController::beginDrawing(Point point)
@@ -3196,6 +3438,27 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         finishText(true);
     }
     const Point point = globalPoint(overlay, local);
+    if (pickMode_ && !editing_) {
+        // The click takes the window under the pointer and ends the session:
+        // picking only decides what to capture, and the pixels come from the
+        // frame Rust captures once this overlay is off the screen.
+        const int index = candidateIndexAt(point);
+        if (index >= 0) {
+            hoveredCandidate_ = index;
+            selection_ = candidates_.at(index).rect;
+            pointer_ = point;
+            // Take the highlight off the screen first: the compositor destroys
+            // these surfaces asynchronously, and a lingering copy of the
+            // picker would end up in the very capture that follows.
+            for (CaptureOverlay *item : overlays_) {
+                item->hide();
+            }
+            terminal(false);
+        } else {
+            updateAll();
+        }
+        return;
+    }
     if (pinEdit_ && !canDrawAt(point)) {
         // Outside the pinned image the surface is bare canvas: only the Select
         // tool reacts, and only by dropping the current annotation selection.
@@ -3268,6 +3531,19 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
     const Point point = globalPoint(overlay, local);
     pointer_ = point;
     pointerOutput_ = overlay->outputIndex();
+    if (pickMode_ && !editing_ && buttons == Qt::NoButton &&
+        gesture_->type == Gesture::Type::None) {
+        // Nothing is committed yet: the pointer only previews which window a
+        // click would take.  Travelling is also the moment to re-check what
+        // the compositor has — a workspace switch or a moved window since the
+        // list was taken would otherwise leave the highlight pointing at
+        // nothing (or at the wrong window).
+        requestCandidateRefresh();
+        if (applyCandidateHover(point, overlay)) {
+            updateAll();
+        }
+        return;
+    }
     const bool insideImage = canDrawAt(point);
     if (pinEdit_ && !insideImage && buttons == Qt::NoButton &&
         gesture_->type == Gesture::Type::None) {
@@ -4161,6 +4437,39 @@ void OverlayController::beginPinEdit()
     showToolbar();
 }
 
+void OverlayController::beginPresetEdit()
+{
+    if (!session_.selection.has_value() || finished_ || cancelled_) {
+        return;
+    }
+    // Start where a finished drag would leave a region session: the selection
+    // is the one the picker resolved, so the toolbar is up and the frozen
+    // frame under it is the canvas the user will annotate and save.
+    selection_ = *session_.selection;
+    editing_ = true;
+    toolbarOutput_ = outputContaining(*selection_);
+    showToolbar();
+    updateAll();
+}
+
+int OverlayController::outputContaining(const LogicalRect &rect) const
+{
+    const Point center{
+        rect.x + static_cast<std::int32_t>(rect.width / 2),
+        rect.y + static_cast<std::int32_t>(rect.height / 2),
+    };
+    for (int index = 0; index < session_.outputs.size(); ++index) {
+        const LogicalRect &geometry = session_.outputs.at(index).geometry;
+        if (center.x >= geometry.x && center.x < geometry.right() && center.y >= geometry.y &&
+            center.y < geometry.bottom()) {
+            return index;
+        }
+    }
+    // A selection that lands on no output at all (a torn-down one) keeps the
+    // toolbar on the first surface instead of nowhere.
+    return 0;
+}
+
 void OverlayController::confirm()
 {
     if (finished_ || cancelled_) {
@@ -4246,6 +4555,15 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         selection.insert(QStringLiteral("height"), static_cast<qint64>(selection_->height));
     }
     root.insert(QStringLiteral("selection"), selection);
+    // Picking reports the click position as well: it runs on a live desktop,
+    // so the caller re-resolves there which window the click actually landed
+    // on before it captures the frame.
+    if (pickMode_) {
+        QJsonObject point;
+        point.insert(QStringLiteral("x"), static_cast<qint64>(pointer_.x));
+        point.insert(QStringLiteral("y"), static_cast<qint64>(pointer_.y));
+        root.insert(QStringLiteral("point"), point);
+    }
 
     QJsonArray outputAnnotations;
     for (const Annotation &annotation : annotations_) {
@@ -4382,9 +4700,27 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     const QRectF imageRect = localRect(output, imageArea, overlay->size());
     painter->save();
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
+    // Picking shows the desktop live and never paints the session's frame:
+    // that would freeze the very screen the user is choosing from.  Everything
+    // but the hovered window is veiled so the pick stands out.  The hovered
+    // window's outline and label pill are drawn below; the click ends the
+    // session, and the frame it is captured into comes from Rust after that.
+    const bool livePick = pickMode_;
     // In pin-edit mode the pinned window itself shows the image: the editor
     // only draws the marks on top, so there is exactly one copy on screen.
-    if (!pinEdit_) {
+    if (livePick) {
+        QPainterPath veil;
+        veil.addRect(target);
+        if (selection_.has_value()) {
+            LogicalRect visible;
+            if (intersection(*selection_, output.geometry, &visible)) {
+                QPainterPath hole;
+                hole.addRect(localRect(output, visible, overlay->size()));
+                veil = veil.subtracted(hole);
+            }
+        }
+        painter->fillPath(veil, QColor(0, 0, 0, 80));
+    } else if (!pinEdit_) {
         painter->drawImage(imageRect, output.image);
         // The dim-out only makes sense around a selectable region.
         painter->fillRect(target, QColor(0, 0, 0, 80));
@@ -4587,13 +4923,17 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
+    // Window picking previews a whole window before it is committed, so its
+    // pill names the window instead of just measuring it.
+    const bool pickPreview = pickMode_ && !editing_ && selection_.has_value();
     if (selection_.has_value() && !pinEdit_ &&
-        (gesture_->type == Gesture::Type::Selecting || editing_)) {
-        const QString dimensions =
-            QStringLiteral("%1 × %2").arg(selection_->width).arg(selection_->height);
+        (pickPreview || gesture_->type == Gesture::Type::Selecting || editing_)) {
+        const QString text = pickPreview
+            ? candidatePillText()
+            : QStringLiteral("%1 × %2").arg(selection_->width).arg(selection_->height);
         drawInfoPill(painter, localPoint(output, Point{selection_->x, selection_->y},
                                          overlay->size()),
-                     dimensions, target);
+                     text, target);
     }
 
     const bool loupeActive = gesture_->type == Gesture::Type::Selecting ||
