@@ -47,12 +47,10 @@ QScreen *screenForOutput(const vshot::OutputSession &output)
 int main(int argc, char **argv)
 {
     qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
-    // wlroots compositors only expose the clipboard through the unstable
-    // zwlr_data_control_v1 protocol, which Qt keeps behind this opt-in flag.
-    // Without it the pin daemon cannot read `wl-copy` content.
-    if (!qEnvironmentVariableIsSet("QT_WAYLAND_USE_DATA_CONTROL")) {
-        qputenv("QT_WAYLAND_USE_DATA_CONTROL", "1");
-    }
+    // The clipboard is read with `wl-paste` rather than through Qt's own
+    // Wayland clipboard: Qt implements only the wlroots
+    // `zwlr_data_control_v1`, which a KWin session does not offer, and its
+    // standard path hands over nothing to a client that has no focus.
 
     // QApplication consumes Qt-managed command-line options it recognizes
     // (including the session-management option that shares our `--session`

@@ -71,25 +71,45 @@ fn run() -> Result<()> {
     let output_infos = wayland.output_infos()?;
     let mut capture = Capturer::connect()?;
 
-    // Metadata lookup is cheap and happens before the capture; a failure is
-    // not fatal yet — the pixel fallback runs on the captured scene.
+    // The focused window's own screenshot, when the compositor offers one —
+    // KWin does.  That is the exact answer: the compositor draws the window
+    // itself, decorations included, at the density of the screen it lives on.
+    // Every route below exists to reconstruct that from something else, so this
+    // one is asked first and the rest is only reached when it cannot answer.
     let pixel_detect = matches!(
         request.target,
         CaptureTarget::ActiveWindow { pixel_detect: true }
     );
-    let mut metadata_error = None;
-    let metadata_window =
-        if matches!(request.target, CaptureTarget::ActiveWindow { .. }) && !pixel_detect {
-            match ProcessWindowProvider.active_window() {
-                Ok(window) => Some(window),
-                Err(error) => {
-                    metadata_error = Some(error);
-                    None
-                }
+    let (native_window, mut unavailable) = match &request.target {
+        CaptureTarget::ActiveWindow { .. } if !pixel_detect => {
+            match capture.capture_active_window(request.cursor) {
+                Some(Ok(window)) => (Some(window), None),
+                Some(Err(error)) => (None, Some(error)),
+                None => (None, None),
             }
-        } else {
-            None
-        };
+        }
+        _ => (None, None),
+    };
+
+    // Metadata lookup is cheap and happens before the capture; a failure is
+    // not fatal yet — the pixel fallback runs on the captured scene, and the
+    // reason only matters if that fails too.
+    let metadata_window = if native_window.is_none()
+        && matches!(request.target, CaptureTarget::ActiveWindow { .. })
+        && !pixel_detect
+    {
+        match ProcessWindowProvider.active_window() {
+            Ok(window) => Some(window),
+            Err(error) => {
+                // Keep the first reason: why the exact route failed says more
+                // than why one of its substitutes did.
+                unavailable.get_or_insert(error);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
 
@@ -140,36 +160,36 @@ fn run() -> Result<()> {
             (scene.frame().clone(), scene.scale())
         }
         CaptureTarget::ActiveWindow { .. } => {
-            let geometry = match metadata_window {
-                Some(window) => {
-                    wayland.show_frozen(false)?;
-                    window.geometry
-                }
-                None => {
-                    // The overlay surfaces must be mapped before the
-                    // compositor routes pointer events to this client, so
-                    // show the frozen scene before reading the pointer.
-                    wayland.show_frozen(false)?;
-                    let cursor = wayland.pointer_position().unwrap_or(None);
-                    match capture::detect_active_window(&scene, cursor) {
-                        Ok(window) => window.geometry,
-                        Err(pixel_error) => {
-                            return Err(match metadata_error {
-                                Some(metadata_error) => VshotError::ActiveWindowUnavailable(
-                                    format!("{metadata_error}; pixel fallback also failed: {pixel_error}"),
-                                ),
-                                None => pixel_error,
-                            });
-                        }
+            if let Some((frame, density)) = native_window {
+                (frame, density)
+            } else if let Some(window) = metadata_window {
+                wayland.show_frozen(false)?;
+                let geometry = selection::validate_selection(&scene, window.geometry)?;
+                // The window's own pixels at its own output's density — cropping
+                // the composed scene would hand back a nearest-upscale of a
+                // window that sits on a lower-density monitor.
+                crop_window(&scene, geometry)?
+            } else {
+                // Neither, so the window has to be found in the frozen frame.
+                // The overlay surfaces must be mapped before the compositor
+                // routes pointer events to this client, so show the frozen
+                // scene before reading the pointer.
+                wayland.show_frozen(false)?;
+                let cursor = wayland.pointer_position().unwrap_or(None);
+                let geometry = match capture::detect_active_window(&scene, cursor) {
+                    Ok(window) => window.geometry,
+                    Err(pixel_error) => {
+                        return Err(match unavailable {
+                            Some(reason) => VshotError::ActiveWindowUnavailable(format!(
+                                "{reason}; the pixel fallback also failed: {pixel_error}"
+                            )),
+                            None => pixel_error,
+                        });
                     }
-                }
-            };
-            let geometry = selection::validate_selection(&scene, geometry)?;
-            wayland.show_frozen(false)?;
-            // The window's own pixels at its own output's density — cropping the
-            // composed scene would hand back a nearest-upscale of a window that
-            // sits on a lower-density monitor.
-            crop_window(&scene, geometry)?
+                };
+                let geometry = selection::validate_selection(&scene, geometry)?;
+                crop_window(&scene, geometry)?
+            }
         }
         CaptureTarget::WindowPick { pixel_detect } => {
             // Compose the candidate set first: the compositor's window list
@@ -261,16 +281,20 @@ fn run() -> Result<()> {
             );
             if result.appended == 0 {
                 // Not one scroll moved anything: the picture is a single frame.
-                // Say so, and say where the wheel was aimed, because the two
-                // causes look identical otherwise — a region that cannot
-                // scroll (a panel, a bar, a window with nothing to scroll) and
-                // a window that ignores synthetic wheel events.
+                // Say which backend carried the wheel and where it was aimed,
+                // because the causes look identical otherwise — a region that
+                // cannot scroll (a panel, a bar, a window with nothing to
+                // scroll), a pointer that never was over the region (only the
+                // compositor protocol moves it), and a window that ignores
+                // synthetic wheel events.
                 eprintln!(
                     "vshot: nothing scrolled, so the result is a single frame of {}x{}: the \
-wheel was sent to the region centre ({}, {}) on {} — a region that has nothing to scroll \
-and a window that ignores synthetic wheel events look the same from here",
+wheel went through {} aimed at the region centre ({}, {}) on {}, and a region that has \
+nothing to scroll, a pointer that is outside it, and a window that ignores synthetic wheel \
+events all look the same from here",
                     result.frame.size().width,
                     result.frame.size().height,
+                    injector.backend_name(),
                     region.origin.x + (region.size.width / 2) as i32,
                     region.origin.y + (region.size.height / 2) as i32,
                     result.output,

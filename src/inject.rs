@@ -345,9 +345,14 @@ impl Drop for WlrPointer {
 
 // -- /dev/uinput ------------------------------------------------------------
 
-// From `linux/uinput.h`: _IOW('U', 100, int), _IOW('U', 102, int), _IO('U', 1).
+// From `linux/uinput.h`: _IOW('U', 100, int), _IOW('U', 102, int),
+// _IOW('U', 3, struct uinput_setup), _IO('U', 1), _IO('U', 2).  Both the ioctl
+// number *and* the encoded size matter — the kernel switches on the number, so
+// a request built with the wrong size is handled as a different command
+// entirely (which is how `UI_DEV_SETUP` first came out as `UI_SET_EVBIT`).
 const UI_SET_EVBIT: c_ulong = 0x4004_5564;
 const UI_SET_RELBIT: c_ulong = 0x4004_5566;
+const UI_DEV_SETUP: c_ulong = 0x405c_5503;
 const UI_DEV_CREATE: c_ulong = 0x5501;
 const UI_DEV_DESTROY: c_ulong = 0x5502;
 
@@ -370,6 +375,32 @@ struct InputEvent {
     kind: u16,
     code: u16,
     value: i32,
+}
+
+/// `UINPUT_MAX_NAME_SIZE` from `linux/uinput.h`.
+const UINPUT_MAX_NAME_SIZE: usize = 80;
+
+/// The identity the wheel registers itself under.  `BUS_USB` is what `ydotool`
+/// uses for its virtual mouse, and a plain mouse is what libinput expects to see
+/// behind a device that only offers a wheel.
+const UINPUT_BUS_USB: u16 = 0x03;
+const UINPUT_NAME: &[u8] = b"vshot virtual wheel";
+
+/// `struct uinput_setup` from `linux/uinput.h`: a `struct input_id` (four
+/// `__u16`s), the fixed-size name, and the force-feedback effect count.
+///
+/// The kernel refuses `UI_DEV_CREATE` with `EINVAL` for a device that was never
+/// set up — it would be registered without a name — so this has to be handed
+/// over first.  The size of this struct is encoded in `UI_DEV_SETUP`, which is
+/// why a test pins it.
+#[repr(C)]
+struct UinputSetup {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+    name: [u8; UINPUT_MAX_NAME_SIZE],
+    ff_effects_max: u32,
 }
 
 /// Wheel injection through a kernel virtual mouse.
@@ -401,6 +432,21 @@ impl UinputWheel {
                 )));
             }
         }
+        let mut setup = UinputSetup {
+            bustype: UINPUT_BUS_USB,
+            vendor: 0x1234,
+            product: 0x5678,
+            version: 1,
+            name: [0; UINPUT_MAX_NAME_SIZE],
+            ff_effects_max: 0,
+        };
+        setup.name[..UINPUT_NAME.len()].copy_from_slice(UINPUT_NAME);
+        if unsafe { ioctl(fd, UI_DEV_SETUP, std::ptr::from_ref(&setup)) } < 0 {
+            return Err(VshotError::LongShotInjection(format!(
+                "{UINPUT_PATH} refused to set the device up ({})",
+                std::io::Error::last_os_error()
+            )));
+        }
         if unsafe { ioctl(fd, UI_DEV_CREATE) } < 0 {
             return Err(VshotError::LongShotInjection(format!(
                 "{UINPUT_PATH} refused to create the device ({})",
@@ -411,16 +457,22 @@ impl UinputWheel {
         Ok(Self { device })
     }
 
-    fn scroll(&mut self, clicks: i32) -> Result<()> {
-        // A relative wheel event only takes effect once the sync report that
-        // closes the packet arrives.
-        let events = [
+    /// The two events one notch travels as: the relative wheel itself and the
+    /// sync report that closes the packet — a relative event only takes effect
+    /// once the report arrives.
+    ///
+    /// The sign flips here.  evdev counts `REL_WHEEL` *up* for a wheel turned
+    /// away from the user, while this type's callers count up as "scroll down"
+    /// (the way `wl_pointer.axis` and the portal both spell it).  Handing the
+    /// count over unchanged is what made a capture walk the page the wrong way.
+    fn events(clicks: i32) -> [InputEvent; 2] {
+        [
             InputEvent {
                 tv_sec: 0,
                 tv_usec: 0,
                 kind: EV_REL,
                 code: REL_WHEEL,
-                value: clicks,
+                value: -clicks,
             },
             InputEvent {
                 tv_sec: 0,
@@ -429,7 +481,11 @@ impl UinputWheel {
                 code: SYN_REPORT,
                 value: 0,
             },
-        ];
+        ]
+    }
+
+    fn scroll(&mut self, clicks: i32) -> Result<()> {
+        let events = Self::events(clicks);
         let bytes = unsafe {
             std::slice::from_raw_parts(events.as_ptr().cast::<u8>(), std::mem::size_of_val(&events))
         };
@@ -490,7 +546,11 @@ impl PortalRemote {
             "session_handle_token",
             Value::from(request_token("session")),
         );
-        let request: OwnedObjectPath = call(&proxy, "CreateSession", &("", options))?;
+        // `CreateSession` takes the options dict and nothing else — both tokens
+        // travel inside it.  A leading empty string (the shape
+        // `CreateSession(s session_handle_token, a{sv} options)`) is answered
+        // with `InvalidArgs` by xdg-desktop-portal 1.20.
+        let request: OwnedObjectPath = call(&proxy, "CreateSession", &(options,))?;
         let results = wait_response(&mut responses, &request)?;
         let session = result_object(&results, "session_handle")?;
 
@@ -609,13 +669,25 @@ fn wait_response(
     ))
 }
 
+/// Reads an object path out of a portal response.  `session_handle` is specified
+/// as an object path, but the interface XML admits it "was erroneously
+/// implemented as `s`" and that this will stay for compatibility, so both
+/// spellings are accepted.  Anything else is an error rather than a guess.
 fn result_object(results: &HashMap<String, OwnedValue>, key: &str) -> Result<OwnedObjectPath> {
     let value = results.get(key).ok_or_else(|| {
         VshotError::LongShotInjection(format!("the portal did not report `{key}`"))
     })?;
-    OwnedObjectPath::try_from(value.clone()).map_err(|error| {
+    if let Ok(path) = OwnedObjectPath::try_from(value.clone()) {
+        return Ok(path);
+    }
+    let text = value.downcast_ref::<&str>().map_err(|error| {
         VshotError::LongShotInjection(format!(
-            "the portal's `{key}` is not an object path: {error}"
+            "the portal's `{key}` is neither an object path nor a string: {error}"
+        ))
+    })?;
+    OwnedObjectPath::try_from(text.to_string()).map_err(|error| {
+        VshotError::LongShotInjection(format!(
+            "the portal's `{key}` is a string that is not an object path: {error}"
         ))
     })
 }
@@ -637,6 +709,87 @@ mod tests {
         assert_eq!(std::mem::size_of::<InputEvent>(), 24);
         assert_eq!(std::mem::offset_of!(InputEvent, kind), 16);
         assert_eq!(std::mem::offset_of!(InputEvent, value), 20);
+    }
+
+    #[test]
+    fn the_device_setup_matches_the_request_that_carries_it() {
+        // `_IOW` encodes the argument size, and the kernel matches on the ioctl
+        // number: a request whose size disagrees with the struct it points at
+        // gets dispatched as whatever command shares that number.
+        let encoded_size = ((UI_DEV_SETUP >> 16) & 0xff) as usize;
+        assert_eq!(encoded_size, std::mem::size_of::<UinputSetup>());
+        assert_eq!(std::mem::size_of::<UinputSetup>(), 92);
+        assert_eq!(std::mem::offset_of!(UinputSetup, name), 8);
+        assert_eq!(std::mem::offset_of!(UinputSetup, ff_effects_max), 88);
+        assert!(UINPUT_NAME.len() < UINPUT_MAX_NAME_SIZE);
+    }
+
+    #[test]
+    fn the_wheel_arrives_counting_the_way_the_callers_do() {
+        // `WheelInjector::scroll` counts positive as "scroll down"; evdev's
+        // vertical wheel counts *up* for a wheel turned away from the user, so
+        // the sign has to flip on the way to the device.
+        let down = UinputWheel::events(1);
+        assert_eq!(
+            (down[0].kind, down[0].code, down[0].value),
+            (EV_REL, REL_WHEEL, -1)
+        );
+        let up = UinputWheel::events(-3);
+        assert_eq!(up[0].value, 3);
+        // A relative event is only acted on once the report closing the packet
+        // follows it.
+        for events in [down, up] {
+            assert_eq!(
+                (events[1].kind, events[1].code, events[1].value),
+                (EV_SYN, SYN_REPORT, 0)
+            );
+        }
+    }
+
+    /// Creates a real virtual mouse, which is the only way to know the kernel
+    /// accepts the device: `UI_DEV_CREATE` is where a missing `UI_DEV_SETUP`
+    /// shows up as `EINVAL`.  Ignored by default because it needs `/dev/uinput`
+    /// to be writable by the user running the tests.
+    #[test]
+    #[ignore = "needs write access to /dev/uinput"]
+    fn a_wheel_only_device_can_be_created() {
+        let mut wheel = UinputWheel::open().expect("/dev/uinput has to accept a wheel device");
+        wheel
+            .scroll(1)
+            .expect("the created device has to take a wheel event");
+    }
+
+    #[test]
+    fn the_session_handle_is_read_whatever_the_portal_calls_it() {
+        // The RemoteDesktop interface XML says the handle "was erroneously
+        // implemented as `s`" and will stay that way, so both spellings have to
+        // be understood — and anything else has to be refused.
+        let handle = "/org/freedesktop/portal/desktop/session/1_1/vshot1";
+        let mut results: HashMap<String, OwnedValue> = HashMap::new();
+        results.insert(
+            "session_handle".into(),
+            Value::from(handle).try_into().unwrap(),
+        );
+        assert_eq!(
+            result_object(&results, "session_handle").unwrap().as_str(),
+            handle
+        );
+        results.insert(
+            "session_handle".into(),
+            Value::from(zbus::zvariant::ObjectPath::try_from(handle).unwrap())
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            result_object(&results, "session_handle").unwrap().as_str(),
+            handle
+        );
+        results.insert(
+            "session_handle".into(),
+            Value::from(7u32).try_into().unwrap(),
+        );
+        assert!(result_object(&results, "session_handle").is_err());
+        assert!(result_object(&results, "missing").is_err());
     }
 
     #[test]

@@ -45,6 +45,43 @@ struct CaptureGeometry {
     stride: usize,
 }
 
+/// What the payload's alpha channel means, which is what decides whether the
+/// frame that comes out can still be see-through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Alpha {
+    /// The pixels cover the whole frame by definition, so the alpha is dropped:
+    /// an output is opaque everywhere, including the regions nothing was drawn
+    /// into.
+    Flatten,
+    /// The alpha is the coverage of what was drawn, so it is kept: a window
+    /// capture is a picture of a window on a transparent backdrop, and the
+    /// pixels the window itself does not cover — its shadow, its rounded
+    /// corners — have to stay transparent.  Flattening them instead restores
+    /// semi-transparent shadow over black, which reads as a black fringe around
+    /// the window.
+    Keep,
+}
+
+/// What a capture is aimed at.  Both of ScreenShot2's calls take options plus a
+/// pipe and differ only in how the target is named, so they share one path
+/// through the protocol — and one place that says what a failure was about.
+enum Shot<'a> {
+    /// One output, under the name KWin knows it by.
+    Output { name: &'a str, cursor: bool },
+    /// The focused window, decorations included.
+    ActiveWindow { cursor: bool },
+}
+
+impl Shot<'_> {
+    /// How this capture is described inside an error message.
+    fn target(&self) -> String {
+        match self {
+            Self::Output { name, .. } => format!("the screen `{name}`"),
+            Self::ActiveWindow { .. } => "the focused window".to_string(),
+        }
+    }
+}
+
 pub struct KwinCapture {
     connection: Connection,
 }
@@ -113,26 +150,60 @@ impl KwinCapture {
     /// Captures one output by its `wl_output` name, which is what KWin calls a
     /// screen: `CaptureScreen` echoes the name back in its results.
     pub fn capture_output(&mut self, name: &str, cursor: bool) -> Result<Frame> {
-        let options = capture_options(cursor);
+        let (frame, _) = self.request(Shot::Output { name, cursor })?;
+        Ok(frame)
+    }
+
+    /// Captures the focused window through KWin's own window screenshot.
+    ///
+    /// It is the only exact answer a Plasma session offers: KWin's window list
+    /// is not published over any protocol vshot speaks, so the alternative is
+    /// to guess the window's rectangle out of the frozen frame.  KWin hands over
+    /// the window's own pixels instead — decorations included, at the window's
+    /// native resolution — and states the `scale` of the screen it lives on,
+    /// which is the density the frame has to keep.
+    pub fn capture_active_window(&mut self, cursor: bool) -> Result<(Frame, u32)> {
+        let (frame, scale) = self.request(Shot::ActiveWindow { cursor })?;
+        let scale = scale.expect("a window capture always carries a scale");
+        Ok((frame, scale))
+    }
+
+    /// Runs one capture and returns the frame KWin rendered, plus the density
+    /// it stated for it when the capture is one that carries a density.
+    ///
+    /// KWin renders on its own thread and can answer the call before the whole
+    /// frame has crossed the pipe — a 64 KiB pipe buffer against a 132 MB
+    /// frame, with the reply arriving first.  Draining from a separate thread
+    /// works whichever order KWin picks; reading only after the reply would
+    /// depend on that order and stall on a full pipe if the compositor ever
+    /// wrote inline.
+    fn request(&self, shot: Shot<'_>) -> Result<(Frame, Option<u32>)> {
+        let options = match &shot {
+            Shot::Output { cursor, .. } => capture_options(*cursor),
+            Shot::ActiveWindow { cursor } => window_options(*cursor),
+        };
         let (read_end, write_end) = rustix::pipe::pipe().map_err(|error| {
             VshotError::KwinScreenShot(format!(
                 "cannot create a pipe for KWin to render into: {error}"
             ))
         })?;
-        // KWin renders on its own thread and can answer the call before the
-        // whole frame has crossed the pipe — a 64 KiB pipe buffer against a
-        // 132 MB frame, with the reply arriving first.  Draining from a
-        // separate thread works whichever order KWin picks; reading only after
-        // the reply would depend on that order and stall on a full pipe if the
-        // compositor ever wrote inline.
         let reader = std::thread::spawn(move || read_to_end(read_end));
-        let reply = self.connection.call_method(
-            Some(SERVICE),
-            PATH,
-            Some(INTERFACE),
-            "CaptureScreen",
-            &(name, options, Fd::from(&write_end)),
-        );
+        let reply = match &shot {
+            Shot::Output { name, .. } => self.connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(INTERFACE),
+                "CaptureScreen",
+                &(*name, options, Fd::from(&write_end)),
+            ),
+            Shot::ActiveWindow { .. } => self.connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(INTERFACE),
+                "CaptureActiveWindow",
+                &(options, Fd::from(&write_end)),
+            ),
+        };
         // Only the compositor's copy of the write end may stay open, otherwise
         // the reader never sees the end of the pixel stream.
         drop(write_end);
@@ -142,7 +213,7 @@ impl KwinCapture {
             // refuses, so the reader finishes on its own.  It is left detached
             // rather than joined so that reporting the refusal never waits on a
             // compositor that might not close anything.
-            Err(error) => return Err(map_dbus_error(&error, name)),
+            Err(error) => return Err(map_dbus_error(&error, &shot.target())),
         };
         let bytes = reader
             .join()
@@ -157,7 +228,16 @@ impl KwinCapture {
             VshotError::KwinScreenShot(format!("the capture results could not be read: {error}"))
         })?;
         let geometry = parse_results(&results)?;
-        convert_premultiplied_bgra(&bytes, geometry)
+        // A window capture is the one that has to know its density — the caller
+        // either pins those pixels or writes them next to the size they are
+        // meant to be shown at — so it is the one that insists on being told.
+        // It is also the one whose pixels do not fill their frame, so it is the
+        // one that keeps them see-through.
+        let (scale, alpha) = match shot {
+            Shot::ActiveWindow { .. } => (Some(result_scale(&results)?), Alpha::Keep),
+            Shot::Output { .. } => (None, Alpha::Flatten),
+        };
+        Ok((convert_premultiplied_bgra(&bytes, geometry, alpha)?, scale))
     }
 }
 
@@ -166,9 +246,38 @@ impl KwinCapture {
 /// reject — so a typo here cannot be caught by a probe.  `include-cursor` is
 /// documented by KDE and passed through, but whether KWin actually draws the
 /// pointer has not been verified: a `--virtual` output has no pointer to draw.
+///
+/// `native-resolution` decides the size of the frame: without it KWin renders
+/// at *logical* size, so a 4K screen at scale 2 arrives as 1920x1080 and then
+/// contradicts the scale the topology reported, which the scene rejects
+/// instead of upscaling silently.
 fn capture_options(cursor: bool) -> HashMap<&'static str, Value<'static>> {
     let mut options = HashMap::new();
     options.insert("include-cursor", Value::from(cursor));
+    options.insert("native-resolution", Value::from(true));
+    options
+}
+
+/// The options for a window capture, which are the output ones plus the
+/// decoration.
+///
+/// `include-decoration` is what keeps the title bar and the window's frame in
+/// the picture: the request is "this window", and a window stripped of its
+/// frame is not what the user is looking at.
+///
+/// `include-shadow` is left at KWin's default, which draws the shadow: it is
+/// part of how the window looks on screen, and the capture keeps the alpha
+/// channel (see [`Alpha::Keep`]) so the pixels the shadow does not cover stay
+/// transparent instead of turning into a black fringe around the window.  A
+/// window that fills the screen has its shadow clipped away, so the same
+/// capture can come back either padded or exactly the size of the window.
+///
+/// A window capture arrives at the window's native resolution either way: on
+/// KWin 6.7.5 a 1920x1046 window on a scale-2 screen came back as 3840x2092
+/// both with and without `native-resolution`, and the reply stated the scale.
+fn window_options(cursor: bool) -> HashMap<&'static str, Value<'static>> {
+    let mut options = capture_options(cursor);
+    options.insert("include-decoration", Value::from(true));
     options
 }
 
@@ -235,15 +344,50 @@ fn result_u32(results: &HashMap<String, Value<'_>>, key: &str) -> Result<u32> {
     })
 }
 
+/// How many device pixels KWin drew per logical pixel of a window, which is the
+/// density the frame has to keep: a window on a 4K screen is twice as many
+/// pixels as it is logical pixels, and pinning it has to be able to work that
+/// out.  Only a window capture needs to be told this — an output's scale comes
+/// from the topology — and a window capture that cannot state it is refused
+/// rather than assumed to be 1, because that assumption is exactly what sizes a
+/// pinned image wrong.
+fn result_scale(results: &HashMap<String, Value<'_>>) -> Result<u32> {
+    let value = results.get("scale").ok_or_else(|| {
+        VshotError::KwinScreenShot(
+            "KWin returned no `scale` for the window, so the density its pixels are meant to \
+             be shown at is unknown"
+                .into(),
+        )
+    })?;
+    // KWin announces a double (`2`, or `1.25` on a fractional-scale screen);
+    // everything else in vshot counts whole device pixels per logical pixel.
+    let scale = value
+        .downcast_ref::<f64>()
+        .map_err(|_| VshotError::KwinScreenShot("the capture's `scale` is not a number".into()))?;
+    let rounded = scale.round();
+    if !scale.is_finite() || scale < 1.0 {
+        return Err(VshotError::KwinScreenShot(format!(
+            "KWin announced a scale of {scale} for the capture, which no screen has"
+        )));
+    }
+    Ok(rounded as u32)
+}
+
 /// Converts the payload ScreenShot2 writes into a pipe into the RGBA frame the
 /// rest of vshot works with.
 ///
 /// The bytes are premultiplied BGRA with a row stride that may be padded, and
-/// the alpha is dropped: a screenshot shows what the compositor composited onto
-/// an output, which is opaque by definition.  Restoring the alpha over black
-/// means a region nothing was drawn into (raw `0, 0, 0, 0`) comes out black
-/// rather than transparent.
-fn convert_premultiplied_bgra(bytes: &[u8], geometry: CaptureGeometry) -> Result<Frame> {
+/// what the alpha means is `alpha`'s to say.  [`Alpha::Flatten`] drops it: a
+/// screenshot shows what the compositor composited onto an output, which is
+/// opaque by definition, so a region nothing was drawn into (raw `0, 0, 0, 0`)
+/// comes out black.  [`Alpha::Keep`] unpremultiplies and keeps it, so those same
+/// pixels come out fully transparent and a half-covered shadow pixel keeps the
+/// coverage that makes it a shadow.
+fn convert_premultiplied_bgra(
+    bytes: &[u8],
+    geometry: CaptureGeometry,
+    alpha_policy: Alpha,
+) -> Result<Frame> {
     let width = usize::try_from(geometry.width)
         .map_err(|_| VshotError::KwinScreenShot("the capture width is too large".into()))?;
     let height = usize::try_from(geometry.height)
@@ -276,16 +420,23 @@ fn convert_premultiplied_bgra(bytes: &[u8], geometry: CaptureGeometry) -> Result
         {
             let alpha = source[3];
             let (red, green, blue) = (source[2], source[1], source[0]);
-            match alpha {
-                0 => destination.copy_from_slice(&[0, 0, 0, 255]),
-                255 => destination.copy_from_slice(&[red, green, blue, 255]),
-                alpha => destination.copy_from_slice(&[
+            // Nothing was drawn here (raw `0, 0, 0, 0`), which has no colour to
+            // restore: it stays black, and only the coverage depends on whether
+            // the frame is meant to be see-through.
+            let colour = if alpha == 0 {
+                [0, 0, 0]
+            } else {
+                [
                     unpremultiply(red, alpha),
                     unpremultiply(green, alpha),
                     unpremultiply(blue, alpha),
-                    255,
-                ]),
-            }
+                ]
+            };
+            let coverage = match alpha_policy {
+                Alpha::Flatten => 255,
+                Alpha::Keep => alpha,
+            };
+            destination.copy_from_slice(&[colour[0], colour[1], colour[2], coverage]);
         }
     }
     Frame::new(Size::new(geometry.width, geometry.height), pixels)
@@ -299,9 +450,9 @@ fn unpremultiply(channel: u8, alpha: u8) -> u8 {
     u8::try_from((scaled / u32::from(alpha)).min(255)).unwrap_or(255)
 }
 
-fn map_dbus_error(error: &zbus::Error, screen: &str) -> VshotError {
+fn map_dbus_error(error: &zbus::Error, target: &str) -> VshotError {
     if let zbus::Error::MethodError(name, detail, _) = error {
-        return map_method_error(name.as_str(), detail.as_deref(), screen);
+        return map_method_error(name.as_str(), detail.as_deref(), target);
     }
     VshotError::KwinScreenShot(format!("the capture call failed: {error}"))
 }
@@ -311,14 +462,17 @@ fn map_dbus_error(error: &zbus::Error, screen: &str) -> VshotError {
 /// ("The process is not authorized to take a screenshot") reads like a prompt
 /// waiting to be approved.  KWin has no such prompt, so the hint spells out the
 /// desktop-file rule instead.
-fn map_method_error(name: &str, detail: Option<&str>, screen: &str) -> VshotError {
+///
+/// `target` is what the capture was aimed at, as [`Shot::target`] spells it:
+/// "the screen `DP-2`" or "the focused window".
+fn map_method_error(name: &str, detail: Option<&str>, target: &str) -> VshotError {
     match name {
         "org.kde.KWin.ScreenShot2.Error.NoAuthorized" => {
             VshotError::ScreenshotDenied(not_authorized_hint())
         }
-        "org.kde.KWin.ScreenShot2.Error.InvalidScreen" => VshotError::IncompleteTopology(format!(
-            "KWin ScreenShot2 does not know the screen `{screen}`"
-        )),
+        "org.kde.KWin.ScreenShot2.Error.InvalidScreen" => {
+            VshotError::IncompleteTopology(format!("KWin ScreenShot2 does not know {target}"))
+        }
         _ => {
             let detail = detail.unwrap_or("no details");
             VshotError::KwinScreenShot(format!("{name}: {detail}"))
@@ -442,7 +596,7 @@ mod tests {
         // 128/128 of red is red — while an opaque colour passes through
         // untouched.
         let bytes = [0, 0, 128, 128, 30, 20, 10, 255, 0, 96, 0, 96];
-        let frame = convert_premultiplied_bgra(&bytes, geometry(3, 1, 12)).unwrap();
+        let frame = convert_premultiplied_bgra(&bytes, geometry(3, 1, 12), Alpha::Flatten).unwrap();
         assert_eq!(
             frame.pixel(crate::geometry::Point::new(0, 0)),
             Some([255, 0, 0, 255])
@@ -463,7 +617,7 @@ mod tests {
         // ScreenShot2 sends B, G, R, A in memory; treating that as RGB would
         // swap red and blue, which is the mistake to catch here.
         let bytes = [0, 0, 255, 255];
-        let frame = convert_premultiplied_bgra(&bytes, geometry(1, 1, 4)).unwrap();
+        let frame = convert_premultiplied_bgra(&bytes, geometry(1, 1, 4), Alpha::Flatten).unwrap();
         assert_eq!(
             frame.pixel(crate::geometry::Point::new(0, 0)),
             Some([255, 0, 0, 255])
@@ -471,17 +625,56 @@ mod tests {
     }
 
     #[test]
-    fn a_transparent_pixel_becomes_black_and_opaque() {
+    fn an_output_capture_flattens_an_undrawn_pixel_to_black() {
         // An output region nothing was composited into arrives as 0, 0, 0, 0;
         // the screen is still opaque there, so the alpha becomes 255.
         let bytes = [0, 0, 0, 0, 0, 0, 0, 0];
-        let frame = convert_premultiplied_bgra(&bytes, geometry(2, 1, 8)).unwrap();
+        let frame = convert_premultiplied_bgra(&bytes, geometry(2, 1, 8), Alpha::Flatten).unwrap();
         assert_eq!(
             frame.pixel(crate::geometry::Point::new(0, 0)),
             Some([0, 0, 0, 255])
         );
         assert_eq!(
             frame.pixel(crate::geometry::Point::new(1, 0)),
+            Some([0, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn a_window_capture_keeps_its_backdrop_transparent() {
+        // A window capture is a picture of a window on a transparent backdrop:
+        // the pixels beyond it arrive as 0, 0, 0, 0 and the shadow arrives as
+        // semi-transparent black.  Both have to survive as coverage, because
+        // restoring them to opaque is exactly the black fringe around the window
+        // that the flattening policy produces.
+        let bytes = [
+            0, 0, 0, 0, // padding: nothing was drawn here
+            0, 0, 0, 128, // the window's shadow, half covered
+            0, 0, 255, 255, // the window itself
+        ];
+        let frame = convert_premultiplied_bgra(&bytes, geometry(3, 1, 12), Alpha::Keep).unwrap();
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(0, 0)),
+            Some([0, 0, 0, 0])
+        );
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(1, 0)),
+            Some([0, 0, 0, 128])
+        );
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(2, 0)),
+            Some([255, 0, 0, 255])
+        );
+
+        // The same payload read as an output is the fringe.
+        let flattened =
+            convert_premultiplied_bgra(&bytes, geometry(3, 1, 12), Alpha::Flatten).unwrap();
+        assert_eq!(
+            flattened.pixel(crate::geometry::Point::new(0, 0)),
+            Some([0, 0, 0, 255])
+        );
+        assert_eq!(
+            flattened.pixel(crate::geometry::Point::new(1, 0)),
             Some([0, 0, 0, 255])
         );
     }
@@ -494,7 +687,7 @@ mod tests {
             3, 2, 1, 255, 0xAA, 0xBB, 0xCC, 0xDD, // row 0 plus padding
             6, 5, 4, 255, 0xAA, 0xBB, 0xCC, 0xDD, // row 1 plus padding
         ];
-        let frame = convert_premultiplied_bgra(&bytes, geometry(1, 2, 8)).unwrap();
+        let frame = convert_premultiplied_bgra(&bytes, geometry(1, 2, 8), Alpha::Flatten).unwrap();
         assert_eq!(frame.size(), Size::new(1, 2));
         assert_eq!(
             frame.pixel(crate::geometry::Point::new(0, 0)),
@@ -511,25 +704,106 @@ mod tests {
     fn a_payload_that_does_not_match_the_announced_geometry_is_refused() {
         // A stride narrower than the row cannot describe the pixels at all.
         assert!(matches!(
-            convert_premultiplied_bgra(&[0; 8], geometry(2, 1, 4)),
+            convert_premultiplied_bgra(&[0; 8], geometry(2, 1, 4), Alpha::Flatten),
             Err(VshotError::KwinScreenShot(_))
         ));
         // A row that is never sent is a truncated frame, not a shorter image.
         assert!(matches!(
-            convert_premultiplied_bgra(&[0; 4], geometry(1, 2, 4)),
+            convert_premultiplied_bgra(&[0; 4], geometry(1, 2, 4), Alpha::Flatten),
             Err(VshotError::KwinScreenShot(_))
         ));
         // Trailing bytes beyond the announced frame are harmless.
-        assert!(convert_premultiplied_bgra(&[0; 9], geometry(1, 2, 4)).is_ok());
+        assert!(convert_premultiplied_bgra(&[0; 9], geometry(1, 2, 4), Alpha::Flatten).is_ok());
     }
 
     #[test]
-    fn the_cursor_option_is_sent_as_a_boolean() {
+    fn the_capture_options_ask_for_native_pixels() {
         let options = capture_options(true);
         assert_eq!(
             options.get("include-cursor"),
             Some(&Value::from(true)),
             "the KDE option name has to survive unchanged"
+        );
+        assert_eq!(
+            options.get("native-resolution"),
+            Some(&Value::from(true)),
+            "a scaled output only arrives at its real size when native resolution is asked for"
+        );
+    }
+
+    #[test]
+    fn a_window_capture_asks_for_the_window_itself() {
+        let options = window_options(false);
+        assert_eq!(
+            options.get("include-decoration"),
+            Some(&Value::from(true)),
+            "the decoration is part of the window the user asked for"
+        );
+        assert_eq!(
+            options.get("include-shadow"),
+            None,
+            "the shadow is not part of the window and would pad the image"
+        );
+        // The output options are still the base: `native-resolution` is what
+        // keeps a HiDPI window at its real pixel count.
+        assert_eq!(options.get("native-resolution"), Some(&Value::from(true)));
+        assert_eq!(options.get("include-cursor"), Some(&Value::from(false)));
+        assert_eq!(
+            window_options(true).get("include-cursor"),
+            Some(&Value::from(true))
+        );
+    }
+
+    #[test]
+    fn the_scale_a_window_capture_states_is_read() {
+        let mut hidpi = full_results();
+        hidpi.insert("scale".into(), Value::from(2.0f64));
+        assert_eq!(result_scale(&hidpi).unwrap(), 2);
+        // Plasma can describe a fractional scale while everything else in
+        // vshot counts whole device pixels per logical pixel, so the value is
+        // rounded rather than refused.
+        hidpi.insert("scale".into(), Value::from(1.5f64));
+        assert_eq!(result_scale(&hidpi).unwrap(), 2);
+        hidpi.insert("scale".into(), Value::from(1.25f64));
+        assert_eq!(result_scale(&hidpi).unwrap(), 1);
+
+        // A capture that cannot say how big its pixels are meant to be shown is
+        // refused: assuming 1 is how a pinned image ends up at the wrong size.
+        let mut missing = full_results();
+        missing.remove("scale");
+        assert!(matches!(
+            result_scale(&missing),
+            Err(VshotError::KwinScreenShot(_))
+        ));
+        let mut not_a_number = full_results();
+        not_a_number.insert("scale".into(), Value::from("2"));
+        assert!(matches!(
+            result_scale(&not_a_number),
+            Err(VshotError::KwinScreenShot(_))
+        ));
+        for nonsense in [0.0f64, 0.5, -2.0, f64::NAN] {
+            let mut results = full_results();
+            results.insert("scale".into(), Value::from(nonsense));
+            assert!(
+                matches!(result_scale(&results), Err(VshotError::KwinScreenShot(_))),
+                "a scale of {nonsense} is not a screen scale"
+            );
+        }
+    }
+
+    #[test]
+    fn every_capture_says_what_it_was_aimed_at() {
+        assert_eq!(
+            Shot::Output {
+                name: "DP-2",
+                cursor: false
+            }
+            .target(),
+            "the screen `DP-2`"
+        );
+        assert_eq!(
+            Shot::ActiveWindow { cursor: true }.target(),
+            "the focused window"
         );
     }
 

@@ -123,12 +123,29 @@ trap 'rm -f "$tmp"' EXIT
 # kdotool answers only the active-window question; listing goes through the
 # scripting probe either way.
 if [ "$mode" = active ] && command -v kdotool >/dev/null 2>&1; then
-    geo="$(run_limited kdotool getactivewindow getwindowgeometry --shell 2>/dev/null)" || geo=""
-    if [ -n "$geo" ]; then
-        eval "$geo"
-        if [ -n "${X:-}" ] && [ -n "${Y:-}" ] && [ -n "${WIDTH:-}" ] && [ -n "${HEIGHT:-}" ] \
-            && [ "${WIDTH:-0}" -gt 0 ] 2>/dev/null && [ "${HEIGHT:-0}" -gt 0 ] 2>/dev/null; then
-            printf '%s %s %s %s\n' "$X" "$Y" "$WIDTH" "$HEIGHT"
+    # `getwindowgeometry` has no `--shell` form — kdotool 0.2.1 offers that only
+    # for `getmouselocation`, and asking anyway fails the whole command — so its
+    # labelled output is parsed instead:
+    #
+    #   Window {1d5f...}
+    #     Position: 400.0702150216,167.68492081784424
+    #     Geometry: 1066x709.9999999999989
+    #
+    # The fractions are kdotool's own arithmetic on whole logical pixels, so
+    # they are rounded back.
+    geo="$(run_limited kdotool getactivewindow getwindowgeometry 2>/dev/null)" || geo=""
+    if [ -n "$geo" ] && command -v awk >/dev/null 2>&1; then
+        geo="$(printf '%s\n' "$geo" | awk '
+            /^[[:space:]]*Position:/ { split($2, at, ","); x = at[1]; y = at[2] }
+            /^[[:space:]]*Geometry:/ { split($2, size, "x"); w = size[1]; h = size[2] }
+            END {
+                if (w > 0 && h > 0) {
+                    printf "%d %d %d %d\n", int(x + 0.5), int(y + 0.5), int(w + 0.5), int(h + 0.5)
+                }
+            }
+        ')"
+        if [ -n "$geo" ]; then
+            printf '%s\n' "$geo"
             exit 0
         fi
     fi

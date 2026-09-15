@@ -2,7 +2,6 @@
 #include "pin_window.hpp"
 #include "text_card.hpp"
 
-#include <QClipboard>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -34,6 +33,159 @@
 
 namespace vshot {
 namespace {
+
+// The clipboard is read through `wl-paste` (wl-clipboard), the way any Wayland
+// client reads a selection.  Qt's own clipboard cannot stand in for it: Qt
+// implements only the wlroots `zwlr_data_control_manager_v1`, and a compositor
+// that offers the standardized `ext_data_control_manager_v1` instead — KWin,
+// which is what Plasma runs — leaves Qt's clipboard empty even while `wl-paste`
+// hands the same text over.  This is the reading counterpart of the `wl-copy`
+// the capture side already writes the clipboard with.
+constexpr int kClipboardTimeoutMs = 5000;
+
+// One `wl-paste` run.  `false` means the program could not be started at all,
+// which is a different failure from an empty clipboard; `ok` says whether the
+// request itself succeeded.
+bool runWlPaste(const QStringList &arguments, QByteArray *bytes, bool *ok)
+{
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-paste"));
+    process.setArguments(arguments);
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.start();
+    if (!process.waitForStarted(kClipboardTimeoutMs)) {
+        return false;
+    }
+    const bool finished = process.waitForFinished(kClipboardTimeoutMs);
+    if (!finished) {
+        // A clipboard owner that never answers must not hold the daemon's event
+        // loop for longer than this.
+        process.kill();
+        process.waitForFinished(kClipboardTimeoutMs);
+    }
+    *bytes = process.readAllStandardOutput();
+    *ok = finished && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+    return true;
+}
+
+// The URLs of a `text/uri-list` payload: one per line, `#` starts a comment.
+QList<QUrl> uriListUrls(const QByteArray &payload)
+{
+    QList<QUrl> urls;
+    for (const QByteArray &line : payload.split('\n')) {
+        const QByteArray trimmed = line.trimmed();
+        if (trimmed.isEmpty() || trimmed.startsWith('#')) {
+            continue;
+        }
+        urls.append(QUrl::fromEncoded(trimmed));
+    }
+    return urls;
+}
+
+// A QMimeData filled from raw clipboard bytes: `setData` is protected, and the
+// card renderer takes the same kind of object the Qt clipboard used to hand
+// over.
+class RawMimeData : public QMimeData
+{
+public:
+    void set(const QString &type, const QByteArray &bytes)
+    {
+        setData(type, bytes);
+    }
+};
+
+// The image encodings worth asking for, best first; any other `image/*` the
+// clipboard offers is taken after these.
+constexpr const char *kClipboardImageTypes[] = {
+    "image/png", "image/jpeg", "image/webp", "image/bmp", "image/tiff",
+};
+
+// The types that carry text a card can be rendered from, best first.
+constexpr const char *kClipboardTextTypes[] = {
+    "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT",
+};
+
+// What the clipboard is offering, as far as it can be read.  Every part the
+// resolution in `addClipboardPin` needs is fetched up front, because the mimes
+// are alternatives: pixels, then a copied file's path, then text.
+struct ClipboardPayload {
+    bool installed = true; // `wl-paste` could be run at all
+    bool offered = false;  // something is copied
+    QStringList types;
+    QString imageType;
+    QByteArray image;
+    QByteArray uriList;
+    QString text;
+    QByteArray html;
+};
+
+ClipboardPayload readClipboard()
+{
+    ClipboardPayload payload;
+    QByteArray listed;
+    bool ok = false;
+    if (!runWlPaste({QStringLiteral("--list-types")}, &listed, &ok)) {
+        payload.installed = false;
+        return payload;
+    }
+    if (!ok) {
+        // Nothing is copied: `wl-paste` exits non-zero and says so.
+        return payload;
+    }
+    payload.offered = true;
+    for (const QByteArray &line : listed.split('\n')) {
+        const QString type = QString::fromUtf8(line).trimmed();
+        if (!type.isEmpty() && !payload.types.contains(type)) {
+            payload.types.append(type);
+        }
+    }
+
+    for (const char *candidate : kClipboardImageTypes) {
+        const QString type = QLatin1String(candidate);
+        if (payload.types.contains(type)) {
+            payload.imageType = type;
+            break;
+        }
+    }
+    if (payload.imageType.isEmpty()) {
+        for (const QString &type : payload.types) {
+            if (type.startsWith(QLatin1String("image/"))) {
+                payload.imageType = type;
+                break;
+            }
+        }
+    }
+
+    // `--no-newline` keeps the transfer byte-exact: wl-paste appends a newline
+    // to text types otherwise, which would turn into a blank line in a card.
+    const auto fetch = [&payload](const QString &type) -> QByteArray {
+        if (!payload.types.contains(type)) {
+            return QByteArray();
+        }
+        QByteArray bytes;
+        bool fetched = false;
+        if (!runWlPaste({QStringLiteral("--type"), type, QStringLiteral("--no-newline")}, &bytes,
+                        &fetched)
+            || !fetched) {
+            return QByteArray();
+        }
+        return bytes;
+    };
+
+    if (!payload.imageType.isEmpty()) {
+        payload.image = fetch(payload.imageType);
+    }
+    payload.uriList = fetch(QStringLiteral("text/uri-list"));
+    for (const char *candidate : kClipboardTextTypes) {
+        const QByteArray bytes = fetch(QLatin1String(candidate));
+        if (!bytes.isEmpty()) {
+            payload.text = QString::fromUtf8(bytes);
+            break;
+        }
+    }
+    payload.html = fetch(QStringLiteral("text/html"));
+    return payload;
+}
 
 // Self-pipe so a termination signal can wake the Qt event loop safely; the
 // handler itself only does an async-signal-safe write().
@@ -89,17 +241,35 @@ constexpr int kGrabMargin = 32;
 
 // Fallback output when nothing better is known: Qt's primary screen. The
 // daemon cannot see the pointer (a windowless process reports it at 0,0), so
-// the CLI resolves the focused output with compositor metadata and passes the
-// rect along; see `src/capture/active_output.rs`.
+// the CLI resolves the output the user is on with compositor metadata and
+// passes it along; see `src/capture/active_output.rs`.
 QScreen *fallbackScreen()
 {
     return QGuiApplication::primaryScreen();
 }
 
+// The Qt screen the CLI's `output_name` names, if any. Qt names its screens
+// after the compositor's outputs, which is why the name is the better half of
+// the answer: it matches on every compositor that speaks xdg-output, KWin
+// included, without any geometry to line up.
+QScreen *screenFromName(const QJsonObject &request)
+{
+    const QString name = request.value(QStringLiteral("output_name")).toString();
+    if (name.isEmpty()) {
+        return nullptr;
+    }
+    for (QScreen *screen : QGuiApplication::screens()) {
+        if (screen != nullptr && screen->name() == name) {
+            return screen;
+        }
+    }
+    return nullptr;
+}
+
 // The Qt screen matching the output rect the CLI reported, if any. A
 // compositor whose rect does not line up with Qt's screens simply gets the
 // fallback.
-QScreen *screenFromRequest(const QJsonObject &request)
+QScreen *screenFromGeometry(const QJsonObject &request)
 {
     const QJsonValue value = request.value(QStringLiteral("output"));
     if (!value.isObject()) {
@@ -124,6 +294,15 @@ QScreen *screenFromRequest(const QJsonObject &request)
         }
     }
     return nullptr;
+}
+
+// The output the CLI asked to pin on, by name first and by geometry second.
+// `nullptr` means the request named no output this daemon can find, which
+// leaves the choice to `fallbackScreen()`.
+QScreen *screenFromRequest(const QJsonObject &request)
+{
+    QScreen *named = screenFromName(request);
+    return named != nullptr ? named : screenFromGeometry(request);
 }
 
 // One pinned image. Image, scale and global position live here rather than in
@@ -537,38 +716,45 @@ private:
     QJsonObject addClipboardPin(const QJsonObject &request)
     {
         QScreen *target = screenFromRequest(request);
-        QClipboard *clipboard = QGuiApplication::clipboard();
-        if (clipboard == nullptr) {
-            return error(QStringLiteral("no clipboard is available"));
+        const ClipboardPayload clipboard = readClipboard();
+        if (!clipboard.installed) {
+            return error(QStringLiteral(
+                "`wl-paste` was not found, so the clipboard cannot be read; it comes from the \
+wl-clipboard package"));
         }
-        const QImage image = clipboard->image();
-        if (!image.isNull()) {
-            // Raw image data carries no path, so only its own declaration can
-            // name a source; the record file cannot be matched.
-            return addImage(image, QStringLiteral("clipboard"), QString(), target, request);
+        if (!clipboard.offered) {
+            return error(QStringLiteral("the clipboard is empty"));
         }
-        const QMimeData *mime = clipboard->mimeData();
-        if (mime != nullptr) {
-            const QList<QUrl> urls = mime->urls();
-            for (const QUrl &url : urls) {
-                if (!url.isLocalFile()) {
-                    continue;
-                }
-                const QString path = url.toLocalFile();
-                const QImage fileImage(path);
-                if (!fileImage.isNull()) {
-                    return addImage(fileImage, path, path, target, request);
-                }
+        if (!clipboard.image.isEmpty()) {
+            const QImage image = QImage::fromData(clipboard.image);
+            if (!image.isNull()) {
+                // Raw image data carries no path, so only its own declaration
+                // can name a source; the record file cannot be matched.
+                return addImage(image, QStringLiteral("clipboard"), QString(), target, request);
             }
         }
-        const QString text = clipboard->text().trimmed();
+        for (const QUrl &url : uriListUrls(clipboard.uriList)) {
+            if (!url.isLocalFile()) {
+                continue;
+            }
+            const QString path = url.toLocalFile();
+            const QImage fileImage(path);
+            if (!fileImage.isNull()) {
+                return addImage(fileImage, path, path, target, request);
+            }
+        }
+        const QString text = clipboard.text.trimmed();
         if (!text.isEmpty() && !text.contains(QLatin1Char('\n')) && QFileInfo::exists(text)) {
             const QImage pathImage(text);
             if (!pathImage.isNull()) {
                 return addImage(pathImage, text, text, target, request);
             }
         }
-        if (!text.isEmpty()) {
+        // A clipboard that offers only HTML has no plain text to fall back on,
+        // and the card renderer can draw the markup itself.
+        const QString card =
+            text.isEmpty() ? QString::fromUtf8(clipboard.html).trimmed() : text;
+        if (!card.isEmpty()) {
             // Cards are rasterized for the density the pin will use, so both
             // the target output and a stated density have to be resolved
             // before rendering; otherwise text would be resampled.
@@ -577,9 +763,18 @@ private:
                 return error(QStringLiteral("no screen is available to pin onto"));
             }
             const int density = resolveDensity(request, screen, QImage(), QString());
-            const QImage card = renderTextCard(mime, text, density);
-            if (!card.isNull()) {
-                return addImage(card, QStringLiteral("clipboard text"), QString(), target,
+            // The renderer reads the payload to tell HTML from plain text, so
+            // what the clipboard offered is handed over as it was.
+            RawMimeData mime;
+            if (!clipboard.text.isEmpty()) {
+                mime.set(QStringLiteral("text/plain"), clipboard.text.toUtf8());
+            }
+            if (!clipboard.html.isEmpty()) {
+                mime.set(QStringLiteral("text/html"), clipboard.html);
+            }
+            const QImage rendered = renderTextCard(&mime, card, density);
+            if (!rendered.isNull()) {
+                return addImage(rendered, QStringLiteral("clipboard text"), QString(), target,
                                 request);
             }
         }

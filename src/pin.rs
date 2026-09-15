@@ -27,9 +27,15 @@ pub(crate) enum PinCommand {
         /// images leave this out and the daemon works it out.
         #[serde(skip_serializing_if = "Option::is_none")]
         density: Option<u32>,
+        /// Name of the output the user is on, when the compositor reports one.
+        /// Qt names its screens after the outputs, so the daemon matches this
+        /// against a screen directly; the rect below is what a compositor that
+        /// names nothing has to offer instead. The daemon cannot work either out
+        /// for itself: a windowless process sees the pointer at (0, 0).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_name: Option<String>,
         /// Global logical rect of the output the user is on, when the
-        /// compositor reports one. The daemon cannot work this out itself: a
-        /// windowless process sees the pointer at (0, 0).
+        /// compositor reports one.
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<WireOutputRect>,
     },
@@ -39,6 +45,8 @@ pub(crate) enum PinCommand {
         /// brings its source density, everything else lets the daemon decide.
         #[serde(skip_serializing_if = "Option::is_none")]
         density: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<WireOutputRect>,
     },
@@ -233,7 +241,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
     // pinned: the probes are subprocesses, and a control flag does not need
     // them. `None` just lets the daemon pick, which is what happens on
     // compositors without a probe.
-    let output = crate::capture::active_output::active_output().map(WireOutputRect::from);
+    let (output, output_name) = active_output_hints();
     for file in &files {
         let absolute = if file.is_absolute() {
             file.clone()
@@ -248,12 +256,29 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
             path: absolute,
             density,
             output,
+            output_name: output_name.clone(),
         })?;
     }
     if clipboard {
-        execute(PinCommand::AddClipboard { density, output })?;
+        execute(PinCommand::AddClipboard {
+            density,
+            output,
+            output_name,
+        })?;
     }
     Ok(())
+}
+
+/// The compositor's answer for "which output is the user on", in the two shapes
+/// the daemon accepts: the output's name, which Qt can match against a screen
+/// outright, and its global logical rect for the compositors and daemons that
+/// only know geometry. Both are `None` when no probe could answer, which leaves
+/// the choice to the daemon.
+fn active_output_hints() -> (Option<WireOutputRect>, Option<String>) {
+    let Some(active) = crate::capture::active_output::active_output() else {
+        return (None, None);
+    };
+    (active.rect.map(WireOutputRect::from), active.name)
 }
 
 /// Where the daemon socket lives: `VSHOT_PIN_SOCKET` overrides everything
@@ -408,12 +433,14 @@ pub(crate) fn pin_png(png: &[u8], density: u32) -> Result<()> {
             source,
         })?;
     drop(file);
+    // A capture is pinned where the user just made the selection; the
+    // compositor still knows which output is focused.
+    let (output, output_name) = active_output_hints();
     let result = execute(PinCommand::Add {
         path: path.clone(),
         density: Some(density.clamp(1, 4)),
-        // A capture is pinned where the user just made the selection; the
-        // compositor still knows which output is focused.
-        output: crate::capture::active_output::active_output().map(WireOutputRect::from),
+        output,
+        output_name,
     });
     // The daemon has copied the pixels by the time it replied; the temp file
     // is ours to remove even when the reply said no.
@@ -587,6 +614,7 @@ mod tests {
             path: PathBuf::from("/tmp/x.png"),
             density: None,
             output: None,
+            output_name: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -594,6 +622,7 @@ mod tests {
         assert_eq!(value["path"], "/tmp/x.png");
         // No probe result means no field at all: the daemon then picks.
         assert!(value.get("output").is_none(), "{value}");
+        assert!(value.get("output_name").is_none(), "{value}");
         assert!(value.get("density").is_none(), "{value}");
         let encoded = serde_json::to_vec(&PinCommand::Add {
             path: PathBuf::from("/tmp/x.png"),
@@ -601,15 +630,30 @@ mod tests {
             output: Some(WireOutputRect::from(crate::geometry::Rect::new(
                 1920, 0, 3840, 2160,
             ))),
+            output_name: Some("DP-2".into()),
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["output_name"], "DP-2");
         assert_eq!(value["output"]["x"], 1920);
         assert_eq!(value["output"]["width"], 3840);
         assert_eq!(value["density"], 2);
+        // The name travels on its own too: KWin answers with the name of the
+        // active output and no geometry at all.
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            density: None,
+            output: None,
+            output_name: Some("DP-2".into()),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["output_name"], "DP-2");
+        assert!(value.get("output").is_none(), "{value}");
         let encoded = serde_json::to_vec(&PinCommand::AddClipboard {
             density: None,
             output: None,
+            output_name: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -617,11 +661,13 @@ mod tests {
         let encoded = serde_json::to_vec(&PinCommand::AddClipboard {
             density: Some(2),
             output: None,
+            output_name: Some("DP-3".into()),
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value["cmd"], "add-clipboard");
         assert_eq!(value["density"], 2);
+        assert_eq!(value["output_name"], "DP-3");
         let encoded = serde_json::to_vec(&PinCommand::Toggle).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value, serde_json::json!({"cmd": "toggle"}));
@@ -690,6 +736,7 @@ mod tests {
             path: PathBuf::from("/tmp/x.png"),
             density: Some(2),
             output: None,
+            output_name: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -700,6 +747,7 @@ mod tests {
             path: PathBuf::from("/tmp/x.png"),
             density: None,
             output: None,
+            output_name: None,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();

@@ -55,6 +55,20 @@ impl Capturer {
         }
     }
 
+    /// The focused window's own pixels, when the backend can hand them over
+    /// directly, together with the density they are meant to be shown at.
+    ///
+    /// KWin screenshots the window itself on request, decorations included; a
+    /// wlroots compositor has no such call — its protocols describe outputs,
+    /// not windows — so `None` means "this backend cannot answer that" and the
+    /// caller has to find the window in the scene instead.
+    pub fn capture_active_window(&mut self, cursor: bool) -> Option<Result<(Frame, u32)>> {
+        match self {
+            Self::Kwin(capture) => Some(capture.capture_active_window(cursor)),
+            Self::Wlr(_) => None,
+        }
+    }
+
     /// Captures one rectangle of an output, given in output-local logical
     /// coordinates.
     ///
