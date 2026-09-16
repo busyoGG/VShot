@@ -317,7 +317,13 @@ impl WaylandSession {
             return Err(error);
         }
         validate_capabilities(&state.topology)?;
-        state.topology.output_infos()?;
+        // The output mapping is deliberately not validated here.  Reading it is
+        // what fails on an output this side cannot compose into a scene
+        // (rotated or flipped), and that is a property of the *scene* routes:
+        // a compositor that draws the focused window itself — KWin, niri — never
+        // needs an output, and refusing it in `connect` would take away the one
+        // route that still works there.  Every route that does need the
+        // topology asks for it, and gets the same diagnosis from there.
         Ok(Self { event_queue, state })
     }
 

@@ -6,6 +6,8 @@ use serde_json::Value;
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
 
+use super::active_output::Session;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveWindow {
     pub geometry: Rect,
@@ -71,14 +73,15 @@ impl WindowCommand {
         }
     }
 
-    /// One-shot KWin scripting probe for KDE Plasma. KWin exposes no direct
-    /// "active window geometry" DBus query, so the probe either uses
-    /// `kdotool` when installed or loads a tiny script through
-    /// `org.kde.kwin.Scripting` that logs the active window's frame
-    /// geometry (`workspace.activeWindow` on Plasma 6, `activeClient` on
-    /// Plasma 5) and reads the marked line back from the user journal.
-    /// Everything is best-effort: on compositors without KWin the DBus name
-    /// is absent and the probe fails in milliseconds.
+    /// KDE Plasma's window metadata, in two routes. `kdotool` comes first when
+    /// it is installed: it drives the same KWin scripting interface, but gets
+    /// its result back over D-Bus instead of through KWin's script logging, so
+    /// it is the one route that does not need the journal. Otherwise the probe
+    /// loads a tiny script through `org.kde.kwin.Scripting` that logs the
+    /// active window's frame geometry (`workspace.activeWindow` on Plasma 6,
+    /// `activeClient` on Plasma 5) and reads the marked line back from the user
+    /// journal. Everything is best-effort: on compositors without KWin the DBus
+    /// name is absent and the probe fails in milliseconds.
     fn kwin() -> Self {
         kwin_probe("active")
     }
@@ -176,8 +179,18 @@ if (w) {
 EOF
 else
 cat > "$tmp" <<EOF
-const windows = workspace.windowList ? workspace.windowList()
-    : (workspace.clientList ? workspace.clientList() : []);
+// Stacking order, bottom to top: the picker takes the last window under the
+// pointer, so the order is what makes that window the one on top.  KWin's own
+// hit test walks this same list from its end for the same reason.  It is a
+// property, not a method; `windowList()` is creation order and only stands in
+// for a KWin too old to have the stacking order at all.
+let stacking = workspace.stackingOrder;
+if (typeof stacking === "function") {
+    stacking = stacking.call(workspace);
+}
+const windows = stacking && stacking.length ? stacking
+    : (workspace.windowList ? workspace.windowList()
+        : (workspace.clientList ? workspace.clientList() : []));
 for (let index = 0; index < windows.length; ++index) {
     const w = windows[index];
     if (!w || w.deleted || w.hidden || w.minimized) {
@@ -291,21 +304,114 @@ impl ProcessWindowProvider {
     /// by the time the click arrives — a window may have moved or the user may
     /// have switched workspace under it.
     ///
-    /// The rule matches the picker's own: the smallest window containing the
-    /// point wins, so pointing at overlapping windows takes the inner one.
+    /// The rule matches the picker's own: the last window containing the point
+    /// wins, and the list is ordered bottom to top, so that is the window on
+    /// top — the one the compositor would hand the click to.
     /// `None` means the compositor cannot answer (no window list, or nothing
     /// there), which is not an error: the caller keeps what the picker had.
     pub fn window_at(&self, point: Point) -> Option<Rect> {
         let windows = self.windows().ok()?;
-        smallest_containing(windows.iter().map(|window| window.geometry), point)
+        topmost_containing(windows.iter().map(|window| window.geometry), point)
     }
 }
 
-/// Smallest rect that contains `point`.
-fn smallest_containing(rects: impl Iterator<Item = Rect>, point: Point) -> Option<Rect> {
-    rects
-        .filter(|rect| rect.contains(point))
-        .min_by_key(|rect| u64::from(rect.size.width) * u64::from(rect.size.height))
+/// The last rect that contains `point`.  The window list is ordered bottom to
+/// top (see [`parse_hyprland_windows`]), so the last hit is the one on top.
+fn topmost_containing(rects: impl Iterator<Item = Rect>, point: Point) -> Option<Rect> {
+    rects.filter(|rect| rect.contains(point)).last()
+}
+
+/// A compositor that can be asked about windows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Compositor {
+    Hyprland,
+    Sway,
+    KWin,
+}
+
+const COMPOSITORS: [Compositor; 3] = [Compositor::Hyprland, Compositor::Sway, Compositor::KWin];
+
+impl Compositor {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hyprland => "Hyprland",
+            Self::Sway => "Sway",
+            Self::KWin => "KWin",
+        }
+    }
+
+    fn session(self) -> Session {
+        match self {
+            Self::Hyprland => Session::Hyprland,
+            Self::Sway => Session::Sway,
+            Self::KWin => Session::KWin,
+        }
+    }
+
+    fn active_window_command(self) -> WindowCommand {
+        match self {
+            Self::Hyprland => WindowCommand::hyprland(),
+            Self::Sway => WindowCommand::sway(),
+            Self::KWin => WindowCommand::kwin(),
+        }
+    }
+
+    fn parse_active_window(self, stdout: &[u8]) -> Result<ActiveWindow> {
+        match self {
+            Self::Hyprland => parse_hyprland_active_window(stdout),
+            Self::Sway => parse_sway_active_window(stdout),
+            Self::KWin => parse_kwin_active_window(stdout),
+        }
+    }
+
+    /// The focused window as this compositor reports it.
+    fn active_window<R: WindowCommandRunner>(self, runner: &R) -> Result<ActiveWindow> {
+        let command = self.active_window_command();
+        let output = runner.run(&command)?;
+        if !output.status.success() {
+            return Err(VshotError::ActiveWindowUnavailable(match self {
+                // The probe is a shell script, so "bash exited 4" would say
+                // nothing about what actually went wrong.
+                Self::KWin => format!(
+                    "the KWin scripting probe exited with {} — it loads a script over D-Bus \
+                     (`gdbus` or `dbus-send`) and reads the answer back from the user journal",
+                    output.status
+                ),
+                _ => format!(
+                    "`{}` exited with {}",
+                    command.program.to_string_lossy(),
+                    output.status
+                ),
+            }));
+        }
+        self.parse_active_window(&output.stdout)
+    }
+
+    /// The windows this compositor shows, as picking wants them.
+    fn window_list<R: WindowCommandRunner>(self, runner: &R) -> Result<Vec<WindowCandidate>> {
+        match self {
+            Self::Hyprland => hyprland_windows(runner),
+            Self::Sway => run_command(runner, &WindowCommand::sway())
+                .and_then(|bytes| parse_sway_windows(&bytes)),
+            Self::KWin => run_command(runner, &WindowCommand::kwin_list())
+                .and_then(|bytes| parse_kwin_windows(&bytes)),
+        }
+    }
+}
+
+/// The compositors worth asking, mirroring [`Session`]: only the session's own
+/// compositor is queried, because a second one running alongside answers for
+/// itself. A Plasma session started from a Hyprland terminal keeps
+/// `HYPRLAND_INSTANCE_SIGNATURE`, so `hyprctl` goes on answering and its
+/// windows would be read as if they were on the KDE desktop.
+///
+/// A session whose compositor has neither query (niri) yields nothing to ask,
+/// which is an honest answer: the caller falls back to the pixels.
+fn compositors_for(session: Session) -> Vec<Compositor> {
+    COMPOSITORS
+        .into_iter()
+        .filter(|compositor| session == Session::Unknown || compositor.session() == session)
+        .collect()
 }
 
 /// Lists the windows the compositor shows, geometry in global logical pixels.
@@ -315,23 +421,27 @@ fn smallest_containing(rects: impl Iterator<Item = Rect>, point: Point) -> Optio
 /// about not knowing: a compositor that reports no list is collected into the
 /// error instead of being guessed at.
 pub fn find_windows<R: WindowCommandRunner>(runner: &R) -> Result<Vec<WindowCandidate>> {
+    find_windows_for(Session::detect(), runner)
+}
+
+fn find_windows_for<R: WindowCommandRunner>(
+    session: Session,
+    runner: &R,
+) -> Result<Vec<WindowCandidate>> {
     let mut reasons: Vec<String> = Vec::new();
-    match hyprland_windows(runner) {
-        Ok(windows) if !windows.is_empty() => return Ok(windows),
-        Ok(_) => reasons.push("Hyprland shows no window".into()),
-        Err(error) => reasons.push(format!("Hyprland: {error}")),
+    for compositor in compositors_for(session) {
+        match compositor.window_list(runner) {
+            Ok(windows) if !windows.is_empty() => return Ok(windows),
+            Ok(_) => reasons.push(format!("{} shows no window", compositor.name())),
+            Err(error) => reasons.push(format!("{}: {error}", compositor.name())),
+        }
     }
-    match run_command(runner, &WindowCommand::sway()).and_then(|bytes| parse_sway_windows(&bytes)) {
-        Ok(windows) if !windows.is_empty() => return Ok(windows),
-        Ok(_) => reasons.push("Sway shows no window".into()),
-        Err(error) => reasons.push(format!("Sway: {error}")),
-    }
-    match run_command(runner, &WindowCommand::kwin_list())
-        .and_then(|bytes| parse_kwin_windows(&bytes))
-    {
-        Ok(windows) if !windows.is_empty() => return Ok(windows),
-        Ok(_) => reasons.push("KWin shows no window".into()),
-        Err(error) => reasons.push(format!("KWin: {error}")),
+    if reasons.is_empty() {
+        return Err(VshotError::WindowPickUnavailable(
+            "this session's compositor has no window list to offer (only Hyprland, Sway and \
+             KWin have one)"
+                .into(),
+        ));
     }
     Err(VshotError::WindowPickUnavailable(format!(
         "no compositor reported a window list ({})",
@@ -361,38 +471,31 @@ fn run_command<R: WindowCommandRunner>(runner: &R, command: &WindowCommand) -> R
 }
 
 pub fn find_active_window<R: WindowCommandRunner>(runner: &R) -> Result<ActiveWindow> {
-    let hyprland = runner.run(&WindowCommand::hyprland());
-    if let Ok(output) = hyprland {
-        if output.status.success() {
-            if let Ok(window) = parse_hyprland_active_window(&output.stdout) {
-                return Ok(window);
-            }
+    find_active_window_for(Session::detect(), runner)
+}
+
+fn find_active_window_for<R: WindowCommandRunner>(
+    session: Session,
+    runner: &R,
+) -> Result<ActiveWindow> {
+    let mut reasons: Vec<String> = Vec::new();
+    for compositor in compositors_for(session) {
+        match compositor.active_window(runner) {
+            Ok(window) => return Ok(window),
+            Err(error) => reasons.push(format!("{}: {error}", compositor.name())),
         }
     }
-
-    let sway = runner.run(&WindowCommand::sway());
-    if let Ok(output) = sway {
-        if output.status.success() {
-            if let Ok(window) = parse_sway_active_window(&output.stdout) {
-                return Ok(window);
-            }
-        }
+    if reasons.is_empty() {
+        return Err(VshotError::ActiveWindowUnavailable(
+            "this session's compositor has no active-window query (only Hyprland, Sway and KWin \
+             have one)"
+                .into(),
+        ));
     }
-
-    let kwin = runner.run(&WindowCommand::kwin());
-    if let Ok(output) = kwin {
-        if output.status.success() {
-            if let Ok(window) = parse_kwin_active_window(&output.stdout) {
-                return Ok(window);
-            }
-        }
-    }
-
-    Err(VshotError::ActiveWindowUnavailable(
-        "neither a valid Hyprland `hyprctl activewindow -j` result, a focused Sway tree node, \
-         nor a KWin scripting probe was available"
-            .into(),
-    ))
+    Err(VshotError::ActiveWindowUnavailable(format!(
+        "no compositor reported an active window ({})",
+        reasons.join("; ")
+    )))
 }
 
 pub fn parse_hyprland_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
@@ -494,6 +597,9 @@ pub fn parse_kwin_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
 ///
 /// Nothing here is a guess about which window the user means; it only removes
 /// entries that cannot be the window under the pointer.
+///
+/// The list comes back in stacking order, bottom to top, because the picker
+/// takes the *last* candidate under the pointer (see [`topmost_containing`]).
 pub fn parse_hyprland_windows(clients: &[u8], monitors: &[u8]) -> Result<Vec<WindowCandidate>> {
     let clients: Value = serde_json::from_slice(clients).map_err(|error| {
         VshotError::WindowPickUnavailable(format!("invalid Hyprland client JSON: {error}"))
@@ -508,7 +614,15 @@ pub fn parse_hyprland_windows(clients: &[u8], monitors: &[u8]) -> Result<Vec<Win
         VshotError::WindowPickUnavailable("Hyprland monitor list is not an array".into())
     })?;
 
-    let mut windows = Vec::new();
+    // Each client lands in one of the three passes Hyprland both draws and
+    // hit-tests in — tiled, floating, pinned floating — and the stable sort
+    // keeps `hyprctl`'s own order inside a pass.  That order is the stacking
+    // order: Hyprland keeps its window vector bottom to top and raises a
+    // focused window to the end of it, and `hyprctl clients` reports that same
+    // vector in that same order.  Without the three passes a floating window
+    // would only outrank a tiled one when it happened to sit later in the
+    // vector, which focusing it usually achieves but does not guarantee.
+    let mut windows: Vec<(u8, WindowCandidate)> = Vec::new();
     for client in clients {
         let Some(shown) = shown_workspaces(client, monitors) else {
             continue;
@@ -521,21 +635,33 @@ pub fn parse_hyprland_windows(clients: &[u8], monitors: &[u8]) -> Result<Vec<Win
         }
         let geometry = Rect::new(at.0, at.1, size.0, size.1);
         let pinned = client.get("pinned").and_then(Value::as_bool) == Some(true);
+        let floating = client.get("floating").and_then(Value::as_bool) == Some(true);
         if !pinned && !shown.is_showing_client_workspace(client) {
             continue;
         }
         if !shown.contains(geometry) {
             continue;
         }
-        windows.push(WindowCandidate {
-            geometry,
-            label: join_label(
-                client.get("class").and_then(Value::as_str).unwrap_or(""),
-                client.get("title").and_then(Value::as_str).unwrap_or(""),
-            ),
-        });
+        // Pinning only lifts a window that floats too: Hyprland's pinned render
+        // pass and its hit test both ask for the two flags together.
+        let pass = match (floating, pinned) {
+            (true, true) => 2,
+            (true, false) => 1,
+            (false, _) => 0,
+        };
+        windows.push((
+            pass,
+            WindowCandidate {
+                geometry,
+                label: join_label(
+                    client.get("class").and_then(Value::as_str).unwrap_or(""),
+                    client.get("title").and_then(Value::as_str).unwrap_or(""),
+                ),
+            },
+        ));
     }
-    Ok(windows)
+    windows.sort_by_key(|(pass, _)| *pass);
+    Ok(windows.into_iter().map(|(_, window)| window).collect())
 }
 
 /// How far outside its monitor a reported rect may reach before it is treated
@@ -623,25 +749,41 @@ fn workspace_identity(workspace: Option<&Value>) -> String {
 
 /// `swaymsg -t get_tree`: the leaves of the tree are the windows.  A leaf on a
 /// hidden workspace is invisible and is therefore left out.
+///
+/// Floating containers are listed last, because sway hit-tests them before the
+/// tiling tree and draws them above it, and the picker takes the last candidate
+/// under the pointer (see [`parse_hyprland_windows`]).
 pub fn parse_sway_windows(bytes: &[u8]) -> Result<Vec<WindowCandidate>> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         VshotError::WindowPickUnavailable(format!("invalid Sway tree JSON: {error}"))
     })?;
-    let mut windows = Vec::new();
-    collect_sway_windows(&value, true, &mut windows);
-    Ok(windows)
+    let mut tiled = Vec::new();
+    let mut floating = Vec::new();
+    collect_sway_windows(&value, true, false, &mut tiled, &mut floating);
+    tiled.extend(floating);
+    Ok(tiled)
 }
 
-fn collect_sway_windows(node: &Value, visible: bool, windows: &mut Vec<WindowCandidate>) {
+/// `is_floating` is true for everything reached through a `floating_nodes`
+/// array: the whole subtree floats, so it belongs in the floating list — and
+/// sway keeps those in the order it raises them, the last one on top.
+fn collect_sway_windows(
+    node: &Value,
+    visible: bool,
+    is_floating: bool,
+    tiled: &mut Vec<WindowCandidate>,
+    floating: &mut Vec<WindowCandidate>,
+) {
     // Only workspaces carry a meaningful `visible`; a hidden one hides its
     // whole subtree.
     let visible = visible
         && !(node.get("type").and_then(Value::as_str) == Some("workspace")
             && node.get("visible").and_then(Value::as_bool) == Some(false));
-    let mut children: Vec<&Value> = Vec::new();
+    let mut children: Vec<(&Value, bool)> = Vec::new();
     for key in ["nodes", "floating_nodes"] {
+        let nested_floating = is_floating || key == "floating_nodes";
         if let Some(nodes) = node.get(key).and_then(Value::as_array) {
-            children.extend(nodes.iter());
+            children.extend(nodes.iter().map(|child| (child, nested_floating)));
         }
     }
     if children.is_empty() {
@@ -672,22 +814,29 @@ fn collect_sway_windows(node: &Value, visible: bool, windows: &mut Vec<WindowCan
                     .and_then(Value::as_str)
             })
             .unwrap_or("");
-        windows.push(WindowCandidate {
+        let candidate = WindowCandidate {
             geometry: Rect::new(x, y, width, height),
             label: join_label(
                 class,
                 node.get("name").and_then(Value::as_str).unwrap_or(""),
             ),
-        });
+        };
+        if is_floating {
+            floating.push(candidate);
+        } else {
+            tiled.push(candidate);
+        }
         return;
     }
-    for child in children {
-        collect_sway_windows(child, visible, windows);
+    for (child, nested_floating) in children {
+        collect_sway_windows(child, visible, nested_floating, tiled, floating);
     }
 }
 
-/// The KWin probe in `list` mode: one `x y width height` line per window.  The
-/// probe reports no titles, so every candidate is unlabelled.
+/// The KWin probe in `list` mode: one `x y width height` line per window, in
+/// KWin's stacking order bottom to top, which the probe asks for by iterating
+/// `workspace.stackingOrder`.  The probe reports no titles, so every candidate
+/// is unlabelled.
 pub fn parse_kwin_windows(bytes: &[u8]) -> Result<Vec<WindowCandidate>> {
     let text = std::str::from_utf8(bytes).map_err(|error| {
         VshotError::WindowPickUnavailable(format!("invalid KWin list output: {error}"))
@@ -710,8 +859,8 @@ pub fn parse_kwin_windows(bytes: &[u8]) -> Result<Vec<WindowCandidate>> {
 }
 
 /// `class — title`, collapsing the cases where either side is missing or both
-/// say the same thing.
-fn join_label(class: &str, title: &str) -> String {
+/// say the same thing.  niri's window replies are labelled with it too.
+pub(crate) fn join_label(class: &str, title: &str) -> String {
     let class = class.trim();
     let title = title.trim();
     match (
@@ -829,40 +978,114 @@ fn json_u32(value: &Value, key: &str) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
     use super::*;
 
-    /// Resolving a click takes the smallest window under it, exactly like the
-    /// picker's own hit test: pointing at overlapping windows means the inner
-    /// one, and a point on bare desktop resolves to nothing.
+    /// Resolving a click takes the window on top under it — the *last*
+    /// candidate containing the point, because the list is ordered bottom to
+    /// top, exactly like the picker's own hit test — and a point on bare
+    /// desktop resolves to nothing.
     #[test]
-    fn the_smallest_window_under_a_point_wins() {
-        let windows = [
-            Rect::new(0, 0, 1920, 1080),
-            Rect::new(100, 100, 800, 600),
-            Rect::new(800, 500, 400, 300),
-        ];
-        let resolved = |point| smallest_containing(windows.into_iter(), point);
-        assert_eq!(
-            resolved(Point::new(900, 700)),
-            Some(Rect::new(800, 500, 400, 300))
-        );
-        assert_eq!(
-            resolved(Point::new(400, 400)),
-            Some(Rect::new(100, 100, 800, 600))
-        );
-        assert_eq!(
-            resolved(Point::new(1900, 1000)),
-            Some(Rect::new(0, 0, 1920, 1080))
-        );
+    fn the_window_on_top_under_a_point_wins() {
+        let desktop = Rect::new(0, 0, 1920, 1080);
+        let inner = Rect::new(100, 100, 800, 600);
+        let floating = Rect::new(800, 500, 400, 300);
+        // Bottom to top: desktop, inner, floating.
+        let windows = [desktop, inner, floating];
+        let resolved = |point| topmost_containing(windows.into_iter(), point);
+        assert_eq!(resolved(Point::new(900, 700)), Some(floating));
+        assert_eq!(resolved(Point::new(400, 400)), Some(inner));
+        assert_eq!(resolved(Point::new(1900, 1000)), Some(desktop));
         assert_eq!(resolved(Point::new(2000, 100)), None);
         // Right and bottom edges belong to the next window, exactly as in the
         // picker's own hit test: (900, 400) is on the inner rect's right edge,
         // so only the full-screen window is left.
-        assert_eq!(
-            resolved(Point::new(900, 400)),
-            Some(Rect::new(0, 0, 1920, 1080))
-        );
+        assert_eq!(resolved(Point::new(900, 400)), Some(desktop));
         assert_eq!(resolved(Point::new(1900, 1100)), None);
+    }
+
+    /// The rule is "on top", not "smallest".  This is the shape that used to
+    /// resolve to the wrong window: a floating window larger than the tiled one
+    /// it sits on, for which the old smallest-area rule handed back the tiled
+    /// window underneath.
+    #[test]
+    fn a_floating_window_larger_than_the_one_under_it_still_wins() {
+        let tiled = Rect::new(0, 0, 400, 300);
+        let floating = Rect::new(100, 100, 800, 600);
+        let resolved = |point| topmost_containing([tiled, floating].into_iter(), point);
+        // Inside both: the larger one wins because it is the one on top.
+        assert_eq!(resolved(Point::new(200, 200)), Some(floating));
+        // Outside the floating window the tiled one is still what is there.
+        assert_eq!(resolved(Point::new(50, 50)), Some(tiled));
+        assert_eq!(resolved(Point::new(950, 700)), None);
+    }
+
+    /// Hyprland's own stacking, which the candidate order has to mirror: the
+    /// tiled window first, then the floating one, then the pinned one.  The
+    /// clients arrive in a different order, so only the sort can produce this.
+    #[test]
+    fn lists_hyprland_floating_and_pinned_windows_last() {
+        let monitors = br#"[{"id":0,"x":0,"y":0,"width":1920,"height":1080,"scale":1.0,
+            "activeWorkspace":{"name":"1"},"specialWorkspace":{"name":""}}]"#;
+        let clients = br#"[
+            {"at":[100,100],"size":[400,300],"monitor":0,"floating":false,"pinned":false,
+             "workspace":{"name":"1"},"class":"tiled","title":"Tiled"},
+            {"at":[200,200],"size":[200,100],"monitor":0,"floating":true,"pinned":true,
+             "workspace":{"name":"1"},"class":"pinned","title":"Pinned"},
+            {"at":[150,150],"size":[300,200],"monitor":0,"floating":true,"pinned":false,
+             "workspace":{"name":"1"},"class":"floating","title":"Floating"}
+        ]"#;
+        let windows = parse_hyprland_windows(clients, monitors).unwrap();
+        let labels: Vec<&str> = windows.iter().map(|window| window.label.as_str()).collect();
+        assert_eq!(labels, ["tiled", "floating", "pinned"]);
+        // A click inside all three lands on the pinned window, the topmost.
+        assert_eq!(
+            topmost_containing(
+                windows.iter().map(|window| window.geometry),
+                Point::new(250, 240)
+            ),
+            Some(Rect::new(200, 200, 200, 100))
+        );
+    }
+
+    /// A pinned window that does not float is not lifted: Hyprland asks for
+    /// both flags before it draws or hit-tests a window as pinned.
+    #[test]
+    fn lists_a_pinned_tiled_hyprland_window_as_tiled() {
+        let monitors = br#"[{"id":0,"x":0,"y":0,"width":1920,"height":1080,"scale":1.0,
+            "activeWorkspace":{"name":"1"},"specialWorkspace":{"name":""}}]"#;
+        let clients = br#"[
+            {"at":[0,0],"size":[800,600],"monitor":0,"floating":false,"pinned":true,
+             "workspace":{"name":"1"},"class":"pinned-tile","title":"Pinned tile"}
+        ]"#;
+        let windows = parse_hyprland_windows(clients, monitors).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "pinned-tile — Pinned tile");
+    }
+
+    /// Sway hit-tests and draws floating containers above the tiling tree, so
+    /// they come last in the list even though the tree visits them first.
+    #[test]
+    fn lists_floating_sway_containers_last() {
+        let tree = br#"{"type":"root","nodes":[{"type":"output","nodes":[{"type":"workspace",
+            "visible":true,"name":"1",
+            "nodes":[{"type":"con","app_id":"tiled","rect":{"x":0,"y":0,"width":800,"height":600}}],
+            "floating_nodes":[{"type":"floating_con","nodes":[{"type":"con","app_id":"float",
+                "rect":{"x":100,"y":100,"width":300,"height":200}}]}]}]}]}"#;
+        let windows = parse_sway_windows(tree).unwrap();
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert_eq!(windows[0].label, "tiled");
+        assert_eq!(windows[1].label, "float");
+        assert_eq!(
+            topmost_containing(
+                windows.iter().map(|window| window.geometry),
+                Point::new(200, 150)
+            ),
+            Some(Rect::new(100, 100, 300, 200))
+        );
     }
 
     #[test]
@@ -1008,5 +1231,124 @@ mod tests {
         assert!(parse_kwin_active_window(b"1 2 3").is_err());
         assert!(parse_kwin_active_window(b"a b c d").is_err());
         assert!(parse_kwin_active_window(b"0 0 0 500").is_err());
+    }
+
+    /// Answers every command the same way and remembers what it was asked, so a
+    /// test can see which compositors a session consults.
+    struct ScriptedRunner {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        asked: RefCell<Vec<OsString>>,
+    }
+
+    impl ScriptedRunner {
+        /// A runner whose every command fails, so the loop runs out of
+        /// compositors and the calls can be counted.
+        fn failing() -> Self {
+            Self {
+                status: ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// A runner whose every command succeeds with this output.
+        fn replying(stdout: &[u8]) -> Self {
+            Self {
+                status: ExitStatus::from_raw(0),
+                stdout: stdout.to_vec(),
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked
+                .borrow()
+                .iter()
+                .map(|program| program.to_string_lossy().into_owned())
+                .collect()
+        }
+    }
+
+    impl WindowCommandRunner for ScriptedRunner {
+        fn run(&self, command: &WindowCommand) -> Result<Output> {
+            self.asked.borrow_mut().push(command.program.clone());
+            Ok(Output {
+                status: self.status,
+                stdout: self.stdout.clone(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// Only the session's own compositor is asked. A Plasma session started
+    /// from a Hyprland terminal keeps `HYPRLAND_INSTANCE_SIGNATURE`, so
+    /// `hyprctl` goes on answering — and its answer is a window on a desktop
+    /// the user is not looking at.
+    #[test]
+    fn a_kde_session_asks_kwin_and_not_hyprland() {
+        let runner = ScriptedRunner::failing();
+        assert!(find_active_window_for(Session::KWin, &runner).is_err());
+        assert_eq!(runner.asked(), ["bash"]);
+
+        let runner = ScriptedRunner::failing();
+        assert!(find_windows_for(Session::KWin, &runner).is_err());
+        assert_eq!(runner.asked(), ["bash"]);
+    }
+
+    /// The KDE session's answer is read as the window: the probe runs, and its
+    /// single line is the focused window.
+    #[test]
+    fn a_kde_session_reads_the_focused_window_from_the_probe() {
+        let runner = ScriptedRunner::replying(b"1920 0 1600 900\n");
+        let window = find_active_window_for(Session::KWin, &runner).unwrap();
+        assert_eq!(window.geometry, Rect::new(1920, 0, 1600, 900));
+        assert_eq!(window.source, WindowSource::KWin);
+        assert_eq!(runner.asked(), ["bash"]);
+    }
+
+    /// With nothing in the environment naming a compositor every probe is worth
+    /// trying, in the order the README gives.
+    #[test]
+    fn an_unknown_session_asks_every_compositor_in_order() {
+        let runner = ScriptedRunner::failing();
+        assert!(find_active_window_for(Session::Unknown, &runner).is_err());
+        assert_eq!(runner.asked(), ["hyprctl", "swaymsg", "bash"]);
+
+        // The window list goes through the same three: Hyprland's first query
+        // (`hyprctl clients`) is already failing here, so its monitor list is
+        // never reached.
+        let runner = ScriptedRunner::failing();
+        assert!(find_windows_for(Session::Unknown, &runner).is_err());
+        assert_eq!(runner.asked(), ["hyprctl", "swaymsg", "bash"]);
+    }
+
+    #[test]
+    fn only_the_sessions_compositor_is_offered_to_picking() {
+        assert_eq!(compositors_for(Session::Hyprland), [Compositor::Hyprland]);
+        assert_eq!(compositors_for(Session::Sway), [Compositor::Sway]);
+        assert_eq!(compositors_for(Session::KWin), [Compositor::KWin]);
+        assert_eq!(compositors_for(Session::Unknown), COMPOSITORS);
+        // niri has no window list and no active-window geometry, so there is
+        // nothing to ask and the caller falls back to the pixels.
+        assert!(compositors_for(Session::Niri).is_empty());
+    }
+
+    /// A session whose compositor cannot answer says that, instead of claiming
+    /// some compositor failed.
+    #[test]
+    fn a_compositor_without_window_queries_says_so() {
+        let runner = ScriptedRunner::failing();
+        let error = find_windows_for(Session::Niri, &runner).unwrap_err();
+        assert!(
+            format!("{error}").contains("no window list to offer"),
+            "{error}"
+        );
+        let error = find_active_window_for(Session::Niri, &runner).unwrap_err();
+        assert!(
+            format!("{error}").contains("no active-window query"),
+            "{error}"
+        );
+        assert!(runner.asked().is_empty());
     }
 }

@@ -42,6 +42,8 @@ pub enum VshotError {
     NoCaptureBackend(String),
     #[error("KWin ScreenShot2 failed: {0}")]
     KwinScreenShot(String),
+    #[error("niri's window screenshot failed: {0}")]
+    NiriScreenshot(String),
     #[error("KDE denied the screenshot: {0}")]
     ScreenshotDenied(String),
     #[error("screen capture timed out before the compositor returned a frame")]

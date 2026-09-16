@@ -285,8 +285,9 @@ struct QtSession<'a> {
     outputs: Vec<QtOutput<'a>>,
 }
 
-/// One pickable window: the helper highlights the smallest candidate under the
-/// pointer and shows its label in the size pill.
+/// One pickable window: the helper highlights the candidate on top at the
+/// pointer — the last one in the list, which arrives bottom to top — and shows
+/// its label in the size pill.
 #[derive(Debug, Serialize)]
 struct QtCandidate {
     x: i64,
@@ -388,8 +389,8 @@ pub(crate) struct PickedWindow {
 }
 
 /// Interactive window picking.  The helper keeps the desktop live, highlights
-/// the smallest candidate under the pointer, and the first click ends the
-/// session: picking only decides *what* to capture, never the pixels.
+/// the candidate on top at the pointer, and the first click ends the session:
+/// picking only decides *what* to capture, never the pixels.
 ///
 /// `refresh` is asked while the session is open for the windows to highlight,
 /// because the desktop it runs on can change under it (a workspace switch, a

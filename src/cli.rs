@@ -13,6 +13,52 @@ use crate::model::PngCompression;
     name = "vshot",
     version,
     about = "Strict-freeze Wayland screenshots for wlroots and KWin/Plasma",
+    after_help = r#"vshot freezes the desktop once and captures from that still frame, so nothing on screen
+moves while a selection is being made.
+
+Capture targets
+  region              a rectangle dragged out in the frozen scene, or a fixed --geometry
+  monitor [NAME]      one output by name, or the output under the pointer with `current`
+  all                 every output, composed at its logical position
+  window active       the focused window: compositor metadata, or pixels with --pixel
+  window pick         the window you click, on a live desktop with the others dimmed
+  long                a scrolling region: vshot scrolls it, grabs frames while it moves and
+                      stitches them into one tall image
+
+Destination (every capture above goes to exactly one)
+  -o, --output PATH   a PNG at PATH, with strftime expanded (shots/%Y%m%d-%H%M%S.png); the
+                      file's URI is copied to the clipboard afterwards. `-` writes the PNG
+                      to stdout and copies nothing.
+  --clipboard         the PNG, copied to the clipboard
+  --pin               the image pinned on screen, by the resident pin daemon
+
+Shared modifiers
+  -c, --cursor        draw the compositor cursor into the capture
+  --png-compression   none | fastest | fast (default) | balanced | high, all lossless
+
+Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) are captured through
+wlr-screencopy; KWin/Plasma through its own org.kde.KWin.ScreenShot2, which KWin grants only
+to a client whose installed desktop file declares
+`X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` -- the package installs one for
+/usr/bin/vshot, so a build run straight out of target/ cannot capture under Plasma. The
+focused window's own pixels come from KWin's and niri's screenshot calls where those exist;
+the rectangle routes below them read Hyprland, Sway or KWin metadata. niri reports no position
+for a tiled window over IPC, so `window active` and `window pick` there go through niri's own
+screenshot (and, for picking, niri's own crosshair); `--pixel` asks for the pixel path instead.
+
+`vshot pin` captures nothing: it drives the resident pin daemon. It pins image files, or with
+--clipboard whatever the clipboard holds -- an image, or text rendered as a card that keeps
+its HTML, markdown or code formatting. A pinned image is dragged to move, zoomed about its
+centre with the wheel, closed with a double-click, focused with a click so that Space opens
+the same annotator as `vshot region`, and shown or hidden for all pins with
+--toggle/--show/--hide.
+
+On-screen selection, picking and the pin editor run as a Qt helper, `vshot-qt-ui`;
+VSHOT_QT_HELPER points at another copy of it. Other environment variables: VSHOT_LANG (UI
+language), VSHOT_PIXEL_DEBUG=1 (what window detection saw), VSHOT_LONG_DEBUG_DIR=<dir> (every
+scrolling frame and stitching decision), VSHOT_PIN_SOCKET, VSHOT_PIN_DENSITY=N.
+
+Each subcommand keeps its own notes: `vshot <command> --help`."#,
     group = ArgGroup::new("destination")
         .args(["output", "clipboard", "pin"])
 )]
@@ -220,14 +266,17 @@ density of every pinned image, exactly like --density."
 
 #[derive(Debug, Subcommand)]
 pub enum WindowTarget {
-    /// Capture the currently focused window: compositor metadata when
-    /// available, otherwise pixel detection on the captured frame.
+    /// Capture the currently focused window: the compositor's own screenshot
+    /// where it offers one, otherwise compositor metadata, otherwise pixel
+    /// detection on the captured frame.
     #[command(
-        after_help = "The window is read from the compositor's metadata (Hyprland, Sway, \
-KWin/Plasma); --pixel skips that and reads the border stroke off the captured frame instead, \
+        after_help = "The window is taken from the compositor itself where it can draw one: KWin's \
+ScreenShot2 and niri's `screenshot-window` both hand over the window's own pixels, so nothing \
+has to be found in the scene. Otherwise the rectangle comes from compositor metadata (Hyprland, \
+Sway), and --pixel skips that and reads the border stroke off the captured frame instead, \
 falling back to background segmentation, which is also what happens when no window list is \
-available at all. Borderless tiling with no gaps or shadows has no pixel signal and is \
-reported as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
+available at all. Borderless tiling with no gaps or shadows has no pixel signal and is reported \
+as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
     )]
     Active {
         /// Skip compositor metadata and detect the focused window from the
@@ -242,7 +291,12 @@ reported as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stag
 time, and everything else dimmed; a left click captures the highlighted window, Esc or a \
 right-click cancels. The frame is grabbed again after the click, so the captured window is \
 the one visible then, not the one from the hover. Candidates come from the compositor's \
-window list unless --pixel is given."
+window list unless --pixel is given.
+
+On niri this is niri's own picker instead: its IPC reports no position for a tiled window, so \
+there is no rectangle to offer the overlay. niri draws a crosshair (no highlight) and the \
+clicked window's own screenshot is captured — which also means no annotation editor afterwards; \
+--pixel asks for the overlay and the pixel detection back."
     )]
     Pick {
         /// Skip the compositor's window list and take the candidates from the

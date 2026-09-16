@@ -1,5 +1,6 @@
 pub mod active_output;
 pub mod kwin;
+pub mod niri;
 pub mod window;
 pub mod window_pixel;
 pub mod wlr;

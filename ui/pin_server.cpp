@@ -1,5 +1,5 @@
 #include "pin_server.hpp"
-#include "pin_window.hpp"
+#include "pin_surface.hpp"
 #include "text_card.hpp"
 
 #include <QCoreApplication>
@@ -305,8 +305,8 @@ QScreen *screenFromRequest(const QJsonObject &request)
     return named != nullptr ? named : screenFromGeometry(request);
 }
 
-// One pinned image. Image, scale and global position live here rather than in
-// a widget: a pin may span several outputs, and every surface has to render
+// One pinned image. Image, scale and global position live here rather than in a
+// widget: a pin may span several outputs, and every surface that shows it needs
 // the same shared state.
 struct Pin {
     quint64 id = 0;
@@ -321,10 +321,6 @@ struct Pin {
     // Global logical top-left of the image.
     QPoint origin;
     QString label;
-    // One surface per output the daemon renders on; normally all of them.
-    // QPointer: a surface can be dismissed by the compositor on its own (an
-    // output going away), which would leave a bare pointer behind.
-    QHash<QScreen *, QPointer<PinWindow>> surfaces;
 
     QSize displaySize() const
     {
@@ -557,23 +553,28 @@ public:
         }
     }
 
-    // Keeps every pin rendering on every output. The compositor can add or
-    // remove outputs at any time, and a surface belongs to exactly one of
-    // them, so the mapping has to follow.
+    // Keeps the stack rendering on every output. The compositor can add or
+    // remove outputs at any time, and a surface belongs to exactly one of them,
+    // so the mapping has to follow. An output that comes and goes while nothing
+    // is pinned has nothing to show and gets no surface.
     void watchScreens()
     {
         connect(qApp, &QGuiApplication::screenAdded, this, [this](QScreen *screen) {
-            for (Pin *pin : pins_) {
-                addSurface(pin, screen);
-                syncGeometry(pin);
+            if (surfaces_.isEmpty()) {
+                return;
             }
+            addSurface(screen);
+            syncAll();
         });
         connect(qApp, &QGuiApplication::screenRemoved, this, [this](QScreen *screen) {
-            for (Pin *pin : pins_) {
-                dropSurface(pin, screen);
-                pin->origin = clampOrigin(*pin, pin->origin);
-                syncGeometry(pin);
+            if (surfaces_.isEmpty()) {
+                return;
             }
+            dropSurface(screen);
+            for (Pin *pin : pins_) {
+                pin->origin = clampOrigin(*pin, pin->origin);
+            }
+            syncAll();
         });
     }
 
@@ -585,8 +586,8 @@ public:
         pins_.clear();
         byId_.clear();
         editingPin_ = nullptr;
+        destroySurfaces();
         for (Pin *pin : pins) {
-            destroySurfaces(pin);
             delete pin;
         }
     }
@@ -676,8 +677,8 @@ private:
             pins_.clear();
             byId_.clear();
             editingPin_ = nullptr;
+            destroySurfaces();
             for (Pin *pin : pins) {
-                destroySurfaces(pin);
                 delete pin;
             }
             // Nothing is pinned any more, so the daemon has no reason to live.
@@ -832,16 +833,20 @@ wl-clipboard package"));
                       QPoint(offset, offset);
         pin->origin = clampOrigin(*pin, pin->origin);
 
-        buildSurfaces(pin);
-        if (pin->surfaces.isEmpty()) {
+        // The surfaces only exist while there is something to paint: an empty
+        // daemon holds no layer surface of its own.
+        ensureSurfaces();
+        if (surfaces_.isEmpty()) {
             delete pin;
             armIdleQuit();
             return error(QStringLiteral("could not create a layer-shell pin surface"));
         }
+        // Appended, so it is painted last: a new pin lands in front of the pins
+        // that were already there.
         pins_.push_back(pin);
         byId_.insert(pin->id, pin);
         idleQuit_->stop();
-        syncGeometry(pin);
+        syncAll();
         return okReply();
     }
 
@@ -878,14 +883,9 @@ wl-clipboard package"));
                 pin->scale = std::clamp(static_cast<double>(display.width()) / image.width(),
                                         kMinScale, kMaxScale);
             }
-            for (const QPointer<PinWindow> &surface : pin->surfaces) {
-                if (surface != nullptr) {
-                    surface->setSourceImage(image);
-                }
-            }
         }
         pin->origin = clampOrigin(*pin, QPoint(x, y));
-        syncGeometry(pin);
+        syncAll();
         const QRect landed = pin->globalRect();
         QJsonObject reply = okReply();
         reply.insert(QStringLiteral("x"), static_cast<qint64>(landed.x()));
@@ -904,10 +904,14 @@ wl-clipboard package"));
         if (editingPin_ != nullptr) {
             return; // one edit session at a time
         }
+        // The editor draws its own overlay above the pins but leaves the image
+        // itself to the pin stack, so the pin being edited has to be the front
+        // one or an overlapping pin would cover what is being annotated.
+        bringToFront(pin);
         const QRect globalRect = pin->globalRect();
         QScreen *screen = QGuiApplication::screenAt(globalRect.center());
         if (screen == nullptr) {
-            screen = pin->surfaces.isEmpty() ? fallbackScreen() : pin->surfaces.constBegin().key();
+            screen = fallbackScreen();
         }
         if (screen == nullptr) {
             return;
@@ -1079,51 +1083,86 @@ wl-clipboard package"));
         return std::max(dx, dy);
     }
 
-    void addSurface(Pin *pin, QScreen *screen)
+    // Creates the stack's surface on one output.
+    void addSurface(QScreen *screen)
     {
-        if (screen == nullptr || pin->surfaces.contains(screen)) {
+        if (screen == nullptr || surfaces_.contains(screen)) {
             return;
         }
-        auto *surface = new PinWindow(pin->image, pin->density, screen);
-        surface->setLabel(pin->label);
-        surface->setScale(pin->scale);
-        surface->setGlobalOrigin(pin->origin);
-        surface->setCloseCallback([this, pin] { removePin(pin); });
-        surface->setEditCallback([this, pin] { startEdit(pin); });
-        // Both gestures belong to the pin, not to the surface that caught
-        // them: the daemon moves and rescales every surface at once.
-        surface->setDragCallback([this, pin](QPoint topLeft) {
-            pin->origin = clampOrigin(*pin, topLeft);
-            syncGeometry(pin);
+        auto *surface = new PinSurface(screen);
+        // Every gesture names the pin it is about: the surface paints and
+        // hit-tests the whole stack, so the daemon looks the pin up by id.
+        surface->setPickCallback([this](quint64 id) {
+            bringToFront(byId_.value(id, nullptr));
         });
-        surface->setZoomCallback([this, pin, surface](double factor) {
-            zoomPin(pin, surface, factor);
+        surface->setDragCallback([this](quint64 id, QPoint topLeft) {
+            Pin *pin = byId_.value(id, nullptr);
+            if (pin == nullptr) {
+                return;
+            }
+            pin->origin = clampOrigin(*pin, topLeft);
+            syncAll();
+        });
+        surface->setZoomCallback([this](quint64 id, double factor) {
+            zoomPin(byId_.value(id, nullptr), factor);
+        });
+        surface->setCloseCallback([this](quint64 id) {
+            if (Pin *pin = byId_.value(id, nullptr)) {
+                removePin(pin);
+            }
+        });
+        surface->setEditCallback([this](quint64 id) {
+            if (Pin *pin = byId_.value(id, nullptr)) {
+                startEdit(pin);
+            }
         });
         if (!surface->showLayerSurface()) {
             delete surface;
             return;
         }
-        pin->surfaces.insert(screen, surface);
-        QObject::connect(surface, &QObject::destroyed, this, [this, pin, screen] {
-            pin->surfaces.remove(screen);
+        surfaces_.insert(screen, surface);
+        QObject::connect(surface, &QObject::destroyed, this, [this, screen] {
+            surfaces_.remove(screen);
         });
     }
 
-    void buildSurfaces(Pin *pin)
+    // Creates one surface per output, for the first pin that arrives: an empty
+    // daemon maps nothing of its own.
+    void ensureSurfaces()
     {
+        if (!surfaces_.isEmpty()) {
+            return;
+        }
         for (QScreen *screen : QGuiApplication::screens()) {
-            addSurface(pin, screen);
+            addSurface(screen);
         }
     }
 
+    // Moves a pin to the top of the stack, so the surfaces paint it last and it
+    // covers the pins it overlaps. Every pin shares one surface per output,
+    // which is exactly what makes the order the daemon's to change: the
+    // compositor orders the surfaces of a layer by map time and offers no
+    // request to restack them, so with one surface per pin this would have to
+    // be a remap — and remapping loses the keyboard focus a click just gave.
+    void bringToFront(Pin *pin)
+    {
+        if (pin == nullptr || pins_.isEmpty() || pins_.constLast() == pin) {
+            return;
+        }
+        pins_.removeAll(pin);
+        pins_.push_back(pin);
+        syncAll();
+    }
+
     // Retires one surface and breaks every connection into the daemon first:
-    // the widget is destroyed asynchronously (WA_DeleteOnClose), and by then
-    // the pin it references may already be gone.
-    void detachSurface(PinWindow *surface)
+    // the widget is destroyed asynchronously (WA_DeleteOnClose), and by then the
+    // pins it references may already be gone.
+    void detachSurface(PinSurface *surface)
     {
         if (surface == nullptr) {
             return;
         }
+        surface->setPickCallback({});
         surface->setCloseCallback({});
         surface->setEditCallback({});
         surface->setDragCallback({});
@@ -1134,22 +1173,25 @@ wl-clipboard package"));
         surface->close();
     }
 
-    void dropSurface(Pin *pin, QScreen *screen)
+    void dropSurface(QScreen *screen)
     {
-        detachSurface(pin->surfaces.take(screen).data());
+        detachSurface(surfaces_.take(screen).data());
     }
 
-    void destroySurfaces(Pin *pin)
+    void destroySurfaces()
     {
-        const QList<QPointer<PinWindow>> surfaces = pin->surfaces.values();
-        pin->surfaces.clear();
-        for (const QPointer<PinWindow> &surface : surfaces) {
+        const QList<QPointer<PinSurface>> surfaces = surfaces_.values();
+        surfaces_.clear();
+        for (const QPointer<PinSurface> &surface : surfaces) {
             detachSurface(surface.data());
         }
     }
 
     void removePin(Pin *pin)
     {
+        if (pin == nullptr) {
+            return;
+        }
         if (editingPin_ == pin) {
             editingPin_ = nullptr;
         }
@@ -1157,30 +1199,60 @@ wl-clipboard package"));
         if (byId_.value(pin->id, nullptr) == pin) {
             byId_.remove(pin->id);
         }
-        // Surfaces first: their destroyed handlers still look at the pin.
-        destroySurfaces(pin);
         delete pin;
-        armIdleQuit();
+        if (pins_.isEmpty()) {
+            // Nothing is left to paint, so the surfaces go as well: they are the
+            // daemon's own layer surfaces and have no reason to outlive the last
+            // pin.
+            destroySurfaces();
+            armIdleQuit();
+            return;
+        }
+        syncAll();
     }
 
-    // Applies the pin's shared state to every surface it renders on.
-    void syncGeometry(Pin *pin)
+    // Hands every surface the whole stack, in paint order: the daemon owns the
+    // order, and a surface only needs to be told which entries changed.
+    void syncAll()
     {
-        for (auto it = pin->surfaces.cbegin(); it != pin->surfaces.cend(); ++it) {
-            PinWindow *surface = it.value();
-            if (surface == nullptr) {
-                continue;
+        QVector<PinSurface::Item> items;
+        items.reserve(pins_.size());
+        for (const Pin *pin : pins_) {
+            items.append(itemFor(*pin));
+        }
+        for (const QPointer<PinSurface> &surface : surfaces_) {
+            if (surface != nullptr) {
+                // A surface created while everything is hidden never got the
+                // hide command, so it would paint the stack the next pin adds.
+                if (surface->isPinnedVisible() != allVisible_) {
+                    surface->setPinnedVisible(allVisible_);
+                }
+                surface->setPins(items);
             }
-            surface->setScale(pin->scale);
-            surface->setGlobalOrigin(pin->origin);
-            surface->setPinnedVisible(allVisible_);
         }
     }
 
-    // Multiplicative zoom keeps the image center in place. Only the surface
-    // that reported the gesture shows the badge.
-    void zoomPin(Pin *pin, PinWindow *source, double factor)
+    // How one pinned image looks on an output. A pin may span several outputs,
+    // so its global state is handed over as it is and each surface paints the
+    // part that overlaps it.
+    static PinSurface::Item itemFor(const Pin &pin)
     {
+        PinSurface::Item item;
+        item.id = pin.id;
+        item.image = pin.image;
+        item.density = pin.density;
+        item.scale = pin.scale;
+        item.origin = pin.origin;
+        return item;
+    }
+
+    // Multiplicative zoom keeps the image center in place. The surface that
+    // reported the gesture shows the factor it just applied.
+    void zoomPin(Pin *pin, double factor)
+    {
+        if (pin == nullptr) {
+            return;
+        }
         const double next = std::clamp(pin->scale * factor, kMinScale, kMaxScale);
         if (next == pin->scale) {
             return;
@@ -1191,25 +1263,30 @@ wl-clipboard package"));
         const QSize resized = pin->displaySize();
         pin->origin = clampOrigin(
             *pin, center - QPoint(resized.width() / 2, resized.height() / 2));
-        syncGeometry(pin);
-        if (source != nullptr) {
-            source->showZoomBadge();
-        }
+        syncAll();
     }
 
     void setVisible(bool visible)
     {
         allVisible_ = visible;
-        for (Pin *pin : pins_) {
-            syncGeometry(pin);
+        for (const QPointer<PinSurface> &surface : surfaces_) {
+            if (surface != nullptr) {
+                surface->setPinnedVisible(visible);
+            }
         }
     }
 
     QLocalServer *server_;
     QString socketPath_;
     QHash<QLocalSocket *, QByteArray> buffer_;
+    // The pins, back to front: the last one is painted last, i.e. it is the one
+    // on top where they overlap.
     QVector<Pin *> pins_;
     QHash<quint64, Pin *> byId_;
+    // One rendering surface per output, each painting the whole stack. QPointer:
+    // a surface can be dismissed by the compositor on its own (an output going
+    // away), which would leave a bare pointer behind.
+    QHash<QScreen *, QPointer<PinSurface>> surfaces_;
     quint64 nextId_ = 1;
     Pin *editingPin_ = nullptr;
     bool allVisible_ = true;

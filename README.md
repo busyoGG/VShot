@@ -135,19 +135,48 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 通用 Wayland 没有标准的 active-window geometry API。`window active` 依次尝试：
 
-1. **KWin 自己的窗口截图**（`org.kde.KWin.ScreenShot2` 的 `CaptureActiveWindow`）：唯一"直接给出答案"的一路——合成器把焦点窗口自己画一遍，带装饰和阴影（阴影那一圈的底色是透明的）、按窗口所在屏的 scale 给出原生像素，回复里的 `scale` 就是密度，`windowId` 是窗口 uuid（见「截图后端」）。它是单次 D-Bus 调用、不依赖任何外部工具，所以排在 KDE 的最前面；代价是 `--cursor` 由 KWin 自己决定画不画；
+**只问当前会话自己的合成器**：`XDG_CURRENT_DESKTOP` / `XDG_SESSION_DESKTOP` 里的名字决定本会话是谁，不属于本会话的探针一律不跑（两个变量都没写合成器名时才把下面几路都试一遍）。同时跑着两个合成器时这不是可选项——从 Hyprland 终端里启动的 Plasma 会话会继承 `HYPRLAND_INSTANCE_SIGNATURE`，`hyprctl` 于是照样应答，报的是**没人看的那个 Hyprland 实例**，于是 `window active` 截的是 Hyprland 里的窗口、`window pick` 把那个会话的窗口列表当成 KDE 桌面上的候选。niri 既没有 Hyprland/Sway 那样的矩形探针，也没有输出焦点窗口的几何，它走的同样是第 1 路里"合成器自己画窗口"那条（见下）。
+
+1. **合成器自己画这个窗口**——唯一"直接给出答案"的一路，也是少数不经过任何裁剪的一路：合成器把焦点窗口自己画一遍，按窗口所在屏的 scale 给出原生像素。两条实现：
+   - **KWin**（`org.kde.KWin.ScreenShot2` 的 `CaptureActiveWindow`）：带装饰和阴影（阴影那一圈的底色是透明的），回复里的 `scale` 就是密度，`windowId` 是窗口 uuid（见「截图后端」）。它是单次 D-Bus 调用、不依赖任何外部工具，所以排在 KDE 的最前面；代价是 `--cursor` 由 KWin 自己决定画不画；
+   - **niri**（`niri msg action screenshot-window --id N --path <绝对路径>`）：niri 自己把该窗口渲染成 PNG 写到我们给的临时路径，再读回来。它**不能改用矩形裁剪**：niri 的 IPC 里平铺窗口没有绝对位置——`niri msg --json windows` 每扇窗只给 `pos_in_scrolling_layout`（1-based 的列/瓦片**索引**）、`tile_size`、`window_size`、`window_offset_in_tile`，而唯一的位置字段 `tile_pos_in_workspace_view` 只对**浮动**窗口有值（平铺路径在 niri 源码里被显式置为 `null`，`Workspace` 里也没有滚动视图偏移），所以"算出矩形再裁冻结场景"在 niri 上只对浮动窗口成立。详见下节；
 2. Hyprland：`hyprctl activewindow -j` 的 `at`/`size`；
 3. Sway：`swaymsg -t get_tree` 中递归查找 focused node 的 `rect`；
-4. KDE Plasma 的兜底（上面那路不可用时才走）：优先 `kdotool`（若安装），读它 `getwindowgeometry` 的 `Position:`/`Geometry:` 两行——kdotool 0.2.1 只为 `getmouselocation` 提供 `--shell`，对 `getwindowgeometry` 传 `--shell` 会当场报 `invalid option` 并失败，整条 kdotool 分支因此形同不存在；否则用一次性 KWin scripting 探针——通过 `org.kde.kwin.Scripting`（gdbus/dbus-send）加载读取 `workspace.activeWindow`/`activeClient` 的 `frameGeometry`（分别对应 Plasma 6/5），再从用户 journal 轮询标记行取回；探针每次独立加载并在结束后卸载。**这条探针依赖 journald 收到 KWin 的 `console.info`**：KWin 从 tty 起、日志只进那台 tty 时，无论等多久都取不到行——这正是本机 KDE 上 `window active` 曾经落到像素识别的第二个原因；
+4. KDE Plasma 的兜底（上面那路不可用时才走），两条路，先试能试的那条：`kdotool`（装了就用）——它驱动的是同一套 KWin scripting 接口，但结果通过 `callDBus` 回给自己那个临时总线名，**不经 journal**，所以是本条路上唯一不依赖 KWin 日志的走法；读它 `getwindowgeometry` 的 `Position:`/`Geometry:` 两行——kdotool 0.2.1 只为 `getmouselocation` 提供 `--shell`，对 `getwindowgeometry` 传 `--shell` 会当场报 `invalid option` 并失败（这正是它早先形同不存在的原因）；没装或读不出几何时退回一次性 KWin scripting 探针——通过 `org.kde.kwin.Scripting`（gdbus/dbus-send）加载读取 `workspace.activeWindow`/`activeClient` 的 `frameGeometry`（分别对应 Plasma 6/5），再从用户 journal 轮询标记行取回；探针每次独立加载并在结束后卸载。**这条探针依赖 journald 收到 KWin 的 `console.info`**：KWin 从 tty 起、日志只进那台 tty 时，无论等多久都取不到行——这正是本机 KDE 上 `window active` 曾经落到像素识别的第二个原因；
 5. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测窗口。分析**逐个输出进行，用该输出自己那份原生像素**，不在合成场景上做——场景会把低 scale 的输出放大，从场景边缘出发的泛洪还会跨过显示器接缝，把"整块桌面"当成一个候选。每个输出内部的候选按可信度分四级，高一级有结果就只用这一级：`Ring`（边框带）→ `Segment`（泛洪分割）→ `Outline`（闭合描边轮廓）→ `WholeOutput`（整块输出，只在该输出基本均匀时）。**Ring 优先**，但只认**有颜色**的那条边：合成器给焦点窗口描的边是画面里唯一明确指向"焦点窗口"的信号。它找"薄而恒定的横带"（两侧跳变 ≥ 20、内部变化 < 10、厚度 ≤ 8 设备像素），把这些带拼成长线，要求**上下两条横线各自找到的左右竖线完全一致**、四条边闭合成环，环的高度/宽度还要够窗口尺寸；两条横线各自去找角点是为了排除"两窗共享同一行边框"的假环——那种情况下横线会一直延伸过邻居的边界。侧边还必须是**一条完整的边**（跨度 ≥ 环高的 60%）：实测一个 kitty 窗口的左右边框各占环高的 95%/96%，而它内部的一条滚动条只占 13%，曾经把那条滚动条当成右边框，让裁剪少了 14 个逻辑像素。环上采到的平均饱和度 ≥ 48 才算"焦点描边"，**灰色的环只按 `Segment` 那级参与竞争**（它可能是 `col.inactive_border`，也可能是壁纸里随便一个方框，两者在像素上无法区分），免得闲置屏上的一个壁纸方框压过指针所在屏上的真窗口。**每条路径给出的都是窗口本来的样子，包含合成器画的那条边框**：`Ring` 取环带的外沿，`Segment` 也不再往里缩掉四周的同色边带（那一步曾被用来和 compositor 元数据对齐，现在裁剪以"画面里看到的窗口"为准）。`Segment` 是原路径（从输出边缘泛洪追踪壁纸与阴影，无边框窗口靠 gaps、阴影或壁纸分离）；`Outline` 是"闭合同色矩形轮廓"，且必须覆盖该输出的足够比例才算窗口——网页内容里到处都是同色矩形，不设这道门槛就会截到某人页面中的一块卡片。一个输出最多保留 32 个环、每个环的饱和度只沿四条边各取 64 个采样点：整个帧本身就是一张网格状图片时（屏幕的照片、满屏嵌套面板），边线两两配对能凑出上千个矩形，这两道闸把开销和候选数都压成常数。
 
-`vshot window active --pixel` 跳过 compositor 元数据，直接走像素识别——用于测试检测器，也可用于完全没有元数据接口的合成器（**niri** 就是其一：它没有输出焦点窗口几何的接口，`focused-window` 只给 tile 布局信息，全局坐标要靠 output 与 column 自己推算）。分析帧按**面积**上限降采样（1080p 逐像素、4K 约 1/2），因为分隔窗口的 gaps 与描边只有几个设备像素宽：按长边压到 1024 会让 4K 场景里的 3px 边框整条消失，实测焦点描边检测在那样的分析帧上一个候选都给不出来。窗口截图**按所在输出原生裁剪**（`SceneSnapshot::crop_output_region`）：混合 DPI 时一块 scale-1 屏上的窗口若从合成场景裁剪，会得到放大一倍且发虚的图，现在直接从那块屏自己的帧裁，PNG 写的密度也是那块屏的；只有跨接缝的窗口才回落到合成场景。像素识别在 release 下两屏共约 0.1 s。**没有焦点描边时按指针判**：合成器若给焦点窗口描一条有颜色的边（Hyprland 的 `col.active_border` 甚至可以是渐变），那条边就是判据；若它描的是纯灰（本机焦点在无边框全屏窗口上时实测四周都是 `#464646` 灰边，平均饱和度 0.8，而有色焦点描边实测 162~175），画面里就没有任何东西能区分"焦点窗口"与"指针下的窗口"，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是**你指着的那个窗口**，与 `hyprctl activewindow` 可能不一致。`VSHOT_PIXEL_DEBUG=1` 把每个输出的分析尺寸、找到的每个环（含饱和度、是否判为焦点描边）以及每一级的答案打到 stderr，用来查一次错误裁剪到底是哪一级给出来的。**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。在保存下来的那张 4K 帧（3830x2156 设备像素，scale 2，右边半屏是焦点 kitty）上实测：边框带把 kitty 精确读成逻辑 (962, 54) 起的 **941x1014** 内容矩形，它的边框是 3 逻辑像素宽，于是裁剪用的矩形是 (959, 51) 起的 947x1020 —— 窗口连同边框；同一帧上泛洪分割给出的却是把并排两窗连成一片的 927..1914 宽一整块，而这条路径早先给出的是 3832x1072——两块屏拼起来的整个桌面。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
+`vshot window active --pixel` 跳过上面这些"直接问合成器"的路，直接在捕获的帧上做像素识别：用于测试检测器，也是拿到一个矩形而不是合成器给的像素时唯一的选择。niri 上它同时是退路——`--pixel` 会放弃 niri 自己的窗口截图，改用识别出来的矩形去裁场景（这也意味着它在 niri 上要求输出能被合成成场景）。分析帧按**面积**上限降采样（1080p 逐像素、4K 约 1/2），因为分隔窗口的 gaps 与描边只有几个设备像素宽：按长边压到 1024 会让 4K 场景里的 3px 边框整条消失，实测焦点描边检测在那样的分析帧上一个候选都给不出来。窗口截图**按所在输出原生裁剪**（`SceneSnapshot::crop_output_region`）：混合 DPI 时一块 scale-1 屏上的窗口若从合成场景裁剪，会得到放大一倍且发虚的图，现在直接从那块屏自己的帧裁，PNG 写的密度也是那块屏的；只有跨接缝的窗口才回落到合成场景。像素识别在 release 下两屏共约 0.1 s。**没有焦点描边时按指针判**：合成器若给焦点窗口描一条有颜色的边（Hyprland 的 `col.active_border` 甚至可以是渐变），那条边就是判据；若它描的是纯灰（本机焦点在无边框全屏窗口上时实测四周都是 `#464646` 灰边，平均饱和度 0.8，而有色焦点描边实测 162~175），画面里就没有任何东西能区分"焦点窗口"与"指针下的窗口"，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是**你指着的那个窗口**，与 `hyprctl activewindow` 可能不一致。`VSHOT_PIXEL_DEBUG=1` 把每个输出的分析尺寸、找到的每个环（含饱和度、是否判为焦点描边）以及每一级的答案打到 stderr，用来查一次错误裁剪到底是哪一级给出来的。**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。在保存下来的那张 4K 帧（3830x2156 设备像素，scale 2，右边半屏是焦点 kitty）上实测：边框带把 kitty 精确读成逻辑 (962, 54) 起的 **941x1014** 内容矩形，它的边框是 3 逻辑像素宽，于是裁剪用的矩形是 (959, 51) 起的 947x1020 —— 窗口连同边框；同一帧上泛洪分割给出的却是把并排两窗连成一片的 927..1914 宽一整块，而这条路径早先给出的是 3832x1072——两块屏拼起来的整个桌面。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
 
-第 1 路不经过任何裁剪：像素是 KWin 直接给的窗口本身，因此跨接缝的窗口也能整块到手（合成场景那条路会把低 scale 的那半放大）。其余各路的目标 geometry 从已经捕获的冻结画面裁剪——窗口路径优先从**所在输出自己那份帧**裁剪（原生分辨率与原生密度，见上），只有跨输出的 geometry 才用合成场景；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
+第 1 路不经过任何裁剪：像素是合成器直接给的窗口本身，因此跨接缝的窗口也能整块到手（合成场景那条路会把低 scale 的那半放大）。其余各路的目标 geometry 从已经捕获的冻结画面裁剪——窗口路径优先从**所在输出自己那份帧**裁剪（原生分辨率与原生密度，见上），只有跨输出的 geometry 才用合成场景；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
+
+### niri：为什么走它自己的截图，以及这条路给出什么
+
+依据是上游源码（`YaLTeR/niri`；本文实测用的会话是 25.11 之后 236 个提交的一个本地构建，仅作旁证）：
+
+- **平铺窗口没有绝对几何**，这不是"没找到"：`niri-ipc` 的 `WindowLayout` 只有 `tile_pos_in_workspace_view: Option<(f64,f64)>` 是"位置"，而它在**浮动**窗口上才被填（`src/layout/floating.rs`），平铺路径显式给 `None`（`src/layout/tile.rs`，`src/layout/scrolling.rs` 只补 `pos_in_scrolling_layout` 那对 1-based 索引）。所以 niri 上的窗口捕获**必须**走 `screenshot-window`，没有第二条路；
+- `window active` 先 `niri msg --json focused-window` 拿焦点窗口（layer-shell 表面持有焦点时是 `null`，此时按"没有焦点窗口"处理并落到后面的路），再让 niri 截它；
+- `window pick` 用 niri 自己的挑窗：`niri msg --json pick-window`，它只把光标换成十字、点哪个窗口就返回哪个（源码里不绘制悬停高亮），所以在 niri 上**没有我们自绘的压暗 overlay，也没有点击后的标注编辑器**（编辑器需要一个矩形来裁场景，而 niri 给不出平铺窗口的矩形）。要回到 overlay + 像素识别那条路就加 `--pixel`；
+- **`--cursor` 是版本相关的**：`Action::ScreenshotWindow` 的 `show_pointer` 字段在上游较新的版本里才有；niri 侧一旦以"未知参数"拒绝，vshot 就退化成不带指针重发一次并在 stderr 说明，而不是把整次截图丢掉；
+- **niri 会同时把这张图写进剪贴板**：`save_screenshot` 里设置剪贴板是必走的（与 `--write-to-disk` 无关），关不掉。所以 `--output`/`--clipboard` 下最终剪贴板是 vshot 自己的内容（文件 URI / PNG），而 `--pin` 下不写剪贴板，用户的剪贴板会被 niri 这次截图占据；
+- **密度不由这张图声明**：niri 写出的 PNG 只有 `IHDR`/`IDAT`/`IEND`，**没有 `pHYs`**（实测），所以密度由 vshot 自己写。规则是"该窗口所在输出的 scale"，优先取**我们拓扑里那台输出的整数 scale**（同一台屏上 `monitor`/`region`/`window` 写出的密度因此一致），拓扑不可用时退回 niri 的 `logical.scale`（小数四舍五入，与 KWin 那条路同一处理）；两者都拿不到就报错，不假设 1；
+- 由于这条路不需要拓扑、也不需要场景，**输出映射的校验被移到了"真正要用拓扑的地方"**：`WaylandSession::connect()` 不再提前校验，`window active`/`window pick` 因此在旋转/翻转输出上也能用（要求场景的 `region`/`monitor`/`all`/`long` 仍然照旧报 `unsupported output mapping`）。
+
+实测（隔离 labwc 里的嵌套 niri，1278x692 输出、scale 1、一个 kitty 平铺窗口）：
+
+| 量 | 值 |
+| --- | --- |
+| `window_size`（内容） | 615x660（边框 off，lab 现在就是这档）／607x652（把 4px 边框打开时） |
+| `tile_size`（含边框） | 615x660（边框 off 时与 `window_size` 相同） |
+| niri 写出的 PNG | **639x684** = `window_size` + 每边 12px（开 4px 边框那次是 631x676 = 607+24，加的仍是 `window_size`） |
+| 那 12px 是什么 | 窗口的**投影**：纯黑、alpha 沿边由 5 渐变到 86；**边框不在图里**（开了 4px 边框后 PNG 仍是 `window_size`+24，而不是 `tile_size`+24） |
+| PNG 里的块 | 只有 `IHDR`/`IDAT`/`IEND`，无 `pHYs` |
+| `screenshot-window` 之后的剪贴板 | `wl-paste --list-types` → `image/png` |
+| `vshot window active` / `window pick` | 均 exit 0，得到同一张 639x684；`--pick` 用 niri 十字选窗 + 真实点击选中该窗口 |
+| 写出的 PNG | 639x684、带 `pHYs` 96 DPI（密度 1，来自 niri 的 `logical.scale`——lab 里拓扑不可用，正好走了回退那条） |
 
 ## 选择窗口
 
-`vshot window pick` 分两步：先在**实时桌面**上挑窗口——**移动指针**高亮指针下的窗口，其余部分**压暗**，左上角的提示条给出窗口标题与将要截取的尺寸；**左键点击**结束挑选阶段（点在没有窗口的位置不选中任何东西，Esc 取消）。然后程序**重新捕获一帧**、把点击位置在**当前的窗口列表**上重新解析成窗口矩形，并以那一帧开一个编辑会话（工具栏、标注、Enter 确认、Esc 取消都与区域截图一致）。所以挑选期间切换工作区、移动窗口都不会让结果停在旧的画面上：裁剪用的是点击那一刻的画面，标注也画在同一帧上。
+`vshot window pick` 分两步：先在**实时桌面**上挑窗口——**移动指针**高亮指针下的窗口，其余部分**压暗**，左上角的提示条给出窗口标题与将要截取的尺寸；**左键点击**结束挑选阶段（点在没有窗口的位置不选中任何东西，Esc 取消）。然后程序**重新捕获一帧**、把点击位置在**当前的窗口列表**上重新解析成窗口矩形，并以那一帧开一个编辑会话（工具栏、标注、Enter 确认、Esc 取消都与区域截图一致）。所以挑选期间切换工作区、移动窗口都不会让结果停在旧的画面上：裁剪用的是点击那一刻的画面，标注也画在同一帧上。（niri 上这段流程不同：见「active window · niri」与下面的说明。）
 
 压暗就是一层半透明黑罩（alpha 80，和编辑阶段选区内外的压暗同一档）。Hyprland 如果给所有 layer namespace 打开了 blur（本机配置就是 `namespace = ".*"` + `blur = true`），这层罩子会让合成器把底下的桌面一起模糊掉——观感上就是"没选中的窗口失焦"（本机实测压暗区的高频能量只剩基线的 0.4%）。overlay 的 layer namespace 是 `vshot-qt-ui`，给它单独关掉 blur 就能得到干净的压暗。
 
@@ -155,13 +184,15 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 挑选期间候选列表**跟着指针刷新**：指针每移动一次（150 ms 内最多一次）helper 就通过 session 的管道向 CLI 要一份新的窗口列表，CLI 现查 compositor 后回答；指针完全不动时也每 300 ms 问一次，免得别处（另一个屏幕切换工作区、窗口被挪走）的变化让高亮停在旧位置上。CLI 没有可复查的来源时（纯像素识别那条路径）会回答「无可奉告」，helper 就继续用它手里那份；回答和手里那份一样时不会重绘。
 
-候选来自 compositor 的窗口列表，依次尝试：
+候选来自 compositor 的窗口列表，依次尝试（**同样只问当前会话自己的合成器**，判定见「active window」）：
 
-1. Hyprland：把 `hyprctl clients -j` 和 `hyprctl monitors -j` 一起看。Hyprland 会列出**所有**工作区的客户端，而且 `visible` 对隐藏工作区的窗口同样为真、其 `at` 还是上次布局留下的过期值（实测：一个 12 窗口的会话里真正在屏幕上的只有 2 个），所以这里不靠标志位而是按结构筛选——客户端的工作区必须正是它所在显示器当前显示的那个（激活工作区，或已激活的 special workspace；pinned 窗口跨工作区常驻，始终保留），且矩形必须落在该显示器逻辑范围内（过期坐标通常指向另一块屏，正是被这条挡下的）。标题用 `class — title`；
-2. Sway：`swaymsg -t get_tree` 的全部叶子节点（隐藏 workspace 下的除外），标题用 `app_id`（X11 用 `window_properties.class`）加 `name`；
-3. KDE Plasma：同一套 KWin scripting 探针的 `list` 模式，遍历 `workspace.windowList()`/`clientList()`，跳过 `deleted`/`hidden`/`minimized` 与非 `normalWindow` 的项；探针只报几何、不带标题，所以提示条只显示尺寸；
+**niri 是例外**：它没有窗口列表可用（见「active window · niri」），所以 `--pixel` 之外它在挑选阶段不画压暗 overlay，而是直接调 niri 自己的十字挑窗（`niri msg --json pick-window`）——点到的窗口由 niri 自己截图交回，因此这里没有"重新解析点击位置"这一步，也没有后面的标注编辑器。`--pixel` 时回到下面这套 overlay + 像素识别。
 
-指针命中的候选取**包含指针的最小矩形**——窗口重叠时选中的是靠里/更小的那个。窗口列表筛完之后为空（或查询本身失败）时会自动落到像素识别，不会直接报错。`vshot window pick --pixel` 跳过窗口列表，直接在冻结帧上做像素识别（与 `window active --pixel` 同一套逐输出、原生分辨率的分析：边框带、泛洪分割、闭合描边轮廓一起上，把所有候选交给用户），把找到的所有候选交给用户挑；这条路径用于没有窗口列表查询的 compositor，也用于测试检测器。纯像素识别只能看到帧里**可分离**的窗口：无缝无边框平铺（无 gaps、无阴影）以及完全均匀的桌面没有像素信号，此时候选为空并如实报错，不会给出一个猜出来的裁剪。点击后的重新解析同样用窗口列表（`--pixel` 或列表不可用时退回挑选阶段给出的矩形），所以 `--pixel` 这条路径在工作区切换后可能仍停在旧矩形上。
+1. Hyprland：把 `hyprctl clients -j` 和 `hyprctl monitors -j` 一起看。Hyprland 会列出**所有**工作区的客户端，而且 `visible` 对隐藏工作区的窗口同样为真、其 `at` 还是上次布局留下的过期值（实测：一个 12 窗口的会话里真正在屏幕上的只有 2 个），所以这里不靠标志位而是按结构筛选——客户端的工作区必须正是它所在显示器当前显示的那个（激活工作区，或已激活的 special workspace；pinned 窗口跨工作区常驻，始终保留），且矩形必须落在该显示器逻辑范围内（过期坐标通常指向另一块屏，正是被这条挡下的）。标题用 `class — title`；候选按叠放序输出（平铺 → 浮动 → pinned 浮动）；
+2. Sway：`swaymsg -t get_tree` 的全部叶子节点（隐藏 workspace 下的除外），标题用 `app_id`（X11 用 `window_properties.class`）加 `name`；浮动的容器排在平铺叶子**之后**（sway 同样是先命中浮动容器、并把它画在平铺之上）；
+3. KDE Plasma：同一套 KWin scripting 探针的 `list` 模式，遍历 `workspace.stackingOrder`（**自底向顶**，与 KWin 自己的命中测试 `windowAt` 从叠放序末尾往前扫同序；KWin 太老而没有这个属性时退回 `windowList()`/`clientList()`，那是创建顺序，不是叠放序），跳过 `deleted`/`hidden`/`minimized` 与非 `normalWindow` 的项；探针只报几何、不带标题，所以提示条只显示尺寸；
+
+指针命中的候选取**列表里最后一个包含指针的窗口**——候选按**叠放顺序自底向顶**排列，所以那就是指针下最上层的窗口。**这条规则不是"取包含指针的最小矩形"**：压在平铺窗口上的浮动窗口通常更小，但不是一定，按最小取就会选中它下面的那个（本机实测：对一个 941×1014 的平铺窗口 `togglefloating`，体积不变、面积相同，旧规则退化成"谁在 `hyprctl clients` 的数组里靠前"，于是随机取到下面那个窗口）。排列按各自合成器自己的命中顺序来：Hyprland 按它绘制与命中测试都用的三个 pass（平铺 → 浮动 → pinned 浮动，pass 内保持 `hyprctl clients` 的数组顺序，那是它真实的叠放序：窗口向量自底向顶，聚焦时被 `moveToZ` 提到末尾）、Sway 的浮动容器排在平铺树之后、KWin 探针报 `workspace.stackingOrder`（自底向顶，与 KWin 自己的 `windowAt` 从末尾往前扫同序）。点击后的重新解析（`window_at`）用同一条规则，所以高亮与最终截到的窗口不会是不一致的两个。像素识别的候选按面积**从大到小**排，"最后一个命中"于是仍然是最小的那个。窗口列表筛完之后为空（或查询本身失败）时会自动落到像素识别，不会直接报错。`vshot window pick --pixel` 跳过窗口列表，直接在冻结帧上做像素识别（与 `window active --pixel` 同一套逐输出、原生分辨率的分析：边框带、泛洪分割、闭合描边轮廓一起上，把所有候选交给用户），把找到的所有候选交给用户挑；这条路径用于没有窗口列表查询的 compositor，也用于测试检测器。纯像素识别只能看到帧里**可分离**的窗口：无缝无边框平铺（无 gaps、无阴影）以及完全均匀的桌面没有像素信号，此时候选为空并如实报错，不会给出一个猜出来的裁剪。点击后的重新解析同样用窗口列表（`--pixel` 或列表不可用时退回挑选阶段给出的矩形），所以 `--pixel` 这条路径在工作区切换后可能仍停在旧矩形上。
 
 ## 长截图（滚动截图）
 
@@ -196,13 +227,15 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 ## pin 图片浮层
 
-`vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**以图片中心缩放（0.1x–8x，并短暂显示倍率）、**双击**关闭该图、**点击聚焦后按 Space** 进入完整标注编辑器。
+`vshot pin` 把图片作为浮层钉在屏幕上：**拖拽**移动、**滚轮**以图片中心缩放（0.1x–8x，并短暂显示倍率）、**双击**关闭该图、**点击聚焦后按 Space** 进入完整标注编辑器。**点击的那张图会立刻提到最前**，所以重叠时被点到的那张一定压在其余之上；进入编辑也一样，正在标注的图不会被压住。
 
-新 pin 落在**激活的输出**上：**指针所在的那块屏优先**（`hyprctl cursorpos` 查询并按其逻辑矩形命中显示器），指针读不到时退回**键盘焦点所在**的输出（Hyprland `hyprctl monitors -j`、Sway `swaymsg -t get_outputs`、niri `niri msg --json focused-output` 中标记 focused 的输出，**KDE 则问 KWin 自己的 `org.kde.KWin.activeOutputName`**——`gdbus` 与 `dbus-send` 任一能用即可），都没有则回退主输出。这样"在哪块屏幕就在哪块屏幕 pin"才成立；daemon 自己拿不到这个信息（无窗口进程只能看到指针在 (0,0)）。
+叠放顺序由 **daemon 自己持有**，不靠合成器：一块输出上的所有 pin 画在**同一个 surface** 里（见下），daemon 的 pin 列表顺序就是绘制顺序，提到最前只是把该 pin 移到列表末尾再重绘一次——不重建 surface、不动输入区域，也不影响键盘焦点。这条是必需的：layer-shell 没有 raise/restack 请求，合成器把同一层的 surface 按 map 顺序排（Hyprland 的实现是每块输出每层一个 surface 向量，新 map 的追加到末尾，绘制按顺序、命中测试反向取），隐藏再显示同一条 surface 不会重排；若每个 pin 各占一个 surface，提升就只剩"重建 surface"这一条路，而那会丢掉刚点出来的键盘焦点（Hyprland 的 xdg-activation 只支持 toplevel，layer surface 的焦点是点击时由合成器给的）并触发一次该层的淡入动画。
 
-**只问当前会话自己的合成器**（按 `XDG_CURRENT_DESKTOP`/`XDG_SESSION_DESKTOP` 判定；两者都没写合成器名时才把所有探针都试一遍）。同时跑着两个合成器时这一步是必须的：从 Hyprland 终端里启动的 Plasma 会话会继承 `HYPRLAND_INSTANCE_SIGNATURE`，`hyprctl` 于是照样应答，报的却是**没人看的那个 Hyprland 实例**的焦点显示器——pin 就固定落在那边，看起来像"永远是主屏"。
+新 pin 落在**激活的输出**上：**指针所在的那块屏优先**（`hyprctl cursorpos` 查询并按其逻辑矩形命中显示器），指针读不到时退回**键盘焦点所在**的输出（Hyprland `hyprctl monitors -j`、Sway `swaymsg -t get_outputs`、niri 没有指针位置查询（它的 IPC 里根本没有这样的请求），所以它只能答"焦点窗口所在的输出"：`niri msg --json focused-output` 直接返回那个输出，没有列表可扫（源码里取的是 `layout.active_output()` → `monitor_set.active_monitor_idx`，而这个索引只在**焦点变化**时更新，指针移动不改它——niri 的 focus-follows-mouse 默认也是关的）。**KDE 则问 KWin 自己的 `org.kde.KWin.activeOutputName`**——`gdbus` 与 `dbus-send` 任一能用即可），都没有则回退主输出。这样"在哪块屏幕就在哪块屏幕 pin"才成立；daemon 自己拿不到这个信息（无窗口进程只能看到指针在 (0,0)）。
 
-CLI 把这个答案的**输出名**发给 daemon（Qt 的屏幕名就是合成器的输出名，按名字匹配一次到位），同时附上**逻辑矩形**作为兜底（老 daemon 或不报名字的合成器按几何匹配）。KDE 上只有名字：KWin 直接回答"当前输出是哪个"，不给几何。Hyprland 上报的 `width`/`height` 是原生分辨率而 `x`/`y` 是逻辑坐标，所以要按 `scale` 换算后才能与 Qt 屏幕几何或指针位置比较。名字的好处是精确：矩形匹配要求 Qt 的逻辑几何与合成器上报值完全相等，而名字没有这个隐患。一个 layer-shell surface 只能属于一块输出，所以每张 pin 由 daemon 为**每一块输出各持有一个渲染面**：pin 的图像、缩放与全局位置由 daemon 统一持有，各屏的面只画它与自己重叠的部分，因此拖拽可以**跨越显示器**——手势始终由拖起它的那个面持有，另一块屏上的副本同步跟随。完全落在别块屏幕上的面会把输入区域移到该面之外（Wayland 没有"无输入区域"的请求，未设置反而等于整面可点），不挡住那里的点击。显示器热插拔时 daemon 会为新输出补面、为移除的输出收面（并把 pin 收回可视区域）。
+**只问当前会话自己的合成器**（按 `XDG_CURRENT_DESKTOP`/`XDG_SESSION_DESKTOP` 判定；两者都没写合成器名时才把所有探针都试一遍。`window active` 与 `window pick` 用的是同一条判定）。同时跑着两个合成器时这一步是必须的：从 Hyprland 终端里启动的 Plasma 会话会继承 `HYPRLAND_INSTANCE_SIGNATURE`，`hyprctl` 于是照样应答，报的却是**没人看的那个 Hyprland 实例**的焦点显示器——pin 就固定落在那边，看起来像"永远是主屏"。
+
+CLI 把这个答案的**输出名**发给 daemon（Qt 的屏幕名就是合成器的输出名，按名字匹配一次到位），同时附上**逻辑矩形**作为兜底（老 daemon 或不报名字的合成器按几何匹配）。KDE 上只有名字：KWin 直接回答"当前输出是哪个"，不给几何。Hyprland 上报的 `width`/`height` 是原生分辨率而 `x`/`y` 是逻辑坐标，所以要按 `scale` 换算后才能与 Qt 屏幕几何或指针位置比较。名字的好处是精确：矩形匹配要求 Qt 的逻辑几何与合成器上报值完全相等，而名字没有这个隐患。一个 layer-shell surface 只能属于一块输出，所以 daemon 为**每一块输出各持有一个渲染面**，面上按自己的顺序画**该屏上所有 pin**：pin 的图像、缩放与全局位置由 daemon 统一持有，每个面只画与它重叠的部分，因此拖拽可以**跨越显示器**——手势始终由拖起它的那个面持有，另一块屏上的副本同步跟随。命中测试也在面内做（从栈顶往下找第一个包含指针的矩形），所以"拖谁、缩谁、双击关谁"由面报回的 pin id 决定，daemon 再按 id 取状态。整个面覆盖输出，但输入区域只跟着各张图的矩形走（并集）；某屏上一张图都没有时输入区域被挪到面之外——Wayland 没有"无输入区域"的请求，未设置反而等于整面可点，不挡住那里的点击。显示器热插拔时 daemon 会为新输出补面、为移除的输出收面（并把 pin 收回可视区域）；没有 pin 时 daemon 不持有任何面。
 
 pin 的**尺寸按图片的来源密度来定**，默认不需要任何参数。图片来源密度按以下顺序确定：
 
@@ -212,7 +245,7 @@ pin 的**尺寸按图片的来源密度来定**，默认不需要任何参数。
 4. **产出图片的工具留下的记录**：截图工具才是唯一知道图片来自哪块屏的一方（grim、satty、spectacle 都不往图里写密度），所以按约定读取
    - `<图片路径>.scale` 文件里单独一个数字，或
    - `$VSHOT_PIN_SOURCE_FILE`（默认 `/tmp/screenshot-path`）里的一行 `<图片路径> <缩放>`，路径与正在 pin 的图一致才采用，因此不会串用上一张截图的倍率；
-5. 都没有时，**按图片尺寸与落点输出推断**：图片像素数放得进该输出的原生分辨率时按 1 图素 = 1 屏幕素；放不进时说明它不可能来自这块屏，取"能容纳它的最小的那块屏"的缩放。最后再**按输出宽度**收一次上限（不放大、也不因为图比屏幕高而缩小），所以初始 pin 一定是可读的自然尺寸：长截图这类本来就比屏幕高的图保持自然宽度、顶边对齐落到屏幕上，超出屏幕的部分垂在下方，滚轮再从这里缩放。
+5. 都没有时，**按图片尺寸与落点输出推断**（落点输出的倍率由 daemon 自己读 Qt 屏幕的 `devicePixelRatio`，也就是合成器给客户端的 Wayland scale，不经过上面的探针——所以整数 scale 的判定与合成器无关，niri 上也一样）：图片像素数放得进该输出的原生分辨率时按 1 图素 = 1 屏幕素；放不进时说明它不可能来自这块屏，取"能容纳它的最小的那块屏"的缩放。最后再**按输出宽度**收一次上限（不放大、也不因为图比屏幕高而缩小），所以初始 pin 一定是可读的自然尺寸：长截图这类本来就比屏幕高的图保持自然宽度、顶边对齐落到屏幕上，超出屏幕的部分垂在下方，滚轮再从这里缩放。
 
 第 4 条要生效，截图脚本在保存图片后写下记录即可，例如 Hyprland (Lua)：
 
@@ -243,7 +276,7 @@ pin 需要一个**常驻后台进程**（daemon）：layer-shell 浮层 surface 
 - daemon 存续到最后一个 pin 关闭：关闭最后一张 pin（或 `--close-all`）约 0.5s 后 daemon 自动退出（新来的 add 会先被服务并取消退出）；下次 pin 命令自动重新拉起。`vshot pin --quit` 仍可随时手动退出；
 - **不要用 `pkill`/`kill -9` 结束 daemon**：它持有 layer-shell surface，被强杀时部分合成器（实测 Hyprland 0.56）会残留该 surface 与其截屏会话，导致**所有输出的 screencopy 永久阻塞**（`vshot`/`grim` 全部超时，且 `hyprctl reload`、DPMS 循环、`force_renderer_reload` 都无法恢复，只能重启会话）。请始终用 `vshot pin --quit`，它会在退出前 unmap 全部浮层；daemon 也已处理 `SIGTERM`/`SIGINT` 走同样的优雅路径；
 - socket 路径默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`（缺失时回退 `/tmp`），可用 `VSHOT_PIN_SOCKET=<绝对路径>` 覆盖，便于隔离测试多实例；
-- pin 浮层平时不持有键盘（`KeyboardInteractivity=OnDemand`）：点击后该 pin 获得键盘焦点（出现亮色描边），点别处自动让出。聚焦时按 **Space** 进入编辑模式。
+- pin 的渲染面平时不持有键盘（`KeyboardInteractivity=OnDemand`）：点击后该屏的渲染面获得键盘焦点，**点中的那张图**出现亮色描边（这块屏上其余 pin 不会），点别处自动让出。聚焦时按 **Space** 进入编辑模式，编辑的是该面最后点中的那张。
 
 Wayland 客户端拿不到全局按键，"一键显隐"请自行绑到合成器快捷键，例如 Hyprland：
 
@@ -273,8 +306,8 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 聚焦某个 pin 后按 **Space**，daemon 会导出该图并拉起与截图相同的完整标注编辑器（工具栏、文字、马赛克、撤销/重做）：
 
-- 编辑器覆盖 pin 所在的整块屏幕，但**不自己绘制图片**：画面上的图就是那个真实的 pin 窗口，编辑器只在其上叠加标注。工具栏和弹出面板浮在图片外的空白画布上，与区域截图的工具栏逻辑一致；标注超出图片的部分会被裁掉。
-- 选中工具（默认）在图片上拖动时，编辑器通过 daemon socket 的 `move` 命令直接复用 pin 窗口自身的移动逻辑，不产生副本；daemon 返回实际落下的矩形（含它自己的防丢失夹取），编辑器据此校正标注位置。方向键可微调，Shift+方向键步长 10px。图片不会被拖到屏幕外（始终至少有 32px 留在它最靠的那块输出上）。
+- 编辑器覆盖 pin 所在的整块屏幕，但**不自己绘制图片**：画面上的图就是那个真实的 pin（daemon 的渲染面画出来的），编辑器只在其上叠加标注。开编辑前 daemon 会先把该 pin 提到栈顶，否则一张压在它上面的 pin 会盖掉正在标注的内容。工具栏和弹出面板浮在图片外的空白画布上，与区域截图的工具栏逻辑一致；标注超出图片的部分会被裁掉。
+- 选中工具（默认）在图片上拖动时，编辑器通过 daemon socket 的 `move` 命令直接复用 pin 自身的移动逻辑（同样只是改 daemon 持有的位置再重绘），不产生副本；daemon 返回实际落下的矩形（含它自己的防丢失夹取），编辑器据此校正标注位置。方向键可微调，Shift+方向键步长 10px。图片不会被拖到屏幕外（始终至少有 32px 留在它最靠的那块输出上）。
 - Esc 取消本次编辑：标注被丢弃、像素保持原样，但**位置不回退**——拖到哪儿就留在哪儿；Enter 或工具栏 OK 确认则连同标注一起写回；
 - 确认后由 Rust 渲染管线把标注合成进图像（与截图导出同一条代码路径，保证所见即所得），结果同样通过 socket `move` 命令回写：像素被替换，pin 落到拖动后的位置（图片尺寸不变）；
 - 一次只能有一个 pin 处于编辑会话；编辑过程中编辑器持有独占键盘。
@@ -334,10 +367,10 @@ Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 l
 
 - 截图后端：wlroots 系走 `wlr-screencopy-unstable-v1` 的 wl_shm 路径（协议版本 1 至 3）；**KWin/Plasma Wayland 改走 `org.kde.KWin.ScreenShot2`**（见「截图后端」），因为 KWin 根本没有 screencopy，也没有 `ext-image-copy-capture`（实测 KWin 6.7.5 的 global 列表与 `libkwin.so.6` 里都找不到这两个接口名）。两者都没有实现 PipeWire、Portal ScreenCast 或 DMA-BUF。**不要以为"grim 能在 KDE 跑所以 vshot 也应该能"**：grim 只带 `zwlr_screencopy_manager_v1` 与 `ext_image_copy_capture_manager_v1`，在 KDE 上两个都不可用（实测报 "compositor doesn't support the screen capture protocol"），KDE 只能走它私有的 D-Bus 服务。GNOME/Mutter 三者都不提供，连 layer-shell 也没有。
 - KWin 那条路的**冻结 overlay 仍然依赖 `zwlr_layer_shell_v1`**（KWin 提供它）。授权不是对话框：KWin 只认调用方那个可执行文件对应的 desktop file 里声明的受限接口（见「KDE 授权」），所以从 `target/` 里直接跑的构建会一直拿到 `NoAuthorized`，装上包再用 `/usr/bin/vshot` 才行。**同一个 `XDG_RUNTIME_DIR` 下可以同时存在多个合成器**（例如 tty 里另起的 KDE 占 `wayland-0`、Hyprland 落在 `wayland-1`），而 `WAYLAND_DISPLAY` 未设置时 libwayland 会用默认的 `wayland-0`——tty 或 ssh 里的 shell 就是这种情况，于是命令会连到"另一个合成器"上去。凡是跟合成器有关的失败，vshot 都会额外打印一行说明这次连的是哪个 display、以及本机还有哪些 display。
-- Portal active-window backend 尚未实现；active window 先问合成器自己——KWin 用 `CaptureActiveWindow` 直接给窗口的像素与密度，其他合成器用 Hyprland/Sway/kdotool/KWin scripting 探针给几何——都缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。像素识别**逐输出**在原生帧上跑，结果只会是某一块屏上的一个窗口，不会横跨接缝；但当合成器不给焦点窗口描有色的边时，它答的是"指针下的窗口"，不是"焦点窗口"（见「截取活动窗口」）。`window pick` 的候选同样来自这三家：没有窗口列表查询的合成器要靠 `--pixel`，无缝无边框平铺与均匀桌面下没有任何候选，只能报错。候选列表在挑选期间**跟着指针刷新**（见「选择窗口」），所以切换工作区或移动窗口后，悬停高亮与最终截到的窗口都是实时的；只有 `--pixel` 那条路径没有可复查的窗口列表，会一直用挑选开始时的候选。
+- Portal active-window backend 尚未实现；active window 先问合成器自己——KWin 用 `CaptureActiveWindow`、niri 用 `screenshot-window`，两者直接给窗口的像素与密度；其他合成器用 Hyprland/Sway/kdotool/KWin scripting 探针给几何——都缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。像素识别**逐输出**在原生帧上跑，结果只会是某一块屏上的一个窗口，不会横跨接缝；但当合成器不给焦点窗口描有色的边时，它答的是"指针下的窗口"，不是"焦点窗口"（见「截取活动窗口」）。`window pick` 的候选来自 Hyprland/Sway/KWin 的窗口列表；**niri 走它自己的挑窗**（没有 overlay 与标注编辑器，见「选择窗口」）；没有窗口列表查询的合成器要靠 `--pixel`，无缝无边框平铺与均匀桌面下没有任何候选，只能报错。候选列表在挑选期间**跟着指针刷新**（见「选择窗口」），所以切换工作区或移动窗口后，悬停高亮与最终截到的窗口都是实时的；只有 `--pixel` 那条路径没有可复查的窗口列表，会一直用挑选开始时的候选。
 - 编辑结果使用 RGBA8 软件绘制，线宽和坐标按截图 logical scale 转换；Qt 文本框接受任意 Unicode 文本（含通过输入法提交的 CJK）。交互式文本由 Qt 按所选系统字体栅格化为 RGBA 位图后由 Rust 合成（见「交互式 overlay」）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体渲染，该回退路径仅支持可打印 ASCII。
 - 交互式 `region` 的键盘和鼠标事件由 Qt/LayerShellQt 处理；不依赖 Hyprland 插件或私有输入接口。
-- 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射会拒绝执行。
+- 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射在**需要把输出合成为场景**的路径上会拒绝执行（`region`/`monitor`/`all`/`long`、像素识别、带标注的编辑）。这个校验在真正要用拓扑时给出，因此合成器自己给窗口像素的两条路（KWin `CaptureActiveWindow`、niri `screenshot-window`）在旋转/翻转输出上仍然可用——它们不碰输出像素，密度取该输出的整数 scale，拓扑不可用时退回合成器自报的 scale。
 - `monitor current` 依赖 overlay 上收到 pointer enter/motion；通用 Wayland 没有可读取的全局鼠标坐标，因此不会用第一个 output 猜测结果。
 - 需要 compositor 实际支持 layer-shell、SHM、xdg-output 及相应 seat capability。原生 screencopy 等待 compositor 返回帧最多 10 秒，超时会返回错误而不是永久阻塞。没有 Wayland 环境时，连接阶段会返回 `Wayland connection failed`；非交互父层和 Qt helper 需要分别在相应环境中验证。
 - 长截图的滚动注入按 compositor 选路（见「长截图」）：Hyprland / sway / niri 用 `zwlr_virtual_pointer_manager_v1`（无需任何权限），KDE / GNOME 用 XDG RemoteDesktop portal（一次授权），都不行时才退到 `/dev/uinput`（需要 `/dev/uinput` 写权限）。无头 compositor 既没有指针也没有可滚动的内容，这条路径只能在真实会话里验证。

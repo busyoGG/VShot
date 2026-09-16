@@ -213,6 +213,11 @@ pub fn detect_active_window(scene: &SceneSnapshot, cursor: Option<Point>) -> Res
 /// whole set rather than one detector's best guess — the user, not the
 /// heuristic, decides between overlapping candidates.  An empty result means
 /// the outputs carry no window signal at all (seamless borderless tiling).
+///
+/// Largest first doubles as the stacking order the picker reads: it takes the
+/// *last* candidate under the pointer, so of two overlapping regions the
+/// innermost — the smaller, which is where the stronger signal is — wins.  The
+/// pixels cannot say which window is on top; nothing about a screenshot does.
 pub fn detect_window_candidates(scene: &SceneSnapshot) -> Vec<Rect> {
     let mut logical: Vec<Rect> = Vec::new();
     for output in scene.outputs() {

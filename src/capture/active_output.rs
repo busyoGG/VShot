@@ -14,7 +14,8 @@
 //! Detection is best-effort and never fatal: a compositor without a probe just
 //! leaves the choice to the daemon, which falls back to the output Qt reports
 //! as primary. Only the session's own compositor is asked — see [`Session`] —
-//! because a second compositor running alongside would answer for itself.
+//! because a second compositor running alongside would answer for itself. The
+//! window probes in [`super::window`] read the same judgement.
 
 use std::process::Command;
 
@@ -52,7 +53,7 @@ enum Probe {
 /// at, and the pin follows *that* session's focus onto the wrong monitor. The
 /// desktop variables the session sets say which one we are in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Session {
+pub(crate) enum Session {
     Hyprland,
     Sway,
     Niri,
@@ -81,7 +82,7 @@ impl Session {
         Self::Unknown
     }
 
-    fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
         let session = std::env::var("XDG_SESSION_DESKTOP").ok();
         Self::from_desktops(current.as_deref(), session.as_deref())

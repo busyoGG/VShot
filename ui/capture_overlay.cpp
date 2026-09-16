@@ -2712,24 +2712,22 @@ int OverlayController::hitHandle(Point point) const
     return 0;
 }
 
-/// Smallest candidate window containing `point`, or -1.  Smallest so that
-/// pointing at overlapping windows takes the topmost-looking inner one, which
-/// is what the user means by pointing at that spot.
+/// The candidate window on top at `point`, or -1.  The session's list arrives
+/// in stacking order, bottom to top, so the *last* window containing the point
+/// is the one on top — which is what the user means by pointing at that spot.
+/// The rule is not "the smallest one": a floating window sitting on a tiled one
+/// is usually the smaller of the two but not always, and picking the smaller
+/// one there would hand back the window underneath.
 int OverlayController::candidateIndexAt(Point point) const
 {
     int best = -1;
-    qint64 bestArea = 0;
     for (int index = 0; index < candidates_.size(); ++index) {
         const LogicalRect &rect = candidates_.at(index).rect;
         if (point.x < rect.x || point.y < rect.y || point.x >= rect.right() ||
             point.y >= rect.bottom()) {
             continue;
         }
-        const qint64 candidateArea = static_cast<qint64>(rect.width) * rect.height;
-        if (best < 0 || candidateArea < bestArea) {
-            best = index;
-            bestArea = candidateArea;
-        }
+        best = index;
     }
     return best;
 }

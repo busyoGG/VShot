@@ -49,7 +49,8 @@ struct Session {
     QString mode;
     LogicalRect bounds;
     QVector<OutputSession> outputs;
-    // `window-pick` only: the pickable windows.
+    // `window-pick` only: the pickable windows, ordered bottom to top, so the
+    // last one containing the pointer is the one on top.
     QVector<WindowCandidate> candidates;
     // `region` only: a selection that is already made, so the session opens in
     // editing state instead of waiting for a drag. Window picking resolves a

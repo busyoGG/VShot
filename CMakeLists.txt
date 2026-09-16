@@ -20,8 +20,8 @@ add_executable(vshot-qt-ui
     ui/hint_window.hpp
     ui/pin_edit.cpp
     ui/pin_edit.hpp
-    ui/pin_window.cpp
-    ui/pin_window.hpp
+    ui/pin_surface.cpp
+    ui/pin_surface.hpp
     ui/pin_server.cpp
     ui/pin_server.hpp
     ui/text_card.cpp
