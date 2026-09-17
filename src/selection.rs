@@ -4,9 +4,12 @@ use crate::error::{Result, VshotError};
 use crate::geometry::Rect;
 use crate::model::{Frame, SceneSnapshot};
 
-pub fn crop_fixed(scene: &SceneSnapshot, geometry: Rect) -> Result<Frame> {
-    scene.crop(geometry)
-}
+// Cropping a rectangle of the desktop is deliberately not a helper here: which
+// pixels it comes from — the one output holding it whole, or the composed scene
+// — is the rule in `crate::main::crop_native`, and it has to be asked in one
+// place.  The composed scene is stretched to the highest scale in the layout,
+// so cropping it directly is what doubles a selection made on a lower-density
+// screen.  What is left here is the rest of the selection rules.
 
 pub fn crop_monitor(scene: &SceneSnapshot, name: &str) -> Result<Frame> {
     let output = scene

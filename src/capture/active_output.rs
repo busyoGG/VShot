@@ -85,8 +85,65 @@ impl Session {
     pub(crate) fn detect() -> Self {
         let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
         let session = std::env::var("XDG_SESSION_DESKTOP").ok();
-        Self::from_desktops(current.as_deref(), session.as_deref())
+        // niri is asked directly rather than through the variables, for the
+        // reason spelled out in `from_environment`.
+        let niri_owns_this = super::niri::owns_this_connection();
+        let decision =
+            Self::from_environment(current.as_deref(), session.as_deref(), niri_owns_this);
+        report_session(
+            decision,
+            current.as_deref(),
+            session.as_deref(),
+            niri_owns_this,
+        );
+        decision
     }
+
+    /// The session, from every piece of evidence the environment offers: the
+    /// names the desktop variables carry, and whether niri's own socket names
+    /// the display we are connected to.
+    ///
+    /// niri comes first because the desktop variables are inherited and
+    /// therefore regularly wrong about it: niri sets neither of them, so a
+    /// session started from a TTY is unnamed, and one nested inside another
+    /// compositor keeps that compositor's name.  Both cases used to leave the
+    /// niri routes unasked — which is invisible until `window active` answers
+    /// with whatever the pixel detector found and `window pick` opens our own
+    /// overlay instead of niri's crosshair.  The socket is decisive because
+    /// niri names it after the display it created, i.e. after the display we
+    /// are talking to; see `niri::owns_this_connection`.
+    fn from_environment(
+        current: Option<&str>,
+        session: Option<&str>,
+        niri_owns_this: bool,
+    ) -> Self {
+        if niri_owns_this {
+            return Self::Niri;
+        }
+        Self::from_desktops(current, session)
+    }
+}
+
+/// Development aid: `VSHOT_SESSION_DEBUG=1` says which compositor the session
+/// was read as and on what evidence, once per run.  Getting this wrong is
+/// otherwise invisible — the routes it skips are the compositor's own ones, and
+/// their substitutes look like capture problems rather than routing ones.
+fn report_session(
+    decision: Session,
+    current: Option<&str>,
+    session: Option<&str>,
+    niri_owns_this: bool,
+) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("VSHOT_SESSION_DEBUG").is_none() {
+            return;
+        }
+        eprintln!(
+            "vshot: session {decision:?} — XDG_CURRENT_DESKTOP={current:?}, \
+             XDG_SESSION_DESKTOP={session:?}, NIRI_SOCKET names this display: {niri_owns_this}"
+        );
+    });
 }
 
 /// A probe as a subprocess. Split out from the running of it so the parsing
@@ -595,6 +652,24 @@ mod tests {
         assert_eq!(detect(Some("GNOME"), Some("gnome")), Session::Unknown);
         assert_eq!(detect(Some(""), Some("")), Session::Unknown);
         assert_eq!(detect(None, None), Session::Unknown);
+    }
+
+    #[test]
+    fn niris_own_socket_settles_what_the_desktop_variables_cannot() {
+        let from = Session::from_environment;
+        // A niri started from a TTY: no display manager put its name anywhere.
+        assert_eq!(from(None, None, true), Session::Niri);
+        // A niri nested inside another compositor: the outer name is inherited,
+        // and the socket is the only thing left that knows better.
+        assert_eq!(
+            from(Some("Hyprland"), Some("Hyprland"), true),
+            Session::Niri
+        );
+        assert_eq!(from(Some("KDE"), Some("KDE"), true), Session::Niri);
+        // The other way round -- Hyprland running inside niri -- keeps the
+        // outer niri's socket in the environment; it must not be read as ours.
+        assert_eq!(from(Some("Hyprland"), None, false), Session::Hyprland);
+        assert_eq!(from(None, None, false), Session::Unknown);
     }
 
     #[test]

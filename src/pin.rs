@@ -308,6 +308,18 @@ fn connect_stream(path: &Path) -> std::io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Whether the daemon should keep the terminal's stderr.
+///
+/// It normally drops every stream: it outlives the terminal the CLI ran in and
+/// has nothing to say. The exception is a debug switch in its environment --
+/// `VSHOT_PIN_DEBUG` and `VSHOT_PIN_FOCUS_DEBUG` send their trace to stderr,
+/// and a trace nobody can read is worse than no trace at all, so the daemon
+/// then writes into the terminal that started it.
+fn keep_daemon_stderr() -> bool {
+    const TRACES: [&str; 2] = ["VSHOT_PIN_DEBUG", "VSHOT_PIN_FOCUS_DEBUG"];
+    TRACES.iter().any(|name| std::env::var_os(name).is_some())
+}
+
 /// Starts the resident daemon detached: no pipes are inherited, so the CLI
 /// returns immediately while the surfaces live on.
 fn spawn_daemon() -> Result<()> {
@@ -317,7 +329,11 @@ fn spawn_daemon() -> Result<()> {
         .arg(socket_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if keep_daemon_stderr() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -527,8 +543,9 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
     // have dragged the image to a new spot. Render the annotations over the
     // pin's own pixels and land the pin exactly there. The editor works in
     // screen-logical pixels; the ratio computed above maps them onto the pin's
-    // device pixels.
-    let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale)?;
+    // device pixels — and it is also the scale the editor rasterized its text
+    // bitmaps at, since that is the only scale its single output declares.
+    let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale, scale)?;
     let edited = pipeline.apply(crate::model::ImageDocument::new(frame))?;
     let png = edited.frame().to_png()?;
 
@@ -606,6 +623,22 @@ mod tests {
         std::env::set_var("VSHOT_PIN_SOCKET", "/tmp/custom-pin.sock");
         assert_eq!(socket_path(), PathBuf::from("/tmp/custom-pin.sock"));
         std::env::remove_var("VSHOT_PIN_SOCKET");
+    }
+
+    #[test]
+    fn a_debug_switch_keeps_the_daemons_stderr() {
+        // The trace goes to stderr, so dropping it would make the switch
+        // useless: the daemon has to inherit the terminal that started it.
+        std::env::remove_var("VSHOT_PIN_DEBUG");
+        std::env::remove_var("VSHOT_PIN_FOCUS_DEBUG");
+        assert!(!keep_daemon_stderr());
+        std::env::set_var("VSHOT_PIN_FOCUS_DEBUG", "1");
+        assert!(keep_daemon_stderr());
+        std::env::remove_var("VSHOT_PIN_FOCUS_DEBUG");
+        std::env::set_var("VSHOT_PIN_DEBUG", "1");
+        assert!(keep_daemon_stderr());
+        std::env::remove_var("VSHOT_PIN_DEBUG");
+        assert!(!keep_daemon_stderr());
     }
 
     #[test]

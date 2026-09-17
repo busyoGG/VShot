@@ -30,13 +30,15 @@ cmake -S . -B build-qt -DCMAKE_BUILD_TYPE=Release
 cmake --build build-qt --parallel
 ```
 
+同一个构建目录里还可以带上不需要合成器的离屏检查（`vshot-color-check`、`vshot-pin-density-check`、`vshot-pin-outline-check`、`vshot-text-card-check`、`vshot-pin-menu-check`，见「验证」）：给上面的第一条命令加 `-DVSHOT_BUILD_CHECKS=ON` 即可，它默认关闭，不影响 `vshot-qt-ui`。
+
 运行交互区域截图时，helper 按以下顺序查找：`VSHOT_QT_HELPER` 环境变量、`vshot` 可执行文件同目录、可执行文件相对的 `../build-qt/` 和 `../../build-qt/`（覆盖 `cargo build` + `cmake -B build-qt` 的开发布局）、最后是 `PATH`。也可以显式指定：
 
 ```sh
 VSHOT_QT_HELPER="$PWD/build-qt/vshot-qt-ui" target/release/vshot region --output shot.png
 ```
 
-Qt 交互界面支持中/英双语：默认跟随系统语言（`QLocale::system()`，中文系统显示中文，其余显示英文），可用 `VSHOT_LANG` 覆盖（以 `zh` 开头 → 中文，其它非空值 → 英文），例如 `VSHOT_LANG=zh target/release/vshot region ...`。语言在 helper 启动时确定，切换需重新运行。Rust CLI 的 `--help` 与错误信息保持英文。
+Qt 交互界面支持中/英双语：默认跟随系统语言（`QLocale::system()`，中文系统显示中文，其余显示英文），可用 `VSHOT_LANG` 覆盖（以 `zh` 开头 → 中文，其它非空值 → 英文），例如 `VSHOT_LANG=zh target/release/vshot region ...`。语言在 helper 启动时确定，切换需重新运行。Rust CLI 的 `--help` 走同一套判定（`src/cli_i18n.rs`，按子命令路径与参数 id 寻址翻译，缺条目退回英文），所以 `VSHOT_LANG=zh vshot --help`、每个子命令的帮助与全局参数说明都是中文；clap 自己的模板词（`Usage:`、`Options:`）与内建的 `Print help` 保持英文，错误信息也是。
 
 运行时需要：
 
@@ -93,7 +95,7 @@ vshot long --ignore-top 48 --clipboard   # 顶部 48 行是滚动中才出现的
 
 # pin 管理：添加图片、显隐、清空、退出 daemon
 vshot pin shot.png another.png
-vshot pin --clipboard        # pin 剪贴板里的图片（或复制的图片文件/路径/文字）
+vshot pin --clipboard        # pin 剪贴板内容：颜色 / 图片 / 复制的图片文件或路径 / 文字
 vshot pin --density 2 shot.png   # 手动指定来源屏倍率（见下文，可选兜底）
 vshot pin --toggle          # 一键显示/隐藏所有 pin
 vshot pin --hide / --show
@@ -129,54 +131,62 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 - Select 工具可点选任意标注：单击先选中，拖动移动（文本也一样），形状/线条/马赛克可拖 8 个把手缩放，Delete/Backspace 删除选中的标注；样式区的修改会即时应用到选中的标注；双击文本标注重新编辑内容；
 - Text 工具点击放置文本框，点击已有文本可重新编辑；标注颜色、线宽、线型、箭头头型/大小和字号都会传入最终渲染，与预览一致；样式区提供系统字体列表选择（`QFontDatabase` 枚举，每项按自身字形预览），选中的字体即时应用到文本框、overlay 预览和选中的文本标注，并纳入撤销/重做；
 - Ctrl+Z / Ctrl+Y（或 Ctrl+Shift+Z）撤销/重做标注，重新编辑文本后撤销会恢复原文；
-- 标注以全局逻辑坐标加 `#RRGGBB` 颜色、逻辑粗细、线型（`dash`）、箭头头型（`arrow_style`）和大小（`size`）、马赛克形状（`mask`）和程度（`strength`）传回 Rust，最终 PNG 由内置软件渲染重绘，与 overlay 预览一致。文本标注额外携带字体名（`font`）和 Qt 按场景最高输出 scale 栅格化的 RGBA 标签位图（`bitmap_width`/`bitmap_height`/`bitmap` 指向 session 临时目录中的 raw 文件）；Rust 直接合成该位图，因此最终 PNG 的字形与 overlay 预览完全一致。旧 helper 未携带位图时回退到内置 5x7 ASCII 字体渲染。
+- 标注以全局逻辑坐标加 `#RRGGBB` 颜色、逻辑粗细、线型（`dash`）、箭头头型（`arrow_style`）和大小（`size`）、马赛克形状（`mask`）和程度（`strength`）传回 Rust，最终 PNG 由内置软件渲染重绘，与 overlay 预览一致。文本标注额外携带字体名（`font`）和 Qt 按场景最高输出 scale 栅格化的 RGBA 标签位图（`bitmap_width`/`bitmap_height`/`bitmap` 指向 session 临时目录中的 raw 文件）；Rust 直接合成该位图，因此最终 PNG 的字形与 overlay 预览完全一致。**位图的 scale 与帧的密度不一致时会先重采样**：helper 只知道场景（最高 scale），而帧可能是低密度输出自己那份原生像素（见「图像和输出映射」），此时按目标像素覆盖到的源像素做一次 alpha 加权的面积平均，否则那段文字会以两倍的尺寸落在图上。旧 helper 未携带位图时回退到内置 5x7 ASCII 字体渲染。
 
 ## active window
 
 通用 Wayland 没有标准的 active-window geometry API。`window active` 依次尝试：
 
-**只问当前会话自己的合成器**：`XDG_CURRENT_DESKTOP` / `XDG_SESSION_DESKTOP` 里的名字决定本会话是谁，不属于本会话的探针一律不跑（两个变量都没写合成器名时才把下面几路都试一遍）。同时跑着两个合成器时这不是可选项——从 Hyprland 终端里启动的 Plasma 会话会继承 `HYPRLAND_INSTANCE_SIGNATURE`，`hyprctl` 于是照样应答，报的是**没人看的那个 Hyprland 实例**，于是 `window active` 截的是 Hyprland 里的窗口、`window pick` 把那个会话的窗口列表当成 KDE 桌面上的候选。niri 既没有 Hyprland/Sway 那样的矩形探针，也没有输出焦点窗口的几何，它走的同样是第 1 路里"合成器自己画窗口"那条（见下）。
+**只问当前会话自己的合成器**：`XDG_CURRENT_DESKTOP` / `XDG_SESSION_DESKTOP` 里的名字决定本会话是谁，不属于本会话的探针一律不跑（两个变量都没写合成器名时才把下面几路都试一遍）。同时跑着两个合成器时这不是可选项——从 Hyprland 终端里启动的 Plasma 会话会继承 `HYPRLAND_INSTANCE_SIGNATURE`，`hyprctl` 于是照样应答，报的是**没人看的那个 Hyprland 实例**，于是 `window active` 截的是 Hyprland 里的窗口、`window pick` 把那个会话的窗口列表当成 KDE 桌面上的候选。niri 不在其中：它的 IPC 给不出平铺窗口的绝对位置，所以那里的 `window active` 与 `window pick` 走第 1 路——由 niri 自己把窗口画出来（见下）。
+
+**niri 由它自己的 socket 认出来，不看那两个变量**——两个变量对 niri 都不可靠：niri 自己不设它们，只有显示管理器按 `DesktopNames=niri` 设，所以**从 TTY 手动 `niri-session` 起的会话里它们是空的（或者还是上一个会话留下的），而嵌在别的合成器里跑的 niri 会继承外层那个名字**。按变量判定的后果是 niri 被判成"没有合成器"或"外层合成器"，niri 那几条路一次都不会被问到：`window active` 落到像素识别（给的是**指针下的窗口**，看着就像随机），`window pick` 打开我们自己的压暗 overlay 而不是 niri 的十字选窗（`--pixel` 之外本来就该走十字）。
+
+判据因此换成 niri 自己的 IPC socket 名字：**`$NIRI_SOCKET` 的文件名形如 `niri.<wayland-socket-name>.<pid>.sock`，而 `<wayland-socket-name>` 就是 niri 建出来的那块 Wayland socket —— 也正是本客户端连着的 `WAYLAND_DISPLAY`**（niri 把这条路径交给自己启动的每一个进程）。名字对得上、文件也真的在，就说明应答的 niri 就是本会话的合成器，直接判成 niri 会话，不再看那两个变量；名字对不上（内层合成器继承了外层 niri 的 `NIRI_SOCKET` 时就是这样）或者文件不存在（过期的变量）就当没有证据，仍由变量决定，所以别的情况一点没变。比较是**逐段**做的，`wayland-11` 的 socket 不会被当成 `wayland-1` 的（前缀比较就会）。想知道这次判成了谁：`VSHOT_SESSION_DEBUG=1` 打一行到 stderr（判定结果 + 两个变量的值 + socket 是否对上），判定错了才看得出是判定错了。
 
 1. **合成器自己画这个窗口**——唯一"直接给出答案"的一路，也是少数不经过任何裁剪的一路：合成器把焦点窗口自己画一遍，按窗口所在屏的 scale 给出原生像素。两条实现：
    - **KWin**（`org.kde.KWin.ScreenShot2` 的 `CaptureActiveWindow`）：带装饰和阴影（阴影那一圈的底色是透明的），回复里的 `scale` 就是密度，`windowId` 是窗口 uuid（见「截图后端」）。它是单次 D-Bus 调用、不依赖任何外部工具，所以排在 KDE 的最前面；代价是 `--cursor` 由 KWin 自己决定画不画；
-   - **niri**（`niri msg action screenshot-window --id N --path <绝对路径>`）：niri 自己把该窗口渲染成 PNG 写到我们给的临时路径，再读回来。它**不能改用矩形裁剪**：niri 的 IPC 里平铺窗口没有绝对位置——`niri msg --json windows` 每扇窗只给 `pos_in_scrolling_layout`（1-based 的列/瓦片**索引**）、`tile_size`、`window_size`、`window_offset_in_tile`，而唯一的位置字段 `tile_pos_in_workspace_view` 只对**浮动**窗口有值（平铺路径在 niri 源码里被显式置为 `null`，`Workspace` 里也没有滚动视图偏移），所以"算出矩形再裁冻结场景"在 niri 上只对浮动窗口成立。详见下节；
+   - **niri**（`niri msg action screenshot-window --id N --path <绝对路径>`）：niri 自己把该窗口渲染成 PNG 写到我们给的临时路径，再读回来。为什么 niri 必须走这里、这条路给出什么，见下节；
 2. Hyprland：`hyprctl activewindow -j` 的 `at`/`size`；
 3. Sway：`swaymsg -t get_tree` 中递归查找 focused node 的 `rect`；
 4. KDE Plasma 的兜底（上面那路不可用时才走），两条路，先试能试的那条：`kdotool`（装了就用）——它驱动的是同一套 KWin scripting 接口，但结果通过 `callDBus` 回给自己那个临时总线名，**不经 journal**，所以是本条路上唯一不依赖 KWin 日志的走法；读它 `getwindowgeometry` 的 `Position:`/`Geometry:` 两行——kdotool 0.2.1 只为 `getmouselocation` 提供 `--shell`，对 `getwindowgeometry` 传 `--shell` 会当场报 `invalid option` 并失败（这正是它早先形同不存在的原因）；没装或读不出几何时退回一次性 KWin scripting 探针——通过 `org.kde.kwin.Scripting`（gdbus/dbus-send）加载读取 `workspace.activeWindow`/`activeClient` 的 `frameGeometry`（分别对应 Plasma 6/5），再从用户 journal 轮询标记行取回；探针每次独立加载并在结束后卸载。**这条探针依赖 journald 收到 KWin 的 `console.info`**：KWin 从 tty 起、日志只进那台 tty 时，无论等多久都取不到行——这正是本机 KDE 上 `window active` 曾经落到像素识别的第二个原因；
-5. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测窗口。分析**逐个输出进行，用该输出自己那份原生像素**，不在合成场景上做——场景会把低 scale 的输出放大，从场景边缘出发的泛洪还会跨过显示器接缝，把"整块桌面"当成一个候选。每个输出内部的候选按可信度分四级，高一级有结果就只用这一级：`Ring`（边框带）→ `Segment`（泛洪分割）→ `Outline`（闭合描边轮廓）→ `WholeOutput`（整块输出，只在该输出基本均匀时）。**Ring 优先**，但只认**有颜色**的那条边：合成器给焦点窗口描的边是画面里唯一明确指向"焦点窗口"的信号。它找"薄而恒定的横带"（两侧跳变 ≥ 20、内部变化 < 10、厚度 ≤ 8 设备像素），把这些带拼成长线，要求**上下两条横线各自找到的左右竖线完全一致**、四条边闭合成环，环的高度/宽度还要够窗口尺寸；两条横线各自去找角点是为了排除"两窗共享同一行边框"的假环——那种情况下横线会一直延伸过邻居的边界。侧边还必须是**一条完整的边**（跨度 ≥ 环高的 60%）：实测一个 kitty 窗口的左右边框各占环高的 95%/96%，而它内部的一条滚动条只占 13%，曾经把那条滚动条当成右边框，让裁剪少了 14 个逻辑像素。环上采到的平均饱和度 ≥ 48 才算"焦点描边"，**灰色的环只按 `Segment` 那级参与竞争**（它可能是 `col.inactive_border`，也可能是壁纸里随便一个方框，两者在像素上无法区分），免得闲置屏上的一个壁纸方框压过指针所在屏上的真窗口。**每条路径给出的都是窗口本来的样子，包含合成器画的那条边框**：`Ring` 取环带的外沿，`Segment` 也不再往里缩掉四周的同色边带（那一步曾被用来和 compositor 元数据对齐，现在裁剪以"画面里看到的窗口"为准）。`Segment` 是原路径（从输出边缘泛洪追踪壁纸与阴影，无边框窗口靠 gaps、阴影或壁纸分离）；`Outline` 是"闭合同色矩形轮廓"，且必须覆盖该输出的足够比例才算窗口——网页内容里到处都是同色矩形，不设这道门槛就会截到某人页面中的一块卡片。一个输出最多保留 32 个环、每个环的饱和度只沿四条边各取 64 个采样点：整个帧本身就是一张网格状图片时（屏幕的照片、满屏嵌套面板），边线两两配对能凑出上千个矩形，这两道闸把开销和候选数都压成常数。
+5. **像素识别兜底**：以上都不可用时，在已捕获的场景帧上自动检测窗口。分析**逐个输出进行，用该输出自己那份原生像素**，不在合成场景上做——场景会把低 scale 的输出放大，从场景边缘出发的泛洪还会跨过显示器接缝，把"整块桌面"当成一个候选。每个输出内部的候选按可信度分四级，高一级有结果就只用这一级：`Ring`（边框带）→ `Segment`（泛洪分割）→ `Outline`（闭合描边轮廓）→ `WholeOutput`（整块输出，只在该输出基本均匀时）。**Ring 优先**，但只认**有颜色**的那条边：合成器给焦点窗口描的边是画面里唯一明确指向"焦点窗口"的信号。它找"薄横带"（两侧跳变 ≥ 20、内部变化不超过两侧跳变的 1/4、厚度 ≤ 8 设备像素）——**内部的判据是相对两侧跳变的份额，不是绝对阈值**：焦点描边可以是渐变（niri 的 `active-gradient … angle=45`），这种边沿自己的厚度方向就在漂移，实测最陡处四像素漂移 17，用"内部变化 < 10"这类绝对值会把整条边判没，于是同一扇窗有的帧认得出、有的帧认不出（`window active --pixel` 间歇截成整屏）。把这些带拼成长线时**每行/列保留全部合格的段，而不是只留最长的那段**——平铺下相邻两窗共享顶边/底边所在的同一行，只留最长会把较窄那扇窗的边直接丢掉。长线要求**上下两条横线各自找到的左右竖线完全一致**、四条边闭合成环，环的高度/宽度还要够窗口尺寸，且**四边厚度一致**（同一条描边；保留全部段之后，无关内容也会两两配成矩形，最宽的那个会靠面积压过真窗口——实测壁纸的一道缝配上窗口底边就凑出过更高的矩形并在每一帧胜出）。侧边还必须是**一条完整的边**（跨度 ≥ 环高的 60%）：实测一个 kitty 窗口的左右边框各占环高的 95%/96%，而它内部的一条滚动条只占 13%，曾经把那条滚动条当成右边框，让裁剪少了 14 个逻辑像素。环上采到的平均饱和度 ≥ 48 才算"焦点描边"，**灰色的环只按 `Segment` 那级参与竞争**（它可能是 `col.inactive_border`，也可能是壁纸里随便一个方框，两者在像素上无法区分），免得闲置屏上的一个壁纸方框压过指针所在屏上的真窗口。**每条路径给出的都是窗口本来的样子，包含合成器画的那条边框**：`Ring` 取环带的外沿，`Segment` 也不再往里缩掉四周的同色边带（那一步曾被用来和 compositor 元数据对齐，现在裁剪以"画面里看到的窗口"为准）。`Segment` 是原路径（从输出边缘泛洪追踪壁纸与阴影，无边框窗口靠 gaps、阴影或壁纸分离）；`Outline` 是"闭合同色矩形轮廓"，且必须覆盖该输出的足够比例才算窗口——网页内容里到处都是同色矩形，不设这道门槛就会截到某人页面中的一块卡片。一个输出最多保留 32 个环、每个环的饱和度只沿四条边各取 64 个采样点：整个帧本身就是一张网格状图片时（屏幕的照片、满屏嵌套面板），边线两两配对能凑出上千个矩形，这两道闸把开销和候选数都压成常数。
 
-`vshot window active --pixel` 跳过上面这些"直接问合成器"的路，直接在捕获的帧上做像素识别：用于测试检测器，也是拿到一个矩形而不是合成器给的像素时唯一的选择。niri 上它同时是退路——`--pixel` 会放弃 niri 自己的窗口截图，改用识别出来的矩形去裁场景（这也意味着它在 niri 上要求输出能被合成成场景）。分析帧按**面积**上限降采样（1080p 逐像素、4K 约 1/2），因为分隔窗口的 gaps 与描边只有几个设备像素宽：按长边压到 1024 会让 4K 场景里的 3px 边框整条消失，实测焦点描边检测在那样的分析帧上一个候选都给不出来。窗口截图**按所在输出原生裁剪**（`SceneSnapshot::crop_output_region`）：混合 DPI 时一块 scale-1 屏上的窗口若从合成场景裁剪，会得到放大一倍且发虚的图，现在直接从那块屏自己的帧裁，PNG 写的密度也是那块屏的；只有跨接缝的窗口才回落到合成场景。像素识别在 release 下两屏共约 0.1 s。**没有焦点描边时按指针判**：合成器若给焦点窗口描一条有颜色的边（Hyprland 的 `col.active_border` 甚至可以是渐变），那条边就是判据；若它描的是纯灰（本机焦点在无边框全屏窗口上时实测四周都是 `#464646` 灰边，平均饱和度 0.8，而有色焦点描边实测 162~175），画面里就没有任何东西能区分"焦点窗口"与"指针下的窗口"，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是**你指着的那个窗口**，与 `hyprctl activewindow` 可能不一致。`VSHOT_PIXEL_DEBUG=1` 把每个输出的分析尺寸、找到的每个环（含饱和度、是否判为焦点描边）以及每一级的答案打到 stderr，用来查一次错误裁剪到底是哪一级给出来的。**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。在保存下来的那张 4K 帧（3830x2156 设备像素，scale 2，右边半屏是焦点 kitty）上实测：边框带把 kitty 精确读成逻辑 (962, 54) 起的 **941x1014** 内容矩形，它的边框是 3 逻辑像素宽，于是裁剪用的矩形是 (959, 51) 起的 947x1020 —— 窗口连同边框；同一帧上泛洪分割给出的却是把并排两窗连成一片的 927..1914 宽一整块，而这条路径早先给出的是 3832x1072——两块屏拼起来的整个桌面。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
+`vshot window active --pixel` 跳过上面这些"直接问合成器"的路，直接在捕获的帧上做像素识别：用于测试检测器，也是拿到一个矩形而不是合成器给的像素时唯一的选择。niri 上 `--pixel` 会放弃 niri 自己的窗口截图，改用识别出来的矩形去裁场景（这也意味着它在 niri 上要求输出能被合成成场景）。分析帧按**面积**上限降采样（1080p 逐像素、4K 约 1/2），因为分隔窗口的 gaps 与描边只有几个设备像素宽：按长边压到 1024 会让 4K 场景里的 3px 边框整条消失，实测焦点描边检测在那样的分析帧上一个候选都给不出来。窗口截图**按所在输出原生裁剪**（`SceneSnapshot::crop_output_region`）：混合 DPI 时一块 scale-1 屏上的窗口若从合成场景裁剪，会得到放大一倍且发虚的图，现在直接从那块屏自己的帧裁，PNG 写的密度也是那块屏的；只有跨接缝的窗口才回落到合成场景。这条规则对所有矩形生效——`region` 与 `window pick` 的选区走同一条路（见「图像和输出映射」）。像素识别在 release 下两屏共约 0.1 s。**没有焦点描边时按指针判**：合成器若给焦点窗口描一条有颜色的边（Hyprland 的 `col.active_border` 甚至可以是渐变），那条边就是判据；若它描的是纯灰（本机焦点在无边框全屏窗口上时实测四周都是 `#464646` 灰边，平均饱和度 0.8，而有色焦点描边实测 162~175），画面里就没有任何东西能区分"焦点窗口"与"指针下的窗口"，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是**你指着的那个窗口**，与 `hyprctl activewindow` 可能不一致。`VSHOT_PIXEL_DEBUG=1` 把每个输出的分析尺寸、找到的每个环（含饱和度、是否判为焦点描边）以及每一级的答案打到 stderr，用来查一次错误裁剪到底是哪一级给出来的。**无缝无边框平铺（无 gaps、无阴影）没有任何像素信号**，此时如实报错而不是给出错误裁剪。在保存下来的那张 4K 帧（3830x2156 设备像素，scale 2，右边半屏是焦点 kitty）上实测：边框带把 kitty 精确读成逻辑 (962, 54) 起的 **941x1014** 内容矩形，它的边框是 3 逻辑像素宽，于是裁剪用的矩形是 (959, 51) 起的 947x1020 —— 窗口连同边框；同一帧上泛洪分割给出的却是把并排两窗连成一片的 927..1914 宽一整块，而这条路径早先给出的是 3832x1072——两块屏拼起来的整个桌面。KWin 探针依赖 `journalctl` 与 `gdbus`/`dbus-send` 之一（Plasma 环境均具备），且需要 journald 记录 KWin 的脚本日志；不可用时自动落到像素识别。
 
 第 1 路不经过任何裁剪：像素是合成器直接给的窗口本身，因此跨接缝的窗口也能整块到手（合成场景那条路会把低 scale 的那半放大）。其余各路的目标 geometry 从已经捕获的冻结画面裁剪——窗口路径优先从**所在输出自己那份帧**裁剪（原生分辨率与原生密度，见上），只有跨输出的 geometry 才用合成场景；overlay 显示后不会重新访问 compositor。其他 compositor 的 Portal active-window backend 尚未实现。
 
 ### niri：为什么走它自己的截图，以及这条路给出什么
 
-依据是上游源码（`YaLTeR/niri`；本文实测用的会话是 25.11 之后 236 个提交的一个本地构建，仅作旁证）：
+niri 是唯一一个矩形路线完全走不通的合成器：它的 IPC 报得出窗口的**尺寸**，却报不出平铺窗口的**绝对位置**——`WindowLayout::tile_pos_in_workspace_view` 只给浮动窗口填，平铺路径刻意留空（niri 源码 `layout/tile.rs` / `layout/scrolling.rs` 只填 `pos_in_scrolling_layout`，那是一对从 1 数起的列/块**序号**），也没有任何请求能报出 workspace 视图的滚动偏移。所以「在冻结场景里找矩形」在 niri 上是猜，连猜的起点都没有。
 
-- **平铺窗口没有绝对几何**，这不是"没找到"：`niri-ipc` 的 `WindowLayout` 只有 `tile_pos_in_workspace_view: Option<(f64,f64)>` 是"位置"，而它在**浮动**窗口上才被填（`src/layout/floating.rs`），平铺路径显式给 `None`（`src/layout/tile.rs`，`src/layout/scrolling.rs` 只补 `pos_in_scrolling_layout` 那对 1-based 索引）。所以 niri 上的窗口捕获**必须**走 `screenshot-window`，没有第二条路；
-- `window active` 先 `niri msg --json focused-window` 拿焦点窗口（layer-shell 表面持有焦点时是 `null`，此时按"没有焦点窗口"处理并落到后面的路），再让 niri 截它；
-- `window pick` 用 niri 自己的挑窗：`niri msg --json pick-window`，它只把光标换成十字、点哪个窗口就返回哪个（源码里不绘制悬停高亮），所以在 niri 上**没有我们自绘的压暗 overlay，也没有点击后的标注编辑器**（编辑器需要一个矩形来裁场景，而 niri 给不出平铺窗口的矩形）。要回到 overlay + 像素识别那条路就加 `--pixel`；
-- **`--cursor` 是版本相关的**：`Action::ScreenshotWindow` 的 `show_pointer` 字段在上游较新的版本里才有；niri 侧一旦以"未知参数"拒绝，vshot 就退化成不带指针重发一次并在 stderr 说明，而不是把整次截图丢掉；
-- **niri 会同时把这张图写进剪贴板**：`save_screenshot` 里设置剪贴板是必走的（与 `--write-to-disk` 无关），关不掉。所以 `--output`/`--clipboard` 下最终剪贴板是 vshot 自己的内容（文件 URI / PNG），而 `--pin` 下不写剪贴板，用户的剪贴板会被 niri 这次截图占据；
-- **密度不由这张图声明**：niri 写出的 PNG 只有 `IHDR`/`IDAT`/`IEND`，**没有 `pHYs`**（实测），所以密度由 vshot 自己写。规则是"该窗口所在输出的 scale"，优先取**我们拓扑里那台输出的整数 scale**（同一台屏上 `monitor`/`region`/`window` 写出的密度因此一致），拓扑不可用时退回 niri 的 `logical.scale`（小数四舍五入，与 KWin 那条路同一处理）；两者都拿不到就报错，不假设 1；
-- 由于这条路不需要拓扑、也不需要场景，**输出映射的校验被移到了"真正要用拓扑的地方"**：`WaylandSession::connect()` 不再提前校验，`window active`/`window pick` 因此在旋转/翻转输出上也能用（要求场景的 `region`/`monitor`/`all`/`long` 仍然照旧报 `unsupported output mapping`）。
+niri 给出的精确答案由 vshot 直接驱动：`Request::FocusedWindow` / `Request::PickWindow` 指认窗口（焦点窗，或用户用 niri 自己的十字选窗点中的那扇），然后 `Action::ScreenshotWindow { id, path }` 让 niri 把这扇窗自己画一遍、写成一个 PNG 到 vshot 给的绝对路径。这张图就是 niri 为该窗口渲染的像素——它的表面树、弹窗都在内——按所在输出的物理 scale 给出；它**不带密度声明**（PNG 没有 `pHYs`），密度由 vshot 自己写：「该窗口所在输出的 scale」，优先取 Wayland 拓扑里那台输出的整数 scale，拓扑不可用时退回 niri 的 `logical.scale`（小数四舍五入）。`window active` 与 `window pick` 在 niri 上都走这一条路；`--pixel` 时才回到上面的像素识别。
 
-实测（隔离 labwc 里的嵌套 niri，1278x692 输出、scale 1、一个 kitty 平铺窗口）：
+**边框**要单独补回来：niri 把窗口边框画在 **tile** 上而不是窗口上（源码里 `Tile::render` 在 `window.render_normal` 之外另调 `self.border.render`），所以 `screenshot-window` 得到的渲染**不含边框**。tile 与窗口的关系由 niri 的 IPC 给出（`niri-ipc` 的文档写明了）：`tile_size` 是「这块 tile 的尺寸，**含边框等装饰**」，`window_size`「**不含** niri 的装饰」，`window_offset_in_tile` 是窗口在 tile 内的偏移——也就是**每边的边框宽度**。vshot 用这三者把定位到的渲染矩形换算成 tile 矩形（先把渲染裁到窗口表面，再向外扩一圈边框），于是截出来的图和屏幕所见一致。实测（DP-2，scale 2，`border { width 4 }`）：渲染 1880x2112，裁出的图 **1896x2128**，四边各 8 设备像素的彩色边框带完整落进产物 = 4 逻辑像素 × scale 2。`offset_in_tile`/`tile_size` 缺失或对不上（老 niri、无 tile 的全屏窗）时退回纯窗口矩形，不凭空造边框。
+
+要注意的是**这个换算依赖定位器给的矩形足够准**：它按 `(inset, border)` 从定位结果推出 tile 矩形，定位偏多少，补进来的边框就在哪一侧缺多少。曾经在这里踩过一次：模板匹配的采样网格按行推进、收满 1200 个点就返回，于是 1880x2112 的渲染上这些点只落在相差 4 像素的三行里，垂直方向几乎没有约束，定位稳定地偏出 (2,4)，产物左边只剩 6 像素、上边只剩 4 像素边框。现在采样步长按渲染**面积**算，两个轴同时铺满整幅图（单测 `samples_spread_over_both_axes_of_a_tall_render` 守住这一点）。
+
+**`--no-blend` 是这条路的备用开关**：整段定位都不做，直接把 niri 交出来的渲染当结果——因此**绝不会错位**（没有可错的位置），代价是半透明处背后空无一物（alpha 原样保留）、且**边框不在图里**（渲染不含边框，而补边框本就依赖定位结果）。实测同一扇 kitty（`background_opacity 0.8`，DP-2 / scale 2 / 4px 边框）：默认路线 1896x2040、alpha 全 255（背景已合入，四边 8 设备像素边框在内）；`--no-blend` 1880x2024、alpha 全 229（窗口表面本身，无边框无背景）。它存在的意义是在定位表现异常时仍有一条确定能出图的路线，而不是去修定位——`window active` 与 `window pick` 都支持，且与 `--pixel` 互斥（两者取的是不同的像素盒子，同时给是矛盾而不是谁优先）。
 
 | 量 | 值 |
 | --- | --- |
-| `window_size`（内容） | 615x660（边框 off，lab 现在就是这档）／607x652（把 4px 边框打开时） |
+| `window_size`（内容） | 615x660（边框 off）／607x652（开 4px 边框） |
 | `tile_size`（含边框） | 615x660（边框 off 时与 `window_size` 相同） |
-| niri 写出的 PNG | **639x684** = `window_size` + 每边 12px（开 4px 边框那次是 631x676 = 607+24，加的仍是 `window_size`） |
-| 那 12px 是什么 | 窗口的**投影**：纯黑、alpha 沿边由 5 渐变到 86；**边框不在图里**（开了 4px 边框后 PNG 仍是 `window_size`+24，而不是 `tile_size`+24） |
+| niri 写出的 PNG | 视 niri 版本二选一：**等于 `window_size·scale`**（本机 25.11-236 实测，渲染就是窗口表面本身）或 **`window_size` + 每边 12px**（早前 lab 构建，加的是窗口的**投影**，纯黑、alpha 沿边 5→86）。两种情况**边框都不在图里**，所以都要靠 tile 几何补 |
 | PNG 里的块 | 只有 `IHDR`/`IDAT`/`IEND`，无 `pHYs` |
-| `screenshot-window` 之后的剪贴板 | `wl-paste --list-types` → `image/png` |
-| `vshot window active` / `window pick` | 均 exit 0，得到同一张 639x684；`--pick` 用 niri 十字选窗 + 真实点击选中该窗口 |
-| 写出的 PNG | 639x684、带 `pHYs` 96 DPI（密度 1，来自 niri 的 `logical.scale`——lab 里拓扑不可用，正好走了回退那条） |
+| 之后的剪贴板 | `wl-paste --list-types` → `image/png`（被改写） |
+
+**半透明窗口**：niri 渲染的 PNG 带 alpha 通道，直接输出就是透明的。vshot 拿到渲染后会对窗口所在输出再做一次 screencopy，在帧上**定位**这张渲染（以渲染自身的不透明像素为模板做匹配），定位成功就**裁帧输出**——半透明处透出的就是屏幕上真实的背景；定位失败时先做**稳定性核查**：再渲染一次窗口，与首次渲染逐采样点比对——两次渲染相同（窗口内容没变）说明失败是位置性的（几乎全透明、悬在输出边缘之外、所在工作区不可见等），退回 niri 原样的透明渲染并在 stderr 说明；两次渲染不同说明窗口内容在渲染与抓帧之间变了（视频、动画），模板已过期，就带着新渲染重试（至多 3 次，每次渲染与抓帧仅隔几毫秒）。渲染与抓帧是两次独立的调用，做不到协议级同刻，但**定位本身就是一致性校验**：只有帧与渲染在 1200 余个采样点上吻合（屏幕像素 = 渲染的**预乘**色 + 背景×(1−α)，即屏幕像素不低于渲染预乘值、且高出量不超过 `(255−α)` 加噪声）才裁帧，所以绝不会输出错位或撕裂的图。**这里是预乘 alpha，不是直通 alpha**：niri 写出的渲染每个像素都满足 `RGB ≤ alpha`（本机实测 380 万像素无一例外），屏幕合成因此是 `render + bg·(1−α)`；按直通解释会把期望色整整压暗一档背景贡献，实测半透明窗口的真实位置只匹配 25% 采样点，反而 40% 错位的地方能过阈值——那正是「窗口截图截到屏幕上别处」这个 bug 的根因。定位用的是模板匹配而非窗口位置查询：stock niri 的 IPC 报不出平铺窗口的位置，而渲染本身就是最可靠的模板。
+
+这条路的几个 niri 自己的脾气：
+
+- **`--cursor` 是版本相关的**：`Action::ScreenshotWindow` 的 `show_pointer` 在上游较新的版本里才有；niri 一旦以「未知参数」拒绝，vshot 就退化成不带指针重发一次并在 stderr 说明，而不是把整次截图丢掉；
+- **niri 会同时把这张图写进剪贴板**：设置剪贴板是该动作必走的（与 `--write-to-disk` 无关），关不掉——所以每次 niri 截窗后用户的剪贴板都会被这张图占据；
+
+**会话判定不看桌面变量**（见上文）：niri 由 `NIRI_SOCKET` 的文件名 `niri.$WAYLAND_DISPLAY.$PID.sock` 认出。没认出来的后果：`window active` 落到普通像素识别（答的是指针下的窗口），`window pick` 打开压暗 overlay 而不是 niri 的十字。
 
 ## 选择窗口
 
-`vshot window pick` 分两步：先在**实时桌面**上挑窗口——**移动指针**高亮指针下的窗口，其余部分**压暗**，左上角的提示条给出窗口标题与将要截取的尺寸；**左键点击**结束挑选阶段（点在没有窗口的位置不选中任何东西，Esc 取消）。然后程序**重新捕获一帧**、把点击位置在**当前的窗口列表**上重新解析成窗口矩形，并以那一帧开一个编辑会话（工具栏、标注、Enter 确认、Esc 取消都与区域截图一致）。所以挑选期间切换工作区、移动窗口都不会让结果停在旧的画面上：裁剪用的是点击那一刻的画面，标注也画在同一帧上。（niri 上这段流程不同：见「active window · niri」与下面的说明。）
+`vshot window pick` 分两步：先在**实时桌面**上挑窗口——**移动指针**高亮指针下的窗口，其余部分**压暗**，左上角的提示条给出窗口标题与将要截取的尺寸；**左键点击**结束挑选阶段（点在没有窗口的位置不选中任何东西，Esc 取消）。然后程序**重新捕获一帧**、把点击位置在**当前的窗口列表**上重新解析成窗口矩形，并以那一帧开一个编辑会话（工具栏、标注、Enter 确认、Esc 取消都与区域截图一致）。所以挑选期间切换工作区、移动窗口都不会让结果停在旧的画面上：裁剪用的是点击那一刻的画面，标注也画在同一帧上。（niri 上这段流程不同：见「active window · niri」一节的末尾。）
 
 压暗就是一层半透明黑罩（alpha 80，和编辑阶段选区内外的压暗同一档）。Hyprland 如果给所有 layer namespace 打开了 blur（本机配置就是 `namespace = ".*"` + `blur = true`），这层罩子会让合成器把底下的桌面一起模糊掉——观感上就是"没选中的窗口失焦"（本机实测压暗区的高频能量只剩基线的 0.4%）。overlay 的 layer namespace 是 `vshot-qt-ui`，给它单独关掉 blur 就能得到干净的压暗。
 
@@ -186,7 +196,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 
 候选来自 compositor 的窗口列表，依次尝试（**同样只问当前会话自己的合成器**，判定见「active window」）：
 
-**niri 是例外**：它没有窗口列表可用（见「active window · niri」），所以 `--pixel` 之外它在挑选阶段不画压暗 overlay，而是直接调 niri 自己的十字挑窗（`niri msg --json pick-window`）——点到的窗口由 niri 自己截图交回，因此这里没有"重新解析点击位置"这一步，也没有后面的标注编辑器。`--pixel` 时回到下面这套 overlay + 像素识别。
+**niri 是例外**：它没有窗口列表可用（见「active window · niri」），改用自己的十字挑窗拿到那扇窗，其像素由 niri 自己渲染——因为矩形已经确定，这里既不画压暗 overlay，也不开标注编辑器。`--pixel` 时回到下面这套 overlay + 像素识别。
 
 1. Hyprland：把 `hyprctl clients -j` 和 `hyprctl monitors -j` 一起看。Hyprland 会列出**所有**工作区的客户端，而且 `visible` 对隐藏工作区的窗口同样为真、其 `at` 还是上次布局留下的过期值（实测：一个 12 窗口的会话里真正在屏幕上的只有 2 个），所以这里不靠标志位而是按结构筛选——客户端的工作区必须正是它所在显示器当前显示的那个（激活工作区，或已激活的 special workspace；pinned 窗口跨工作区常驻，始终保留），且矩形必须落在该显示器逻辑范围内（过期坐标通常指向另一块屏，正是被这条挡下的）。标题用 `class — title`；候选按叠放序输出（平铺 → 浮动 → pinned 浮动）；
 2. Sway：`swaymsg -t get_tree` 的全部叶子节点（隐藏 workspace 下的除外），标题用 `app_id`（X11 用 `window_properties.class`）加 `name`；浮动的容器排在平铺叶子**之后**（sway 同样是先命中浮动容器、并把它画在平铺之上）；
@@ -241,7 +251,7 @@ pin 的**尺寸按图片的来源密度来定**，默认不需要任何参数。
 
 1. **手动指定**：`--density N`（1–4），或同级的环境变量 `VSHOT_PIN_DENSITY=N`（便于在快捷键/脚本里设一次）。优先级最高，自动判定不对或信息缺失时用；
 2. **vshot 自己的截图**（`region`/窗口/monitor 加 `--pin`）：直接带上来源输出的缩放，逐像素还原，不放大也不糊；
-3. **图片自己声明**：PNG 的 `pHYs` 块（例如 192 DPI = 2 倍）。这是通用标准，不依赖任何桌面；96 DPI（Qt 对未声明 PNG 的默认值）和 300 DPI 这类打印分辨率都不算密度声明，不会误用。**vshot 自己写出的 PNG**（`--output` 文件、`-o -` 标准输出、`--clipboard`）都会写上这个块，所以之后再 pin 这些图、或者 pin 回贴到剪贴板里的图，都不需要任何记录；
+3. **图片自己声明**：PNG 的 `pHYs` 块（例如 192 DPI = 2 倍）。这是通用标准，不依赖任何桌面。**96 DPI 同样是一次声明**——它就是 vshot 在 scale-1 输出上截图时写下的值（1 倍）——所以判定必须看**这个块在不在**，而不是看 Qt 报回来的数值：一张根本没有 `pHYs` 的 PNG 也会被 Qt 读成 96 DPI 左右（有 `QGuiApplication` 时 3780 点/米，没有时 3937），"声明了 1 倍"与"什么都没声明"因此只有在字节里才分得开（`ui/pin_density.cpp`）。没有 `pHYs` 的图照旧不算声明、落到第 5 条；300 DPI 这类打印分辨率、只写宽高比的 `pHYs`（unit=0）、以及宽高不相等的声明也都不是密度。**vshot 自己写出的 PNG**（`--output` 文件、`-o -` 标准输出、`--clipboard`）都会写上这个块，所以之后再 pin 这些图、或者把图贴回剪贴板再 pin，都不需要任何记录——1 倍截图也因此保持它原来的大小，而不会按落点屏的倍率缩水（1080p 屏上的一块选区 pin 到 4K 屏上曾只有一半大，就是因为 96 DPI 被当成了"没声明"）；
 4. **产出图片的工具留下的记录**：截图工具才是唯一知道图片来自哪块屏的一方（grim、satty、spectacle 都不往图里写密度），所以按约定读取
    - `<图片路径>.scale` 文件里单独一个数字，或
    - `$VSHOT_PIN_SOURCE_FILE`（默认 `/tmp/screenshot-path`）里的一行 `<图片路径> <缩放>`，路径与正在 pin 的图一致才采用，因此不会串用上一张截图的倍率；
@@ -260,14 +270,31 @@ hl.exec_cmd("echo " .. path .. " " .. hl.get_active_monitor().scale .. " > /tmp/
 echo 2 > "$shot.png.scale"
 ```
 
-`vshot pin` 与 `--clipboard`（剪贴板里是图片文件路径时）都会去匹配这条记录；剪贴板里是裸图像数据时没有路径可匹配，只能用第 1、3、5 条（vshot 自己放上剪贴板的图带着第 3 条，仍然能被认出来）。
+`vshot pin` 与 `--clipboard`（剪贴板里是图片文件路径时）都会去匹配这条记录；剪贴板里是裸图像数据时没有路径可匹配，只能用第 1、3、5 条（vshot 自己放上剪贴板的图带着第 3 条，仍然能被认出来）。若**复制路径把 PNG 重新编码了、顺手丢掉了块**（某些查看器与工具会），那份数据就什么都不声明，只能落到第 5 条，或手动 `--density` 指明。
 
 ```sh
 vshot pin --density 2 shot.png      # 明确来源是 2 倍屏
 VSHOT_PIN_DENSITY=2 vshot pin --clipboard
 ```
 
-最坏情况（图不是 vshot 截的、脚本也没记记录）第 5 条仍能给出合理结果；`--density` 是最后的手动兜底。因此同一张图 pin 到 2 倍缩放的 4K 屏上时，占的逻辑尺寸是 1080p 屏上的一半，**两块屏上的物理大小一致**。跨密度渲染由每个渲染面自己做一次面积滤波下采样并缓存，而不是让 painter 每帧用 2x2 近似重采样（那会让 4K 图 pin 到 1080p 时发糊）。
+判错了想知道为什么：`VSHOT_PIN_DEBUG=1` 让 daemon 把每一张 pin 的判定打到 stderr——图片像素数、最终密度、**这一条是哪个来源给出的**、以及落点屏的 `devicePixelRatio`（例如 `pin 1: 300x200 px -> density 1 from the PNG's own chunks (the file); screen DP-2 at 2 device pixels per logical pixel`）。变量必须在 daemon 启动时就位，已经在常驻的那个要先 `vshot pin --quit`，再带着变量重新 pin 一次（只要环境里有 `VSHOT_PIN_DEBUG` 或 `VSHOT_PIN_FOCUS_DEBUG`，daemon 就不再把 stderr 丢给 `/dev/null`，踪迹因此看得见）。
+
+描边那两种颜色是**合成器**给的：本屏的渲染面拿到键盘 → 点中的那张转纯黑，键盘被收走 → 退回浅灰（点别的窗口就是收走的那一下）。哪一步没发生，只有事件本身知道，所以还有 `VSHOT_PIN_FOCUS_DEBUG=1`，它让每个渲染面在**每一次可能改变描边颜色的事件**上打一行，带上屏名、选中的 pin、当前是否自认持有键盘、窗口是否 active：
+
+```
+$ VSHOT_PIN_FOCUS_DEBUG=1 vshot pin shot.png
+pin focus: DP-2: window activate (picked 0, keyboard no, window active yes)
+pin focus: DP-2: keyboard in (picked 0, keyboard yes, window active yes)
+pin focus: DP-2: pointer entered (picked 0, keyboard yes, window active yes)
+pin focus: DP-2: picked 1 (picked 1, keyboard yes, window active yes)
+pin focus: DP-2: pointer left (picked 1, keyboard yes, window active yes)
+pin focus: DP-2: window deactivate (picked 1, keyboard yes, window active no)
+pin focus: DP-2: keyboard out (picked 1, keyboard no, window active no)
+```
+
+读法：点了窗口之后如果**没有** `window deactivate`/`keyboard out`，说明合成器压根没把键盘从渲染面收回去（黑边不退不是重绘的问题，是它还在拿着键盘）；如果两行都在、黑边却没退，那才是我们这边的问题。`window activate` 出现在你还没点任何 pin 之前也是正常的：合成器把新映射的 on-demand 层当成焦点，渲染面并没有主动要。
+
+最坏情况（图不是 vshot 截的、脚本也没记记录）第 5 条仍能给出合理结果；`--density` 是最后的手动兜底。因此同一张图 pin 到 2 倍缩放的 4K 屏上时，占的逻辑尺寸是 1080p 屏上的一半，**两块屏上的物理大小一致**；1 倍截图（密度 1）反过来占的逻辑尺寸与它的像素数相同——在那块 1080p 屏上它正是选区本身的大小，在 4K 屏上占同样的逻辑尺寸（两屏逻辑宽度相同）而设备像素翻倍，**屏幕占比与物理大小同样一致**。跨密度渲染由每个渲染面自己做一次面积滤波下采样并缓存，而不是让 painter 每帧用 2x2 近似重采样（那会让 4K 图 pin 到 1080p 时发糊）。
 
 pin 需要一个**常驻后台进程**（daemon）：layer-shell 浮层 surface 由创建它的进程拥有，`vshot pin x.png` 命令退出后 surface 就会消失；并且"一键显示/隐藏所有 pin""关闭其中一张"都要求一个同时持有全部浮层的进程。因此：
 
@@ -276,7 +303,7 @@ pin 需要一个**常驻后台进程**（daemon）：layer-shell 浮层 surface 
 - daemon 存续到最后一个 pin 关闭：关闭最后一张 pin（或 `--close-all`）约 0.5s 后 daemon 自动退出（新来的 add 会先被服务并取消退出）；下次 pin 命令自动重新拉起。`vshot pin --quit` 仍可随时手动退出；
 - **不要用 `pkill`/`kill -9` 结束 daemon**：它持有 layer-shell surface，被强杀时部分合成器（实测 Hyprland 0.56）会残留该 surface 与其截屏会话，导致**所有输出的 screencopy 永久阻塞**（`vshot`/`grim` 全部超时，且 `hyprctl reload`、DPMS 循环、`force_renderer_reload` 都无法恢复，只能重启会话）。请始终用 `vshot pin --quit`，它会在退出前 unmap 全部浮层；daemon 也已处理 `SIGTERM`/`SIGINT` 走同样的优雅路径；
 - socket 路径默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`（缺失时回退 `/tmp`），可用 `VSHOT_PIN_SOCKET=<绝对路径>` 覆盖，便于隔离测试多实例；
-- pin 的渲染面平时不持有键盘（`KeyboardInteractivity=OnDemand`）：点击后该屏的渲染面获得键盘焦点，**点中的那张图**出现亮色描边（这块屏上其余 pin 不会），点别处自动让出。聚焦时按 **Space** 进入编辑模式，编辑的是该面最后点中的那张。
+- pin 的渲染面平时不持有键盘（`KeyboardInteractivity=OnDemand`）：点击后该屏的渲染面获得键盘焦点（并把那张图提到最前），**鼠标停在哪张图上，哪张图**的描边就是纯黑（`#000000`）；该屏上其余 pin——以及本屏不持有键盘时被指到的那张——是同一条**纯浅灰**（`#c0c0c0`）的边，够把图和同色的背景分开，又不抢眼。两个状态共用同一圈几何：**2 逻辑像素**粗，以图像边缘为中线（于是向外扩出 1 逻辑像素）；线宽是偶数、边落在整数像素上，所以描边始终是实的、不会糊成两行，焦点切换就只是换颜色，描边既不位移也不变粗细。改用单色之前那里是"白芯加一圈深色外环"的双色描边，实现在浅色内容上看着就是一圈噪点。黑色的那张由**指针**决定，而不是等合成器通知：合成器没有义务告诉一个 layer 面"它已经不是焦点了"，实测里 niri 与 Hyprland 都不说，于是黑边会在用户已经点开别的窗口之后还留着；而"指针离开了这张图"每个合成器都会发（它就是这个面的输入区域边界）。所以鼠标离开所有 pin，边就退回浅灰；回到某张 pin 上，那张重新变黑。合成器究竟有没有把键盘交还，用 `VSHOT_PIN_FOCUS_DEBUG=1` 看每一次变化的踪迹（见上文）。鼠标停在某张 pin 上（且本屏还持有键盘）时按 **Space** 进入编辑模式，编辑的就是它。
 
 Wayland 客户端拿不到全局按键，"一键显隐"请自行绑到合成器快捷键，例如 Hyprland：
 
@@ -288,17 +315,48 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 `vshot pin --clipboard` 把**剪贴板当前内容**pin 上屏，可与文件参数混用（`vshot pin a.png --clipboard`）。剪贴板由 daemon 用 `wl-paste` 读取——`wl-clipboard` 的读取端，与截图侧写剪贴板用的 `wl-copy` 对称。Qt 自己的 Wayland 剪贴板在这里不能用：Qt 6.11 只实现了 wlroots 的 `zwlr_data_control_manager_v1`（`libQt6WaylandClient` 里只有这套符号），而 KWin/Plasma 提供的是标准化的 `ext_data_control_manager_v1`，两边对不上；实测同一个 KDE 会话里 `wl-paste --list-types` 列出 Firefox 的 `text/html`、`text/plain` 等类型时，Qt 的 `QClipboard` 连 `formats()` 都是空的，pin daemon 因此永远读不到内容。解析顺序：
 
-1. 内嵌图像数据——截图工具或浏览器"复制图像"放入的位图（`image/png`、`image/jpeg` 等，任取剪贴板提供的第一种能解码的）；
-2. 复制的文件——文件管理器里复制的图片文件（`text/uri-list`，取第一张能解码的本地文件）；
-3. 纯文本——内容为一个存在的本地图片路径；
-4. 纯文本——其余文字渲染成一张"文字卡片"图再 pin，按内容自动选择格式：
+1. **颜色**——剪贴板带结构化颜色 `application/x-color` 时直接 pin 出一张**色卡**（Qt 与 X11 系程序的复制颜色约定，8 字节大端 16 位 RGBA 再补齐到 16 字节）。这一步排在图像**之前**：色板类程序常把颜色同时放成一张 1×1 的色块图，pin 那个像素只会得到一个看不见的点，而色卡本身就是这个颜色并且还带格式信息；
+2. 内嵌图像数据——截图工具或浏览器"复制图像"放入的位图（`image/png`、`image/jpeg` 等，任取剪贴板提供的第一种能解码的）；
+3. 复制的文件——文件管理器里复制的图片文件（`text/uri-list`，取第一张能解码的本地文件）；
+4. 纯文本——内容为一个存在的本地图片路径；
+5. 纯文本——**整段文字恰好是一个颜色字面量**时 pin 出色卡（见下）；
+6. 纯文本——其余文字渲染成一张"文字卡片"图再 pin，按内容自动选择格式：
 
    - 剪贴板带 `text/html`（IDE/浏览器复制的代码、富文本）→ 按 HTML 渲染，**保留语法高亮配色**。只提供 HTML 而不提供纯文本的剪贴板也走这条（以前 Qt 的 `text()` 会返回空、直接失败）；
    - 看起来是 markdown（代码围栏、标题、列表、表格、加粗、链接等特征）→ 按 GitHub 风格 markdown 渲染；
    - 看起来是代码（分号/花括号/缩进/常见关键字等特征，启发式）→ 等宽字体深色编辑器风格卡片；
    - 其余 → 普通文本卡片（跟随系统亮暗主题，自动换行）。
 
-   文字卡片按所在输出的像素密度渲染，HiDPI 下不模糊；超宽内容自动换行，超高内容截断。
+   文字卡片按所在输出的像素密度渲染，HiDPI 下不模糊；超宽内容自动换行，超高内容截断。卡片的内边距故意只留 **3 逻辑像素**（外加 1 逻辑像素描边）：卡片底色取自主题的 `Base`，亮色主题下那就是纯白，留白一大，一小段文字看上去就成了"白框里放着一行字"而不是那段文字本身——实测一段 24 个字符的普通文本，12 逻辑像素的留白会把卡片撑成 159×39，收紧后是 141×21，两张并排放在深色背景上差别一眼就能看出来。剩下的这点留白只够让字形不碰边框、行距不被压掉；描边与"底色跟随亮暗主题"都不变（普通卡半透明黑、代码卡半透明白）。
+
+### pin 出来的色卡
+
+第 1 步与第 5 步都会 pin 出同一张**色卡**：左边是这个颜色本身的色块，右边把同一个颜色按每一种格式写出来，直接照着读或抄走即可。不透明的颜色是 5 行：
+
+| 行 | 例（`#FF0000`） |
+| --- | --- |
+| `HEX` | `#FF0000` |
+| `RGB` | `rgb(255, 0, 0)` |
+| `HSL` | `hsl(0, 100%, 50%)` |
+| `HSV` | `hsv(0, 100%, 100%)` |
+| `CMYK` | `cmyk(0%, 100%, 100%, 0%)` |
+
+半透明时再多两行 `HEX8`（`#RRGGBBAA`）与 `RGBA`（`rgba(r, g, b, 0.50)`），色块底下铺标准棋盘格——和图像编辑器表示"这里是半透明"的方式一致；颜色正好对应某个 CSS/Qt 具名色时（`#FF0000` → `red`、`#000000` → `black`）末尾再加一行 `NAME`。卡片本身跟随系统亮暗主题（与文字卡片同一套调色板），只有色块是剪贴板自己的颜色，并且始终带一条描边，纯白和纯黑也能在卡片上看出边界。
+
+整段文字被认成颜色字面量的拼法只有这些（大小写不限、两端空白忽略）：
+
+- `#RGB` / `#RGBA` / `#RRGGBB` / `#RRGGBBAA`，**4 位与 8 位按 CSS 的顺序读，alpha 在最后**（`#3B82F680` = `#3B82F6` 半透明）——这是网页取色器和设计工具复制的写法；Qt 自己的 `QColor::name(HexArgb)` 把 alpha 写在最前，正是这个歧义让卡片把那一行标成 `HEX8` 而不是含糊的 `HEX`；
+- `rgb()` / `rgba()` / `hsl()` / `hsla()` / `hsv()` / `hsva()` / `hsb()`（含 CSS4 的 `255 0 0 / 50%` 写法）、`cmyk()` / `cmyka()`，通道可以是百分比，alpha 可以是小数、百分比或 0–255 的字节。
+
+**故意不认**的写法：`#` 缺失的裸十六进制（`ff0000`）、`0xRRGGBB`（`0x400000` 更像一段代码里的地址）、以及**任何夹在别的内容里的色值**——`color: #ff0000;`、设计稿里的"主色 #3B82F6"这类整段文字仍然按文字卡片渲染。判据是"整段剪贴板内容恰好等于一个字面量"，所以复制一段 CSS 不会突然变成一块色块。这也意味着剪贴板里只有一个单词 `red` 时不会被当成颜色（`red` 同时是很普通的英文词）；要 pin 它就直接复制 `#ff0000` 或用取色器。
+
+色卡与文字卡片一样按所在输出的像素密度栅格化，落下来的 pin 尺寸也就是它在任何屏上都保持一致的逻辑尺寸（见上文"尺寸按图片的来源密度来定"第 5 条：小图按落点输出的密度 1:1）；此后它就是一个普通 pin——拖动、滚轮缩放、双击关闭、聚焦后按 Space 进标注编辑器，全都照旧，被识别错颜色也只影响这一张图。
+
+**色卡上右键可以把它抄回去**：右键弹出一个小菜单，标题 `复制`，下面就是卡片上那几行——`HEX` / `RGB` / `HSL` / `HSV` / `CMYK`（半透明时还有 `HEX8` / `RGBA`，有具名色时还有 `NAME`）。移上去高亮，左键点中哪一行，那一行**印在卡片上的原文**就进剪贴板（写回用 `wl-copy`，和读取用 `wl-paste` 是同一套理由）。菜单里的行与卡片上的行出自同一个函数（`colorCardRows`），所以不可能出现"菜单抄出来的值和卡片上写的不一样"。键盘也能用：↑/↓ 选行、回车抄走、Esc 关掉；点菜单外面等于关掉菜单（不会顺手选中底下的 pin）。复制成功后卡片右下角会闪一个 `已复制 HEX` 这样的小徽标（和滚轮缩放后那个百分比徽标同一套机制）；`wl-copy` 起不来或失败时徽标写 `复制失败`，不会假装成功。
+
+菜单是画在 pin 的渲染面里的，不是 `QMenu`：弹出窗口需要 xdg_surface 父窗口，而这个面本身是 layer-shell 面，做不了别人的父窗口（`QMenu` 在这里要么失败要么变成另一个顶层）。因此菜单的框、悬停高亮、键盘处理和命中判定都是自己画的，打开期间它的矩形会被加进输入掩膜，否则合成器会把点击交给后面的窗口。
+
+非色卡的 pin（图片、文字卡片）右键不做任何事：它们没有可以抄回去的格式。
 
 剪贴板为空时提示 `the clipboard is empty`（`wl-paste` 用非零退出码说明"Nothing is copied"），有内容但既无图像也无可用文字时提示内容不可 pin；缺少 `wl-paste` 时直接说明要装 `wl-clipboard`。三种情况都不影响已有的 pin。
 
@@ -314,7 +372,9 @@ bind = SUPER, P, exec, vshot pin --toggle
 
 ## 图像和输出映射
 
-内部帧统一为 RGBA8、top-left origin。PNG 输入由 `image` 解码，最终 sink 前重新编码 PNG。多输出合成支持负 logical origin 和输出间空隙；场景画布使用最高输出 scale，较低 scale 的输出使用 nearest-neighbor 放大。当前仍要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。窗口截图（`window active`、`window pick`）与像素识别都尽量绕开这层放大：落在单个输出内的矩形从那个输出自己的帧裁剪、用它的 scale 写密度，像素识别也逐输出分析。
+内部帧统一为 RGBA8、top-left origin。PNG 输入由 `image` 解码，最终 sink 前重新编码 PNG。多输出合成支持负 logical origin 和输出间空隙；场景画布使用最高输出 scale，较低 scale 的输出使用 nearest-neighbor 放大。当前仍要求正整数 scale、`transform=normal` 以及可安全证明的 logical/pixel 映射；fractional scale、旋转和无法证明的映射会清晰失败，而不是生成疑似错误的截图。
+
+**落在单个输出内的矩形一律从那块输出自己那份原生帧裁剪，并按那块屏的 scale 写密度**（`SceneSnapshot::crop_output_region`）：`region` 的 `--geometry` 与交互选择两条、`window active`、`window pick`、以及像素识别给出的矩形都走这条路，只有**跨接缝**的矩形才回落到合成场景；`all` 是整块桌面，没有第二份像素可用，只能由场景给出。这条规则是必需的而不是优化：从合成场景裁一块 1080p 屏（scale 1）上的矩形，得到的是**两倍大**的图——尺寸翻倍、细节减半，而它写出的密度却是 2，于是在任何看图程序里都"尺寸看着对、像素其实糊"。实测（DP-2 4K@scale 2 与 DP-3 1080p@scale 1 并排，`region --geometry '100,100 300x200'` 落在 DP-3 上）：修复前写出 600x400、`pHYs` 192 DPI，且**每个像素与右邻、下邻完全相同（2x2 复制块占 100%）**；修复后是 300x200、`pHYs` 96 DPI 的原生像素，把旧图按 2x 降采样后与新图**逐像素完全一致（0 个像素不同）**——裁的是同一块内容，只是不再被放大。
 
 ## 截图后端
 
@@ -370,7 +430,7 @@ Rust 非交互模式为每个输出创建一个全屏、四边 anchored 的父 l
 - Portal active-window backend 尚未实现；active window 先问合成器自己——KWin 用 `CaptureActiveWindow`、niri 用 `screenshot-window`，两者直接给窗口的像素与密度；其他合成器用 Hyprland/Sway/kdotool/KWin scripting 探针给几何——都缺失时回退到像素识别（`--pixel` 可强制），无缝无边框平铺场景除外。像素识别**逐输出**在原生帧上跑，结果只会是某一块屏上的一个窗口，不会横跨接缝；但当合成器不给焦点窗口描有色的边时，它答的是"指针下的窗口"，不是"焦点窗口"（见「截取活动窗口」）。`window pick` 的候选来自 Hyprland/Sway/KWin 的窗口列表；**niri 走它自己的挑窗**（没有 overlay 与标注编辑器，见「选择窗口」）；没有窗口列表查询的合成器要靠 `--pixel`，无缝无边框平铺与均匀桌面下没有任何候选，只能报错。候选列表在挑选期间**跟着指针刷新**（见「选择窗口」），所以切换工作区或移动窗口后，悬停高亮与最终截到的窗口都是实时的；只有 `--pixel` 那条路径没有可复查的窗口列表，会一直用挑选开始时的候选。
 - 编辑结果使用 RGBA8 软件绘制，线宽和坐标按截图 logical scale 转换；Qt 文本框接受任意 Unicode 文本（含通过输入法提交的 CJK）。交互式文本由 Qt 按所选系统字体栅格化为 RGBA 位图后由 Rust 合成（见「交互式 overlay」）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体渲染，该回退路径仅支持可打印 ASCII。
 - 交互式 `region` 的键盘和鼠标事件由 Qt/LayerShellQt 处理；不依赖 Hyprland 插件或私有输入接口。
-- 混合 integer scale 会统一到最高 scale；fractional scale、rotation 和复杂 viewport 映射在**需要把输出合成为场景**的路径上会拒绝执行（`region`/`monitor`/`all`/`long`、像素识别、带标注的编辑）。这个校验在真正要用拓扑时给出，因此合成器自己给窗口像素的两条路（KWin `CaptureActiveWindow`、niri `screenshot-window`）在旋转/翻转输出上仍然可用——它们不碰输出像素，密度取该输出的整数 scale，拓扑不可用时退回合成器自报的 scale。
+- 混合 integer scale 只在**合成场景**里统一到最高 scale；落在单个输出内的矩形从该输出自己那份原生帧裁剪、按它自己的 scale 写密度（见「图像和输出映射」），所以 1080p 屏上的选区不会被同一会话里 4K 屏的 scale 放大成两倍大。fractional scale、rotation 和复杂 viewport 映射在**需要把输出合成为场景**的路径上会拒绝执行（`region`/`monitor`/`all`/`long`、像素识别、带标注的编辑）。这个校验在真正要用拓扑时给出，因此合成器自己给窗口像素的两条路（KWin `CaptureActiveWindow`、niri `screenshot-window`）在旋转/翻转输出上仍然可用——它们不碰输出像素，密度取该输出的整数 scale，拓扑不可用时退回合成器自报的 scale。
 - `monitor current` 依赖 overlay 上收到 pointer enter/motion；通用 Wayland 没有可读取的全局鼠标坐标，因此不会用第一个 output 猜测结果。
 - 需要 compositor 实际支持 layer-shell、SHM、xdg-output 及相应 seat capability。原生 screencopy 等待 compositor 返回帧最多 10 秒，超时会返回错误而不是永久阻塞。没有 Wayland 环境时，连接阶段会返回 `Wayland connection failed`；非交互父层和 Qt helper 需要分别在相应环境中验证。
 - 长截图的滚动注入按 compositor 选路（见「长截图」）：Hyprland / sway / niri 用 `zwlr_virtual_pointer_manager_v1`（无需任何权限），KDE / GNOME 用 XDG RemoteDesktop portal（一次授权），都不行时才退到 `/dev/uinput`（需要 `/dev/uinput` 写权限）。无头 compositor 既没有指针也没有可滚动的内容，这条路径只能在真实会话里验证。
@@ -399,6 +459,34 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-ke2e \
 ```
 
 无头 KWin 的虚拟输出名是 `Virtual-0`，尺寸 1024x768；可用 `WAYLAND_DISPLAY=wayland-ke2e wayland-info` 确认。它没有 pointer capability，所以完整流程（需要 `WaylandSession::connect()` 的 seat pointer 检查）在无头环境必然失败——这是预期的，集成测试因此只覆盖到 D-Bus 采集这一层。`VSHOT_KWIN_E2E_OUTPUT` / `_WIDTH` / `_HEIGHT` / `_COLOR=R,G,B` 可覆盖默认的输出名、尺寸与中心像素颜色断言。
+
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**，覆盖剪贴板颜色的解析（十六进制、`rgb()`/`hsl()`/`hsv()`/`cmyk()` 及各种 alpha 写法，以及故意不认的那些）与色卡的渲染（亮/暗主题、半透明、2 倍密度），pin 的**图片自述密度**（`pHYs` 的读数：1/2/3/4 倍、unit=0、非正方形、打印分辨率、块出现在 `IDAT` 之后、长度字段不可信、200 KB 的注释块、文件与内存两条读法，以及"Qt 对声明 1 倍与不声明的图报出同一个 96 DPI"这条），以及 pin 的**描边**（未激活的浅灰与聚焦的纯黑两种状态、四边各取一个像素、图像本身不被覆盖、描边之外仍是透明的、只有一个像素的 pin 也要有描边，再加上"点中别的 pin 时黑边跟着走"，还有"键盘被收走后点中的那张必须回到浅灰"，还有指针那一半：鼠标离开所有 pin 边退回浅灰，回到某张 pin 上重新变黑，在两张之间移动时黑边跟着走（并先断言没有键盘时光是悬停不该让任何 pin 变黑），**文字卡片的留白**（普通文本、自动换行后的多行文本、代码卡、markdown 卡、HTML 卡五种内容各在 1/2/3 倍密度下测一遍：从卡片外沿到最近一个字形像素的距离要落在 2~8 逻辑像素（水平）与 2~10 逻辑像素（垂直）之间——收紧过头会把字裁掉，放回去就是那圈白框），还有**色卡的右键菜单**（用合成的鼠标与键盘事件驱动一个真 `PinSurface`，再把渲染结果读成像素：图片 pin 与空白处右键不开菜单、色卡右键开出贴在卡片外的菜单、菜单里能走到的行数等于卡片上的格式数、每行等高、悬停时只有指针所在那行高亮、点第 k 行交出去的正是第 k 行的原文、点菜单外面与 Esc 只关菜单不复制、回车抄走高亮行、复制后出现徽标、`wl-copy` 失败时徽标换成另一句）：
+
+```sh
+cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt --target vshot-color-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check          # 打印每一项判定
+QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check /tmp     # 顺带把每张色卡写成 PNG
+
+cmake --build build-qt --target vshot-pin-density-check
+build-qt/vshot-pin-density-check                              # 密度读数，不需要任何平台插件
+build-qt/vshot-pin-density-check /tmp                         # 顺带把三种声明写成 PNG
+
+cmake --build build-qt --target vshot-pin-outline-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check    # 需要 Qt Widgets 与 offscreen 平台插件，仍然不需要合成器
+QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check /tmp          # 顺带把三个状态写成 PNG
+QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=2 build-qt/vshot-pin-outline-check /tmp  # 2 倍密度下同一组像素断言
+
+cmake --build build-qt --target vshot-text-card-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check      # 要 Qt Gui 与 offscreen 平台插件（卡片底色取自主题调色板）
+QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check /tmp # 顺带把五种卡片、三种密度写成 PNG
+
+cmake --build build-qt --target vshot-pin-menu-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check       # 要 Qt Widgets 与 offscreen 平台插件，仍然不需要合成器
+QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check /tmp  # 顺带把菜单开着/选完/失败三张图写成 PNG
+QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=2 build-qt/vshot-pin-menu-check  # 2 倍密度下同一组断言
+```
+
+它随时可以对着 `target/` 里的构建跑，不需要 Wayland、不需要 layer-shell，因此和 `cargo test` 一样能进 CI；默认不构建（`VSHOT_BUILD_CHECKS=OFF`），不影响 `vshot-qt-ui` 本身。描边检查、文字卡片检查与菜单检查要平台插件（描边与菜单检查真造一个 `QWidget` 再渲染进 `QImage`，见 `ui/pin_outline_check.cpp` 与 `ui/pin_menu_check.cpp`；文字卡片检查要读调色板，见 `ui/text_card_check.cpp`），密度检查与色卡检查连平台插件都不用。
 
 长截图需要真实会话：无头 compositor 既没有指针也没有可滚动的内容。排查时可以把每一帧和每一次判定落盘，再和产出的长图逐段比对：
 

@@ -72,11 +72,24 @@ const MAX_BORDER: u32 = 8;
 /// band: the compositor draws its stroke against both a wallpaper and a window,
 /// so both sides of the band change by more than this.
 const BAND_JUMP: i32 = 20;
-/// A band may not contain a neighbour change this big or larger, or it is two
-/// edges rather than one border.
-const BAND_CALM: i32 = 10;
-/// … and its rows must stay this close to its first row.
-const BAND_SPREAD: i32 = 14;
+/// How much a band's interior may wander, as a share of the jumps that delimit
+/// it: a border is a strip that changes far less than the edges around it.
+///
+/// The share is relative on purpose, because an absolute limit read a gradient
+/// stroke as no border at all.  A border the compositor paints as a ramp —
+/// niri's `active-gradient … angle=45` — drifts along its own thickness, and
+/// where the ramp is steep (measured 17 across four analysis pixels) it exceeded
+/// both of the absolute limits this used to carry: the drift from the band's
+/// first pixel, and the cap on a single step, which aborted the band outright.
+/// Frames where the ramp happened to be gentle passed, so `window active --pixel`
+/// found the window on some frames and fell through to the whole output on
+/// others.
+///
+/// Against the delimiting jumps the same ramp is unambiguous: 17 of a 205-pixel
+/// jump.  A flat stroke keeps its interior at 0, so it reads as a border just as
+/// before, and what separates a border from two neighbouring edges is still the
+/// contrast at its sides rather than any absolute constant.
+const BAND_RAMP: i32 = 4;
 /// Share of the output a band run must span to be a window edge.
 const RING_LINE_MIN_PCT: u64 = 12;
 /// Two edge candidates belong to the same window when they overlap this much.
@@ -419,7 +432,8 @@ fn mark_bands(
     let jump = |at: usize| channel_delta(line[at], line[at + 1]);
     let mut start = 1usize;
     while start + 1 < length {
-        if jump(start - 1) < BAND_JUMP {
+        let opening = jump(start - 1);
+        if opening < BAND_JUMP {
             start += 1;
             continue;
         }
@@ -429,14 +443,20 @@ fn mark_bands(
             if start + t >= length {
                 break;
             }
-            if t > 1 && jump(start + t - 2) >= BAND_CALM {
-                break;
+            let closing = jump(start + t - 1);
+            if closing < BAND_JUMP {
+                continue;
             }
-            if jump(start + t - 1) >= BAND_JUMP
-                && line[start..start + t]
-                    .iter()
-                    .all(|pixel| channel_delta(*pixel, line[start]) <= BAND_SPREAD)
-            {
+            // Neither the band's rows nor any single step inside it may change
+            // by as much as a fraction of the jumps that open and close it: a
+            // border is what changes far less than the edges around it, whether
+            // it is painted flat or as a ramp.
+            let limit = opening.min(closing) / BAND_RAMP;
+            let ramps = line[start..start + t]
+                .iter()
+                .all(|pixel| channel_delta(*pixel, line[start]) <= limit);
+            let calm = (1..t).all(|i| jump(start + i - 1) <= limit);
+            if ramps && calm {
                 thickness = t;
                 break;
             }
@@ -466,6 +486,18 @@ impl Line {
     }
 }
 
+/// Every long run of band starts along a row or column: a window edge candidate.
+///
+/// A row yields **every** qualifying run rather than its longest one.  Two
+/// tiled windows share the rows their top and bottom edges sit on, so a row
+/// holds one run per window; keeping only the longest silently discards the
+/// narrower window's edge, and with it the whole window — measured on a real
+/// niri desktop, `window active --pixel` returned the entire output for all ten
+/// frames whenever the focused window was the narrower of the two.
+///
+/// Keeping them all does not by itself make a wrong answer possible: an extra
+/// run is only an extra *line*, and a ring still needs four sides that close on
+/// each other with a matched stroke width ([`ring_candidates`]).
 fn edge_lines(frame: &AnalysisFrame, bands: &Bands) -> Vec<Line> {
     let mut lines = Vec::new();
     for horizontal in [true, false] {
@@ -483,7 +515,6 @@ fn edge_lines(frame: &AnalysisFrame, bands: &Bands) -> Vec<Line> {
                     bands.vertical[(at * frame.height + along) as usize]
                 }
             };
-            let mut best: Option<Line> = None;
             let mut along = 0u32;
             while along < inner {
                 if thickness_at(along) == 0 {
@@ -506,21 +537,14 @@ fn edge_lines(frame: &AnalysisFrame, bands: &Bands) -> Vec<Line> {
                     .skip(1)
                     .max_by_key(|(_, count)| *count)
                     .map_or(1, |(thickness, _)| thickness as u32);
-                let line = Line {
+                lines.push(Line {
                     at,
                     from,
                     to,
                     thickness,
                     horizontal,
-                };
-                if best
-                    .as_ref()
-                    .is_none_or(|best: &Line| best.span() < line.span())
-                {
-                    best = Some(line);
-                }
+                });
             }
-            lines.extend(best);
         }
     }
     lines
@@ -570,6 +594,22 @@ fn ring_candidates(frame: &AnalysisFrame) -> Vec<Ring> {
                 continue;
             }
             if right.at <= left.at + left.thickness + min_side {
+                continue;
+            }
+            // All four sides are one compositor stroke, so they are the same
+            // width.  This is what keeps a rectangle a *window* now that every
+            // run of a row is a line: rows of unrelated content pair off into
+            // rectangles too, and the widest of those would otherwise outrank
+            // the real window on area alone (measured: a wallpaper seam paired
+            // with a window's bottom edge produced a taller rectangle that won
+            // on every frame).
+            let sides = [
+                top.thickness,
+                bottom.thickness,
+                left.thickness,
+                right.thickness,
+            ];
+            if sides.iter().max() != sides.iter().min() {
                 continue;
             }
             // The ring *is* the compositor's stroke, and the screenshot wants
@@ -1269,6 +1309,62 @@ mod tests {
         assert_eq!(window.source, WindowSource::Pixel);
         // The window as it looks, stroke included — not the content inside it.
         assert_eq!(window.geometry, Rect::new(100, 80, 200, 140));
+    }
+
+    #[test]
+    fn ring_reads_a_gradient_stroke_without_needing_a_flat_band() {
+        // niri strokes the focused window with `active-gradient … angle=45`, so
+        // the border ramps along its own thickness instead of holding one
+        // colour.  Absolute limits on that interior — a fixed spread from the
+        // band's first pixel, and a fixed cap on a single step — both broke
+        // where the ramp was steep, and the frame's phase decides whether that
+        // happened: `window active --pixel` found the window on some frames and
+        // fell through to the whole output on others.
+        let mut canvas = Canvas::new(400, 300, [40, 60, 80, 255]);
+        canvas.fill(100, 80, 200, 140, [200, 200, 200, 255]);
+        // A 4px ramp drifting 40 in total, 13–14 per step: rejected by both
+        // absolute limits, and plainly a border against the 100+ jumps at its
+        // sides.
+        let ramp: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],
+            [255, 13, 0, 255],
+            [255, 27, 0, 255],
+            [255, 40, 0, 255],
+        ];
+        for (t, color) in ramp.iter().enumerate() {
+            let t = t as i32;
+            canvas.fill(100, 80 + t, 200, 1, *color);
+            canvas.fill(100, 219 - t, 200, 1, ramp[3 - t as usize]);
+            canvas.fill(100 + t, 80, 1, 140, *color);
+            canvas.fill(299 - t, 80, 1, 140, ramp[3 - t as usize]);
+        }
+        let window = detect_active_window(&canvas.scene(), None).unwrap();
+        assert_eq!(window.source, WindowSource::Pixel);
+        assert_eq!(window.geometry, Rect::new(100, 80, 200, 140));
+    }
+
+    #[test]
+    fn ring_reads_the_stroke_of_a_narrow_window_beside_a_wider_one() {
+        // Two tiled windows share their top and bottom rows.  A row keeps only
+        // its *longest* run, so the wider neighbour's edge is the one that
+        // survives; the narrower window still has to be read off its own sides,
+        // which is what the ring's corner pairing does.
+        let mut canvas = Canvas::new(400, 300, [40, 60, 80, 255]);
+        canvas.fill(10, 40, 80, 220, [210, 210, 210, 255]);
+        canvas.fill(110, 40, 250, 220, [200, 200, 200, 255]);
+        // Strokes: the narrow window's is vivid, the wide one's is gray.
+        let (narrow, wide) = ([255, 140, 0, 255], [90, 90, 90, 255]);
+        for (x, y, width, height, stroke) in [(10, 40, 80, 220, narrow), (110, 40, 250, 220, wide)]
+        {
+            canvas.fill(x, y, width, 3, stroke);
+            canvas.fill(x, y + height as i32 - 3, width, 3, stroke);
+            canvas.fill(x, y, 3, height, stroke);
+            canvas.fill(x + width as i32 - 3, y, 3, height, stroke);
+        }
+        // The vivid stroke marks the focused window even though the wide
+        // neighbour's edge is the longer line on the shared rows.
+        let window = detect_active_window(&canvas.scene(), None).unwrap();
+        assert_eq!(window.geometry, Rect::new(10, 40, 80, 220));
     }
 
     #[test]

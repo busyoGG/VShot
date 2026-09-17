@@ -24,6 +24,8 @@ tar \
     --exclude='./build-qt' \
     --exclude='./dist' \
     --exclude='./.zcode' \
+    --exclude='./.Trash-0' \
+    --exclude='./.workbuddy' \
     -C "$project_root" -cf - . | tar -C "$tmp_dir" -xf -
 
 makepkg_args=(--force --clean --noconfirm)

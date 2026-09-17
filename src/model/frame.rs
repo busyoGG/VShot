@@ -992,7 +992,7 @@ impl Frame {
         y.checked_mul(width)?.checked_add(x)?.checked_mul(4)
     }
 
-    fn blend_pixel_at(&mut self, x: i64, y: i64, color: [u8; 4]) {
+    pub(crate) fn blend_pixel_at(&mut self, x: i64, y: i64, color: [u8; 4]) {
         let Some(index) = self.pixel_index_at(x, y) else {
             return;
         };

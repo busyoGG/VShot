@@ -1,16 +1,22 @@
 #include "pin_surface.hpp"
 
+#include "i18n.hpp"
+
 #include <LayerShellQt/Window>
 
 #include <QFocusEvent>
+#include <QFontDatabase>
+#include <QFontMetrics>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPalette>
 #include <QRegion>
 #include <QScreen>
 #include <QSet>
 #include <QTimer>
 #include <QWheelEvent>
+#include <QWindow>
 
 #include <algorithm>
 
@@ -18,10 +24,43 @@ namespace vshot {
 
 namespace {
 
-// The focused outline's 2px pen is centered on the rect edge and paints up
-// to ~2px outside the image rect; every repaint region must include that
-// bleed, or stale border pixels survive at the previous position.
+// Whether the surfaces trace their focus life. Which of the outline's two
+// colours a pin gets is decided by events only the compositor can produce --
+// the keyboard being handed to this surface and taken away again -- and none
+// of that is visible from the outside. With `VSHOT_PIN_FOCUS_DEBUG=1` in the
+// daemon's environment, "the compositor never told us" and "we never repainted"
+// stop looking the same.
+bool focusTrace()
+{
+    static const bool on = qEnvironmentVariableIsSet("VSHOT_PIN_FOCUS_DEBUG");
+    return on;
+}
+
+// The outline's stroke is centered on the image edge and reaches 1px outside
+// it; every repaint region must include that bleed (plus a pixel of slack),
+// or stale border pixels survive at the previous position.
 constexpr int kOutlineBleedPx = 3;
+
+// The pin outline, in both of its states: a solid, fully opaque stroke of one
+// colour. Idle pins are light grey — enough to tell an image apart from a
+// background of its own colour, quiet enough to ignore — and the pin the
+// keyboard would act on is black, which is unmistakable on light content
+// without needing the second, contrasting ring the two-tone edge used to
+// carry. Both states share the width below, so a focus change is a pure
+// recolour: the border never shifts or changes weight under the pointer.
+constexpr double kOutlineWidthPx = 2.0;
+const QColor kIdleOutlineColor(192, 192, 192);
+const QColor kActiveOutlineColor(0, 0, 0);
+
+// The right-click menu of a color card, in logical pixels. The rows reuse the
+// card's own two fonts (label and value), so the menu reads as the same card
+// with one more thing to click.
+constexpr int kMenuRowPaddingY = 5;
+constexpr int kMenuPaddingX = 10;
+constexpr qreal kMenuLabelGap = 14.0;  // label column to the value column
+constexpr qreal kMenuRadius = 6.0;
+constexpr int kMenuHeadingPaddingY = 4;
+constexpr int kMenuCursorGap = 4;  // menu offset from the pointer
 
 QRect expandOutline(const QRect &rect)
 {
@@ -64,7 +103,7 @@ PinSurface::PinSurface(QScreen *screen)
     connect(zoomTimer_, &QTimer::timeout, this, [this] {
         const QRect gone = badgeRect_;
         badgeId_ = 0;
-        zoomLabel_.clear();
+        badgeText_.clear();
         badgeRect_ = QRect();
         if (!gone.isNull()) {
             update(gone.adjusted(-1, -1, 1, 1));
@@ -102,6 +141,8 @@ bool PinSurface::showLayerSurface()
     // elsewhere. This is what makes the Space edit shortcut work without a
     // global grab.
     layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityOnDemand);
+    layer_ = layer;
+    keyboardWanted_ = true;
     layer->setScope(QStringLiteral("vshot-pin"));
     layer->setDesiredSize(QSize(0, 0)); // follow the anchored edges
     layer->setScreen(screen_);
@@ -204,8 +245,12 @@ void PinSurface::setPins(const QVector<Item> &pins)
     }
     if (!ids.contains(badgeId_)) {
         badgeId_ = 0;
-        zoomLabel_.clear();
+        badgeText_.clear();
         badgeRect_ = QRect();
+    }
+    // A menu is about a pin; the pin going away takes the menu with it.
+    if (!ids.contains(menuId_)) {
+        closeMenu();
     }
     applyMask();
     if (surfaceReady_ && !dirty.isNull()) {
@@ -276,6 +321,15 @@ void PinSurface::applyMask()
             mask += rect;
         }
     }
+    // The right-click menu is not part of any pin, but it has to take clicks
+    // like one: without this the compositor would hand its clicks to whatever
+    // is behind, and the menu could never be used.
+    if (menuId_ != 0 && !menuRect_.isEmpty()) {
+        const QRect rect = menuRect_.intersected(bounds);
+        if (!rect.isEmpty()) {
+            mask += rect;
+        }
+    }
     if (mask.isEmpty()) {
         if (draggingId_ != 0) {
             // A drag that carries the last image onto another output empties
@@ -292,12 +346,137 @@ void PinSurface::applyMask()
     window->setMask(mask);
 }
 
+// One line per event that can change the outline's colour, for
+// `VSHOT_PIN_FOCUS_DEBUG`. `what` names the event; the state every line carries
+// is what the next paint will read.
+void PinSurface::traceFocus(const QString &what) const
+{
+    const QWindow *window = windowHandle();
+    qWarning("pin focus: %s: %s (picked %llu, keyboard %s, window active %s)",
+             qPrintable(screen_ != nullptr ? screen_->name() : QStringLiteral("-")), qPrintable(what),
+             static_cast<unsigned long long>(pickedId_), hasFocus_ ? "yes" : "no",
+             window != nullptr && window->isActive() ? "yes" : "no");
+}
+
 QRect PinSurface::pickedOutline() const
 {
     if (const Entry *entry = entryFor(pickedId_)) {
         return expandOutline(localRect(entry->item));
     }
     return QRect();
+}
+
+bool PinSurface::event(QEvent *event)
+{
+    // The window's activation is a separate fact from the widget's focus, and
+    // it is the one a layer surface loses when the compositor takes the
+    // keyboard away, so both are traced.
+    if (focusTrace()) {
+        if (event->type() == QEvent::WindowActivate) {
+            traceFocus(QStringLiteral("window activate"));
+        } else if (event->type() == QEvent::WindowDeactivate) {
+            traceFocus(QStringLiteral("window deactivate"));
+        }
+    }
+    return QWidget::event(event);
+}
+
+// Which pin a key press would act on is the one under the pointer: that is what
+// the black edge claims, and the pointer is the only signal about it that every
+// compositor sends. Clicking a pin still hands this surface the keyboard (and
+// raises the pin); the pointer decides which edge is black.
+void PinSurface::movePickTo(quint64 id)
+{
+    if (id == pickedId_) {
+        return;
+    }
+    const QRect was = pickedOutline();
+    pickedId_ = id;
+    const QRect now = pickedOutline();
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("picked %1 (pointer)").arg(id));
+    }
+    if (!was.isNull()) {
+        update(was);
+    }
+    if (!now.isNull() && now != was) {
+        update(now);
+    }
+}
+
+void PinSurface::offerKeyboardBack()
+{
+    if (layer_ == nullptr || !keyboardWanted_) {
+        return;
+    }
+    keyboardWanted_ = false;
+    layer_->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+    // The interactivity change only reaches the compositor with the next
+    // commit; requestUpdate schedules exactly that, so the keyboard leaves
+    // now rather than at some later repaint.
+    if (QWindow *window = windowHandle()) {
+        window->requestUpdate();
+    }
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("keyboard offered back (interactivity none)"));
+    }
+}
+
+void PinSurface::wantKeyboard()
+{
+    if (layer_ == nullptr || keyboardWanted_) {
+        return;
+    }
+    keyboardWanted_ = true;
+    layer_->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityOnDemand);
+    if (QWindow *window = windowHandle()) {
+        window->requestUpdate();
+    }
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("keyboard wanted again (interactivity on-demand)"));
+    }
+}
+
+void PinSurface::enterEvent(QEnterEvent *event)
+{
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("pointer entered"));
+    }
+    // Back from the empty desktop: the surface has to want the keyboard again,
+    // or the click that follows could not take it (the offerKeyboardBack()
+    // commit below switched it off while the pointer was away).
+    wantKeyboard();
+    // A menu and a drag own the surface while they are open: the pointer moving
+    // inside them must not change what they act on.
+    if (menuId_ == 0 && draggingId_ == 0) {
+        movePickTo(pinAt(event->position().toPoint()));
+    }
+    QWidget::enterEvent(event);
+}
+
+void PinSurface::leaveEvent(QEvent *event)
+{
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("pointer left"));
+    }
+    if (menuId_ == 0 && draggingId_ == 0) {
+        // The pointer left every pin on this output, so no pin is the one a key
+        // press would act on any more. Riding on the pointer rather than on the
+        // keyboard is deliberate: a compositor is not obliged to tell a layer
+        // surface that it has stopped being focused, and the ones in the field
+        // that stay quiet left the edge black long after the user had clicked a
+        // window -- while the pointer had already gone. This one always comes.
+        movePickTo(0);
+        // The same signal is also the only reliable moment to hand the
+        // keyboard back. Waiting for the compositor to move it on the click
+        // into a window does not work: the click focuses the window's own
+        // surface but the compositors in use leave the layer surface holding
+        // the keyboard, so typing went nowhere until another pin was clicked.
+        // Offering it back here means the click that follows lands on a
+        // surface that no longer wants it, and the window gets it.
+        offerKeyboardBack();
+    }
+    QWidget::leaveEvent(event);
 }
 
 void PinSurface::paintEvent(QPaintEvent *event)
@@ -325,31 +504,43 @@ void PinSurface::paintEvent(QPaintEvent *event)
         // blit then.
         painter.drawImage(target, renderSource(entry));
         // A thin outline keeps a pinned image distinguishable from identical
-        // content behind it; the pin the user picked gets a bright one while
-        // this output holds the keyboard.
+        // content behind it, and its colour says whether the pin is the one a
+        // key press would act on: black while this output holds the keyboard
+        // and that pin was the last one clicked, light grey otherwise.
         const bool focused = hasFocus_ && entry.item.id == pickedId_;
-        painter.setPen(focused ? QPen(QColor(255, 255, 255, 200), 2.0)
-                              : QPen(QColor(0, 0, 0, 120), 1.0));
-        painter.drawRect(QRectF(target.x() + 0.5, target.y() + 0.5,
-                                target.width() - 1.0, target.height() - 1.0));
+        // Whole-pixel rect edges with an even pen width put both stroke lines
+        // on whole device pixels, so the edge stays crisp instead of fading
+        // over two rows. Centred that way the stroke sits one pixel outside
+        // the image on each side — which also keeps it from degenerating on a
+        // one-pixel pin, where an inward stroke would have no room at all. A
+        // pin flush against the edge of its output simply loses that outer
+        // pixel row, the same as it did before.
+        const QRectF edge(target.x(), target.y(), target.width(), target.height());
+        painter.setPen(QPen(focused ? kActiveOutlineColor : kIdleOutlineColor, kOutlineWidthPx));
+        painter.drawRect(edge);
+    }
+    // Above every pin: the menu belongs to one of them but must never end up
+    // under another.
+    if (menuId_ != 0) {
+        paintMenu(painter);
     }
     badgeRect_ = QRect();
-    if (zoomLabel_.isEmpty()) {
+    if (badgeText_.isEmpty()) {
         return;
     }
     const Entry *badge = entryFor(badgeId_);
     if (badge == nullptr) {
         return;
     }
-    // Transient zoom badge pinned to the image's bottom-right corner that is
-    // still on this output. The font size is fixed: the badge reports the
-    // factor, it must not grow with the image itself.
+    // Transient badge pinned to the image's bottom-right corner that is still
+    // on this output. The font size is fixed: the badge reports what just
+    // happened to the pin, it must not grow with the image itself.
     QFont font = painter.font();
     font.setPixelSize(16);
     font.setBold(true);
     painter.setFont(font);
     const QFontMetrics metrics(font);
-    const QString text = QStringLiteral("%1%").arg(zoomLabel_);
+    const QString text = badgeText_;
     const QRect textRect = metrics.boundingRect(text);
     const int pad = metrics.height() / 3;
     QRect badgeBox = textRect.adjusted(-pad, -pad / 2, pad, pad / 2);
@@ -376,19 +567,254 @@ void PinSurface::showZoomBadge(quint64 id)
     }
     // The factor is relative to the image's native density, so a 4K capture
     // pinned at its natural size on a 4K output reads as 100%.
-    zoomLabel_ = QString::number(qRound(entry->item.scale * entry->item.density * 100));
+    showBadge(id, QStringLiteral("%1%").arg(qRound(entry->item.scale * entry->item.density * 100)));
+}
+
+void PinSurface::showBadge(quint64 id, const QString &text)
+{
+    const Entry *entry = entryFor(id);
+    if (entry == nullptr) {
+        return;
+    }
+    badgeText_ = text;
     badgeId_ = id;
-    zoomTimer_->start(kZoomBadgeMs);
+    zoomTimer_->start(kBadgeMs);
+    // The badge is painted inside the pin's rect, so repainting that rect is
+    // what puts it up and what takes the previous one down.
     update(localRect(entry->item));
+}
+
+void PinSurface::openMenu(quint64 id, const QPoint &anchor)
+{
+    const Entry *entry = entryFor(id);
+    if (entry == nullptr || entry->item.colorRows.isEmpty()) {
+        return;
+    }
+    const QRect was = menuRect_;
+    menuId_ = id;
+    menuRows_ = entry->item.colorRows;
+    menuHover_ = -1;
+    menuRect_ = menuRectFor(anchor);
+    // The keyboard is this surface's only while it has focus, and Esc is part
+    // of using a menu: ask for it here rather than requiring a click first.
+    setFocus(Qt::MouseFocusReason);
+    applyMask();
+    // Repaint both the old menu area (there may be none) and the new one; the
+    // pins under either are covered by these two rects alone.
+    if (!was.isNull() && was != menuRect_) {
+        update(was.adjusted(-1, -1, 1, 1));
+    }
+    update(menuRect_.adjusted(-1, -1, 1, 1));
+}
+
+void PinSurface::closeMenu()
+{
+    if (menuId_ == 0) {
+        return;
+    }
+    const QRect gone = menuRect_;
+    menuId_ = 0;
+    menuRows_.clear();
+    menuHover_ = -1;
+    menuRect_ = QRect();
+    applyMask();
+    if (!gone.isNull()) {
+        update(gone.adjusted(-1, -1, 1, 1));
+    }
+}
+
+QRect PinSurface::menuRectFor(const QPoint &anchor) const
+{
+    const QFontMetrics labelMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
+    const QFontMetrics valueMetrics(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    const QFontMetrics headingMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
+    qreal labelWidth = 0.0;
+    qreal valueWidth = 0.0;
+    for (const ColorRow &row : menuRows_) {
+        labelWidth = std::max<qreal>(labelWidth, labelMetrics.horizontalAdvance(row.label));
+        valueWidth = std::max<qreal>(valueWidth, valueMetrics.horizontalAdvance(row.value));
+    }
+    const int rowHeight = std::max(labelMetrics.height(), valueMetrics.height())
+        + 2 * kMenuRowPaddingY;
+    const int headingHeight = headingMetrics.height() + 2 * kMenuHeadingPaddingY;
+    const qreal headingWidth = headingMetrics.horizontalAdvance(uiTr("Copy"));
+    // Wide enough for the widest row and for the heading, whichever is wider.
+    const qreal contentWidth =
+        std::max(std::max(labelWidth + kMenuLabelGap + valueWidth, headingWidth), 1.0);
+    const int width = qCeil(contentWidth) + 2 * kMenuPaddingX;
+    const int height = headingHeight + menuRows_.size() * rowHeight;
+
+    // Down and right of the pointer, the way a menu opens; flipped when that
+    // would run off the output, and clamped so a pin at the very edge still
+    // gets a usable menu (the pointer may sit anywhere inside it then).
+    QRect box(anchor + QPoint(kMenuCursorGap, kMenuCursorGap), QSize(width, height));
+    if (box.right() > rect().right()) {
+        box.moveLeft(anchor.x() - kMenuCursorGap - width);
+    }
+    if (box.bottom() > rect().bottom()) {
+        box.moveTop(anchor.y() - kMenuCursorGap - height);
+    }
+    box = box.intersected(rect());
+    return box.width() > 0 && box.height() > 0 ? box : QRect();
+}
+
+int PinSurface::menuRowAt(const QPoint &local) const
+{
+    if (menuId_ == 0 || menuRect_.isEmpty()) {
+        return -1;
+    }
+    const QFontMetrics labelMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
+    const QFontMetrics valueMetrics(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    const QFontMetrics headingMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
+    const int rowHeight = std::max(labelMetrics.height(), valueMetrics.height())
+        + 2 * kMenuRowPaddingY;
+    const int headingHeight = headingMetrics.height() + 2 * kMenuHeadingPaddingY;
+    const int offset = local.y() - menuRect_.top() - headingHeight;
+    if (offset < 0) {
+        return -1;
+    }
+    const int row = offset / rowHeight;
+    return row >= 0 && row < menuRows_.size() ? row : -1;
+}
+
+void PinSurface::paintMenu(QPainter &painter)
+{
+    if (menuId_ == 0 || menuRect_.isEmpty()) {
+        return;
+    }
+    const QPalette palette = this->palette();
+    const QFont labelFont = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+    const QFont valueFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    const QFontMetrics labelMetrics(labelFont);
+    const QFontMetrics valueMetrics(valueFont);
+    const QFontMetrics headingMetrics(labelFont);
+    const int rowHeight = std::max(labelMetrics.height(), valueMetrics.height())
+        + 2 * kMenuRowPaddingY;
+    const int headingHeight = headingMetrics.height() + 2 * kMenuHeadingPaddingY;
+
+    qreal labelWidth = 0.0;
+    for (const ColorRow &row : menuRows_) {
+        labelWidth = std::max<qreal>(labelWidth, labelMetrics.horizontalAdvance(row.label));
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(0, 0, 0, 90), 1.0));
+    painter.setBrush(palette.color(QPalette::Base));
+    painter.drawRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius,
+                            kMenuRadius);
+
+    // The heading says what clicking a row does; the rows themselves stay the
+    // card's own label-and-value pairs, so the value that gets copied is the
+    // one the card prints.
+    QColor dim = palette.color(QPalette::Text);
+    dim.setAlpha(160);
+    painter.setFont(labelFont);
+    painter.setPen(dim);
+    painter.drawText(QRect(menuRect_.left() + kMenuPaddingX, menuRect_.top() + kMenuHeadingPaddingY,
+                           menuRect_.width() - 2 * kMenuPaddingX, headingMetrics.height()),
+                     Qt::AlignLeft | Qt::AlignVCenter, uiTr("Copy"));
+    painter.setPen(QPen(QColor(0, 0, 0, 40), 1.0));
+    const int separator = menuRect_.top() + headingHeight;
+    painter.drawLine(menuRect_.left() + 1, separator, menuRect_.right() - 1, separator);
+
+    const qreal labelX = menuRect_.left() + kMenuPaddingX;
+    const qreal valueX = labelX + labelWidth + kMenuLabelGap;
+    for (int index = 0; index < menuRows_.size(); ++index) {
+        const QRect row(menuRect_.left(), separator + index * rowHeight, menuRect_.width(),
+                        rowHeight);
+        const bool hovered = index == menuHover_;
+        if (hovered) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(palette.color(QPalette::Highlight));
+            painter.drawRect(row);
+        }
+        const QColor labelColor = hovered ? palette.color(QPalette::HighlightedText) : dim;
+        const QColor valueColor = hovered ? palette.color(QPalette::HighlightedText)
+                                         : palette.color(QPalette::Text);
+        const QRect textBox(row.left(), row.top(), row.width(), row.height());
+        painter.setFont(labelFont);
+        painter.setPen(labelColor);
+        painter.drawText(QRectF(labelX, textBox.top(), labelWidth, textBox.height()),
+                         Qt::AlignLeft | Qt::AlignVCenter, menuRows_.at(index).label);
+        painter.setFont(valueFont);
+        painter.setPen(valueColor);
+        painter.drawText(QRectF(valueX, textBox.top(),
+                                menuRect_.right() - kMenuPaddingX - valueX + 1.0,
+                                textBox.height()),
+                         Qt::AlignLeft | Qt::AlignVCenter, menuRows_.at(index).value);
+    }
+    painter.restore();
+}
+
+void PinSurface::copyRow(int row)
+{
+    if (row < 0 || row >= menuRows_.size()) {
+        return;
+    }
+    const ColorRow chosen = menuRows_.at(row);
+    const quint64 id = menuId_;
+    bool copied = false;
+    if (copyRequested_) {
+        // The callback runs the clipboard write; it can also take the whole
+        // stack down (nothing in it does today), so nothing after it may touch
+        // the menu state without re-reading it.
+        const std::function<bool(quint64, const QString &)> copy = copyRequested_;
+        copied = copy(id, chosen.value);
+    }
+    showBadge(id, copied ? uiTr("Copied") + QLatin1Char(' ') + chosen.label
+                         : uiTr("Copy failed"));
 }
 
 void PinSurface::mousePressEvent(QMouseEvent *event)
 {
+    const QPoint local = event->position().toPoint();
+    // Any press that the menu does not keep for itself may start a gesture on
+    // the pins, and a gesture may legitimately begin with a double-click.
+    swallowNextDoubleClick_ = false;
+    // An open menu owns the next click, whichever button it is: a row copies
+    // its format, anything else merely dismisses the menu -- a click that
+    // closes a menu must not also start acting on the pins underneath.
+    if (menuId_ != 0) {
+        if (event->button() == Qt::LeftButton && menuRowAt(local) >= 0) {
+            const int row = menuRowAt(local);
+            // Order matters: the badge lands on the card, and closing the menu
+            // must not repaint over it.
+            copyRow(row);
+            closeMenu();
+            // This press was the menu's, and it may be the first half of a
+            // double-click: the menu is gone by the time the second half
+            // arrives, and that one would otherwise reach the pin the menu was
+            // covering.
+            swallowNextDoubleClick_ = true;
+            event->accept();
+            return;
+        }
+        closeMenu();
+        swallowNextDoubleClick_ = true;
+        event->accept();
+        return;
+    }
+    // The right button is the card's: on a pinned color it opens the list of
+    // formats, each of which the menu can put back on the clipboard. The
+    // right button never picks or drags, so this cannot be confused with a
+    // left-click gesture.
+    if (event->button() == Qt::RightButton) {
+        const quint64 id = pinAt(local);
+        const Entry *entry = entryFor(id);
+        if (entry != nullptr && !entry->item.colorRows.isEmpty()) {
+            openMenu(id, local);
+            event->accept();
+            return;
+        }
+        QWidget::mousePressEvent(event);
+        return;
+    }
     if (event->button() != Qt::LeftButton) {
         QWidget::mousePressEvent(event);
         return;
     }
-    const quint64 id = pinAt(event->position().toPoint());
+    const quint64 id = pinAt(local);
     if (id == 0) {
         QWidget::mousePressEvent(event);
         return;
@@ -396,7 +822,16 @@ void PinSurface::mousePressEvent(QMouseEvent *event)
     const QRect wasPicked = pickedOutline();
     pickedId_ = id;
     draggingId_ = id;
+    // In case the pointer entered and clicked within one commit's time, the
+    // wantKeyboard() from enterEvent may not have reached the compositor yet;
+    // ask again so a second click is not needed to take the keyboard.
+    wantKeyboard();
     setFocus(Qt::MouseFocusReason);
+    if (focusTrace()) {
+        // `setFocus` above may already have logged "keyboard in"; this line is
+        // the pick itself, which is what the black outline follows.
+        traceFocus(QStringLiteral("picked %1").arg(id));
+    }
     pressGlobal_ = event->globalPosition().toPoint();
     // Read the origin before telling the daemon: bringing the pin to the front
     // hands this surface a fresh stack, so the entry the value came from is
@@ -418,6 +853,17 @@ void PinSurface::mousePressEvent(QMouseEvent *event)
 
 void PinSurface::mouseMoveEvent(QMouseEvent *event)
 {
+    if (menuId_ != 0) {
+        // Hovering a row is the whole interaction model the menu needs: the
+        // highlighted row is the one a click or Enter would copy.
+        const int row = menuRowAt(event->position().toPoint());
+        if (row != menuHover_) {
+            menuHover_ = row;
+            update(menuRect_.adjusted(-1, -1, 1, 1));
+        }
+        event->accept();
+        return;
+    }
     if (draggingId_ != 0) {
         // Global deltas are frame-independent, so they map straight onto the
         // shared global position. The daemon applies the move to every surface
@@ -449,6 +895,12 @@ void PinSurface::mouseReleaseEvent(QMouseEvent *event)
 
 void PinSurface::wheelEvent(QWheelEvent *event)
 {
+    if (menuId_ != 0) {
+        // Zooming the card out from under its own menu would leave the menu
+        // pointing at nothing; the wheel waits until the menu is closed.
+        event->accept();
+        return;
+    }
     const QPoint steps = event->angleDelta();
     if (steps.y() == 0) {
         QWidget::wheelEvent(event);
@@ -471,6 +923,39 @@ void PinSurface::wheelEvent(QWheelEvent *event)
 
 void PinSurface::keyPressEvent(QKeyEvent *event)
 {
+    // While the menu is up it takes the three keys a menu is expected to take;
+    // everything else falls through, so this surface's other shortcuts are not
+    // shadowed by it.
+    if (menuId_ != 0 && !menuRows_.isEmpty()) {
+        const int count = menuRows_.size();
+        switch (event->key()) {
+        case Qt::Key_Escape:
+            event->accept();
+            closeMenu();
+            return;
+        case Qt::Key_Down:
+        case Qt::Key_Up: {
+            const int step = event->key() == Qt::Key_Down ? 1 : -1;
+            // With nothing highlighted yet, Down enters the list at the top
+            // and Up at the bottom.
+            const int from = menuHover_ < 0 ? (step > 0 ? -1 : 0) : menuHover_;
+            menuHover_ = (from + step + count) % count;
+            update(menuRect_.adjusted(-1, -1, 1, 1));
+            event->accept();
+            return;
+        }
+        case Qt::Key_Return:
+        case Qt::Key_Enter:
+            event->accept();
+            if (menuHover_ >= 0) {
+                copyRow(menuHover_);
+            }
+            closeMenu();
+            return;
+        default:
+            break;
+        }
+    }
     if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
         event->accept();
         const quint64 id = pickedId_;
@@ -488,6 +973,9 @@ void PinSurface::keyPressEvent(QKeyEvent *event)
 void PinSurface::focusInEvent(QFocusEvent *event)
 {
     hasFocus_ = true;
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("keyboard in"));
+    }
     // The outline style depends on focus; repaint it explicitly so the change
     // never waits for an unrelated repaint to piggyback on.
     const QRect outline = pickedOutline();
@@ -500,6 +988,9 @@ void PinSurface::focusInEvent(QFocusEvent *event)
 void PinSurface::focusOutEvent(QFocusEvent *event)
 {
     hasFocus_ = false;
+    if (focusTrace()) {
+        traceFocus(QStringLiteral("keyboard out"));
+    }
     const QRect outline = pickedOutline();
     if (!outline.isNull()) {
         update(outline);
@@ -509,6 +1000,13 @@ void PinSurface::focusOutEvent(QFocusEvent *event)
 
 void PinSurface::mouseDoubleClickEvent(QMouseEvent *event)
 {
+    if (swallowNextDoubleClick_) {
+        // The press before this one went to the menu, so this is the tail of a
+        // double-click on a menu row -- not a double-click on a pin.
+        swallowNextDoubleClick_ = false;
+        event->accept();
+        return;
+    }
     if (event->button() == Qt::LeftButton) {
         const quint64 id = pinAt(event->position().toPoint());
         if (id != 0) {

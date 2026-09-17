@@ -56,6 +56,12 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Discard capture (Esc)"),
          QString::fromUtf8("取消截图 (Esc)")},
 
+        // The pinned color card's right-click menu: the heading, and what the
+        // badge says once a format has been put back on the clipboard.
+        {QStringLiteral("Copy"), QString::fromUtf8("复制")},
+        {QStringLiteral("Copied"), QString::fromUtf8("已复制")},
+        {QStringLiteral("Copy failed"), QString::fromUtf8("复制失败")},
+
         // Tool tooltips.
         {QStringLiteral("Adjust selection; click an annotation to select, drag to "
                         "move, handles to resize, double-click text to re-edit"),

@@ -139,6 +139,93 @@ pub struct TextBitmap {
     pub pixels: Vec<u8>,
 }
 
+impl TextBitmap {
+    /// The same label at `target` device pixels per logical pixel, given that
+    /// it was rasterized at `source`.
+    ///
+    /// The helper draws the label at the scene's highest output scale, but the
+    /// frame it lands on carries the density of the output the selection came
+    /// from (see `crate::main::crop_native`), and a rect on a lower-density
+    /// screen is cropped at *that* screen's scale.  Resampling here keeps the
+    /// one contract the helper holds — the bitmap is always in scene device
+    /// pixels — instead of moving the "which output holds this rect" rule into
+    /// the helper as well.
+    ///
+    /// Each target pixel averages the source pixels it covers, weighted by
+    /// alpha: the antialiased rim of a downscaled label is then the average of
+    /// what was drawn, rather than one pixel of it picked out.  A label that
+    /// only goes up in scale comes back as it was, since a bitmap rendered at
+    /// the scene's scale is already the sharpest copy the helper produced.
+    pub fn resampled(&self, source: u32, target: u32) -> TextBitmap {
+        let source = u64::from(source.max(1));
+        let target = u64::from(target.max(1));
+        if source == target || self.width == 0 || self.height == 0 || target > source {
+            return self.clone();
+        }
+        let width = resampled_length(self.width, source, target);
+        let height = resampled_length(self.height, source, target);
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..height {
+            let (top, bottom) = covered_span(y, self.height, source, target);
+            for x in 0..width {
+                let (left, right) = covered_span(x, self.width, source, target);
+                let mut alpha_sum = 0u64;
+                let mut weighted = [0u64; 3];
+                let mut count = 0u64;
+                for row in top..bottom {
+                    for column in left..right {
+                        let offset = (row * u64::from(self.width) + column) as usize * 4;
+                        let Some(pixel) = self.pixels.get(offset..offset + 4) else {
+                            continue;
+                        };
+                        let alpha = u64::from(pixel[3]);
+                        alpha_sum += alpha;
+                        for channel in 0..3 {
+                            weighted[channel] += u64::from(pixel[channel]) * alpha;
+                        }
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    continue;
+                }
+                let destination = (y * width + x) as usize * 4;
+                // A fully transparent source span keeps the colour at zero
+                // rather than dividing by it; every other span divides by the
+                // alpha it accumulated, which is what makes the average
+                // colour-weighted instead of biased towards the transparent
+                // pixels around a glyph.
+                let divisor = alpha_sum.max(1);
+                pixels[destination + 3] = (alpha_sum / count) as u8;
+                for channel in 0..3 {
+                    pixels[destination + channel] = (weighted[channel] / divisor) as u8;
+                }
+            }
+        }
+        TextBitmap {
+            width,
+            height,
+            pixels,
+        }
+    }
+}
+
+/// How many pixels long a `length`-pixel span becomes at `target`/`source`.
+fn resampled_length(length: u32, source: u64, target: u64) -> u32 {
+    let scaled = u64::from(length) * target;
+    u32::try_from(scaled.div_ceil(source).max(1)).unwrap_or(u32::MAX)
+}
+
+/// Half-open source span the `index`-th target pixel covers.  The end is
+/// rounded up so a span can never come out empty — a target pixel covering less
+/// than one source pixel still has to take one.
+fn covered_span(index: u32, length: u32, source: u64, target: u64) -> (u64, u64) {
+    let length = u64::from(length);
+    let start = (u64::from(index) * source / target).min(length.saturating_sub(1));
+    let end = ((u64::from(index) + 1) * source).div_ceil(target);
+    (start, end.clamp(start + 1, length))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EditOperation {
     Crop(Rect),
@@ -439,10 +526,16 @@ pub fn crop_operation(frame: &Frame, rect: Rect) -> Result<ImageDocument> {
 /// `selection`-local device pixels and folds them into one pipeline. Shared
 /// by the capture flow and by pin editing, which renders annotations on top
 /// of a pinned image instead of a frozen scene.
+///
+/// `scale` is the frame's density — device pixels per logical pixel of the
+/// pixels being annotated.  `bitmap_scale` is the density the helper rasterized
+/// its text bitmaps at, which is the scene's scale for a capture and the pin's
+/// own for pin editing; text is resampled when the two differ.
 pub fn pipeline_for_annotations(
     annotations: Vec<crate::wayland::input::Annotation>,
     selection: Rect,
     scale: u32,
+    bitmap_scale: u32,
 ) -> Result<EditPipeline> {
     use crate::wayland::input::Annotation;
 
@@ -521,8 +614,10 @@ pub fn pipeline_for_annotations(
                 let origin = local_point(origin, selection, scale)?;
                 pipeline = match bitmap {
                     // Helper-rendered with the user-selected font: composite
-                    // the device-pixel bitmap as-is.
-                    Some(bitmap) => pipeline.blit(origin, bitmap),
+                    // the bitmap, brought to this frame's density if the
+                    // selection came from a lower-density output than the one
+                    // the helper drew it for.
+                    Some(bitmap) => pipeline.blit(origin, bitmap.resampled(bitmap_scale, scale)),
                     None => {
                         pipeline.text(origin, text, color, text_scale.saturating_mul(scale).max(1))
                     }
@@ -590,6 +685,57 @@ mod tests {
         let frame = Frame::solid(Size::new(4, 4), [1, 2, 3, 255]).unwrap();
         let document = crop_operation(&frame, Rect::new(1, 1, 2, 2)).unwrap();
         assert_eq!(document.frame().size(), Size::new(2, 2));
+    }
+
+    #[test]
+    fn a_label_drawn_for_a_denser_screen_comes_down_to_the_frames_own_density() {
+        // A 2x2 label rasterized at scale 2: two opaque red pixels beside two
+        // opaque blue ones.  On a frame from a scale-1 output it is one pixel,
+        // and that pixel is the average of the four — not one of them picked
+        // out, and not four times the size it was previewed at.
+        let bitmap = TextBitmap {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255, 0, 0, 255, 255, //
+                0, 0, 255, 255, 255, 0, 0, 255,
+            ],
+        };
+        let resampled = bitmap.resampled(2, 1);
+        assert_eq!((resampled.width, resampled.height), (1, 1));
+        assert_eq!(resampled.pixels, vec![127, 0, 127, 255]);
+    }
+
+    #[test]
+    fn transparent_pixels_do_not_darken_a_downscaled_label() {
+        // One opaque white pixel next to a fully transparent one: averaging
+        // the colour plainly would give half-brightness grey, which is what a
+        // thin antialiased edge is made of.
+        let bitmap = TextBitmap {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 255, 255, 255, 0, 0, 0, 0],
+        };
+        let resampled = bitmap.resampled(2, 1);
+        assert_eq!(resampled.pixels, vec![255, 255, 255, 127]);
+        // A scale that already matches is left exactly as the helper drew it.
+        assert_eq!(bitmap.resampled(2, 2), bitmap);
+        assert_eq!(bitmap.resampled(1, 2), bitmap);
+    }
+
+    #[test]
+    fn a_label_is_downscaled_over_the_whole_span_even_when_it_does_not_divide() {
+        // Three pixels at scale 2 cover one and a half at scale 1: the extra
+        // source pixel is not dropped, it joins the last target pixel.
+        let bitmap = TextBitmap {
+            width: 3,
+            height: 1,
+            pixels: vec![0, 0, 0, 255, 0, 0, 0, 255, 90, 90, 90, 255],
+        };
+        let resampled = bitmap.resampled(2, 1);
+        assert_eq!(resampled.width, 2);
+        assert_eq!(&resampled.pixels[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&resampled.pixels[4..8], &[90, 90, 90, 255]);
     }
 
     #[test]

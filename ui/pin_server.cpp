@@ -1,8 +1,12 @@
+#include "pin_density.hpp"
 #include "pin_server.hpp"
+#include "color_card.hpp"
 #include "pin_surface.hpp"
 #include "text_card.hpp"
 
+#include <QColor>
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -68,6 +72,34 @@ bool runWlPaste(const QStringList &arguments, QByteArray *bytes, bool *ok)
     return true;
 }
 
+// Puts `text` on the clipboard through `wl-copy`, the writing counterpart of
+// the `wl-paste` above.  Qt's own clipboard is no more usable for writing a
+// selection than for reading one.
+//
+// `wl-copy` forks and the child stays alive as the selection owner, so only the
+// short-lived process started here is waited for: the copy outlives this call,
+// and the daemon keeps its event loop.
+bool runWlCopy(const QString &text)
+{
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-copy"));
+    // `--` ends the options: a value is content, never a switch.
+    process.setArguments({QStringLiteral("--")});
+    process.start();
+    if (!process.waitForStarted(kClipboardTimeoutMs)) {
+        return false;
+    }
+    process.write(text.toUtf8());
+    process.closeWriteChannel();
+    const bool finished = process.waitForFinished(kClipboardTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(kClipboardTimeoutMs);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
 // The URLs of a `text/uri-list` payload: one per line, `#` starts a comment.
 QList<QUrl> uriListUrls(const QByteArray &payload)
 {
@@ -117,6 +149,9 @@ struct ClipboardPayload {
     QByteArray uriList;
     QString text;
     QByteArray html;
+    // The X11/Qt convention for a copied color, present when a picker or a
+    // toolkit put one there; the text types usually carry the same color.
+    QByteArray color;
 };
 
 ClipboardPayload readClipboard()
@@ -184,6 +219,7 @@ ClipboardPayload readClipboard()
         }
     }
     payload.html = fetch(QStringLiteral("text/html"));
+    payload.color = fetch(QStringLiteral("application/x-color"));
     return payload;
 }
 
@@ -321,6 +357,10 @@ struct Pin {
     // Global logical top-left of the image.
     QPoint origin;
     QString label;
+    // The formats a pinned color card shows, empty for every other pin. Kept
+    // here rather than re-derived when the menu opens: the card was rendered
+    // from these rows, so the menu copies exactly what the card printed.
+    QVector<ColorRow> colorRows;
 
     QSize displaySize() const
     {
@@ -374,11 +414,14 @@ bool densityValue(const QString &token, int *out)
     return true;
 }
 
-// Density an image declares about itself. PNG carries it as pixels per metre
-// (the `pHYs` chunk). This is only consulted for a genuine multi-pixel
-// declaration: Qt reports 3780 dots per metre (96 DPI) for a PNG that declares
-// nothing at all, and that default would otherwise mask the real source. A
-// print resolution is not a device density either, so the value has to be a
+// Density a decoded image declares about itself. This is the fallback for the
+// callers that have no PNG bytes left to look at, and for the formats whose
+// declaration the PNG chunks cannot show in the first place (a JPEG carries its
+// density in the JFIF header). Here only the decoded value is left, so a 96 DPI
+// reading is indistinguishable from the 3780 dots per metre Qt reports for a
+// PNG that declares nothing at all, and it has to be left to the other
+// sources: only `pngDeclaredDensity` can recognise a 1x declaration. A print
+// resolution is not a device density either, so the value has to be a
 // near-exact multiple of 96 DPI.
 int declaredDensity(const QImage &image)
 {
@@ -504,25 +547,43 @@ int inferDensity(const QImage &image, QScreen *target)
     return inferred > 0 ? inferred : targetDensity;
 }
 
+// A density and the source that decided it, so `VSHOT_PIN_DEBUG` can say why a
+// pin came out the size it did.
+struct PinDensity {
+    int value = 1;
+    const char *source = "the fallback";
+};
+
 // Device pixels per logical pixel of the image being pinned, so the pin takes
 // the same room on screen it had where it came from. In order: what vshot's own
-// capture stated, what the image declares, what the producer recorded, and else
-// what the image's size and the target output imply.
-int resolveDensity(const QJsonObject &request, QScreen *target, const QImage &image,
-                   const QString &sourcePath)
+// capture stated, what the PNG declares in its chunks, what the decoded image
+// declares, what the producer recorded, and else what the image's size and the
+// target output imply. `sourceBytes` is the PNG the image was decoded from when
+// the caller has it (a clipboard payload); `sourcePath` is where it came from,
+// read for its chunks when the bytes are not at hand.
+PinDensity resolveDensity(const QJsonObject &request, QScreen *target, const QImage &image,
+                          const QString &sourcePath, const QByteArray &sourceBytes)
 {
     bool ok = false;
     const int stated = request.value(QStringLiteral("density")).toVariant().toInt(&ok);
     if (ok && stated > 0) {
-        return std::clamp(stated, 1, 4);
+        return {std::clamp(stated, 1, 4), "the request (--density or VSHOT_PIN_DENSITY)"};
+    }
+    // The PNG's own chunks first: this is the one source that can say "1x",
+    // which is what a capture on a scale-1 output declares.
+    if (const int declared = pngDeclaredDensity(sourceBytes); declared > 0) {
+        return {declared, "the PNG's own chunks (clipboard payload)"};
+    }
+    if (const int declared = pngDeclaredDensityOfFile(sourcePath); declared > 0) {
+        return {declared, "the PNG's own chunks (the file)"};
     }
     if (const int declared = declaredDensity(image); declared > 0) {
-        return declared;
+        return {declared, "the decoded PNG density"};
     }
     if (const int recorded = recordedDensity(sourcePath); recorded > 0) {
-        return recorded;
+        return {recorded, "the producer's record"};
     }
-    return inferDensity(image, target);
+    return {inferDensity(image, target), "the image size and the target output"};
 }
 
 // Owns every pinned surface and dispatches daemon commands. It inherits
@@ -533,6 +594,7 @@ public:
     PinServer(QLocalServer *server, QString socketPath)
         : server_(server)
         , socketPath_(std::move(socketPath))
+        , debug_(qEnvironmentVariableIsSet("VSHOT_PIN_DEBUG"))
     {
         idleQuit_ = new QTimer(this);
         idleQuit_->setSingleShot(true);
@@ -707,13 +769,14 @@ private:
         if (image.isNull()) {
             return error(QStringLiteral("cannot load pin image `%1`").arg(path));
         }
-        return addImage(image, path, path, screenFromRequest(request), request);
+        return addImage(image, path, path, QByteArray(), screenFromRequest(request), request);
     }
 
-    // Pins the image currently on the clipboard. Resolution order: embedded
-    // image data (screenshots, "copy image"), then image files referenced by
-    // a copied file (URI list), then a single plain-text local path, then
-    // clipboard text rendered as a card (HTML, markdown, code, or plain).
+    // Pins whatever the clipboard holds. Resolution order: a color that came
+    // with the structured `application/x-color` payload, embedded image data
+    // (screenshots, "copy image"), image files referenced by a copied file
+    // (URI list), a single plain-text local path, a color written out as text,
+    // then clipboard text rendered as a card (HTML, markdown, code, or plain).
     QJsonObject addClipboardPin(const QJsonObject &request)
     {
         QScreen *target = screenFromRequest(request);
@@ -726,12 +789,22 @@ wl-clipboard package"));
         if (!clipboard.offered) {
             return error(QStringLiteral("the clipboard is empty"));
         }
+        // A structured color outranks the image, the one case where the two
+        // disagree: color pickers commonly put a one-pixel image of the color
+        // on the clipboard beside it, and pinning that pixel alone would show
+        // a single dot. The card carries the same color and more.
+        if (QColor color; colorFromX11Payload(clipboard.color, &color)) {
+            return addColorPin(color, target, request);
+        }
         if (!clipboard.image.isEmpty()) {
             const QImage image = QImage::fromData(clipboard.image);
             if (!image.isNull()) {
-                // Raw image data carries no path, so only its own declaration
-                // can name a source; the record file cannot be matched.
-                return addImage(image, QStringLiteral("clipboard"), QString(), target, request);
+                // Raw image data carries no path, so only its own chunks can
+                // name a source; the record file cannot be matched. The bytes
+                // go along because they are the only place a 1x declaration
+                // (96 DPI) survives -- the decoded image cannot show it.
+                return addImage(image, QStringLiteral("clipboard"), QString(), clipboard.image,
+                                target, request);
             }
         }
         for (const QUrl &url : uriListUrls(clipboard.uriList)) {
@@ -741,15 +814,21 @@ wl-clipboard package"));
             const QString path = url.toLocalFile();
             const QImage fileImage(path);
             if (!fileImage.isNull()) {
-                return addImage(fileImage, path, path, target, request);
+                return addImage(fileImage, path, path, QByteArray(), target, request);
             }
         }
         const QString text = clipboard.text.trimmed();
         if (!text.isEmpty() && !text.contains(QLatin1Char('\n')) && QFileInfo::exists(text)) {
             const QImage pathImage(text);
             if (!pathImage.isNull()) {
-                return addImage(pathImage, text, text, target, request);
+                return addImage(pathImage, text, text, QByteArray(), target, request);
             }
+        }
+        // Text that is nothing but a color is a copied color rather than a
+        // snippet: the color card shows it and every format it converts to.
+        // Checked after the file above, so a copied path never looks like one.
+        if (QColor color; colorFromLiteral(text, &color)) {
+            return addColorPin(color, target, request);
         }
         // A clipboard that offers only HTML has no plain text to fall back on,
         // and the card renderer can draw the markup itself.
@@ -763,7 +842,8 @@ wl-clipboard package"));
             if (screen == nullptr) {
                 return error(QStringLiteral("no screen is available to pin onto"));
             }
-            const int density = resolveDensity(request, screen, QImage(), QString());
+            const int density =
+                resolveDensity(request, screen, QImage(), QString(), QByteArray()).value;
             // The renderer reads the payload to tell HTML from plain text, so
             // what the clipboard offered is handed over as it was.
             RawMimeData mime;
@@ -775,17 +855,45 @@ wl-clipboard package"));
             }
             const QImage rendered = renderTextCard(&mime, card, density);
             if (!rendered.isNull()) {
-                return addImage(rendered, QStringLiteral("clipboard text"), QString(), target,
-                                request);
+                return addImage(rendered, QStringLiteral("clipboard text"), QString(), QByteArray(),
+                                target, request);
             }
         }
         return error(QStringLiteral("the clipboard contains no pinnable image or text"));
     }
 
+    // Renders a copied color as a card and pins it: the color as a swatch
+    // beside its own value in every format the clipboard could want back
+    // (hex, RGB, HSL, HSV, CMYK). Cards are rasterized at the density the pin
+    // will use, so the values stay sharp on a HiDPI output -- the same rule
+    // the text cards follow.
+    QJsonObject addColorPin(const QColor &color, QScreen *target, const QJsonObject &request)
+    {
+        QScreen *screen = target != nullptr ? target : fallbackScreen();
+        if (screen == nullptr) {
+            return error(QStringLiteral("no screen is available to pin onto"));
+        }
+        const int density =
+            resolveDensity(request, screen, QImage(), QString(), QByteArray()).value;
+        const QImage rendered = renderColorCard(color, density);
+        if (rendered.isNull()) {
+            return error(QStringLiteral("could not render the clipboard color"));
+        }
+        // The rows the card was drawn from: a right-click on the finished pin
+        // turns them into the menu that puts one format back on the clipboard.
+        return addImage(rendered, QStringLiteral("clipboard color"), QString(), QByteArray(), target,
+                        request, colorCardRows(color));
+    }
+
     // `sourcePath` is where the pixels came from, empty for data with no file
     // behind it: it is what lets a recorded capture scale be matched.
+    // `sourceBytes` is that file's PNG when the caller read it already, or a
+    // clipboard payload: it is what the declared density is read from, a chunk
+    // the decoded image cannot show once the pixels have been unpacked.
     QJsonObject addImage(const QImage &image, const QString &label, const QString &sourcePath,
-                         QScreen *requested, const QJsonObject &request)
+                         const QByteArray &sourceBytes, QScreen *requested,
+                         const QJsonObject &request,
+                         const QVector<ColorRow> &colorRows = QVector<ColorRow>())
     {
         if (image.isNull()) {
             armIdleQuit();
@@ -800,7 +908,19 @@ wl-clipboard package"));
         pin->id = nextId_++;
         pin->image = image;
         pin->label = label;
-        pin->density = resolveDensity(request, screen, image, sourcePath);
+        pin->colorRows = colorRows;
+        const PinDensity density = resolveDensity(request, screen, image, sourcePath, sourceBytes);
+        pin->density = density.value;
+        // Why a pin came out the size it did is the first question when one
+        // looks wrong, and only the daemon can answer it: the CLI sends the
+        // request, not the decision.
+        if (debug_) {
+            qWarning("pin %llu: %dx%d px -> density %d from %s; screen %s at %.2g device "
+                     "pixels per logical pixel",
+                     static_cast<unsigned long long>(pin->id), image.width(), image.height(),
+                     pin->density, density.source, qPrintable(screen->name()),
+                     screen->devicePixelRatio());
+        }
         // Natural size: one image pixel per logical pixel of an output with
         // the same density, so a 4K capture takes the room it did on the 4K
         // output even when it lands on a 1080p one.
@@ -1116,6 +1236,16 @@ wl-clipboard package"));
                 startEdit(pin);
             }
         });
+        // A menu pick is a clipboard write and nothing else: the surface
+        // collects the gesture and the format, the daemon owns the clipboard.
+        surface->setCopyCallback([this](quint64 id, const QString &value) {
+            const bool copied = runWlCopy(value);
+            if (debug_ || !copied) {
+                qWarning("pin %llu: %s `%s`", static_cast<unsigned long long>(id),
+                         copied ? "copied" : "could not copy", qPrintable(value));
+            }
+            return copied;
+        });
         if (!surface->showLayerSurface()) {
             delete surface;
             return;
@@ -1167,6 +1297,7 @@ wl-clipboard package"));
         surface->setEditCallback({});
         surface->setDragCallback({});
         surface->setZoomCallback({});
+        surface->setCopyCallback({});
         QObject::disconnect(surface, nullptr, this, nullptr);
         surface->setPinnedVisible(false);
         surface->hide();
@@ -1243,6 +1374,7 @@ wl-clipboard package"));
         item.density = pin.density;
         item.scale = pin.scale;
         item.origin = pin.origin;
+        item.colorRows = pin.colorRows;
         return item;
     }
 
@@ -1278,6 +1410,9 @@ wl-clipboard package"));
 
     QLocalServer *server_;
     QString socketPath_;
+    // `VSHOT_PIN_DEBUG` logs the density decision behind every pinned image,
+    // the way `VSHOT_PIXEL_DEBUG` logs the detection behind a window rect.
+    bool debug_ = false;
     QHash<QLocalSocket *, QByteArray> buffer_;
     // The pins, back to front: the last one is painted last, i.e. it is the one
     // on top where they overlap.

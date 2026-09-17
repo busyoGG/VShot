@@ -23,6 +23,14 @@
 //! own, so the caller states the density (see [`window_scale`]).  niri also
 //! always puts that image on the clipboard as part of the same action; that is
 //! niri's own behaviour and not something this side can turn off.
+//!
+//! Which niri is asked is decided by [`owns_this_connection`], not by the
+//! desktop variables: niri does not set `XDG_CURRENT_DESKTOP` itself (only a
+//! display manager does), so a manually started session would otherwise be
+//! misread and the routes below would never run.  The socket is named
+//! `niri.$WAYLAND_DISPLAY.$PID.sock`, and niri hands `NIRI_SOCKET` to the
+//! processes it starts — the display inside the socket name matching this
+//! client's `WAYLAND_DISPLAY` is what says the answering niri is ours.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -34,6 +42,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::error::{Result, VshotError};
+use crate::geometry::Rect;
 use crate::model::Frame;
 
 use super::window::{join_label, WindowCommand, WindowCommandRunner};
@@ -49,12 +58,95 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// One window as niri's IPC describes it.  `workspace_id` is what places it on
 /// an output: niri reports the workspace → output mapping separately.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `tile_size` and `offset_in_tile` are what makes the decorations findable.
+/// niri draws a window's border as part of the *tile*, not the window
+/// (`Tile::render` calls `self.border.render` beside `window.render_normal`),
+/// so its own `screenshot-window` is the window surface alone — no border.  The
+/// tile is the window plus exactly those decorations, and this is where the two
+/// are related: the border on each side is `offset_in_tile` wide, and the tile
+/// is `tile_size` large.  (This is also what niri's IPC documents: "tile_size —
+/// size of the tile this window is in, including decorations like borders",
+/// "window_size — does not include niri decorations like borders".)
+#[derive(Clone, Debug, PartialEq)]
 pub struct NiriWindow {
     pub id: u64,
     /// `app_id — title`, when niri reports either.
     pub label: String,
     pub workspace_id: Option<u64>,
+    /// The tile's size in logical pixels, borders included.
+    pub tile_size: Option<(f64, f64)>,
+    /// Where the window's own geometry sits inside its tile, in logical
+    /// pixels.  Each component is the border width on that axis — how far the
+    /// decoration reaches out from the window on each side.
+    pub offset_in_tile: Option<(f64, f64)>,
+}
+
+impl NiriWindow {
+    /// How to turn the located render rectangle into the window's *tile* — the
+    /// window plus its border.
+    ///
+    /// `render_size` is the size in device pixels of the render as it was found
+    /// on the screen (and `scale` the output's device-pixels-per-logical-pixel).
+    /// Returns `(inset, border)`: shrink the found rectangle by `inset` to reach
+    /// the window's own surface, then grow the result by `border` on every side
+    /// to reach the tile.  Both are in device pixels.
+    ///
+    /// Two niri versions differ here and both are handled: the render may be the
+    /// window surface exactly (render size = `window_size · scale`, seen on
+    /// 25.11-236) or carry a drop shadow around it (the 12px-per-side case seen
+    /// on an earlier lab build), so the padding is measured from the found
+    /// rectangle rather than assumed to be zero.
+    ///
+    /// `None` when niri stated no geometry, the numbers do not describe the
+    /// window plus an even border on each side, or the render is smaller than
+    /// the window it is supposed to show — in every one of those cases a
+    /// guess would be worse than the plain window rectangle.
+    pub fn tile_from_render(
+        &self,
+        render_size: (u32, u32),
+        scale: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let (offset_x, offset_y) = self.offset_in_tile?;
+        let (tile_w, tile_h) = self.tile_size?;
+        if !offset_x.is_finite()
+            || !offset_y.is_finite()
+            || offset_x < 0.0
+            || offset_y < 0.0
+            || !tile_w.is_finite()
+            || !tile_h.is_finite()
+        {
+            return None;
+        }
+        // The tile is the window plus its border on each side, so the window's
+        // logical size follows from the two niri-documented fields.
+        let window_w = tile_w - 2.0 * offset_x;
+        let window_h = tile_h - 2.0 * offset_y;
+        if window_w <= 0.0 || window_h <= 0.0 {
+            return None;
+        }
+        let scale = f64::from(scale.max(1));
+        // Integer logical window geometry scales to whole device pixels.
+        let window_device = (
+            (window_w * scale).round() as i64,
+            (window_h * scale).round() as i64,
+        );
+        let (render_w, render_h) = (i64::from(render_size.0), i64::from(render_size.1));
+        // The render may hold the window surface exactly or carry padding
+        // (a shadow) around it.  Negative padding would mean the render is
+        // smaller than the window it shows, which cannot be trusted.
+        let padding_w = render_w - window_device.0;
+        let padding_h = render_h - window_device.1;
+        if padding_w < 0 || padding_h < 0 || padding_w % 2 != 0 || padding_h % 2 != 0 {
+            return None;
+        }
+        let inset = ((padding_w / 2) as u32, (padding_h / 2) as u32);
+        let border = (
+            (offset_x * scale).round() as u32,
+            (offset_y * scale).round() as u32,
+        );
+        Some((inset.0, inset.1, border.0, border.1))
+    }
 }
 
 /// The focused window, or `None` when niri has none (a layer-shell surface can
@@ -64,12 +156,177 @@ pub fn focused_window<R: WindowCommandRunner>(runner: &R) -> Result<Option<NiriW
     parse_window(&output.stdout, "focused-window")
 }
 
+/// Is the niri that answers over `NIRI_SOCKET` the compositor of *this* client?
+///
+/// niri names its IPC socket after the Wayland display it created
+/// (`$XDG_RUNTIME_DIR/niri.$WAYLAND_DISPLAY.$PID.sock`) and hands that path to
+/// every process it starts, as `NIRI_SOCKET`.  A socket naming our own
+/// `WAYLAND_DISPLAY` therefore proves that the niri behind it is the compositor
+/// serving this connection — which is the one thing the desktop variables
+/// cannot say.  Those are inherited: a niri started from a TTY has no display
+/// manager to put its name there, and a niri nested inside another compositor
+/// leaves the *outer* name in place.  Read as the outer compositor — or as
+/// nothing at all — the routes that exist for niri are never asked, and
+/// `window active` falls back to the pixel detector (a window under the
+/// pointer, not the focused one) while `window pick` falls back to our own
+/// overlay picker instead of niri's crosshair.
+///
+/// A socket naming a different display is somebody else's niri, and a path that
+/// is not there is a stale variable: neither is an answer, so the desktop
+/// variables get to decide after all.
+pub fn owns_this_connection() -> bool {
+    let (Ok(socket), Ok(display)) = (
+        std::env::var("NIRI_SOCKET"),
+        std::env::var("WAYLAND_DISPLAY"),
+    ) else {
+        return false;
+    };
+    socket_names_display(&socket, &display) && Path::new(&socket).exists()
+}
+
+/// The naming rule behind [`owns_this_connection`], on its own so it can be
+/// tested without an environment: `niri.<display>.<pid>.sock`.
+///
+/// `WAYLAND_DISPLAY` is a socket *name* (`wayland-1`) or the absolute path of
+/// one, in which case niri named its socket after the file name it used.
+/// Everything is compared component by component rather than by prefix, so the
+/// socket of `wayland-11` is not mistaken for one of `wayland-1`.
+fn socket_names_display(socket: &str, display: &str) -> bool {
+    let Some(name) = Path::new(socket).file_name() else {
+        return false;
+    };
+    let Some(display) = Path::new(display).file_name() else {
+        return false;
+    };
+    let display = display.to_string_lossy();
+    if display.is_empty() {
+        return false;
+    }
+    let name = name.to_string_lossy();
+    let parts: Vec<&str> = name.split('.').collect();
+    parts.len() == 4
+        && parts[0] == "niri"
+        && parts[1] == display
+        && !parts[2].is_empty()
+        && parts[2].chars().all(|digit| digit.is_ascii_digit())
+        && parts[3] == "sock"
+}
+
 /// Asks niri to run its own window picker and waits for the answer.  This
 /// blocks until the user clicks a window or cancels (`None`); niri draws only a
 /// crosshair while it runs.
 pub fn pick_window<R: WindowCommandRunner>(runner: &R) -> Result<Option<NiriWindow>> {
     let output = run(runner, &command(&["msg", "--json", "pick-window"]))?;
     parse_window(&output.stdout, "pick-window")
+}
+
+/// niri's window picture, made to look the way the screen showed it.
+///
+/// [`capture_window`] hands over the window rendered with its alpha channel, so
+/// a translucent window comes out translucent, with none of the wallpaper that
+/// showed through it.  The screen *did* show that wallpaper, and a fresh
+/// capture of the window's own output holds exactly that composite — so the
+/// render is located on the capture (a template match over its own pixels, see
+/// [`super::window_blend`]) and the capture is cropped there.  The match is
+/// also the consistency check between the two separate moments — render and
+/// grab — and a window whose content moved on in between is re-rendered and
+/// retried before giving up.  When the render cannot be located at all — a
+/// window too translucent to verify, one that hangs off its output, one on a
+/// workspace that is not visible — niri's own render is used as it is, and
+/// stderr says so.
+pub fn capture_composited<R: WindowCommandRunner>(
+    grab_output: &mut dyn FnMut(&str, bool) -> Result<Frame>,
+    runner: &R,
+    window: &NiriWindow,
+    cursor: bool,
+    output_infos: &[crate::wayland::topology::OutputInfo],
+) -> Result<Frame> {
+    let mut render = capture_window(runner, window, cursor)?;
+    let Some((name, scale)) = window_scale(runner, window)? else {
+        eprintln!(
+            "vshot: niri places window {} on no output, so its own (translucent) render is \
+             used as it is",
+            window.id
+        );
+        return Ok(render);
+    };
+    let Some(_) = output_infos.iter().find(|info| info.name == name) else {
+        eprintln!(
+            "vshot: output {name} was not captured, so niri's own (translucent) render of \
+             window {} is used as it is",
+            window.id
+        );
+        return Ok(render);
+    };
+    // The render and the grab are two separate moments — niri's IPC answers one
+    // call at a time, so nothing can make them the same instant.  What makes
+    // the crop trustworthy anyway is that *locating the render is the check*:
+    // the screen pixel has to equal `render · α + background · (1−α)` at well
+    // over a thousand sampled points before a crop is taken, so the frame only
+    // comes out when it still agrees with the render.  When it does not, the
+    // reason decides what happens next: a window whose own pixels moved on
+    // between the two moments (a video, an animation) made the template stale,
+    // and a fresh render — milliseconds old — is worth another try; a render
+    // that is current but unverifiable (nearly invisible, off the output's
+    // edge, invisible workspace) is a positional dead end that no retry helps.
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        // A fresh capture of the window's output: the screen already shows the
+        // window composited over whatever was behind it.  The pointer is
+        // captured too when `--cursor` asked for one, matching the pointer
+        // niri may have drawn into the render.
+        let screen = grab_output(&name, cursor)?;
+        match super::window_blend::locate_window(&render, &screen) {
+            Some(rect) => {
+                // The render is the window surface alone (or that surface with
+                // a shadow around it, on niri builds that draw one); the screen
+                // shows the window *inside its tile*, the border included and
+                // drawn by niri as part of the tile.  Growing the located
+                // rectangle out to the tile is what puts that border in the
+                // capture — see [`NiriWindow::tile_from_render`].
+                let rect = match window.tile_from_render((rect.size.width, rect.size.height), scale)
+                {
+                    Some((inset_x, inset_y, border_x, border_y)) => Rect::new(
+                        rect.origin.x + inset_x as i32 - border_x as i32,
+                        rect.origin.y + inset_y as i32 - border_y as i32,
+                        rect.size.width - 2 * inset_x + 2 * border_x,
+                        rect.size.height - 2 * inset_y + 2 * border_y,
+                    ),
+                    None => rect,
+                };
+                eprintln!(
+                    "vshot: niri's render of window {} was located on {name}, so the screen's \
+                     own pixels are used",
+                    window.id
+                );
+                return screen.crop(rect);
+            }
+            None if attempt + 1 == ATTEMPTS => break,
+            None => {
+                let fresh = capture_window(runner, window, cursor)?;
+                if super::window_blend::renders_agree(&render, &fresh) {
+                    // The template is current, yet no position verifies: the
+                    // window itself is the problem, not its timing.
+                    eprintln!(
+                        "vshot: niri's render of window {} could not be located on {name} and \
+                         the window is not changing, so its own (translucent) render is used \
+                         as it is",
+                        window.id
+                    );
+                    return Ok(fresh);
+                }
+                // Stale template: take the fresh one into the next try, where
+                // the gap between render and grab is milliseconds.
+                render = fresh;
+            }
+        }
+    }
+    eprintln!(
+        "vshot: niri's render of window {} kept changing under the capture and no frame \
+         could be located, so its own (translucent) render is used as it is",
+        window.id
+    );
+    Ok(render)
 }
 
 /// The output the window sits on and the scale niri lays that output out at.
@@ -265,10 +522,24 @@ fn parse_window(bytes: &[u8], what: &str) -> Result<Option<NiriWindow>> {
     })?;
     let app_id = value.get("app_id").and_then(Value::as_str).unwrap_or("");
     let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+    let layout = value.get("layout");
+    let pair = |field: &str| {
+        layout
+            .and_then(|layout| layout.get(field))
+            .and_then(|value| value.as_array())
+            .and_then(|pair| {
+                let [first, second] = pair.as_slice() else {
+                    return None;
+                };
+                Some((first.as_f64()?, second.as_f64()?))
+            })
+    };
     Ok(Some(NiriWindow {
         id,
         label: join_label(app_id, title),
         workspace_id: value.get("workspace_id").and_then(Value::as_u64),
+        tile_size: pair("tile_size"),
+        offset_in_tile: pair("window_offset_in_tile"),
     }))
 }
 
@@ -323,14 +594,16 @@ mod tests {
     use super::*;
     use crate::geometry::Size;
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::ffi::OsStr;
+    use std::ffi::OsString;
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process::ExitStatus;
 
     /// A focused tiled window, shaped exactly like niri's `Window` — notice
     /// `tile_pos_in_workspace_view: null`, which is what makes the rect route
-    /// impossible.
+    /// impossible and the screenshot route the answer.
     const FOCUSED_TILED: &str = r#"{
         "id": 12,
         "title": "t w",
@@ -402,6 +675,89 @@ mod tests {
         assert_eq!(window.id, 12);
         assert_eq!(window.label, "Alacritty — t w");
         assert_eq!(window.workspace_id, Some(6));
+    }
+
+    #[test]
+    fn the_socket_names_the_display_it_was_created_for() {
+        assert!(socket_names_display(
+            "/run/user/1000/niri.wayland-1.2474.sock",
+            "wayland-1"
+        ));
+        assert!(socket_names_display("niri.wayland-2.9.sock", "wayland-2"));
+        // `WAYLAND_DISPLAY` is allowed to be the absolute path of the socket,
+        // in which case niri named its own after the file name it used.
+        assert!(socket_names_display(
+            "/run/user/1000/niri.wayland-1.7.sock",
+            "/run/user/1000/wayland-1"
+        ));
+    }
+
+    #[test]
+    fn another_displays_socket_is_not_ours() {
+        // The nesting that matters: a compositor inside niri inherits the outer
+        // `NIRI_SOCKET`, whose name carries the outer display.
+        assert!(!socket_names_display(
+            "/run/user/1000/niri.wayland-1.2474.sock",
+            "wayland-2"
+        ));
+        // `wayland-1` is a prefix of `wayland-11`: components are compared, not
+        // prefixes, so the socket of the other display never passes.
+        assert!(!socket_names_display(
+            "/run/user/1000/niri.wayland-11.44.sock",
+            "wayland-1"
+        ));
+        assert!(!socket_names_display(
+            "sway-ipc.1000.2474.sock",
+            "wayland-1"
+        ));
+        // Names that only look like niri's: no display, no pid, no socket.
+        assert!(!socket_names_display(
+            "/run/user/1000/niri.sock",
+            "wayland-1"
+        ));
+        assert!(!socket_names_display("niri.wayland-1.sock", "wayland-1"));
+        assert!(!socket_names_display("niri.wayland-1.x.sock", "wayland-1"));
+        assert!(!socket_names_display("niri.wayland-1.7.log", "wayland-1"));
+        assert!(!socket_names_display("niri.wayland-1.7.sock", ""));
+        assert!(!socket_names_display("", "wayland-1"));
+    }
+
+    #[test]
+    fn the_environment_says_when_the_niri_is_ours() {
+        // The one test here that touches the process environment: it is the
+        // only reader of these two variables, and it puts them back, so a
+        // parallel runner has nothing to trip over.
+        use std::env;
+        let saved = (env::var_os("NIRI_SOCKET"), env::var_os("WAYLAND_DISPLAY"));
+        let dir = env::temp_dir().join(format!("vshot-niri-socket-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("niri.wayland-7.123.sock");
+        std::fs::write(&socket, b"").unwrap();
+
+        env::set_var("NIRI_SOCKET", &socket);
+        env::set_var("WAYLAND_DISPLAY", "wayland-7");
+        assert!(owns_this_connection(), "the socket names our display");
+
+        env::set_var("WAYLAND_DISPLAY", "wayland-8");
+        assert!(
+            !owns_this_connection(),
+            "another display's socket is not ours to ask"
+        );
+
+        env::set_var("WAYLAND_DISPLAY", "wayland-7");
+        std::fs::remove_file(&socket).unwrap();
+        assert!(
+            !owns_this_connection(),
+            "a path that is not there is a stale variable, not an answer"
+        );
+
+        for (name, value) in [("NIRI_SOCKET", saved.0), ("WAYLAND_DISPLAY", saved.1)] {
+            match value {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -488,6 +844,8 @@ mod tests {
             id: 5,
             label: String::new(),
             workspace_id: None,
+            tile_size: None,
+            offset_in_tile: None,
         };
         assert_eq!(window_scale(&runner, &window).unwrap(), None);
         assert!(runner.asked().is_empty(), "nothing worth asking about");
@@ -500,6 +858,8 @@ mod tests {
             id: 12,
             label: String::new(),
             workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
         };
         capture_window(&runner, &window, false).unwrap();
 
@@ -534,6 +894,8 @@ mod tests {
             id: 12,
             label: String::new(),
             workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
         };
         capture_window(&runner, &window, true).unwrap();
         assert!(runner.asked()[0].contains(&"--show-pointer".to_owned()));
@@ -553,6 +915,8 @@ mod tests {
             id: 12,
             label: String::new(),
             workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
         };
         let frame = capture_window(&runner, &window, true).unwrap();
         assert_eq!(frame.size(), Size::new(40, 30));
@@ -572,6 +936,8 @@ mod tests {
             id: 12,
             label: String::new(),
             workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
         };
         let frame = capture_window(&runner, &window, false).unwrap();
         assert_eq!(frame.size(), Size::new(40, 30));
@@ -584,6 +950,8 @@ mod tests {
             id: 12,
             label: String::new(),
             workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
         };
         let error =
             capture_window_within(&runner, &window, false, Duration::from_millis(50)).unwrap_err();
@@ -597,9 +965,238 @@ mod tests {
             id: 99,
             label: String::new(),
             workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
         };
         let error = capture_window(&runner, &window, false).unwrap_err();
         assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    /// One captured output, for `capture_composited`'s output check.
+    fn test_output(name: &str) -> crate::wayland::topology::OutputInfo {
+        crate::wayland::topology::OutputInfo {
+            global_id: 1,
+            name: name.to_owned(),
+            geometry: crate::geometry::Rect::new(0, 0, 400, 300),
+            pixel_size: Size::new(400, 300),
+            scale: 1,
+            transform: wayland_client::protocol::wl_output::Transform::Normal,
+        }
+    }
+
+    /// The grab closure's screen: a plain desktop with `window` composited at
+    /// (20, 30), the way the compositor would.
+    fn screen_showing(window: &Frame, at: crate::geometry::Point) -> Frame {
+        let mut screen = Frame::solid(Size::new(400, 300), [240, 240, 240, 255]).unwrap();
+        for y in 0..window.size().height {
+            for x in 0..window.size().width {
+                let Some(color) = window.pixel(crate::geometry::Point::new(x as i32, y as i32))
+                else {
+                    continue;
+                };
+                screen.blend_pixel_at(
+                    i64::from(at.x) + i64::from(x),
+                    i64::from(at.y) + i64::from(y),
+                    color,
+                );
+            }
+        }
+        screen
+    }
+
+    fn placed_window() -> NiriWindow {
+        NiriWindow {
+            id: 12,
+            label: String::new(),
+            workspace_id: Some(6),
+            tile_size: None,
+            offset_in_tile: None,
+        }
+    }
+
+    /// A window with niri's tile geometry: a 940x1012 window inside a
+    /// 948x1020 tile, i.e. a 4-logical-pixel border on every side.  Those are
+    /// the numbers a live niri reports for a focused tiled window with
+    /// `border { width 4 }`.
+    fn bordered_window() -> NiriWindow {
+        NiriWindow {
+            tile_size: Some((948.0, 1020.0)),
+            offset_in_tile: Some((4.0, 4.0)),
+            ..placed_window()
+        }
+    }
+
+    #[test]
+    fn a_render_without_padding_grows_to_the_tile_by_its_border() {
+        // The 25.11-236 render is the window surface exactly: 940x1012 logical
+        // at scale 2 is 1880x2024 device pixels, and the 4-logical-pixel border
+        // is 8 device pixels on each side.
+        let (inset_x, inset_y, border_x, border_y) = bordered_window()
+            .tile_from_render((1880, 2024), 2)
+            .expect("a bordered window has a computable tile");
+        assert_eq!(
+            (inset_x, inset_y),
+            (0, 0),
+            "the render is the window itself"
+        );
+        assert_eq!((border_x, border_y), (8, 8), "4 logical pixels at scale 2");
+    }
+
+    #[test]
+    fn a_shadowed_render_is_inset_before_the_border_grows_out() {
+        // The earlier lab build drew a 12px-per-side shadow around the window,
+        // so the located rectangle is 24px larger on each axis; that padding
+        // has to come off before the border goes on, or the crop would be
+        // 12px too large on every side.
+        let (inset_x, inset_y, border_x, border_y) = bordered_window()
+            .tile_from_render((1880 + 24, 2024 + 24), 2)
+            .expect("a shadowed render still describes the tile");
+        assert_eq!((inset_x, inset_y), (12, 12), "the shadow is not the window");
+        assert_eq!((border_x, border_y), (8, 8));
+    }
+
+    #[test]
+    fn a_borderless_window_states_a_zero_border() {
+        // `border { off }`: tile and window are the same size, so the crop must
+        // not invent a border around a window that has none.
+        let window = NiriWindow {
+            tile_size: Some((940.0, 1012.0)),
+            offset_in_tile: Some((0.0, 0.0)),
+            ..placed_window()
+        };
+        assert_eq!(window.tile_from_render((1880, 2024), 2), Some((0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn a_render_smaller_than_the_window_is_not_turned_into_a_tile() {
+        // The render cannot be smaller than the window it shows; such numbers
+        // are not the pair they are assumed to be, and a wrong rectangle is
+        // worse than none.
+        assert_eq!(bordered_window().tile_from_render((1000, 1000), 2), None);
+    }
+
+    #[test]
+    fn a_window_without_tile_geometry_keeps_the_plain_rectangle() {
+        // An older niri (or a fullscreen window with no tile) reports no
+        // geometry: the located rectangle stands as it is.
+        assert_eq!(placed_window().tile_from_render((1880, 2024), 2), None);
+    }
+
+    #[test]
+    fn a_fractional_border_is_rounded_to_whole_device_pixels() {
+        // niri's IPC notes borders are logical and may be fractional (a 2
+        // physical-pixel border is 1.6 logical at scale 1.25).  The window here
+        // is 800x600 logical, so at scale 2 the render is 1600x1200 device
+        // pixels and the 1.6-logical border rounds to 3 device pixels.
+        let window = NiriWindow {
+            tile_size: Some((803.2, 603.2)),
+            offset_in_tile: Some((1.6, 1.6)),
+            ..placed_window()
+        };
+        assert_eq!(window.tile_from_render((1600, 1200), 2), Some((0, 0, 3, 3)));
+    }
+
+    fn screenshot_requests(runner: &ScriptedRunner) -> usize {
+        runner
+            .asked()
+            .iter()
+            .filter(|command| command.contains(&"--id".to_owned()))
+            .count()
+    }
+
+    #[test]
+    fn a_moving_window_is_retried_with_a_fresh_render() {
+        // The window is animating: the first render (red) is stale by the time
+        // the screen is grabbed — which already shows the blue state.  The
+        // stability check tells a stale template from a positional dead end,
+        // the fresh render is located, and the crop is the screen's own pixels
+        // at the window's true position.
+        let red = Frame::solid(Size::new(60, 40), [200, 30, 30, 255]).unwrap();
+        let blue = Frame::solid(Size::new(60, 40), [30, 30, 200, 255]).unwrap();
+        let runner = ScriptedRunner::new()
+            .replying("workspaces", WORKSPACES.as_bytes())
+            .replying("outputs", OUTPUTS.as_bytes())
+            .writes_png_sequence(vec![red, blue.clone()]);
+        let screen = screen_showing(&blue, crate::geometry::Point::new(20, 30));
+        let got = capture_composited(
+            &mut |_name, _cursor| Ok(screen.clone()),
+            &runner,
+            &placed_window(),
+            false,
+            &[test_output("DP-2")],
+        )
+        .unwrap();
+        assert_eq!(got.size(), blue.size());
+        assert_eq!(
+            got.pixel(crate::geometry::Point::new(10, 10)),
+            Some([30, 30, 200, 255]),
+            "the crop is the screen's own pixels, background included"
+        );
+        assert_eq!(
+            screenshot_requests(&runner),
+            2,
+            "the stale render is retried once"
+        );
+    }
+
+    #[test]
+    fn a_stable_render_that_cannot_be_located_is_not_retried_into_nothing() {
+        // The window is not on the screen at all (invisible workspace, off the
+        // output) and its content does not change between renders: the second
+        // render only confirms stability, and the render is handed back as it
+        // is — no third try could locate what is not there.
+        let red = Frame::solid(Size::new(60, 40), [200, 30, 30, 255]).unwrap();
+        let runner = ScriptedRunner::new()
+            .replying("workspaces", WORKSPACES.as_bytes())
+            .replying("outputs", OUTPUTS.as_bytes())
+            .writes_png_sequence(vec![red.clone(), red.clone()]);
+        let screen = Frame::solid(Size::new(400, 300), [240, 240, 240, 255]).unwrap();
+        let got = capture_composited(
+            &mut |_name, _cursor| Ok(screen.clone()),
+            &runner,
+            &placed_window(),
+            false,
+            &[test_output("DP-2")],
+        )
+        .unwrap();
+        assert_eq!(got.pixels(), red.pixels());
+        assert_eq!(
+            screenshot_requests(&runner),
+            2,
+            "one stability render, then the positional dead end is accepted"
+        );
+    }
+
+    #[test]
+    fn a_window_that_keeps_changing_falls_back_to_its_freshest_render() {
+        // Content changing under every attempt: the loop runs out, and the
+        // newest render — the closest thing to what the user sees — is the
+        // answer, not an error.
+        let frames = vec![
+            Frame::solid(Size::new(60, 40), [200, 30, 30, 255]).unwrap(),
+            Frame::solid(Size::new(60, 40), [30, 200, 30, 255]).unwrap(),
+            Frame::solid(Size::new(60, 40), [30, 30, 200, 255]).unwrap(),
+        ];
+        let freshest = frames[2].clone();
+        let runner = ScriptedRunner::new()
+            .replying("workspaces", WORKSPACES.as_bytes())
+            .replying("outputs", OUTPUTS.as_bytes())
+            .writes_png_sequence(frames);
+        let screen = Frame::solid(Size::new(400, 300), [240, 240, 240, 255]).unwrap();
+        let got = capture_composited(
+            &mut |_name, _cursor| Ok(screen.clone()),
+            &runner,
+            &placed_window(),
+            false,
+            &[test_output("DP-2")],
+        )
+        .unwrap();
+        assert_eq!(got.pixels(), freshest.pixels());
+        assert_eq!(
+            screenshot_requests(&runner),
+            3,
+            "every attempt gets one render"
+        );
     }
 
     /// A runner that answers with fixed JSON, records every command and can
@@ -608,7 +1205,9 @@ mod tests {
         repl: RefCell<Vec<(&'static str, Vec<u8>)>>,
         fail_with: RefCell<Vec<(&'static str, String)>>,
         asked: RefCell<Vec<Vec<String>>>,
-        png: RefCell<Option<Vec<u8>>>,
+        /// One PNG per screenshot request, handed out in order: a window whose
+        /// content moves on between requests.
+        pngs: RefCell<VecDeque<Vec<u8>>>,
         write_half_first: bool,
     }
 
@@ -618,7 +1217,7 @@ mod tests {
                 repl: RefCell::new(Vec::new()),
                 fail_with: RefCell::new(Vec::new()),
                 asked: RefCell::new(Vec::new()),
-                png: None.into(),
+                pngs: RefCell::new(VecDeque::new()),
                 write_half_first: false,
             }
         }
@@ -640,12 +1239,18 @@ mod tests {
 
         /// Succeeds and writes a whole PNG to the requested path.
         fn writes_png(self) -> Self {
-            *self.png.borrow_mut() = Some(
-                Frame::solid(Size::new(40, 30), [10, 20, 30, 255])
-                    .unwrap()
-                    .to_png()
-                    .unwrap(),
-            );
+            self.writes_png_sequence(vec![
+                Frame::solid(Size::new(40, 30), [10, 20, 30, 255]).unwrap()
+            ])
+        }
+
+        /// Succeeds and writes each given render in turn, one per screenshot
+        /// request.
+        fn writes_png_sequence(self, frames: Vec<Frame>) -> Self {
+            *self.pngs.borrow_mut() = frames
+                .into_iter()
+                .map(|frame| frame.to_png().unwrap())
+                .collect();
             self
         }
 
@@ -712,17 +1317,21 @@ mod tests {
                 .map(|(_, stdout)| stdout.clone())
                 .unwrap_or_default();
 
-            if let (Some(png), Some(path)) = (self.png.borrow().clone(), self.writes_to(command)) {
-                if self.write_half_first {
-                    let half = png.len() / 2;
-                    std::fs::write(&path, &png[..half]).unwrap();
-                    let path = path.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(60));
-                        std::fs::write(&path, png).unwrap();
-                    });
-                } else {
-                    std::fs::write(&path, &png).unwrap();
+            // Only a screenshot request consumes a render: the metadata
+            // queries carry no --path and must leave the sequence alone.
+            if let Some(path) = self.writes_to(command) {
+                if let Some(png) = self.pngs.borrow_mut().pop_front() {
+                    if self.write_half_first {
+                        let half = png.len() / 2;
+                        std::fs::write(&path, &png[..half]).unwrap();
+                        let path = path.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(60));
+                            std::fs::write(&path, png).unwrap();
+                        });
+                    } else {
+                        std::fs::write(&path, &png).unwrap();
+                    }
                 }
             }
 

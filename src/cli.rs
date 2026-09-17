@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{error::ErrorKind, ArgGroup, CommandFactory, Parser, Subcommand};
+use clap::{error::ErrorKind, ArgGroup, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::error::{Result, VshotError};
 use crate::geometry::{parse_geometry, Rect};
@@ -47,16 +47,20 @@ for a tiled window over IPC, so `window active` and `window pick` there go throu
 screenshot (and, for picking, niri's own crosshair); `--pixel` asks for the pixel path instead.
 
 `vshot pin` captures nothing: it drives the resident pin daemon. It pins image files, or with
---clipboard whatever the clipboard holds -- an image, or text rendered as a card that keeps
-its HTML, markdown or code formatting. A pinned image is dragged to move, zoomed about its
-centre with the wheel, closed with a double-click, focused with a click so that Space opens
-the same annotator as `vshot region`, and shown or hidden for all pins with
---toggle/--show/--hide.
+--clipboard whatever the clipboard holds -- a color, pinned as a card carrying the same color in
+hex, RGB, HSL, HSV and CMYK; an image; or text rendered as a card that keeps its HTML, markdown
+or code formatting. A pinned image is dragged to move, zoomed about its
+centre with the wheel, closed with a double-click; the pin under the pointer carries the
+black outline, and Space with the pointer on a pin opens the same annotator as
+`vshot region`. A pin covers every output it overlaps, so it can be dragged from one
+monitor onto another.
 
 On-screen selection, picking and the pin editor run as a Qt helper, `vshot-qt-ui`;
 VSHOT_QT_HELPER points at another copy of it. Other environment variables: VSHOT_LANG (UI
-language), VSHOT_PIXEL_DEBUG=1 (what window detection saw), VSHOT_LONG_DEBUG_DIR=<dir> (every
-scrolling frame and stitching decision), VSHOT_PIN_SOCKET, VSHOT_PIN_DENSITY=N.
+language), VSHOT_PIXEL_DEBUG=1 (what window detection saw), VSHOT_SESSION_DEBUG=1 (which
+compositor the session was read as, and on what evidence), VSHOT_LONG_DEBUG_DIR=<dir> (every
+scrolling frame and stitching decision), VSHOT_PIN_FOCUS_DEBUG=1 (every time a pin surface is
+handed the keyboard or gives it back), VSHOT_PIN_SOCKET, VSHOT_PIN_DENSITY=N.
 
 Each subcommand keeps its own notes: `vshot <command> --help`."#,
     group = ArgGroup::new("destination")
@@ -206,17 +210,18 @@ stitching decision to steps.log."
         inject: String,
     },
 
-    /// Manage pinned images shown by the resident pin daemon. The global
-    /// --clipboard flag switches the source: pin the clipboard image, or
-    /// render clipboard text as a card (HTML, markdown, code, or plain),
-    /// instead of image files.
+    /// Manage pinned images shown by the resident pin daemon; see --help for
+    /// what can be pinned and how the pins behave.
     #[command(
         after_help = "Pins are owned by a resident daemon: the first `pin` starts it, and it \
 exits by itself once nothing is pinned any more. On screen, a pin is dragged to move it, the \
 wheel zooms about the image centre (0.1x-8x, the factor showing in the image's corner), a \
-double-click closes that pin, and a click focuses it (bright outline) so that Space opens it \
-in the same editor as `vshot region`. A pin covers every output it overlaps, so it can be \
-dragged from one monitor onto another.
+double-click closes that pin, and the pin under the pointer carries the black outline -- that \
+is the one Space opens in the same editor as `vshot region`. Clicking a pin is what gives its \
+output the keyboard; the outline follows the pointer rather than the keyboard, because the \
+compositors in use never tell a layer surface that it has stopped being focused. A pin covers \
+every output it overlaps, so it can be \
+dragged from one monitor onto another. Right-clicking a pinned color card copies one of its formats.
 
 Visibility control goes to the running daemon over its socket, \
 so --toggle/--show/--hide take effect at once and do not start a second daemon. Wayland \
@@ -226,7 +231,10 @@ compositor, e.g. Hyprland:
     bind = SUPER SHIFT, P, exec, vshot pin --close-all
 
 VSHOT_PIN_SOCKET overrides the socket the daemon listens on, VSHOT_PIN_DENSITY=N the source \
-density of every pinned image, exactly like --density."
+density of every pinned image, exactly like --density. VSHOT_PIN_DEBUG=1 and \
+VSHOT_PIN_FOCUS_DEBUG=1 make the daemon trace its density decisions and its surfaces' focus to \
+stderr; a debug switch also keeps the daemon's stderr attached to the terminal that started it, \
+so the trace is readable while the daemon lives on without it."
     )]
     Pin {
         /// Image files to pin (starts the daemon when it is not running).
@@ -251,9 +259,10 @@ density of every pinned image, exactly like --density."
         list: bool,
         /// Device pixels per logical pixel of the pinned image (1-4), e.g. 2
         /// for a screenshot taken on a 2x output. vshot works this out by
-        /// itself from the capture, the image's own PNG density, the
-        /// screenshot tool's record, or the image size; this overrides all of
-        /// that when the answer is wrong or unknown.
+        /// itself from the capture, the image's own PNG density (a 96 DPI
+        /// declaration is 1x), the screenshot tool's record, or the image
+        /// size; this overrides all of that when the answer is wrong or
+        /// unknown.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
         density: Option<u32>,
         /// Internal: run one annotation editor for a pin-edit session JSON
@@ -272,11 +281,19 @@ pub enum WindowTarget {
     #[command(
         after_help = "The window is taken from the compositor itself where it can draw one: KWin's \
 ScreenShot2 and niri's `screenshot-window` both hand over the window's own pixels, so nothing \
-has to be found in the scene. Otherwise the rectangle comes from compositor metadata (Hyprland, \
-Sway), and --pixel skips that and reads the border stroke off the captured frame instead, \
-falling back to background segmentation, which is also what happens when no window list is \
-available at all. Borderless tiling with no gaps or shadows has no pixel signal and is reported \
-as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
+has to be found in the scene. On niri a translucent window comes out with its alpha, so vshot \
+locates that render on a fresh capture of the window's output and crops the screen there: the \
+output is what the screen showed, background included. A match failure first renders the window \
+again and compares: unchanged content means the render cannot be located at all (nearly invisible, \
+off the output's edge, invisible workspace) and falls back to niri's own translucent picture, while \
+changed content (a video, an animation) means the template went stale and the capture is retried with \
+a fresh render (up to three attempts, render and grab only milliseconds apart). `--no-blend` skips \
+that locating altogether and takes niri's render exactly as handed over — never misplaced, but a \
+translucent window comes out transparent and niri's border (drawn on the tile) is missing. Otherwise the rectangle comes from compositor metadata \
+(Hyprland, Sway), and --pixel skips that and reads the border stroke off the captured frame \
+instead, falling back to background segmentation, which is also what happens when no window \
+list is available at all. Borderless tiling with no gaps or shadows has no pixel signal and is \
+reported as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
     )]
     Active {
         /// Skip compositor metadata and detect the focused window from the
@@ -284,6 +301,14 @@ as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
         /// For testing the detector and for compositors without metadata.
         #[arg(long)]
         pixel: bool,
+        /// On niri, take its own window render exactly as it hands it over
+        /// instead of compositing it onto the captured background. A
+        /// translucent window then comes out with its alpha and nothing
+        /// behind it, and niri's border is missing (it is drawn on the tile,
+        /// not the window) — the spare route for when locating the render on
+        /// the screen misbehaves.
+        #[arg(long = "no-blend", conflicts_with = "pixel")]
+        no_blend: bool,
     },
     /// Pick a window on screen: hover to highlight, click to capture it.
     #[command(
@@ -296,7 +321,14 @@ window list unless --pixel is given.
 On niri this is niri's own picker instead: its IPC reports no position for a tiled window, so \
 there is no rectangle to offer the overlay. niri draws a crosshair (no highlight) and the \
 clicked window's own screenshot is captured — which also means no annotation editor afterwards; \
---pixel asks for the overlay and the pixel detection back."
+--pixel asks for the overlay and the pixel detection back. A translucent window comes out of \
+niri with its alpha, so vshot locates that render on a fresh capture of the window's output and \
+crops the screen there: the output is what the screen showed, background included. A render \
+that cannot be located at all (nearly invisible, off the output's edge, invisible workspace) falls \
+back to niri's own translucent picture — but changed content (a video, an animation) gets the capture \
+retried with a fresh render, up to three attempts, before the same fallback. `--no-blend` skips \
+that locating altogether and takes niri's render exactly as handed over — never misplaced, but a \
+translucent window comes out transparent and niri's border (drawn on the tile) is missing."
     )]
     Pick {
         /// Skip the compositor's window list and take the candidates from the
@@ -306,6 +338,11 @@ clicked window's own screenshot is captured — which also means no annotation e
         /// signal and is reported as such.
         #[arg(long)]
         pixel: bool,
+        /// On niri, take its own window render exactly as it hands it over
+        /// instead of compositing it onto the captured background — see
+        /// `window active --no-blend`.
+        #[arg(long = "no-blend", conflicts_with = "pixel")]
+        no_blend: bool,
     },
 }
 
@@ -327,12 +364,18 @@ pub enum CaptureTarget {
     ActiveWindow {
         /// Detect the window from pixels instead of compositor metadata.
         pixel_detect: bool,
+        /// Take niri's own window render as it is instead of compositing it
+        /// onto the captured background.
+        no_blend: bool,
     },
     /// Interactive window picking: the compositor's window list when it has
     /// one, the captured pixels otherwise.
     WindowPick {
         /// Take the candidates from the pixels instead of the window list.
         pixel_detect: bool,
+        /// Take niri's own window render as it is instead of compositing it
+        /// onto the captured background.
+        no_blend: bool,
     },
     /// Scrolling capture over an interactive (or fixed) region.
     LongShot {
@@ -359,6 +402,18 @@ pub enum Action {
     Pin(crate::pin::PinInvocation),
     /// Internal: render one pin-edit session and write the result back.
     PinApply(std::path::PathBuf),
+}
+
+/// The parser, with the help output in the language `VSHOT_LANG` (or the
+/// locale) asks for: the command tree is built as usual and then every help
+/// string that has a translation is replaced, so `--help` and every
+/// subcommand's help follow the same language as the Qt helper's UI.  clap's
+/// own error wording stays English — those strings are clap's.
+pub fn parse() -> Cli {
+    let mut command = Cli::command();
+    crate::cli_i18n::localize(&mut command);
+    let matches = command.get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
 
 impl Cli {
@@ -439,14 +494,16 @@ impl Cli {
             }
             Command::All => CaptureTarget::All,
             Command::Window {
-                target: WindowTarget::Active { pixel },
+                target: WindowTarget::Active { pixel, no_blend },
             } => CaptureTarget::ActiveWindow {
                 pixel_detect: pixel,
+                no_blend,
             },
             Command::Window {
-                target: WindowTarget::Pick { pixel },
+                target: WindowTarget::Pick { pixel, no_blend },
             } => CaptureTarget::WindowPick {
                 pixel_detect: pixel,
+                no_blend,
             },
             Command::Long {
                 geometry,
@@ -571,7 +628,8 @@ mod tests {
             action,
             Action::Capture(Request {
                 target: CaptureTarget::ActiveWindow {
-                    pixel_detect: false
+                    pixel_detect: false,
+                    no_blend: false,
                 },
                 destination: Destination::Clipboard,
                 cursor: false,
@@ -584,10 +642,41 @@ mod tests {
         assert!(matches!(
             action,
             Action::Capture(Request {
-                target: CaptureTarget::ActiveWindow { pixel_detect: true },
+                target: CaptureTarget::ActiveWindow {
+                    pixel_detect: true,
+                    ..
+                },
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn window_active_parses_the_no_blend_flag() {
+        let action =
+            Cli::try_parse_action_from(["vshot", "window", "active", "--no-blend", "--clipboard"])
+                .unwrap();
+        assert!(matches!(
+            action,
+            Action::Capture(Request {
+                target: CaptureTarget::ActiveWindow {
+                    pixel_detect: false,
+                    no_blend: true,
+                },
+                ..
+            })
+        ));
+        // The two choose different boxes of pixels, so asking for both is a
+        // contradiction rather than one winning.
+        assert!(Cli::try_parse_action_from([
+            "vshot",
+            "window",
+            "active",
+            "--no-blend",
+            "--pixel",
+            "--clipboard"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -598,7 +687,8 @@ mod tests {
             action,
             Action::Capture(Request {
                 target: CaptureTarget::WindowPick {
-                    pixel_detect: false
+                    pixel_detect: false,
+                    no_blend: false,
                 },
                 destination: Destination::Clipboard,
                 ..
@@ -610,7 +700,10 @@ mod tests {
         assert!(matches!(
             action,
             Action::Capture(Request {
-                target: CaptureTarget::WindowPick { pixel_detect: true },
+                target: CaptureTarget::WindowPick {
+                    pixel_detect: true,
+                    ..
+                },
                 destination: Destination::Stdout,
                 ..
             })

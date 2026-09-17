@@ -18,7 +18,13 @@ namespace {
 
 // Layout constants in logical pixels; the card is rasterized at `pixelRatio`
 // device pixels per logical pixel so text stays crisp on HiDPI outputs.
-constexpr qreal kPadding = 12.0;
+//
+// The padding is deliberately tiny: the card is drawn in the palette's Base
+// colour, so on a light theme every millimetre of padding is white, and a
+// loosely padded card reads as a white frame around the text rather than as
+// the text itself. What is left is just enough that the glyphs never touch
+// the border and the line spacing stays intact.
+constexpr qreal kPadding = 3.0;
 constexpr qreal kBorder = 1.0;
 constexpr qreal kMaxContentWidth = 560.0;
 constexpr qreal kMaxContentHeight = 1200.0;

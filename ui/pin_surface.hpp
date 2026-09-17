@@ -1,5 +1,7 @@
 #pragma once
 
+#include "color_card.hpp"
+
 #include <QHash>
 #include <QImage>
 #include <QPoint>
@@ -12,6 +14,10 @@
 #include <functional>
 
 class QScreen;
+
+namespace LayerShellQt {
+class Window;
+}
 
 namespace vshot {
 
@@ -46,6 +52,10 @@ public:
         double scale = 1.0;
         // Global logical top-left of the image.
         QPoint origin;
+        // The formats a pinned color card shows, empty for every other pin.
+        // A right-click on the card turns them into a copy menu, and the menu
+        // hands back the very string the card prints for that format.
+        QVector<ColorRow> colorRows;
     };
 
     explicit PinSurface(QScreen *screen);
@@ -96,9 +106,20 @@ public:
     {
         editRequested_ = std::move(callback);
     }
+    // Invoked when the user picks a format out of the right-click menu of a
+    // pinned color card, with the exact text the card shows for that format.
+    // `false` means the copy did not reach the clipboard, which the surface
+    // reports in the badge instead of claiming success.
+    void setCopyCallback(std::function<bool(quint64, const QString &)> callback)
+    {
+        copyRequested_ = std::move(callback);
+    }
 
 protected:
+    bool event(QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
+    void enterEvent(QEnterEvent *event) override;
+    void leaveEvent(QEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
@@ -109,8 +130,9 @@ protected:
     void focusOutEvent(QFocusEvent *event) override;
 
 private:
-    // How long the zoom factor badge stays visible after the last wheel step.
-    static constexpr int kZoomBadgeMs = 900;
+    // How long a badge — the zoom factor after a wheel step, the confirmation
+    // after a menu pick — stays visible.
+    static constexpr int kBadgeMs = 900;
 
     // One stack entry: the daemon's item plus the scaled copy this surface keeps
     // of it, at its own device resolution.
@@ -138,8 +160,44 @@ private:
     QRect pickedOutline() const;
     // Points the input mask at the images' rects.
     void applyMask();
+    // Moves which pin is picked, repainting the strokes that change colour.
+    void movePickTo(quint64 id);
+    // Hands the keyboard back to the compositor: interactivity goes to None
+    // and a commit makes the change reach the compositor at once. Needed
+    // because the compositors in the field never tell a layer surface that a
+    // click on a window took the keyboard away -- the click focuses the
+    // window's own surface, but the layer surface keeps the keyboard until it
+    // gives it up itself. The pointer leaving every pin is the moment to do
+    // that: by the time the user clicks a window, the keyboard is already
+    // back with the compositor, and the click moves it to that window.
+    void offerKeyboardBack();
+    // Asks for the keyboard again (OnDemand) once the pointer returns to a
+    // pin, so the compositor grants it on the next click.
+    void wantKeyboard();
+    // One line per focus event, for `VSHOT_PIN_FOCUS_DEBUG`.
+    void traceFocus(const QString &what) const;
     // Repaints the transient badge showing the current zoom factor.
     void showZoomBadge(quint64 id);
+    // Puts `text` into the badge on `id`'s bottom-right corner and starts its
+    // timer. Both badges (the zoom factor and a copy confirmation) share it.
+    void showBadge(quint64 id, const QString &text);
+
+    // The right-click menu of a pinned color card. It is painted into this
+    // surface instead of being a QMenu: a menu is a popup window, a popup needs
+    // an xdg_surface parent, and this surface is a layer-shell surface, which
+    // cannot be one. So the box, the hover highlight and the keyboard handling
+    // are all drawn and hit-tested here.
+    void openMenu(quint64 id, const QPoint &anchor);
+    void closeMenu();
+    // Where the menu is painted, anchored at the right-click point and clamped
+    // into the surface so a pin at the edge of its output keeps it usable.
+    QRect menuRectFor(const QPoint &anchor) const;
+    // The menu row under a point, -1 for none.
+    int menuRowAt(const QPoint &local) const;
+    // Paints the open menu; does nothing while it is closed.
+    void paintMenu(QPainter &painter);
+    // Copies one row's value through the daemon and reports it in the badge.
+    void copyRow(int row);
 
     QVector<Entry> entries_;
     QScreen *screen_;
@@ -148,6 +206,7 @@ private:
     std::function<void(quint64, double)> zoomRequested_;
     std::function<void(quint64)> closeRequested_;
     std::function<void(quint64)> editRequested_;
+    std::function<bool(quint64, const QString &)> copyRequested_;
 
     // The pin the user last clicked on this output: the one the zoom badge and
     // the Space edit shortcut belong to, and the only one drawn as focused.
@@ -158,14 +217,29 @@ private:
     QPoint pressOrigin_;
     // The pin the badge reports on, and its text.
     quint64 badgeId_ = 0;
-    QString zoomLabel_;
+    QString badgeText_;
     // Where the badge was painted last, so clearing it does not repaint the
     // whole output.
     QRect badgeRect_;
+    // The open right-click menu: the pin it belongs to (0 while closed), its
+    // rows, where it is painted, and the row the pointer is over.
+    quint64 menuId_ = 0;
+    QVector<ColorRow> menuRows_;
+    QRect menuRect_;
+    int menuHover_ = -1;
+    // Set when a press was spent on the menu, so the second half of a
+    // double-click is not read as a double-click on the pin underneath it (and
+    // does not close that pin).
+    bool swallowNextDoubleClick_ = false;
     class QTimer *zoomTimer_ = nullptr;
     bool hasFocus_ = false;
     bool visible_ = true;
     bool surfaceReady_ = false;
+    // This surface's layer-shell window, kept for the keyboard hand-back; null
+    // until showLayerSurface() succeeded.
+    LayerShellQt::Window *layer_ = nullptr;
+    // What interactivity was last committed: true = OnDemand, false = None.
+    bool keyboardWanted_ = true;
 };
 
 } // namespace vshot
