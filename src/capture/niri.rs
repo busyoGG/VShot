@@ -68,6 +68,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// is `tile_size` large.  (This is also what niri's IPC documents: "tile_size —
 /// size of the tile this window is in, including decorations like borders",
 /// "window_size — does not include niri decorations like borders".)
+///
+/// `tile_pos_in_workspace_view` is the tile's own position, and niri fills it
+/// **only for a floating window** (`src/layout/floating.rs`) — a tiled one
+/// leaves it unset (`src/layout/tile.rs`, `src/layout/scrolling.rs`) and states
+/// a pair of column/tile indices instead.  So the window the rectangle routes
+/// cannot place is exactly the one niri places itself, and
+/// [`NiriWindow::render_origin`] is where that is turned into a pixel position.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NiriWindow {
     pub id: u64,
@@ -80,9 +87,84 @@ pub struct NiriWindow {
     /// pixels.  Each component is the border width on that axis — how far the
     /// decoration reaches out from the window on each side.
     pub offset_in_tile: Option<(f64, f64)>,
+    /// The tile's position within its workspace view, in logical pixels.
+    /// Filled for floating windows only; see the type docs.
+    pub tile_pos_in_workspace_view: Option<(f64, f64)>,
 }
 
 impl NiriWindow {
+    /// Where this window's own render starts on its output, in device pixels,
+    /// when niri stated a position for it at all.
+    ///
+    /// niri fills `tile_pos_in_workspace_view` only for floating windows, and
+    /// for those it *is* the answer the template match has to guess at: the
+    /// tile's top-left corner in workspace-view coordinates, at the output's
+    /// scale.  Adding `offset_in_tile` reaches the window's own surface, which
+    /// is what `screenshot-window` renders — the tile's border is drawn around
+    /// it and is not part of the render.
+    ///
+    /// The workspace view is the output: with the overview closed, a workspace
+    /// is exactly the output's size and sits at its origin (`workspaces_render_geo`
+    /// in niri's `src/layout/monitor.rs` centres a `view_size`-sized rectangle,
+    /// which is zero offset at zoom 1), so these coordinates are output-local
+    /// as they stand.
+    ///
+    /// `None` for a tiled window — niri does not place it, which is the whole
+    /// reason the render has to be located on a capture — or when the numbers
+    /// are not a position.  Both the position and the offset are rounded to
+    /// whole device pixels, the way niri itself rounds the position before
+    /// reporting it (`to_physical_precise_round`).
+    pub fn render_origin(&self, scale: u32) -> Option<(i32, i32)> {
+        let (pos_x, pos_y) = self.tile_pos_in_workspace_view?;
+        let (offset_x, offset_y) = self.offset_in_tile?;
+        if !pos_x.is_finite()
+            || !pos_y.is_finite()
+            || !offset_x.is_finite()
+            || !offset_y.is_finite()
+        {
+            return None;
+        }
+        let scale = f64::from(scale.max(1));
+        let round = |value: f64| (value * scale).round();
+        // A position no i32 can hold is not a position; truncating it would put
+        // the crop somewhere the window is not.
+        let to_i32 = |value: f64| {
+            (value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX)).then_some(value as i32)
+        };
+        Some((
+            to_i32(round(pos_x + offset_x))?,
+            to_i32(round(pos_y + offset_y))?,
+        ))
+    }
+
+    /// The tile's rectangle on its output in device pixels, for a window niri
+    /// placed itself — the floating case [`Self::render_origin`] answers.
+    ///
+    /// `render_size` is niri's own render size; the same adjustment
+    /// [`Self::tile_from_render`] describes is applied here, so a build that
+    /// draws a drop shadow around the window has it taken off before the
+    /// border goes on.  Unlike the located-render path there is no search
+    /// involved: the position is niri's own answer, so this is arithmetic.
+    ///
+    /// `None` when niri stated no usable position, or the numbers do not
+    /// describe a window inside a tile with an even border.
+    pub fn tile_rect(&self, render_size: (u32, u32), scale: u32) -> Option<Rect> {
+        let (surface_x, surface_y) = self.render_origin(scale)?;
+        let (inset_x, inset_y, border_x, border_y) = self.tile_from_render(render_size, scale)?;
+        let border_x = i64::from(border_x);
+        let border_y = i64::from(border_y);
+        let origin_x = i64::from(surface_x) - i64::from(inset_x) - border_x;
+        let origin_y = i64::from(surface_y) - i64::from(inset_y) - border_y;
+        let width = i64::from(render_size.0) - 2 * i64::from(inset_x) + 2 * border_x;
+        let height = i64::from(render_size.1) - 2 * i64::from(inset_y) + 2 * border_y;
+        Some(Rect::new(
+            i32::try_from(origin_x).ok()?,
+            i32::try_from(origin_y).ok()?,
+            u32::try_from(width).ok()?,
+            u32::try_from(height).ok()?,
+        ))
+    }
+
     /// How to turn the located render rectangle into the window's *tile* — the
     /// window plus its border.
     ///
@@ -269,6 +351,56 @@ pub fn capture_composited<R: WindowCommandRunner>(
     // and a fresh render — milliseconds old — is worth another try; a render
     // that is current but unverifiable (nearly invisible, off the output's
     // edge, invisible workspace) is a positional dead end that no retry helps.
+    //
+    // A floating window never has to be searched for: niri states its position
+    // itself (`tile_pos_in_workspace_view` is filled for the floating space and
+    // only there), so the crop is arithmetic.  That matters most for exactly
+    // the window a terminal is — mostly one flat colour, which a template match
+    // cannot pin down on a desktop of a similar shade (measured: 41% at the
+    // window's own position, against 100% for the pixels that carry structure).
+    //
+    // The position is still verified before it is used.  It comes from a
+    // different moment than the grab — a window dragged or animated in between
+    // would otherwise be cropped where it used to be, silently, because the
+    // arithmetic would succeed on the stale numbers.  The check is the same
+    // sample-and-ratio test the search uses, so a position that verifies is as
+    // trustworthy as a located one, and one that does not falls through to the
+    // search below rather than to a guess.
+    if let Some(rect) = window.tile_rect((render.size().width, render.size().height), scale) {
+        let screen = grab_output(&name, cursor)?;
+        let inside = rect.intersection(Rect::new(0, 0, screen.size().width, screen.size().height));
+        let confirmed = window
+            .render_origin(scale)
+            .and_then(|(x, y)| super::window_blend::matches_at_position(&render, &screen, x, y));
+        // `Some(false)` is the one verdict that rejects the stated position —
+        // the render is demonstrably somewhere else.  `None` means the render
+        // says nothing either way (a nearly flat window, which is exactly the
+        // one that needs the stated position), and the position stands.
+        match (inside, confirmed) {
+            (Some(_), Some(false)) => eprintln!(
+                "vshot: niri placed window {} where its render is not, so the position is \
+                 searched for instead",
+                window.id
+            ),
+            (Some(inside), _) => {
+                eprintln!(
+                    "vshot: niri placed window {} at ({}, {}), so the screen's own pixels are \
+                     used",
+                    window.id, inside.origin.x, inside.origin.y
+                );
+                return screen.crop(inside);
+            }
+            (None, _) => {
+                eprintln!(
+                    "vshot: niri places window {} off {name}, so its own (translucent) render is \
+                     used as it is",
+                    window.id
+                );
+                return Ok(render);
+            }
+        }
+    }
+
     const ATTEMPTS: usize = 3;
     for attempt in 0..ATTEMPTS {
         // A fresh capture of the window's output: the screen already shows the
@@ -540,6 +672,7 @@ fn parse_window(bytes: &[u8], what: &str) -> Result<Option<NiriWindow>> {
         workspace_id: value.get("workspace_id").and_then(Value::as_u64),
         tile_size: pair("tile_size"),
         offset_in_tile: pair("window_offset_in_tile"),
+        tile_pos_in_workspace_view: pair("tile_pos_in_workspace_view"),
     }))
 }
 
@@ -846,6 +979,7 @@ mod tests {
             workspace_id: None,
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         assert_eq!(window_scale(&runner, &window).unwrap(), None);
         assert!(runner.asked().is_empty(), "nothing worth asking about");
@@ -860,6 +994,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         capture_window(&runner, &window, false).unwrap();
 
@@ -896,6 +1031,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         capture_window(&runner, &window, true).unwrap();
         assert!(runner.asked()[0].contains(&"--show-pointer".to_owned()));
@@ -917,6 +1053,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         let frame = capture_window(&runner, &window, true).unwrap();
         assert_eq!(frame.size(), Size::new(40, 30));
@@ -938,6 +1075,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         let frame = capture_window(&runner, &window, false).unwrap();
         assert_eq!(frame.size(), Size::new(40, 30));
@@ -952,6 +1090,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         let error =
             capture_window_within(&runner, &window, false, Duration::from_millis(50)).unwrap_err();
@@ -967,6 +1106,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         };
         let error = capture_window(&runner, &window, false).unwrap_err();
         assert!(error.to_string().contains("does not exist"), "{error}");
@@ -974,11 +1114,21 @@ mod tests {
 
     /// One captured output, for `capture_composited`'s output check.
     fn test_output(name: &str) -> crate::wayland::topology::OutputInfo {
+        test_output_sized(name, 400, 300)
+    }
+
+    /// [`test_output`] at a size that can hold a window niri placed somewhere
+    /// other than the top-left corner.
+    fn test_output_sized(
+        name: &str,
+        width: u32,
+        height: u32,
+    ) -> crate::wayland::topology::OutputInfo {
         crate::wayland::topology::OutputInfo {
             global_id: 1,
             name: name.to_owned(),
-            geometry: crate::geometry::Rect::new(0, 0, 400, 300),
-            pixel_size: Size::new(400, 300),
+            geometry: crate::geometry::Rect::new(0, 0, width, height),
+            pixel_size: Size::new(width, height),
             scale: 1,
             transform: wayland_client::protocol::wl_output::Transform::Normal,
         }
@@ -987,7 +1137,13 @@ mod tests {
     /// The grab closure's screen: a plain desktop with `window` composited at
     /// (20, 30), the way the compositor would.
     fn screen_showing(window: &Frame, at: crate::geometry::Point) -> Frame {
-        let mut screen = Frame::solid(Size::new(400, 300), [240, 240, 240, 255]).unwrap();
+        screen_of(Size::new(400, 300), window, at)
+    }
+
+    /// [`screen_showing`] on a screen of the caller's size, for a window placed
+    /// at a position a 400×300 output cannot hold.
+    fn screen_of(screen_size: Size, window: &Frame, at: crate::geometry::Point) -> Frame {
+        let mut screen = Frame::solid(screen_size, [240, 240, 240, 255]).unwrap();
         for y in 0..window.size().height {
             for x in 0..window.size().width {
                 let Some(color) = window.pixel(crate::geometry::Point::new(x as i32, y as i32))
@@ -1011,6 +1167,7 @@ mod tests {
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
+            tile_pos_in_workspace_view: None,
         }
     }
 
@@ -1024,6 +1181,229 @@ mod tests {
             offset_in_tile: Some((4.0, 4.0)),
             ..placed_window()
         }
+    }
+
+    /// A floating window, with the numbers a live niri 25.11-236 reported for
+    /// one (`niri msg --json focused-window`): `tile_pos_in_workspace_view` is
+    /// filled for the floating space and only there, and `offset_in_tile` is
+    /// the same 4-logical-pixel border — a floating window keeps its border.
+    fn floating_window() -> NiriWindow {
+        NiriWindow {
+            tile_pos_in_workspace_view: Some((598.5, 38.5)),
+            ..bordered_window()
+        }
+    }
+
+    #[test]
+    fn a_floating_windows_position_is_turned_into_its_render_origin() {
+        // The live numbers, and the position a template match was made to find
+        // by hand from them: 598.5 logical + the 4-logical border, at scale 2,
+        // is device pixel 1205 — an odd coordinate, which is exactly what a
+        // stride-4 sweep can never land on.  (Cross-checked against a real
+        // capture: the render matched the screen there on 1194 of 1194 samples,
+        // while one pixel over it matched 41%.)
+        assert_eq!(floating_window().render_origin(2), Some((1205, 85)));
+        // At scale 1 the same window rounds the 602.5 logical position up, the
+        // way `round` takes halves away from zero.
+        assert_eq!(floating_window().render_origin(1), Some((603, 43)));
+    }
+
+    #[test]
+    fn a_tiled_window_states_no_position_of_its_own() {
+        // niri fills `tile_pos_in_workspace_view` only for the floating space;
+        // a tiled window leaves it unset and the render has to be located on a
+        // capture instead.
+        assert_eq!(bordered_window().render_origin(2), None);
+        assert_eq!(
+            bordered_window().tile_rect((1880, 2024), 2),
+            None,
+            "no position, no tile rectangle"
+        );
+    }
+
+    #[test]
+    fn a_floating_windows_tile_rectangle_wraps_its_border_around_the_position() {
+        // The render is the window surface (1880x2024), and the tile adds the
+        // 8-device-pixel border on every side, reaching back from the surface
+        // position: origin (1205-8, 85-8) = (1197, 77), size 1880+16 x 2024+16.
+        assert_eq!(
+            floating_window().tile_rect((1880, 2024), 2),
+            Some(Rect::new(1197, 77, 1896, 2040))
+        );
+    }
+
+    #[test]
+    fn a_floating_window_off_its_output_is_not_placed() {
+        // A window niri reports off the output cannot be cropped from it; the
+        // caller falls back to the render instead of inventing a rectangle.
+        let window = NiriWindow {
+            tile_pos_in_workspace_view: Some((-5000.0, 38.5)),
+            ..bordered_window()
+        };
+        let rect = window.tile_rect((1880, 2024), 2).expect("still arithmetic");
+        assert_eq!(
+            rect.intersection(Rect::new(0, 0, 1920, 1080)),
+            None,
+            "a rectangle off the output does not intersect it"
+        );
+    }
+
+    #[test]
+    fn a_position_that_is_not_a_number_is_not_a_position() {
+        let window = NiriWindow {
+            tile_pos_in_workspace_view: Some((f64::NAN, 38.5)),
+            ..bordered_window()
+        };
+        assert_eq!(window.render_origin(2), None);
+    }
+
+    #[test]
+    fn a_floating_window_is_cropped_at_the_position_niri_stated() {
+        // The whole point: on the output, a floating window is cropped where
+        // niri says it is, with no search at all.  The screen is a plain
+        // desktop with the window's (flat) render composited at the position
+        // niri called out, which is a frame a template match cannot place — the
+        // window is mostly one colour.
+        let window = floating_window();
+        let render = frame_of_size(1880, 2024, [200, 194, 180, 204]);
+        let at = crate::geometry::Point::new(1205, 85);
+        let screen = screen_of(Size::new(3840, 2160), &render, at);
+        let runner = ScriptedRunner::new()
+            .replying("workspaces", WORKSPACES.as_bytes())
+            .replying("outputs", OUTPUTS.as_bytes())
+            .writes_png_sequence(vec![render.clone(), render.clone()]);
+        let got = capture_composited(
+            &mut |_name, _cursor| Ok(screen.clone()),
+            &runner,
+            &window,
+            false,
+            &[test_output_sized("DP-2", 3840, 2160)],
+        )
+        .unwrap();
+        // The tile is the render plus the border on every side.
+        assert_eq!(got.size(), Size::new(1896, 2040));
+        assert_eq!(
+            screenshot_requests(&runner),
+            1,
+            "a placed window is cropped straight away, with no retry"
+        );
+        assert_eq!(
+            got.pixel(crate::geometry::Point::new(10, 10)),
+            Some([208, 203, 192, 255]),
+            "the crop is the screen's own pixels where niri placed the window — the flat \
+             render composited over the desktop ((200·204 + 240·51)/255 = 208)"
+        );
+    }
+
+    /// A frame of one colour, all of it opaque once composited.
+    fn frame_of_size(width: u32, height: u32, color: [u8; 4]) -> Frame {
+        Frame::solid(Size::new(width, height), color).unwrap()
+    }
+
+    /// A window render that carries structure — two blocks of unique pixels —
+    /// so a stated position can be verified against it, and a search for it
+    /// has one right answer rather than many.  The blocks sit far apart on both
+    /// axes, so neither the horizontal nor the vertical position can drift.
+    fn textured_float_render() -> Frame {
+        let (width, height) = (1880u32, 2024u32);
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let in_block = (20..40).contains(&y) && (100..140).contains(&x)
+                    || (1980..2000).contains(&y) && (900..940).contains(&x);
+                if in_block {
+                    // Every pixel distinct, so only the true position matches.
+                    let value = ((x * 7 + y * 13) % 251) as u8;
+                    pixels.extend_from_slice(&[
+                        value,
+                        value.wrapping_mul(3),
+                        value.wrapping_add(9),
+                        255,
+                    ]);
+                } else {
+                    pixels.extend_from_slice(&[200, 194, 180, 204]);
+                }
+            }
+        }
+        Frame::new(Size::new(width, height), pixels).unwrap()
+    }
+
+    #[test]
+    fn a_stale_stated_position_falls_back_to_searching_for_the_render() {
+        // The stated position comes from a different moment than the grab: here
+        // the window has since been dragged 300 device pixels right.  Using the
+        // stale position would crop the desktop where the window *was*, so the
+        // verification has to reject it and the search has to take over — and
+        // the search finds the window where it really is.
+        let window = floating_window();
+        let render = textured_float_render();
+        let at = crate::geometry::Point::new(1505, 85);
+        let screen = screen_of(Size::new(3840, 2160), &render, at);
+        let runner = ScriptedRunner::new()
+            .replying("workspaces", WORKSPACES.as_bytes())
+            .replying("outputs", OUTPUTS.as_bytes())
+            .writes_png_sequence(vec![render.clone(), render.clone()]);
+        let got = capture_composited(
+            &mut |_name, _cursor| Ok(screen.clone()),
+            &runner,
+            &window,
+            false,
+            &[test_output_sized("DP-2", 3840, 2160)],
+        )
+        .unwrap();
+        // The crop follows the search, so it sits at the moved position rather
+        // than the stated one: the tile is the render plus its border, and the
+        // render's unique block is present at the offset the move implies.  (An
+        // exact byte comparison would be too strict: the refinement searches
+        // whole device pixels around the coarse winner and may settle one
+        // pixel off, which is well inside the border.)
+        assert_eq!(got.size(), Size::new(1896, 2040));
+        // The block lives at (100..140, 20..40) inside the render, so within
+        // the tile it starts 8 device pixels further in on each axis.  If the
+        // crop had used the stale position, the window would be 300 device
+        // pixels away and this block would not be here.
+        let block = got
+            .pixel(crate::geometry::Point::new(108 + 10, 28 + 5))
+            .expect("the tile holds the block");
+        assert_ne!(
+            block,
+            [208, 203, 192, 255],
+            "the crop is the window, not the flat desktop where it used to be"
+        );
+        assert_eq!(block[3], 255, "the block is opaque");
+    }
+
+    #[test]
+    fn a_verified_stated_position_is_used_without_a_search() {
+        // The complementary half: the render *is* where niri said it is, so the
+        // verification passes and the stated position is used.  One screenshot
+        // is asked for — the crop itself needs none — and the result is the
+        // stated rectangle, not a searched-for one.
+        let window = floating_window();
+        let render = textured_float_render();
+        let at = crate::geometry::Point::new(1205, 85);
+        let screen = screen_of(Size::new(3840, 2160), &render, at);
+        let runner = ScriptedRunner::new()
+            .replying("workspaces", WORKSPACES.as_bytes())
+            .replying("outputs", OUTPUTS.as_bytes())
+            .writes_png_sequence(vec![render.clone()]);
+        let got = capture_composited(
+            &mut |_name, _cursor| Ok(screen.clone()),
+            &runner,
+            &window,
+            false,
+            &[test_output_sized("DP-2", 3840, 2160)],
+        )
+        .unwrap();
+        let expected = screen
+            .crop(Rect::new(1197, 77, 1896, 2040))
+            .expect("the stated tile is inside the screen");
+        assert_eq!(got.pixels(), expected.pixels());
+        assert_eq!(
+            screenshot_requests(&runner),
+            1,
+            "the render is handed over once, before the verification"
+        );
     }
 
     #[test]

@@ -12,7 +12,10 @@
 //! position a sampled frame pixel equals the render's colour scaled by its
 //! alpha (the screen is `render · α + background · (1−α)`, and the background
 //! is the only unknown); anywhere else, window content and background
-//! disagree.  A coarse pass at quarter resolution narrows the position down, a
+//! disagree.  Only pixels that carry structure are sampled — a window's own
+//! flat background verifies a position almost anywhere, which is how a capture
+//! once landed on the window next door; see [`collect_structure_samples`].  A
+//! coarse pass at quarter resolution narrows the position down, a
 //! full-resolution pass refines it, and the match ratio decides whether the
 //! position is trusted at all.
 
@@ -38,6 +41,17 @@ const MATCH_SLACK: i32 = 24;
 /// it the background dominates the screen pixel and says nothing about where
 /// the window is.
 const MIN_SAMPLE_ALPHA: u8 = 150;
+/// How far a pixel has to differ from a neighbour before it counts as
+/// *structure* — something that pins a position down.  A window's own flat
+/// background verifies a position almost anywhere on a desktop of the same
+/// colour, so sampling it is what once put a capture on the window next door;
+/// see [`collect_structure_samples`].
+const MIN_STRUCTURE_DELTA: u8 = 8;
+/// Cap on how many structured pixels are held while collecting, so a busy
+/// render cannot make the collection itself the cost.  Hitting it halves the
+/// kept set and doubles the stride from there, which keeps the samples spread
+/// over the render instead of clustered on its busiest corner.
+const MAX_STRUCTURED_PIXELS: usize = 16384;
 /// Fraction of participating samples that must match for a position to be
 /// trusted.
 const MIN_MATCH_RATIO: f64 = 0.6;
@@ -56,6 +70,12 @@ struct Sample {
 
 /// Lays an even grid over the render and keeps the pixels opaque enough to
 /// verify a position, roughly `target` of them.
+///
+/// This is the sampler that ignores structure entirely, and it is what
+/// [`locate_window`] falls back to for a render that has none (a plain solid
+/// window, which says nothing about where it sits either way).  It is also
+/// what [`renders_agree`] compares with: that question is "did the content
+/// move on", and a flat area changing colour answers it just as well.
 ///
 /// The step is taken from the render's *area*, so the samples spread over both
 /// axes at once.  A step that walked the rows with a single stride and stopped
@@ -97,6 +117,98 @@ fn collect_samples(window: &Frame, target: usize) -> Vec<Sample> {
         y += stride;
     }
     samples
+}
+
+/// Does the pixel at `(x, y)` differ from any neighbour by more than
+/// [`MIN_STRUCTURE_DELTA`] on some channel?  Edges are marked on both sides —
+/// the bright and the dark pixel of a stroke both answer true — so a stroke one
+/// pixel wide is not missed.
+fn has_structure(pixels: &[u8], width: usize, height: usize, x: usize, y: usize) -> bool {
+    let index = (y * width + x) * 4;
+    let Some(pixel) = pixels.get(index..index + 4) else {
+        return false;
+    };
+    let neighbours = [
+        x.checked_sub(1).map(|nx| (nx, y)),
+        (x + 1 < width).then_some((x + 1, y)),
+        y.checked_sub(1).map(|ny| (x, ny)),
+        (y + 1 < height).then_some((x, y + 1)),
+    ];
+    neighbours.iter().flatten().any(|&(nx, ny)| {
+        let other = (ny * width + nx) * 4;
+        pixels.get(other..other + 4).is_some_and(|other| {
+            (0..3).any(|channel| other[channel].abs_diff(pixel[channel]) > MIN_STRUCTURE_DELTA)
+        })
+    })
+}
+
+/// The pixels that actually pin a position down: opaque ones that carry
+/// structure.
+///
+/// Sampling by opacity alone is what once put a capture on the window next
+/// door.  A terminal is mostly one flat colour with a little text in it —
+/// measured on a live 1880×2024 kitty render, 99.68% of its pixels were the
+/// single background colour — and a flat colour matches almost anywhere on a
+/// desktop of a similar shade.  The coarse grid's stride is taken from the
+/// render's area (78 pixels on that render, 155 on it in another run), so all
+/// its samples landed on the flat background, none on the text: the true
+/// position scored 180/182 while a point 850 device pixels away scored
+/// 182/182 and won.  Structure is what makes the difference: the same two
+/// windows then score 160/160 at the truth and under 70/160 at the decoy.
+///
+/// The pixels are collected in one pass and then thinned by an even stride, so
+/// the samples still spread over the render's whole extent.  A render with too
+/// little structure to place is not a failure here: it falls back to
+/// [`collect_samples`] and lets the match ratio decide, rather than refusing a
+/// window the old sampler could still locate.
+fn collect_structure_samples(window: &Frame, target: usize) -> Vec<Sample> {
+    let Size { width, height } = window.size();
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let pixels = window.pixels();
+    let (width, height) = (width as usize, height as usize);
+    let mut kept: Vec<(u32, u32)> = Vec::new();
+    let mut seen: u64 = 0;
+    let mut stride: u64 = 1;
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) * 4;
+            if pixels
+                .get(index + 3)
+                .is_none_or(|alpha| *alpha < MIN_SAMPLE_ALPHA)
+                || !has_structure(pixels, width, height, x, y)
+            {
+                continue;
+            }
+            if seen.is_multiple_of(stride) {
+                kept.push((x as u32, y as u32));
+                if kept.len() >= MAX_STRUCTURED_PIXELS {
+                    // A busy render: thin what is held so far and take every
+                    // other one from here on.  The set stays spread over the
+                    // render, which random sampling would not guarantee.
+                    kept = kept.iter().copied().step_by(2).collect();
+                    stride = stride.saturating_mul(2);
+                }
+            }
+            seen += 1;
+        }
+    }
+    if kept.len() < MIN_SAMPLES {
+        return collect_samples(window, target);
+    }
+    let step = kept.len().div_ceil(target.max(1));
+    kept.iter()
+        .step_by(step)
+        .map(|&(x, y)| {
+            let index = (y as usize * width + x as usize) * 4;
+            Sample {
+                x,
+                y,
+                color: pixels[index..index + 4].try_into().unwrap(),
+            }
+        })
+        .collect()
 }
 
 /// How many of `samples` agree with the frame when the render is placed at
@@ -191,19 +303,31 @@ pub fn locate_window(window: &Frame, frame: &Frame) -> Option<Rect> {
     }
     let frame_pixels = frame.pixels();
 
-    // Coarse: a quarter-resolution sweep finds the neighbourhood.
-    let coarse = collect_samples(window, COARSE_SAMPLES);
+    // Coarse: a sweep every [`COARSE_STEP`] narrows the neighbourhood.  Both
+    // passes sample structure, not just opacity — see
+    // [`collect_structure_samples`] for the neighbour window that opacity
+    // sampling put a capture on.
+    //
+    // The coarse pass narrows, it does not judge: the verdict is the
+    // refinement's, at full resolution.  It used to require `MIN_MATCH_RATIO`
+    // as well, which is what structure sampling breaks — its samples are sharp,
+    // so a coarse grid point two pixels off the truth scores well under the
+    // ratio (measured on a 60×40 texture pasted at (210,130): the truth scores
+    // 153/153, the grid point (208,132) only 70/153).  Judging there rejected
+    // windows the old sampler could still locate, so the gate is gone and only
+    // "nothing anywhere matched" stops the search.
+    let coarse = collect_structure_samples(window, COARSE_SAMPLES);
     if coarse.len() < MIN_SAMPLES {
         return None;
     }
     let (coarse_x, coarse_y, coarse_matched) =
         best_position(frame, frame_pixels, &coarse, window, COARSE_STEP)?;
-    if (coarse_matched as f64 / coarse.len() as f64) < MIN_MATCH_RATIO {
+    if coarse_matched == 0 {
         return None;
     }
 
     // Refine: full-resolution samples around the coarse winner.
-    let refine = collect_samples(window, REFINE_SAMPLES);
+    let refine = collect_structure_samples(window, REFINE_SAMPLES);
     let mut best: Option<(usize, i64, i64)> = None;
     for dy in -REFINE_RADIUS..=REFINE_RADIUS {
         for dx in -REFINE_RADIUS..=REFINE_RADIUS {
@@ -228,6 +352,57 @@ pub fn locate_window(window: &Frame, frame: &Frame) -> Option<Rect> {
         window.size().width,
         window.size().height,
     ))
+}
+
+/// Whether `window`'s render sits at `(origin_x, origin_y)` on `frame`, by the
+/// same sample-and-ratio test [`locate_window`] judges a searched position
+/// with.
+///
+/// This is the check a position that was *stated* rather than searched for
+/// needs.  A floating window's position comes from niri's IPC, which is a
+/// different moment from the grab: a window dragged or animated between the two
+/// would otherwise be cropped where it used to be — silently, since the
+/// arithmetic succeeds on stale numbers just as well as on current ones.
+///
+/// The ratio is taken over the samples that fall inside `frame`, so a window
+/// hanging off the edge is still judged on the part that is there (which is the
+/// part a crop can use).
+///
+/// `None` when the position cannot be checked at all: too little structure in
+/// the render to judge with, or too little of it inside the frame.  The caller
+/// must not read that as agreement — it is the absence of evidence.
+pub fn matches_at_position(
+    window: &Frame,
+    frame: &Frame,
+    origin_x: i32,
+    origin_y: i32,
+) -> Option<bool> {
+    let (width, height) = (window.size().width, window.size().height);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let samples = collect_structure_samples(window, REFINE_SAMPLES);
+    if samples.len() < MIN_SAMPLES {
+        return None;
+    }
+    let (frame_width, frame_height) = (
+        i64::from(frame.size().width),
+        i64::from(frame.size().height),
+    );
+    let (origin_x, origin_y) = (i64::from(origin_x), i64::from(origin_y));
+    let in_frame = samples
+        .iter()
+        .filter(|sample| {
+            let x = origin_x + i64::from(sample.x);
+            let y = origin_y + i64::from(sample.y);
+            x >= 0 && y >= 0 && x < frame_width && y < frame_height
+        })
+        .count();
+    if in_frame < MIN_SAMPLES {
+        return None;
+    }
+    let matched = matches_at(frame, frame.pixels(), &samples, origin_x, origin_y);
+    Some((matched as f64 / in_frame as f64) >= MIN_MATCH_RATIO)
 }
 
 /// Whether two renders of one window show the same picture: the same size,
@@ -379,6 +554,81 @@ mod tests {
         assert_eq!(
             locate_window(&window, &screen),
             Some(Rect::new(210, 130, 60, 40))
+        );
+    }
+
+    /// A window that is almost entirely one flat colour with a single
+    /// structured block in it — a terminal showing a little text on a solid
+    /// background, measured on a live kitty render at 99.68% flat.
+    ///
+    /// The block's position is what makes this a regression frame: the coarse
+    /// pass strides its sample grid by the render's area (a stride of 28 on a
+    /// 400×300 render), and the block sits *between* those grid lines, so an
+    /// opacity-sampling search samples the flat background alone and locates
+    /// the window wherever that colour happens to match.
+    fn mostly_flat_window(width: u32, height: u32) -> Frame {
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                // Premultiplied: RGB ≤ alpha, the form niri writes.
+                pixels[index..index + 4].copy_from_slice(&[200, 194, 180, 204]);
+            }
+        }
+        // A striped block at x=100..105, y=40..60 — off the coarse grid.
+        for y in 40..60u32 {
+            for x in 100..105u32 {
+                let index = (y as usize * width as usize + x as usize) * 4;
+                let color: [u8; 4] = match (x * 37 + y * 11) % 3 {
+                    0 => [40, 40, 40, 255],
+                    1 => [220, 220, 220, 255],
+                    _ => [30, 90, 200, 255],
+                };
+                pixels[index..index + 4].copy_from_slice(&color);
+            }
+        }
+        Frame::new(Size::new(width, height), pixels).unwrap()
+    }
+
+    #[test]
+    fn a_flat_window_is_not_located_where_its_background_happens_to_match() {
+        // The regression behind a capture of the window *next door*, seen on a
+        // live niri with two kitty windows side by side: the right-hand
+        // window's render is 99.68% one flat colour, that colour also covers
+        // most of the desktop and of its neighbour, so the true position scored
+        // 180/182 coarse samples while a position 850 device pixels away scored
+        // 182/182 — and the sweep takes the first best, so the window was
+        // captured from the wrong rectangle.  Sampling structure instead of
+        // opacity scores this frame 100% at the truth and well under 70% on any
+        // decoy.
+        //
+        // The desktop here is the same hue as the window's background, and
+        // differs from it enough that a flat-background match would still pass:
+        // that is what makes the frame a regression rather than a formality.
+        let mut background = vec![0u8; 900 * 700 * 4];
+        for pixel in background.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[204, 198, 184, 255]);
+        }
+        let frame = Frame::new(Size::new(900, 700), background).unwrap();
+        let window = mostly_flat_window(400, 300);
+        let screen = composited(&frame, &window, Point::new(500, 300));
+        assert_eq!(
+            locate_window(&window, &screen),
+            Some(Rect::new(500, 300, 400, 300)),
+            "the structured block has to decide the position, not the flat background"
+        );
+    }
+
+    #[test]
+    fn a_render_with_nothing_structured_falls_back_to_the_opaque_sampler() {
+        // A plain solid window has no structure to sample, and refusing to
+        // locate it would be a worse answer than the old sampler's: the
+        // fallback keeps that behaviour, and the match ratio still decides.
+        let window = Frame::solid(Size::new(60, 40), [30, 30, 200, 204]).unwrap();
+        let samples = collect_structure_samples(&window, COARSE_SAMPLES);
+        assert!(
+            !samples.is_empty(),
+            "a structured-less render still samples its opaque pixels"
         );
     }
 
