@@ -200,6 +200,17 @@ for (let index = 0; index < windows.length; ++index) {
     if (w.normalWindow === false) {
         continue;
     }
+    // The picker's own overlay is a normal, full-screen window as far as KWin
+    // is concerned (layer-shell surfaces are not special-cased here), and it
+    // sits on top of the stack while the session is open.  Re-listing the
+    // windows mid-session would otherwise offer the overlay itself as the
+    // candidate under the pointer — a full-screen rectangle that wins every
+    // hit test, so the highlight covers the whole desktop and no real window
+    // can be picked.  Match on the class and on our own scope name.
+    const klass = String(w.resourceClass || "");
+    if (klass === "vshot-qt-ui" || klass.indexOf("vshot") === 0) {
+        continue;
+    }
     const g = w.frameGeometry || w.geometry;
     if (!g || !(g.width > 0) || !(g.height > 0)) {
         continue;
@@ -1222,6 +1233,33 @@ mod tests {
         assert_eq!(windows[0].geometry, Rect::new(1920, 0, 1600, 900));
         assert_eq!(windows[1].geometry, Rect::new(-20, 30, 800, 600));
         assert!(windows[0].label.is_empty());
+    }
+
+    /// The KWin probe has to skip vshot's own overlay.
+    ///
+    /// The picker re-lists the windows while its session is open, and the
+    /// overlay it is drawing with is a full-screen, `normalWindow` surface on
+    /// top of the stack — so it passed every other filter and became the
+    /// candidate under the pointer, veiling the whole desktop instead of
+    /// highlighting a window.  The fix is a class check in the probe script.
+    ///
+    /// This is a guard, not a behavioural test: the filter is JavaScript
+    /// embedded in a shell script, so there is no JavaScript to run here.  What
+    /// it catches is the realistic regression — someone refactoring the probe
+    /// loop drops the check — and the live KDE check is what proves it works.
+    #[test]
+    fn the_kwin_probe_skips_vshots_own_overlay() {
+        assert!(
+            KWIN_PROBE.contains(r#"String(w.resourceClass || "")"#),
+            "the probe is expected to read the window class"
+        );
+        assert!(
+            KWIN_PROBE.contains(r#"indexOf("vshot") === 0"#),
+            "and to skip windows whose class belongs to vshot"
+        );
+        // The filters that were already there must survive the change.
+        assert!(KWIN_PROBE.contains("w.normalWindow === false"));
+        assert!(KWIN_PROBE.contains("w.deleted"));
     }
 
     #[test]
