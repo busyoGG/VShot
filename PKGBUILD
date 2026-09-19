@@ -3,6 +3,7 @@ pkgname=vshot
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pin server'
+url='https://github.com/busyoGG/VShot'
 arch=('x86_64')
 license=('MIT')
 depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt')
