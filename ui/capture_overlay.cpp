@@ -1,4 +1,5 @@
 #include "capture_overlay.hpp"
+#include "config.hpp"
 #include "i18n.hpp"
 
 #include <LayerShellQt/Window>
@@ -181,6 +182,32 @@ QString toolName(Tool tool)
         return QStringLiteral("select");
     }
     return QStringLiteral("pen");
+}
+
+/// The inverse of [`toolName`], for a name that came out of the config file.
+/// An unrecognized name is a typo in a file the user can edit, so it falls
+/// back to the tool a session has always started with.
+Tool toolForName(const QString &name)
+{
+    if (name == QStringLiteral("rectangle")) {
+        return Tool::Rectangle;
+    }
+    if (name == QStringLiteral("ellipse")) {
+        return Tool::Ellipse;
+    }
+    if (name == QStringLiteral("arrow")) {
+        return Tool::Arrow;
+    }
+    if (name == QStringLiteral("pen")) {
+        return Tool::Pen;
+    }
+    if (name == QStringLiteral("mosaic")) {
+        return Tool::Mosaic;
+    }
+    if (name == QStringLiteral("text")) {
+        return Tool::Text;
+    }
+    return Tool::Select;
 }
 
 QFont textFont(const QString &family, int pixelSize)
@@ -2458,6 +2485,26 @@ OverlayController::OverlayController(Session session)
     // Scrolling capture wants a rectangle, not an editor: the pixels it will
     // annotate only exist once the page has been scrolled and stitched.
     selectOnly_ = session_.mode == QStringLiteral("region-only");
+    // The style the user last left the editor in.  Only the drawing tools get
+    // their remembered tool back: a region session has always opened on Select
+    // so a fresh drag draws the rectangle, and a picking session on Select so
+    // the click picks; opening on, say, Mosaic would break both.
+    const EditorPreferences preferences = loadEditorPreferences();
+    currentColor_ = preferences.color;
+    currentFont_ = preferences.font;
+    currentWidth_ = preferences.width;
+    textSize_ = preferences.textSize;
+    currentDash_ = preferences.dash;
+    arrowSize_ = preferences.arrowSize;
+    currentArrowStyle_ = preferences.arrowStyle;
+    mosaicShape_ = preferences.mosaicShape;
+    mosaicStrength_ = preferences.mosaicStrength;
+    if (!selectOnly_ && !pickMode_) {
+        const Tool remembered = toolForName(preferences.tool);
+        if (remembered != Tool::Select) {
+            tool_ = remembered;
+        }
+    }
 }
 
 OverlayController::~OverlayController()
@@ -4500,6 +4547,23 @@ void OverlayController::terminal(bool cancelled)
     }
     finished_ = true;
     cancelled_ = cancelled;
+    // Remember the style for the next session.  This is written once here
+    // rather than in every setter: a slider drag fires dozens of them, and the
+    // preference that matters is the one the session ended on.  It is saved on
+    // cancellation too -- a style the user picked is theirs whether or not the
+    // capture went through.
+    EditorPreferences preferences;
+    preferences.tool = toolName(tool_);
+    preferences.color = currentColor_;
+    preferences.font = currentFont_;
+    preferences.width = currentWidth_;
+    preferences.textSize = textSize_;
+    preferences.dash = currentDash_;
+    preferences.arrowSize = arrowSize_;
+    preferences.arrowStyle = currentArrowStyle_;
+    preferences.mosaicShape = mosaicShape_;
+    preferences.mosaicStrength = mosaicStrength_;
+    saveEditorPreferences(preferences);
     hideToolbar();
     removeTextEditor();
     if (terminalCallback_) {

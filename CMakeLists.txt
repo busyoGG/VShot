@@ -10,6 +10,8 @@ find_package(LayerShellQt REQUIRED)
 
 add_executable(vshot-qt-ui
     ui/main.cpp
+    ui/config.cpp
+    ui/config.hpp
     ui/session_protocol.cpp
     ui/session_protocol.hpp
     ui/capture_overlay.cpp

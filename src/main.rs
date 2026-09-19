@@ -1,6 +1,7 @@
 mod capture;
 mod cli;
 mod cli_i18n;
+mod config;
 mod edit;
 mod error;
 mod geometry;

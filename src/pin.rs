@@ -182,11 +182,15 @@ impl PinInvocation {
                 "pin requires image files, --clipboard, or a control flag such as --toggle".into(),
             ));
         }
-        // The flag wins over the environment; the environment is the fallback
-        // for a hotkey that cannot pass flags.
+        // The flag wins over the environment, which wins over the config file;
+        // the environment is the fallback for a hotkey that cannot pass flags,
+        // and the config file is the fallback for one that cannot pass either.
         let density = match density {
             Some(value) => Some(value),
-            None if !files.is_empty() || clipboard => density_from_env()?,
+            None if !files.is_empty() || clipboard => match density_from_env()? {
+                Some(value) => Some(value),
+                None => crate::config::load().pin.density,
+            },
             None => None,
         };
         let command = if !files.is_empty() || clipboard {

@@ -62,6 +62,12 @@ compositor the session was read as, and on what evidence), VSHOT_LONG_DEBUG_DIR=
 scrolling frame and stitching decision), VSHOT_PIN_FOCUS_DEBUG=1 (every time a pin surface is
 handed the keyboard or gives it back), VSHOT_PIN_SOCKET, VSHOT_PIN_DENSITY=N.
 
+$XDG_CONFIG_HOME/vshot/config.json (or ~/.config/vshot/config.json) is optional and remembers
+things between runs: the `editor` section is the annotation editor's own style, written back
+when a session ends, and the `cli` section supplies defaults for flags not given here -- a
+command-line flag always wins over it. An unreadable or malformed file falls back to the
+built-in defaults.
+
 Each subcommand keeps its own notes: `vshot <command> --help`."#,
     group = ArgGroup::new("destination")
         .args(["output", "clipboard", "pin"])
@@ -100,13 +106,8 @@ pub struct Cli {
     /// default to) and `high` can take a second or more. Pinning an image
     /// onto the screen writes nothing to disk, so this does not apply to
     /// `--pin`.
-    #[arg(
-        long = "png-compression",
-        global = true,
-        value_name = "LEVEL",
-        default_value = "fast"
-    )]
-    pub png_compression: String,
+    #[arg(long = "png-compression", global = true, value_name = "LEVEL")]
+    pub png_compression: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -143,8 +144,7 @@ output works there."
     )]
     Monitor {
         /// Output name, or `current` for the output under the pointer.
-        #[arg(default_value = "current")]
-        name: String,
+        name: Option<String>,
     },
     /// Capture the complete frozen desktop scene.
     #[command(
@@ -187,27 +187,27 @@ stitching decision to steps.log."
         #[arg(long, allow_hyphen_values = true)]
         geometry: Option<String>,
         /// Wheel notches sent at a time while the capture scrolls.
-        #[arg(long, default_value_t = 1)]
-        notches: u32,
+        #[arg(long)]
+        notches: Option<u32>,
         /// Height limit of the stitched image, in pixels.
-        #[arg(long = "max-height", default_value_t = 30_000)]
-        max_height: u32,
+        #[arg(long = "max-height")]
+        max_height: Option<u32>,
         /// Frame limit for one capture.
-        #[arg(long = "max-frames", default_value_t = 6_000)]
-        max_frames: u32,
+        #[arg(long = "max-frames")]
+        max_frames: Option<u32>,
         /// Time limit for one capture, in seconds.
-        #[arg(long, default_value_t = 120)]
-        timeout: u64,
+        #[arg(long)]
+        timeout: Option<u64>,
         /// Rows at the top of every frame left out of the match, for sticky
         /// headers and fixed toolbars.  Rows that never move are recognized on
         /// their own; this is for the ones that do not sit still.
-        #[arg(long = "ignore-top", default_value_t = 0)]
-        ignore_top: u32,
+        #[arg(long = "ignore-top")]
+        ignore_top: Option<u32>,
         /// Which wheel backend to use: `auto` (try them in order), `wlr` (the
         /// compositor's virtual pointer protocol), `portal` (the XDG
         /// RemoteDesktop portal) or `uinput` (`/dev/uinput`).
-        #[arg(long, default_value = "auto")]
-        inject: String,
+        #[arg(long)]
+        inject: Option<String>,
     },
 
     /// Manage pinned images shown by the resident pin daemon; see --help for
@@ -458,7 +458,11 @@ impl Cli {
     }
 
     pub fn parse_request(self) -> Result<Request> {
-        let compression = PngCompression::parse(&self.png_compression)?;
+        // The flag wins, then the config file, then the built-in default.
+        let compression = match self.png_compression.as_deref() {
+            Some(name) => PngCompression::parse(name)?,
+            None => crate::config::compression_default().unwrap_or_default(),
+        };
         let destination = match (self.output, self.clipboard, self.pin) {
             (Some(path), false, false) if path.as_os_str() == "-" => Destination::Stdout,
             (Some(path), false, false) => Destination::File(path),
@@ -485,6 +489,10 @@ impl Cli {
                 interactive: true,
             } => return Err(VshotError::ConflictingRegionSelection),
             Command::Monitor { name } => {
+                // The flag wins, then the config file, then `current`.
+                let name = name
+                    .or_else(|| crate::config::load().monitor)
+                    .unwrap_or_else(|| "current".to_owned());
                 if name.trim().is_empty() {
                     return Err(VshotError::InvalidDestination(
                         "monitor name cannot be empty".into(),
@@ -513,17 +521,26 @@ impl Cli {
                 timeout,
                 ignore_top,
                 inject,
-            } => CaptureTarget::LongShot {
-                region: geometry.as_deref().map(parse_geometry).transpose()?,
-                options: LongShotOptions {
-                    notches,
-                    max_height,
-                    max_frames,
-                    timeout: std::time::Duration::from_secs(timeout),
-                    ignore_top,
-                },
-                inject: Prefer::parse(&inject)?,
-            },
+            } => {
+                // Each value falls back flag → config file → built-in default.
+                let defaults = crate::config::load().long;
+                let inject = inject
+                    .or(defaults.inject)
+                    .unwrap_or_else(|| "auto".to_owned());
+                CaptureTarget::LongShot {
+                    region: geometry.as_deref().map(parse_geometry).transpose()?,
+                    options: LongShotOptions {
+                        notches: notches.or(defaults.notches).unwrap_or(1),
+                        max_height: max_height.or(defaults.max_height).unwrap_or(30_000),
+                        max_frames: max_frames.or(defaults.max_frames).unwrap_or(6_000),
+                        timeout: std::time::Duration::from_secs(
+                            timeout.or(defaults.timeout).unwrap_or(120),
+                        ),
+                        ignore_top: ignore_top.or(defaults.ignore_top).unwrap_or(0),
+                    },
+                    inject: Prefer::parse(&inject)?,
+                }
+            }
             Command::Pin { .. } => {
                 return Err(VshotError::InvalidDestination(
                     "the pin subcommand is not a capture target".into(),

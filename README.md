@@ -338,6 +338,74 @@ vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一
 - **niri 的 pin 落点**——只能问"焦点窗口所在的输出"（niri 的 IPC 没有指针位置查询），所以**不跟随指针，只跟随键盘焦点**。
 - **pin daemon 与 screencopy**——不要用 `pkill`/`kill -9` 结束 daemon（见[「pin daemon」](#pin-daemon)），否则部分合成器会残留 layer surface 与其截屏会话，导致所有输出的 screencopy 永久阻塞。
 
+## 配置文件
+
+`vshot` 把两样东西记在 `$XDG_CONFIG_HOME/vshot/config.json`（缺省 `~/.config/vshot/config.json`）：**标注编辑器的样式**，以及**部分命令行参数的默认值**。文件是可选的——没有它、读不了它、或者内容坏了，都退回内置默认值，不会影响截图。
+
+```json
+{
+  "editor": {
+    "tool": "arrow",
+    "color": "#ff8800ff",
+    "width": 4,
+    "textSize": 6,
+    "dash": "dotted",
+    "arrowSize": 3,
+    "arrowStyle": "filled",
+    "mosaicShape": "brush",
+    "mosaicStrength": 3,
+    "font": "Noto Sans"
+  },
+  "cli": {
+    "png-compression": "high",
+    "monitor": "DP-2",
+    "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
+    "pin": { "density": 2 }
+  }
+}
+```
+
+### `editor`——编辑器样式
+
+每次区域截图或 pin 编辑结束时，编辑器把当前样式写回这里，下次打开就是上次离开时的样子。**取消截图也会保存**——你挑的颜色是你的，跟这次截图有没有成没关系。
+
+| 键 | 取值 | 默认 |
+| --- | --- | --- |
+| `tool` | `select` / `rectangle` / `ellipse` / `arrow` / `pen` / `text` / `mosaic` | `select` |
+| `color` | `#rrggbb` 或 `#rrggbbaa` | `#ff4040ff` |
+| `width` | 1–64 | `2` |
+| `textSize` | 1–64 | `2` |
+| `dash` | `solid` / `dashed` / `dotted` | `solid` |
+| `arrowSize` | 1–8 | `1` |
+| `arrowStyle` | `open` / `filled` | `open` |
+| `mosaicShape` | `rect` / `ellipse` / `brush` | `rect` |
+| `mosaicStrength` | 1–3 | `2` |
+| `font` | 字体族名；空串用系统默认 | `""` |
+
+`tool` 只对**区域截图**生效：`window pick` 与滚动截图总是从 Select 打开（否则一次点击或一次拖拽就不再是挑选/框选）。取值超出范围的整数会被夹到范围内，不认识的名字按默认值处理——手改文件写错了不会报错，只是那一项不生效。
+
+### `cli`——命令行默认值
+
+给**没有在命令行上给出**的参数提供默认值。优先级是：
+
+```
+命令行参数 > 环境变量 > 配置文件 > 内置默认
+```
+
+| 键 | 对应参数 | 内置默认 |
+| --- | --- | --- |
+| `png-compression` | `--png-compression` | `fast` |
+| `monitor` | `monitor [NAME]` 的输出名 | `current` |
+| `long.notches` | `long --notches` | `1` |
+| `long.max-height` | `long --max-height` | `30000` |
+| `long.max-frames` | `long --max-frames` | `6000` |
+| `long.timeout` | `long --timeout` | `120` |
+| `long.ignore-top` | `long --ignore-top` | `0` |
+| `long.inject` | `long --inject` | `auto` |
+| `pin.density` | `pin --density` | 自动推断 |
+
+`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效。
+
 ## 环境变量
 
 | 变量 | 作用 |

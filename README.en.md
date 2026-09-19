@@ -338,6 +338,74 @@ vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer"
 - **niri pin landing** — it can only ask "the output the focused window is on" (niri's IPC has no pointer position query), so it **follows the keyboard focus, not the pointer**.
 - **pin daemon and screencopy** — do not end the daemon with `pkill`/`kill -9` (see ["pin daemon"](#pin-daemon)), or some compositors leave the layer surface and its screencopy session behind, making screencopy block forever on every output.
 
+## Configuration file
+
+`vshot` remembers two things in `$XDG_CONFIG_HOME/vshot/config.json` (or `~/.config/vshot/config.json`): the **annotation editor's style**, and **defaults for some command-line flags**. The file is optional — missing, unreadable, or malformed all fall back to the built-in defaults and never affect a capture.
+
+```json
+{
+  "editor": {
+    "tool": "arrow",
+    "color": "#ff8800ff",
+    "width": 4,
+    "textSize": 6,
+    "dash": "dotted",
+    "arrowSize": 3,
+    "arrowStyle": "filled",
+    "mosaicShape": "brush",
+    "mosaicStrength": 3,
+    "font": "Noto Sans"
+  },
+  "cli": {
+    "png-compression": "high",
+    "monitor": "DP-2",
+    "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
+    "pin": { "density": 2 }
+  }
+}
+```
+
+### `editor` — the editor's style
+
+At the end of every region capture or pin edit, the editor writes its current style back here, so the next session opens the way you left the last one. **Cancelling saves too** — a style you picked is yours whether or not that capture went through.
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `tool` | `select` / `rectangle` / `ellipse` / `arrow` / `pen` / `text` / `mosaic` | `select` |
+| `color` | `#rrggbb` or `#rrggbbaa` | `#ff4040ff` |
+| `width` | 1–64 | `2` |
+| `textSize` | 1–64 | `2` |
+| `dash` | `solid` / `dashed` / `dotted` | `solid` |
+| `arrowSize` | 1–8 | `1` |
+| `arrowStyle` | `open` / `filled` | `open` |
+| `mosaicShape` | `rect` / `ellipse` / `brush` | `rect` |
+| `mosaicStrength` | 1–3 | `2` |
+| `font` | font family; an empty string uses the system default | `""` |
+
+`tool` applies to **region capture** only: `window pick` and scrolling capture always open on Select, or a single click or drag would stop being a pick or a selection. Out-of-range integers are clamped, and an unrecognized name falls back to the default — a typo in a hand-edited file costs you that one setting, not an error.
+
+### `cli` — command-line defaults
+
+Supplies values for flags **not given on the command line**. The order is:
+
+```
+command line > environment > config file > built-in default
+```
+
+| Key | Flag | Built-in default |
+| --- | --- | --- |
+| `png-compression` | `--png-compression` | `fast` |
+| `monitor` | the output name for `monitor [NAME]` | `current` |
+| `long.notches` | `long --notches` | `1` |
+| `long.max-height` | `long --max-height` | `30000` |
+| `long.max-frames` | `long --max-frames` | `6000` |
+| `long.timeout` | `long --timeout` | `120` |
+| `long.ignore-top` | `long --ignore-top` | `0` |
+| `long.inject` | `long --inject` | `auto` |
+| `pin.density` | `pin --density` | inferred |
+
+`pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid.
+
 ## Environment variables
 
 | Variable | Purpose |
