@@ -24,7 +24,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 
 ## 安装（Arch Linux）
 
-`PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次安装同时提供 `/usr/bin/vshot`、`/usr/bin/vshot-qt-ui` 和给 KWin 授权用的 `/usr/share/applications/vshot.desktop`（见[「KDE 授权」](#kde-授权)）：
+`PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次安装同时提供 `/usr/bin/vshot`、`/usr/bin/vshot-qt-ui`、给 KWin 授权用的 `/usr/share/applications/vshot.desktop`，以及一个带图标的启动入口 `/usr/share/applications/vshot-settings.desktop`（见[「应用菜单入口」](#应用菜单入口)）：
 
 ```sh
 ./scripts/build-arch-package.sh
@@ -32,6 +32,14 @@ sudo pacman -U dist/vshot-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 脚本把当前工作树（含未提交改动）快照到临时目录再调 `makepkg`，产物写到 `dist/`；也可以直接 `makepkg -si`。运行时依赖 `glibc`、`wayland`（通过 dlopen 使用 `libwayland-client`）、`qt6-base`、`layer-shell-qt`；文件输出、`--clipboard` 与 `vshot pin --clipboard` 需要可选依赖 `wl-clipboard`（写用 `wl-copy`，读用 `wl-paste`）。其它发行版按下面的源码方式构建。
+
+## 应用菜单入口
+
+包会装一个 `vshot-settings.desktop`，在应用菜单里显示为 **VShot Settings**，点开就是 `vshot settings` 的图形设置界面。图标是 `icons/vshot.svg`，装在 `hicolor/scalable/apps/` 下——一个可缩放 SVG 而不是一整套尺寸，桌面外壳（KDE、GNOME、wlroots 系的启动器）自己渲染并按需取尺寸。
+
+Wayland **没有逐窗口的图标**：合成器拿客户端声明的 application id，去找 `<id>.desktop`，再画它 `Icon=` 指的东西。所以 `ui/main.cpp` 里那句 `setDesktopFileName("vshot-settings")` 必须与安装的 desktop 文件名一致，改一处就得改另一处，否则窗口只会拿到一个通用占位图标、且**不会报任何错**。`vshot-settings-check` 里有一节专门盯这条链（app id、文件名、`Icon=` 指向的文件、PKGBUILD 是否都装）。
+
+给 KWin 授权用的那份 `vshot.desktop` 是**另一个文件**，不能合并进来：它的 `Exec=` 必须精确指向 `/usr/bin/vshot`（KWin 按 pid 取 `/proc/<pid>/exe` 比对 `Exec=` 第一个词），而且是 `NoDisplay=true`，因为不带子命令直接跑 `vshot` 只会报「没给输出目标」。
 
 ## 构建
 
@@ -89,6 +97,9 @@ vshot pin --hide
 vshot pin --close-all
 vshot pin --list
 vshot pin --quit
+
+# 设置：开窗口改编辑器样式与命令行默认值（写进 config.json）
+vshot settings
 ```
 
 全局参数对所有捕获生效：
@@ -342,6 +353,16 @@ vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一
 
 `vshot` 把两样东西记在 `$XDG_CONFIG_HOME/vshot/config.json`（缺省 `~/.config/vshot/config.json`）：**标注编辑器的样式**，以及**部分命令行参数的默认值**。文件是可选的——没有它、读不了它、或者内容坏了，都退回内置默认值，不会影响截图。
 
+改它有三种方式，怎么顺手怎么来：**手改文件**、在标注编辑器里直接调（样式会在会话结束时自动写回）、或者跑 **`vshot settings`** 开一个窗口改——窗口里两段都能改，保存即写盘。
+
+```bash
+vshot settings
+```
+
+窗口只是普通窗口，不截图、不需要任何合成器协议，所以在一个 vshot 本来截不了图的合成器上也能用。装包后也可以直接从**应用菜单**里的「VShot Settings」打开（见[「应用菜单入口」](#应用菜单入口)）。`cli` 段的数值留空/留 0 表示「不设，用内置默认」，而不是把 0 存进去；`editor` 段则总是整段写出。保存是**合并写入**：本版不认识的键（新版 vshot 写的、或你自己加的）原样保留，不会因为存一次就被抹掉。
+
+窗口分两页，左边栏切换：**标注编辑器**（工具、颜色、线宽、线型、箭头、文本、马赛克）与**命令行默认值**（压缩、默认输出、pin 密度、滚动截图的各项）。每页是一列卡片，一行一项，标签在左、控件在右；两页在默认窗口尺寸下都**不需要滚动**。下拉框与数字框的箭头是自绘的（原生那套是带斜面的老式三角），所以控件外观与工具栏一致。
+
 ```json
 {
   "editor": {
@@ -404,7 +425,9 @@ vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | 自动推断 |
 
-`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效。
+`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效——一个键写错只损失那一个键，其余照常生效。
+
+`color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）。注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 
 ## 环境变量
 
@@ -442,16 +465,20 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖剪贴板颜色解析与色卡渲染、pin 的图片自述密度、pin 描边、文字卡片留白、色卡右键菜单：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置文件读写与设置窗口、剪贴板颜色解析与色卡渲染、pin 的图片自述密度、pin 描边、文字卡片留白、色卡右键菜单：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
+build-qt/vshot-config-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-settings-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check
 build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 ```
+
+其中 `vshot-config-check` 覆盖的是最容易静默出错的一块：保存时**合并写入**是否真的保住了本版不认识的键、清空一个值是否真的把它删掉、以及 `#rrggbbaa` 是否按 CSS 那套解析（Qt 自己会把它读成 `#aarrggbb`，于是「不透明橙色」变成紫色）。`vshot-settings-check` 则把设置窗口真建出来、逐个驱动它的控件，再回读配置文件——某一个字段接错了线，只有这样才看得出来。改窗口布局时这一项尤其值得跑：它靠控件名找控件，所以重排、换控件类都不会漏掉，只有真的把某个字段接错了才会红。
 
 另有 4 个默认**不执行**（`#[ignore]`）的集成测试，需要真实环境：KWin 的 D-Bus 采集与后端选择（需要跑着的 KWin，起无头 KWin 即可，见 `src/capture/kwin.rs` 的注释，虚拟输出名 `Virtual-0`、1024x768、无 pointer capability，所以只覆盖到 D-Bus 采集这一层）、活跃输出探针（需要任一真实会话）、`/dev/uinput` 滚动注入（需要写权限）。跑法：
 

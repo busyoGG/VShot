@@ -24,7 +24,7 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 
 ## Install (Arch Linux)
 
-`PKGBUILD` builds the Rust CLI and the Qt helper into one package, so a single install provides `/usr/bin/vshot`, `/usr/bin/vshot-qt-ui`, and the `/usr/share/applications/vshot.desktop` that authorizes KWin (see ["KDE authorization"](#kde-authorization)):
+`PKGBUILD` builds the Rust CLI and the Qt helper into one package, so a single install provides `/usr/bin/vshot`, `/usr/bin/vshot-qt-ui`, the `/usr/share/applications/vshot.desktop` that authorizes KWin, and an icon-bearing launcher entry `/usr/share/applications/vshot-settings.desktop` (see ["Application menu entry"](#application-menu-entry)):
 
 ```sh
 ./scripts/build-arch-package.sh
@@ -32,6 +32,14 @@ sudo pacman -U dist/vshot-0.1.0-1-x86_64.pkg.tar.zst
 ```
 
 The script snapshots the current working tree (uncommitted changes included) into a temporary directory and runs `makepkg`, writing the result to `dist/`; `makepkg -si` works directly too. Runtime dependencies are `glibc`, `wayland` (uses `libwayland-client` through dlopen), `qt6-base`, and `layer-shell-qt`; file output, `--clipboard`, and `vshot pin --clipboard` need the optional `wl-clipboard` (writes via `wl-copy`, reads via `wl-paste`). For other distributions, build from source as below.
+
+## Application menu entry
+
+The package installs a `vshot-settings.desktop` that shows up in the application menu as **VShot Settings** and opens the graphical settings window, `vshot settings`. Its icon is `icons/vshot.svg`, installed under `hicolor/scalable/apps/` — one scalable SVG rather than a size ladder, because the shells that read it (KDE, GNOME, wlroots launchers) render SVG themselves and ask for the size they need.
+
+Wayland has **no per-window icon**: a compositor takes the application id the client declares, finds `<id>.desktop`, and draws whatever `Icon=` names. So the `setDesktopFileName("vshot-settings")` in `ui/main.cpp` has to match the installed desktop file's name; change one and you must change the other, or the window silently falls back to a generic placeholder with no error anywhere. `vshot-settings-check` has a section that watches exactly that chain (the app id, the file name, the file `Icon=` points at, and whether the PKGBUILD installs all of it).
+
+The `vshot.desktop` that authorizes KWin is a **separate file** and cannot be merged into this one: its `Exec=` has to name `/usr/bin/vshot` exactly (KWin resolves the caller's pid to `/proc/<pid>/exe` and compares it against `Exec=`'s first word), and it is `NoDisplay=true`, because running `vshot` with no subcommand only reports that no output destination was given.
 
 ## Build
 
@@ -89,6 +97,9 @@ vshot pin --hide
 vshot pin --close-all
 vshot pin --list
 vshot pin --quit
+
+# Settings: a window for the editor style and the command-line defaults
+vshot settings
 ```
 
 The global options apply to every capture:
@@ -342,6 +353,16 @@ vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer"
 
 `vshot` remembers two things in `$XDG_CONFIG_HOME/vshot/config.json` (or `~/.config/vshot/config.json`): the **annotation editor's style**, and **defaults for some command-line flags**. The file is optional — missing, unreadable, or malformed all fall back to the built-in defaults and never affect a capture.
 
+There are three ways to change it, whichever suits you: **edit the file by hand**, adjust things in the annotation editor itself (its style is written back when a session ends), or run **`vshot settings`** for a window over both sections, saved as you press Save.
+
+```bash
+vshot settings
+```
+
+The window is an ordinary window: it captures nothing and needs no compositor protocol, so it also works on a compositor vshot cannot otherwise capture. After installing the package you can also open it from the application menu as **VShot Settings** (see ["Application menu entry"](#application-menu-entry)). An empty or zero value in the `cli` section means "leave it unset, use the built-in default" rather than storing a zero; the `editor` section is always written whole. Saving **merges**: keys this build does not recognize — a newer vshot's, or your own — survive untouched instead of being wiped by a save.
+
+The window has two pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic) and **Command-line defaults** (compression, default monitor, pin density, and the scrolling-capture settings). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and both fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look.
+
 ```json
 {
   "editor": {
@@ -404,7 +425,9 @@ command line > environment > config file > built-in default
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | inferred |
 
-`pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid.
+`pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid — a misspelled key costs you that one setting, and the rest still apply.
+
+`color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 
 ## Environment variables
 
@@ -442,16 +465,20 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering clipboard color parsing and color card rendering, a pin's self-declared density, pin outlines, text card padding, and the color card's right-click menu:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config file reads and writes and the settings window, clipboard color parsing and color card rendering, a pin's self-declared density, pin outlines, text card padding, and the color card's right-click menu:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
+build-qt/vshot-config-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-settings-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check
 build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 ```
+
+`vshot-config-check` covers the part most likely to fail silently: whether a save really **merges** (keeping keys this build does not recognize), whether clearing a value really removes it, and whether `#rrggbbaa` parses as CSS (Qt itself reads that as `#aarrggbb`, turning "opaque orange" into purple). `vshot-settings-check` builds the real settings window, drives every one of its widgets, and reads the config file back — a field wired to the wrong member is visible only that way. It is worth running whenever the window's layout changes: it finds widgets by object name, so a re-layout or a switch to a different widget class does not hide anything, and it only goes red when a field is genuinely mis-wired.
 
 There are also 4 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (needs a running KWin; a headless KWin suffices, see the comments in `src/capture/kwin.rs`, with a virtual output named `Virtual-0`, 1024x768, no pointer capability, so it only covers the D-Bus capture layer), the active output probe (needs any real session), and `/dev/uinput` scroll injection (needs write access). To run them:
 

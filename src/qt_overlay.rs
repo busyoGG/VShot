@@ -114,6 +114,35 @@ fn helper_exit_error(status: std::process::ExitStatus, stderr: &[u8]) -> VshotEr
     })
 }
 
+/// Runs the Qt helper's settings window and waits for it to be closed.
+///
+/// The window is an ordinary toplevel with no session behind it: it reads and
+/// writes the shared config file by itself.  Its stdio is inherited rather than
+/// piped, because nothing here consumes a result and a failure worth reading
+/// (no compositor, no config directory) lands on stderr while the window is
+/// still open.
+pub(crate) fn run_settings() -> Result<()> {
+    let helper = helper_program()?;
+    let status = Command::new(&helper.path)
+        .arg("--settings")
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|error| helper_spawn_error(&helper, error))?
+        .wait()
+        .map_err(|error| {
+            VshotError::Selection(format!(
+                "failed to wait for Qt helper `{}`: {error}",
+                helper.path.display()
+            ))
+        })?;
+    if !status.success() {
+        return Err(VshotError::Selection(format!(
+            "the settings window exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
 fn run_helper(helper: &HelperLookup, session_path: &Path) -> Result<Vec<u8>> {
     let child = Command::new(&helper.path)
         .arg("--session")

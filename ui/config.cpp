@@ -12,14 +12,35 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace vshot {
 namespace {
+
+/// The accepted values for each enumerated field.  They live here rather than
+/// at the call sites because two readers depend on them: the loader below, and
+/// the settings window's combo boxes, which must offer exactly what the loader
+/// will accept.
+const QStringList kToolNames = {QStringLiteral("select"), QStringLiteral("rectangle"),
+                                QStringLiteral("ellipse"), QStringLiteral("arrow"),
+                                QStringLiteral("pen"), QStringLiteral("text"),
+                                QStringLiteral("mosaic")};
+const QStringList kDashNames = {QStringLiteral("solid"), QStringLiteral("dashed"),
+                                QStringLiteral("dotted")};
+const QStringList kArrowStyleNames = {QStringLiteral("open"), QStringLiteral("filled")};
+const QStringList kMosaicShapeNames = {QStringLiteral("rect"), QStringLiteral("ellipse"),
+                                       QStringLiteral("brush")};
+const QStringList kCompressionNames = {QStringLiteral("none"), QStringLiteral("fastest"),
+                                       QStringLiteral("fast"), QStringLiteral("balanced"),
+                                       QStringLiteral("high")};
+const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
+                                  QStringLiteral("portal"), QStringLiteral("uinput")};
 
 constexpr int kMaxWidth = 64;
 constexpr int kMaxTextSize = 64;
 constexpr int kMaxArrowSize = 8;
 constexpr int kMaxMosaicStrength = 3;
+constexpr int kMaxDensity = 4;
 
 /// Reads a non-negative integer, clamped into `[1, max]`; anything absent or
 /// of the wrong type keeps `fallback`.
@@ -39,6 +60,42 @@ std::uint32_t readBounded(const QJsonObject &object, const QString &key, std::ui
         return fallback;
     }
     return static_cast<std::uint32_t>(std::min<long long>(rounded, max));
+}
+
+/// Like [`readBounded`] but for a value that may legitimately be zero, which
+/// the `cli` section uses for "the file says nothing".
+std::uint32_t readOptional(const QJsonObject &object, const QString &key, std::uint32_t max)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return 0;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return 0;
+    }
+    const auto rounded = static_cast<long long>(raw);
+    if (rounded < 1) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(std::min<long long>(rounded, max));
+}
+
+std::uint64_t readOptionalWide(const QJsonObject &object, const QString &key, std::uint64_t max)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return 0;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return 0;
+    }
+    const auto rounded = static_cast<long long>(raw);
+    if (rounded < 1) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(std::min<long long>(rounded, static_cast<long long>(max)));
 }
 
 /// Reads one of `allowed`; anything else keeps `fallback`.  The values come
@@ -61,24 +118,257 @@ QString readString(const QJsonObject &object, const QString &key, const QString 
     return value.isString() ? value.toString() : fallback;
 }
 
-/// A color is stored as `#rrggbb` or `#rrggbbaa`, which is what the editor's
-/// own hex field accepts, so a value copied out of the UI can be pasted back
-/// into the file unchanged.
+/// The `#rrggbbaa` spelling of a color that is not opaque.
+QString colorTextWithAlpha(const QColor &color)
+{
+    return QStringLiteral("#%1%2%3%4")
+        .arg(color.red(), 2, 16, QLatin1Char('0'))
+        .arg(color.green(), 2, 16, QLatin1Char('0'))
+        .arg(color.blue(), 2, 16, QLatin1Char('0'))
+        .arg(color.alpha(), 2, 16, QLatin1Char('0'));
+}
+
+/// A color is stored as `#rrggbb`, or `#rrggbbaa` when it is not opaque.
+///
+/// This is the CSS spelling, and it is parsed here by hand rather than handed
+/// to `QColor(QString)`: Qt reads an eight-digit literal as `#aarrggbb`
+/// instead, so `#ff8800ff` -- which every other tool calls opaque orange --
+/// would come out as purple.  The file is meant to be written by hand, so the
+/// spelling has to be the one people already know.
 QColor readColor(const QJsonObject &object, const QString &key, const QColor &fallback)
 {
     const QJsonValue value = object.value(key);
     if (!value.isString()) {
         return fallback;
     }
-    const QColor color(value.toString());
+    const QColor color = parseColorText(value.toString());
     return color.isValid() ? color : fallback;
 }
 
-QString colorText(const QColor &color)
+/// The whole file as it is on disk, so a save can merge into it instead of
+/// replacing it.  An unreadable or malformed file reads as empty, which turns
+/// the next save into a plain write.
+QJsonObject readRoot()
 {
-    // `#rrggbb` when opaque, `#rrggbbaa` when not: the shorter form is what
-    // people write by hand.
-    return color.alpha() == 255 ? color.name(QColor::HexRgb) : color.name(QColor::HexArgb);
+    const QString path = configFilePath();
+    if (path.isEmpty()) {
+        return QJsonObject();
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return QJsonObject();
+    }
+    QJsonParseError error{};
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject()) {
+        return QJsonObject();
+    }
+    return document.object();
+}
+
+/// Merges `section` into `root`'s key of the same name, leaving keys the
+/// incoming object does not mention as they were.
+void mergeSection(QJsonObject &root, const QString &name, const QJsonObject &section)
+{
+    QJsonObject merged = root.value(name).toObject();
+    for (auto entry = section.constBegin(); entry != section.constEnd(); ++entry) {
+        merged.insert(entry.key(), entry.value());
+    }
+    root.insert(name, merged);
+}
+
+/// The `cli` leaves this build owns, as `(section, key)` pairs; `section` is
+/// empty for a key directly under `cli`.
+///
+/// A plain merge cannot express "the user cleared this": the value the window
+/// left empty is simply absent from the incoming object, and merging would put
+/// the old one back.  So these leaves are dropped from the file before the
+/// merge, which makes the incoming section authoritative for them — while every
+/// key *not* listed here (a newer vshot's, or one added by hand, at any depth)
+/// still survives.  The `editor` section needs no such list: the editor always
+/// writes all of it.
+const std::pair<const char *, const char *> kOwnedCliKeys[] = {
+    {"", "png-compression"}, {"", "monitor"},
+    {"long", "notches"},     {"long", "max-height"},
+    {"long", "max-frames"},  {"long", "timeout"},
+    {"long", "ignore-top"},  {"long", "inject"},
+    {"pin", "density"},
+};
+
+/// Removes `key` from `object`, leaving `object` possibly empty for the caller
+/// to prune.
+void removeLeaf(QJsonObject &object, const QString &key)
+{
+    object.remove(key);
+}
+
+/// Writes the `cli` section: this build's leaves replaced, everything else —
+/// including keys nested beside them that this build does not know — kept.
+void writeCliSection(QJsonObject &root, const QJsonObject &cli)
+{
+    QJsonObject merged = root.value(QStringLiteral("cli")).toObject();
+    for (const auto &[section, key] : kOwnedCliKeys) {
+        const QString leaf = QString::fromLatin1(key);
+        if (section[0] == '\0') {
+            removeLeaf(merged, leaf);
+            continue;
+        }
+        const QString parent = QString::fromLatin1(section);
+        QJsonObject nested = merged.value(parent).toObject();
+        nested.remove(leaf);
+        if (nested.isEmpty()) {
+            merged.remove(parent);
+        } else {
+            merged.insert(parent, nested);
+        }
+    }
+    for (auto entry = cli.constBegin(); entry != cli.constEnd(); ++entry) {
+        // A nested section merges into whatever survived above rather than
+        // replacing it, so `long.future-key` is not lost to a save.
+        if (entry.value().isObject()) {
+            QJsonObject nested = merged.value(entry.key()).toObject();
+            const QJsonObject incoming = entry.value().toObject();
+            for (auto nestedEntry = incoming.constBegin(); nestedEntry != incoming.constEnd();
+                 ++nestedEntry) {
+                nested.insert(nestedEntry.key(), nestedEntry.value());
+            }
+            merged.insert(entry.key(), nested);
+        } else {
+            merged.insert(entry.key(), entry.value());
+        }
+    }
+    if (merged.isEmpty()) {
+        root.remove(QStringLiteral("cli"));
+    } else {
+        root.insert(QStringLiteral("cli"), merged);
+    }
+}EditorPreferences readEditor(const QJsonObject &editor)
+{
+    EditorPreferences preferences;
+    preferences.tool =
+        readChoice(editor, QStringLiteral("tool"), preferences.tool, kToolNames);
+    preferences.color = readColor(editor, QStringLiteral("color"), preferences.color);
+    preferences.font = readString(editor, QStringLiteral("font"), preferences.font);
+    preferences.width =
+        readBounded(editor, QStringLiteral("width"), preferences.width, kMaxWidth);
+    preferences.textSize =
+        readBounded(editor, QStringLiteral("textSize"), preferences.textSize, kMaxTextSize);
+    preferences.dash = readChoice(editor, QStringLiteral("dash"), preferences.dash, kDashNames);
+    preferences.arrowSize = readBounded(editor, QStringLiteral("arrowSize"),
+                                        preferences.arrowSize, kMaxArrowSize);
+    preferences.arrowStyle = readChoice(editor, QStringLiteral("arrowStyle"),
+                                        preferences.arrowStyle, kArrowStyleNames);
+    preferences.mosaicShape = readChoice(editor, QStringLiteral("mosaicShape"),
+                                         preferences.mosaicShape, kMosaicShapeNames);
+    preferences.mosaicStrength = readBounded(editor, QStringLiteral("mosaicStrength"),
+                                             preferences.mosaicStrength, kMaxMosaicStrength);
+    return preferences;
+}
+
+CliPreferences readCli(const QJsonObject &cli)
+{
+    CliPreferences preferences;
+    preferences.pngCompression =
+        readChoice(cli, QStringLiteral("png-compression"), QString(), kCompressionNames);
+    preferences.monitor = readString(cli, QStringLiteral("monitor"), QString());
+    const QJsonObject longSection = cli.value(QStringLiteral("long")).toObject();
+    preferences.longInject =
+        readChoice(longSection, QStringLiteral("inject"), QString(), kInjectNames);
+    preferences.longNotches = readOptional(longSection, QStringLiteral("notches"), 1000);
+    preferences.longMaxHeight = readOptional(longSection, QStringLiteral("max-height"), 1'000'000);
+    preferences.longMaxFrames = readOptional(longSection, QStringLiteral("max-frames"), 1'000'000);
+    preferences.longTimeout = readOptionalWide(longSection, QStringLiteral("timeout"), 86'400);
+    preferences.longIgnoreTop = readOptional(longSection, QStringLiteral("ignore-top"), 100'000);
+
+    const QJsonObject pinSection = cli.value(QStringLiteral("pin")).toObject();
+    preferences.pinDensity = readOptional(pinSection, QStringLiteral("density"), kMaxDensity);
+    return preferences;
+}
+
+/// The `editor` section as JSON.  Every field is written, because the editor's
+/// style is a complete picture rather than a set of overrides.
+QJsonObject editorJson(const EditorPreferences &preferences)
+{
+    QJsonObject editor;
+    editor.insert(QStringLiteral("tool"), preferences.tool);
+    editor.insert(QStringLiteral("color"), colorText(preferences.color));
+    editor.insert(QStringLiteral("font"), preferences.font);
+    editor.insert(QStringLiteral("width"), static_cast<double>(preferences.width));
+    editor.insert(QStringLiteral("textSize"), static_cast<double>(preferences.textSize));
+    editor.insert(QStringLiteral("dash"), preferences.dash);
+    editor.insert(QStringLiteral("arrowSize"), static_cast<double>(preferences.arrowSize));
+    editor.insert(QStringLiteral("arrowStyle"), preferences.arrowStyle);
+    editor.insert(QStringLiteral("mosaicShape"), preferences.mosaicShape);
+    editor.insert(QStringLiteral("mosaicStrength"),
+                  static_cast<double>(preferences.mosaicStrength));
+    return editor;
+}
+
+/// The `cli` section as JSON.  Only the entries that carry a value are
+/// written: an empty string or a zero is how the settings window says "let the
+/// built-in default stand", and writing them out would freeze today's default
+/// into the file.
+QJsonObject cliJson(const CliPreferences &preferences)
+{
+    QJsonObject cli;
+    if (!preferences.pngCompression.isEmpty()) {
+        cli.insert(QStringLiteral("png-compression"), preferences.pngCompression);
+    }
+    if (!preferences.monitor.isEmpty()) {
+        cli.insert(QStringLiteral("monitor"), preferences.monitor);
+    }
+    QJsonObject longSection;
+    if (preferences.longNotches > 0) {
+        longSection.insert(QStringLiteral("notches"), static_cast<double>(preferences.longNotches));
+    }
+    if (preferences.longMaxHeight > 0) {
+        longSection.insert(QStringLiteral("max-height"),
+                           static_cast<double>(preferences.longMaxHeight));
+    }
+    if (preferences.longMaxFrames > 0) {
+        longSection.insert(QStringLiteral("max-frames"),
+                           static_cast<double>(preferences.longMaxFrames));
+    }
+    if (preferences.longTimeout > 0) {
+        longSection.insert(QStringLiteral("timeout"), static_cast<double>(preferences.longTimeout));
+    }
+    if (preferences.longIgnoreTop > 0) {
+        longSection.insert(QStringLiteral("ignore-top"),
+                           static_cast<double>(preferences.longIgnoreTop));
+    }
+    if (!preferences.longInject.isEmpty()) {
+        longSection.insert(QStringLiteral("inject"), preferences.longInject);
+    }
+    if (!longSection.isEmpty()) {
+        cli.insert(QStringLiteral("long"), longSection);
+    }
+    if (preferences.pinDensity > 0) {
+        QJsonObject pinSection;
+        pinSection.insert(QStringLiteral("density"), static_cast<double>(preferences.pinDensity));
+        cli.insert(QStringLiteral("pin"), pinSection);
+    }
+    return cli;
+}
+
+bool writeRoot(const QJsonObject &root)
+{
+    const QString path = configFilePath();
+    if (path.isEmpty()) {
+        return false;
+    }
+    const QFileInfo info(path);
+    QDir directory = info.absoluteDir();
+    if (!directory.exists() && !directory.mkpath(QStringLiteral("."))) {
+        return false;
+    }
+    // `QSaveFile` writes to a temporary and renames, so a crash mid-write
+    // cannot leave a half-written file that the next run would refuse.
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    return file.commit();
 }
 
 } // namespace
@@ -97,93 +387,114 @@ QString configFilePath()
     return base + QStringLiteral("/vshot/config.json");
 }
 
-EditorPreferences loadEditorPreferences()
+QString colorText(const QColor &color)
 {
-    EditorPreferences preferences;
-    const QString path = configFilePath();
-    if (path.isEmpty()) {
-        return preferences;
-    }
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        // No config yet is the normal first run, not a problem worth a word.
-        return preferences;
-    }
-    QJsonParseError error{};
-    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &error);
-    if (error.error != QJsonParseError::NoError || !document.isObject()) {
-        return preferences;
-    }
-    const QJsonObject object = document.object();
-    const QJsonValue editorValue = object.value(QStringLiteral("editor"));
-    if (!editorValue.isObject()) {
-        return preferences;
-    }
-    const QJsonObject editor = editorValue.toObject();
-
-    preferences.tool = readChoice(
-        editor, QStringLiteral("tool"), preferences.tool,
-        {QStringLiteral("select"), QStringLiteral("rectangle"), QStringLiteral("ellipse"),
-         QStringLiteral("arrow"), QStringLiteral("pen"), QStringLiteral("text"),
-         QStringLiteral("mosaic")});
-    preferences.color = readColor(editor, QStringLiteral("color"), preferences.color);
-    preferences.font = readString(editor, QStringLiteral("font"), preferences.font);
-    preferences.width =
-        readBounded(editor, QStringLiteral("width"), preferences.width, kMaxWidth);
-    preferences.textSize =
-        readBounded(editor, QStringLiteral("textSize"), preferences.textSize, kMaxTextSize);
-    preferences.dash = readChoice(editor, QStringLiteral("dash"), preferences.dash,
-                                  {QStringLiteral("solid"), QStringLiteral("dashed"),
-                                   QStringLiteral("dotted")});
-    preferences.arrowSize = readBounded(editor, QStringLiteral("arrowSize"),
-                                        preferences.arrowSize, kMaxArrowSize);
-    preferences.arrowStyle = readChoice(editor, QStringLiteral("arrowStyle"),
-                                        preferences.arrowStyle,
-                                        {QStringLiteral("open"), QStringLiteral("filled")});
-    preferences.mosaicShape = readChoice(editor, QStringLiteral("mosaicShape"),
-                                         preferences.mosaicShape,
-                                         {QStringLiteral("rect"), QStringLiteral("ellipse"),
-                                          QStringLiteral("brush")});
-    preferences.mosaicStrength = readBounded(editor, QStringLiteral("mosaicStrength"),
-                                             preferences.mosaicStrength, kMaxMosaicStrength);
-    return preferences;
+    // `#rrggbb` when opaque, `#rrggbbaa` when not: the shorter form is what
+    // people write by hand, and it matches what the editor's own hex field
+    // accepts.
+    return color.alpha() == 255 ? color.name(QColor::HexRgb) : colorTextWithAlpha(color);
 }
 
-void saveEditorPreferences(const EditorPreferences &preferences)
+QColor parseColorText(const QString &text)
 {
-    const QString path = configFilePath();
-    if (path.isEmpty()) {
-        return;
+    QString digits = text.trimmed();
+    if (digits.startsWith(QLatin1Char('#'))) {
+        digits.remove(0, 1);
     }
-    QJsonObject editor;
-    editor.insert(QStringLiteral("tool"), preferences.tool);
-    editor.insert(QStringLiteral("color"), colorText(preferences.color));
-    editor.insert(QStringLiteral("font"), preferences.font);
-    editor.insert(QStringLiteral("width"), static_cast<double>(preferences.width));
-    editor.insert(QStringLiteral("textSize"), static_cast<double>(preferences.textSize));
-    editor.insert(QStringLiteral("dash"), preferences.dash);
-    editor.insert(QStringLiteral("arrowSize"), static_cast<double>(preferences.arrowSize));
-    editor.insert(QStringLiteral("arrowStyle"), preferences.arrowStyle);
-    editor.insert(QStringLiteral("mosaicShape"), preferences.mosaicShape);
-    editor.insert(QStringLiteral("mosaicStrength"),
-                  static_cast<double>(preferences.mosaicStrength));
+    const auto isHex = [](QChar character) {
+        return (character >= QLatin1Char('0') && character <= QLatin1Char('9')) ||
+               (character >= QLatin1Char('a') && character <= QLatin1Char('f')) ||
+               (character >= QLatin1Char('A') && character <= QLatin1Char('F'));
+    };
+    for (const QChar character : digits) {
+        if (!isHex(character)) {
+            return QColor();
+        }
+    }
+    const auto nibble = [&digits](int index) {
+        return digits.mid(index, 1).toInt(nullptr, 16);
+    };
+    const auto byte = [&digits](int index) {
+        return digits.mid(index * 2, 2).toInt(nullptr, 16);
+    };
+    switch (digits.size()) {
+    case 3:
+        // `#f80` is `#ff8800`, each digit doubled.  `QChar::digitValue` is not
+        // used here: it answers only for decimal digits, so `f` would read as
+        // -1 and the color would come out black.
+        return QColor(nibble(0) * 17, nibble(1) * 17, nibble(2) * 17);
+    case 6:
+        return QColor(byte(0), byte(1), byte(2));
+    case 8:
+        return QColor(byte(0), byte(1), byte(2), byte(3));
+    default:
+        return QColor();
+    }
+}
 
-    QJsonObject root;
-    root.insert(QStringLiteral("editor"), editor);
+Config loadConfig()
+{
+    Config config;
+    const QJsonObject root = readRoot();
+    config.editor = readEditor(root.value(QStringLiteral("editor")).toObject());
+    config.cli = readCli(root.value(QStringLiteral("cli")).toObject());
+    return config;
+}
 
-    const QFileInfo info(path);
-    QDir directory = info.absoluteDir();
-    if (!directory.exists() && !directory.mkpath(QStringLiteral("."))) {
-        return;
+bool saveConfig(const Config &config)
+{
+    if (configFilePath().isEmpty()) {
+        return false;
     }
-    // `QSaveFile` writes to a temporary and renames, so a crash mid-write
-    // cannot leave a half-written file that the next run would refuse.
-    QSaveFile file(path);
-    if (!file.open(QIODevice::WriteOnly)) {
-        return;
+    QJsonObject root = readRoot();
+    mergeSection(root, QStringLiteral("editor"), editorJson(config.editor));
+    writeCliSection(root, cliJson(config.cli));
+    return writeRoot(root);
+}
+
+EditorPreferences loadEditorPreferences()
+{
+    return loadConfig().editor;
+}
+
+bool saveEditorPreferences(const EditorPreferences &preferences)
+{
+    if (configFilePath().isEmpty()) {
+        return false;
     }
-    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-    file.commit();
+    QJsonObject root = readRoot();
+    mergeSection(root, QStringLiteral("editor"), editorJson(preferences));
+    return writeRoot(root);
+}
+
+const QStringList &toolNames()
+{
+    return kToolNames;
+}
+
+const QStringList &dashNames()
+{
+    return kDashNames;
+}
+
+const QStringList &arrowStyleNames()
+{
+    return kArrowStyleNames;
+}
+
+const QStringList &mosaicShapeNames()
+{
+    return kMosaicShapeNames;
+}
+
+const QStringList &compressionNames()
+{
+    return kCompressionNames;
+}
+
+const QStringList &injectNames()
+{
+    return kInjectNames;
 }
 
 } // namespace vshot

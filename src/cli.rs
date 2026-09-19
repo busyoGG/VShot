@@ -271,6 +271,17 @@ so the trace is readable while the daemon lives on without it."
         #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list", "density"])]
         apply: Option<PathBuf>,
     },
+
+    /// Edit the remembered settings in a window: the annotation editor's style
+    /// and the command-line defaults, both from the shared config file.
+    #[command(
+        after_help = "Opens a window over the same `$XDG_CONFIG_HOME/vshot/config.json` the \
+annotation editor and the CLI already read. Saving writes the file, so the next `vshot region` \
+opens with the chosen style and the next run falls back to the chosen defaults for flags that \
+are not given. Nothing is captured and no compositor protocol is needed beyond showing a window, \
+so this also works under a compositor vshot cannot otherwise capture."
+    )]
+    Settings,
 }
 
 #[derive(Debug, Subcommand)]
@@ -394,14 +405,17 @@ pub struct Request {
     pub compression: PngCompression,
 }
 
-/// What `vshot` was asked to do: capture something to a destination, or drive
-/// the pin daemon. Pin management never touches the Wayland capture path.
+/// What `vshot` was asked to do.  Only the capture arm touches the Wayland
+/// capture path; pin management talks to the daemon, and the settings window is
+/// an ordinary toplevel over the config file.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Capture(Request),
     Pin(crate::pin::PinInvocation),
     /// Internal: render one pin-edit session and write the result back.
     PinApply(std::path::PathBuf),
+    /// Show the settings window and wait for it to close.
+    Settings,
 }
 
 /// The parser, with the help output in the language `VSHOT_LANG` (or the
@@ -417,9 +431,21 @@ pub fn parse() -> Cli {
 }
 
 impl Cli {
-    /// Splits the CLI into the two things `vshot` can do: capture to a
-    /// destination, or drive the pin daemon.
+    /// Splits the CLI into the things `vshot` can do: capture to a destination,
+    /// drive the pin daemon, render a pin-edit session, or show the settings
+    /// window.
     pub fn parse_action(self) -> Result<Action> {
+        if let Command::Settings = &self.command {
+            // Nothing else applies: this subcommand captures nothing and has
+            // no destination to argue about.
+            if self.output.is_some() || self.pin || self.clipboard {
+                return Err(VshotError::InvalidDestination(
+                    "--output, --clipboard and --pin do not apply to the settings subcommand"
+                        .into(),
+                ));
+            }
+            return Ok(Action::Settings);
+        }
         if let Command::Pin {
             files,
             toggle,
@@ -544,6 +570,11 @@ impl Cli {
             Command::Pin { .. } => {
                 return Err(VshotError::InvalidDestination(
                     "the pin subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Settings => {
+                return Err(VshotError::InvalidDestination(
+                    "the settings subcommand is not a capture target".into(),
                 ))
             }
         };

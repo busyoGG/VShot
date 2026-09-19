@@ -20,8 +20,12 @@ use crate::model::PngCompression;
 /// `"png-compression"` and `--max-height` is `"max-height"`; that is what a
 /// user editing the file by hand would reach for, and it matches the Qt side's
 /// camelCase habit of naming things as they appear in the UI.
+///
+/// Unknown keys are ignored rather than rejected: this is a file the user may
+/// edit by hand and that a newer vshot may write, and refusing the whole
+/// section over one unrecognized name would silently drop every default in it.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case")]
 pub struct CliDefaults {
     /// `--png-compression`, one of `none` / `fastest` / `fast` / `balanced` /
     /// `high`.
@@ -35,7 +39,7 @@ pub struct CliDefaults {
 
 /// Defaults for `vshot long`.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case")]
 pub struct LongDefaults {
     pub notches: Option<u32>,
     pub max_height: Option<u32>,
@@ -48,7 +52,7 @@ pub struct LongDefaults {
 
 /// Defaults for `vshot pin`.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct PinDefaults {
     /// `--density` for every pinned image.
     pub density: Option<u32>,

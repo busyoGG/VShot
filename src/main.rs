@@ -68,6 +68,11 @@ fn run() -> Result<()> {
             // Internal: render a pin-edit session, no Wayland capture needed.
             return pin::apply_edit(&session);
         }
+        Action::Settings => {
+            // The settings window is a plain toplevel over the config file: no
+            // capture, no scene, no Wayland connection of our own.
+            return qt_overlay::run_settings();
+        }
         Action::Capture(request) => request,
     };
     let mut wayland = WaylandSession::connect()?;

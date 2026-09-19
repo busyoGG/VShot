@@ -4,6 +4,7 @@
 #include "pin_edit.hpp"
 #include "pin_server.hpp"
 #include "session_protocol.hpp"
+#include "settings_window.hpp"
 
 #include <QApplication>
 #include <QFileInfo>
@@ -46,15 +47,45 @@ QScreen *screenForOutput(const vshot::OutputSession &output)
 
 int main(int argc, char **argv)
 {
-    qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
+    // QApplication consumes Qt-managed command-line options it recognizes
+    // (including the session-management option that shares our `--session`
+    // spelling), so parse our own arguments before constructing it -- and
+    // before any platform-level environment is set, because which shell
+    // integration is wanted depends on the mode.
+    const bool settingsMode =
+        argc == 2 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--settings");
+    // Every other mode draws a layer surface: the capture overlay, the picking
+    // overlay, the scrolling-capture hint and the pin windows all anchor
+    // themselves and must sit above ordinary windows.  The settings window is
+    // the exception -- it is a plain toplevel dialog, and a dialog under the
+    // layer-shell integration is created and then never mapped, because there
+    // is no layer surface to map it as.  So the override is set only where it
+    // is wanted, and cleared where it would get in the way: a session that
+    // exports it globally would otherwise leave this window invisible with no
+    // error to show for it.
+    if (settingsMode) {
+        qunsetenv("QT_WAYLAND_SHELL_INTEGRATION");
+    } else {
+        qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
+    }
     // The clipboard is read with `wl-paste` rather than through Qt's own
     // Wayland clipboard: Qt implements only the wlroots
     // `zwlr_data_control_v1`, which a KWin session does not offer, and its
     // standard path hands over nothing to a client that has no focus.
 
-    // QApplication consumes Qt-managed command-line options it recognizes
-    // (including the session-management option that shares our `--session`
-    // spelling), so parse our own arguments before constructing it.
+    if (settingsMode) {
+        QApplication app(argc, argv);
+        // The desktop file this window's icon comes from.  Wayland has no
+        // per-window icon: a compositor takes the application id the client
+        // declares, finds `<id>.desktop` in the installed data directories and
+        // draws whatever `Icon=` names.  The id has to be set before the
+        // window is created, and it must match the installed file exactly or
+        // the window comes up with a generic placeholder.
+        QGuiApplication::setDesktopFileName(QStringLiteral("vshot-settings"));
+        QApplication::setQuitOnLastWindowClosed(true);
+        vshot::initUiLanguage();
+        return vshot::runSettingsWindow();
+    }
     if (argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--pin-server")) {
         const QString socketPath = QString::fromLocal8Bit(argv[2]);
         if (!socketPath.startsWith(QLatin1Char('/'))) {
@@ -79,6 +110,7 @@ int main(int argc, char **argv)
     }
     if (argc != 3 || QString::fromLocal8Bit(argv[1]) != QStringLiteral("--session")) {
         reportError(QStringLiteral("usage: vshot-qt-ui --session <absolute-json-path>\n"
+                                   "       vshot-qt-ui --settings\n"
                                    "       vshot-qt-ui --pin-edit <absolute-json-path>\n"
                                    "       vshot-qt-ui --pin-server <absolute-socket-path>"));
         return 2;

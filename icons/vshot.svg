@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  VShot's application icon: a region selection with its resize handles, which
+  is what the tool puts on screen when you drag one out.
+
+  The palette is the annotation toolbar's (the panel colour #2a303a it draws
+  its cards in, and the accent #dde1ff it highlights with), so the icon and the
+  interface it opens read as the same program.
+
+  Four corner handles rather than the editor's full eight: at 16px the edge
+  handles merge with the frame into a solid blob, while the corners survive as
+  distinct marks.  The frame is kept thin for the same reason.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect x="6" y="6" width="244" height="244" rx="56" fill="#2a303a"/>
+
+  <!-- The selection. -->
+  <rect x="74" y="74" width="108" height="108" rx="8"
+        fill="none" stroke="#dde1ff" stroke-width="12"/>
+
+  <!-- The four corner handles. -->
+  <g fill="#dde1ff">
+    <rect x="56" y="56" width="36" height="36" rx="9"/>
+    <rect x="164" y="56" width="36" height="36" rx="9"/>
+    <rect x="56" y="164" width="36" height="36" rx="9"/>
+    <rect x="164" y="164" width="36" height="36" rx="9"/>
+  </g>
+</svg>

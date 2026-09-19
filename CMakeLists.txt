@@ -24,6 +24,8 @@ add_executable(vshot-qt-ui
     ui/hint_window.hpp
     ui/pin_edit.cpp
     ui/pin_edit.hpp
+    ui/settings_window.cpp
+    ui/settings_window.hpp
     ui/pin_density.cpp
     ui/pin_density.hpp
     ui/pin_surface.cpp
@@ -55,6 +57,48 @@ install(TARGETS vshot-qt-ui RUNTIME DESTINATION bin)
 # and no layer shell. Off by default; see the README's verification section.
 option(VSHOT_BUILD_CHECKS "Build the offline checks" OFF)
 if(VSHOT_BUILD_CHECKS)
+    # The config check: what a save does to the parts of the shared config file
+    # it did not write. It is the one place where reading and writing have to
+    # agree with each other and with the CLI's own config.rs, and where a
+    # mistake silently loses the user's settings rather than failing loudly.
+    add_executable(vshot-config-check
+        ui/config_check.cpp
+        ui/config.cpp
+        ui/config.hpp
+    )
+    target_link_libraries(vshot-config-check PRIVATE Qt6::Core Qt6::Gui)
+    target_compile_features(vshot-config-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-config-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    # The settings window check: it builds the real dialog and drives its
+    # widgets, then reads the config file back. A field wired to the wrong
+    # member is invisible until a user notices their stroke width changing
+    # their text size, so it is worth driving all eighteen of them.
+    add_executable(vshot-settings-check
+        ui/settings_check.cpp
+        ui/settings_window.cpp
+        ui/settings_window.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-settings-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+    )
+    target_compile_features(vshot-settings-check PRIVATE cxx_std_17)
+    # The check reads the launcher entry and the icon out of the source tree,
+    # so it needs to know where that is.
+    target_compile_definitions(vshot-settings-check PRIVATE
+        VSHOT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-settings-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     add_executable(vshot-color-check
         ui/color_card_check.cpp
         ui/color_card.cpp
