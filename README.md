@@ -1,5 +1,9 @@
 # vshot
 
+**中文** | [English](README.en.md)
+
+> **本项目是纯 vibe coding 项目**：需求由人提，代码与文档由 AI 写。
+
 Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕获采用**严格冻结**：先把桌面拍成静态帧，之后所有选择与标注都在那一帧上做，选区期间屏幕上没有任何东西会动。
 
 已适配 Hyprland、niri、KWin/Plasma、Sway，以及任何提供 `wlr-screencopy` 的合成器（如 labwc）的基础截屏。
