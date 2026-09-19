@@ -196,8 +196,11 @@ protected:
     {
         QComboBox::paintEvent(event);
         QPainter painter(this);
-        const qreal ratio = devicePixelRatioF();
-        const QRectF box(width() - 24.0 / ratio, 0.0, 16.0 / ratio, height() / ratio);
+        // The painter's coordinate system on a widget is already in logical
+        // pixels -- Qt has applied the ratio -- so dividing by
+        // devicePixelRatioF() here would halve every coordinate on a scale-2
+        // output and leave the chevron jammed in the corner.
+        const QRectF box(width() - 24.0, 0.0, 16.0, height());
         paintChevron(painter, box, kChevron, true);
     }
 };
@@ -252,13 +255,14 @@ protected:
     }
 
 private:
-    /// The two arrow hit boxes, stacked in the right-hand strip.
+    /// The two arrow hit boxes, stacked in the right-hand strip.  Logical
+    /// pixels, like every other coordinate the painter and the event handlers
+    /// see: Qt has already folded the output's scale into both.
     QRectF upBox() const
     {
-        const qreal ratio = devicePixelRatioF();
-        const qreal strip = 26.0 / ratio;
-        const qreal width = 16.0 / ratio;
-        return QRectF(this->width() / ratio - strip, 0.0, width, height() / ratio / 2.0);
+        constexpr qreal strip = 26.0;
+        constexpr qreal arrowWidth = 16.0;
+        return QRectF(width() - strip, 0.0, arrowWidth, height() / 2.0);
     }
 
     QRectF downBox() const

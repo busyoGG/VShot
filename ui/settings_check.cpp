@@ -267,9 +267,14 @@ void checkTheDesktopEntryAndIconAgree()
     const QString contents = QString::fromUtf8(desktop.readAll());
 
     // The id the window declares has to be the file's own name, or the
-    // compositor never finds it.
+    // compositor never finds it -- and it has to be declared only when that
+    // file is installed, because Qt also registers it with the host portal and
+    // an id with no desktop file behind it makes the portal log a failure on
+    // every start.  Both halves are read out of the source, since neither is
+    // observable without a compositor and an installed package.
     QFile mainSource(sourceDir + QStringLiteral("/ui/main.cpp"));
     QString declared;
+    QString guard;
     if (mainSource.open(QIODevice::ReadOnly)) {
         const QString text = QString::fromUtf8(mainSource.readAll());
         const QString marker = QStringLiteral("setDesktopFileName(QStringLiteral(\"");
@@ -278,12 +283,20 @@ void checkTheDesktopEntryAndIconAgree()
             const int start = at + marker.size();
             declared = text.mid(start, text.indexOf(QLatin1Char('"'), start) - start);
         }
+        // The condition the call sits behind, e.g.
+        //   if (!QStandardPaths::locate(...).isEmpty()) {
+        const QString guardMarker = QStringLiteral("QStandardPaths::locate");
+        if (text.contains(guardMarker)) {
+            guard = guardMarker;
+        }
     }
     expect(declared == QStringLiteral("vshot-settings"),
            "the window declares the desktop file name the entry is installed as", declared);
     expect(QFileInfo(desktopPath).fileName() == declared + QStringLiteral(".desktop"),
            "the desktop file is named after that id",
            QFileInfo(desktopPath).fileName());
+    expect(!guard.isEmpty(),
+           "that id is declared only when the desktop file is installed", guard);
 
     // `Icon=` has to name an icon that exists, and the package has to install
     // it under that name.

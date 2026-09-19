@@ -37,7 +37,11 @@ sudo pacman -U dist/vshot-0.1.0-1-x86_64.pkg.tar.zst
 
 包会装一个 `vshot-settings.desktop`，在应用菜单里显示为 **VShot Settings**，点开就是 `vshot settings` 的图形设置界面。图标是 `icons/vshot.svg`，装在 `hicolor/scalable/apps/` 下——一个可缩放 SVG 而不是一整套尺寸，桌面外壳（KDE、GNOME、wlroots 系的启动器）自己渲染并按需取尺寸。
 
-Wayland **没有逐窗口的图标**：合成器拿客户端声明的 application id，去找 `<id>.desktop`，再画它 `Icon=` 指的东西。所以 `ui/main.cpp` 里那句 `setDesktopFileName("vshot-settings")` 必须与安装的 desktop 文件名一致，改一处就得改另一处，否则窗口只会拿到一个通用占位图标、且**不会报任何错**。`vshot-settings-check` 里有一节专门盯这条链（app id、文件名、`Icon=` 指向的文件、PKGBUILD 是否都装）。
+Wayland **没有逐窗口的图标**：合成器拿客户端声明的 application id，去找 `<id>.desktop`，再画它 `Icon=` 指的东西。所以 `ui/main.cpp` 里声明的那个名字必须与安装的 desktop 文件名一致，改一处就得改另一处，否则窗口只会拿到一个通用占位图标。
+
+但这个 id 不只是图标查找用的：**Qt 还会把它注册给 host portal**，portal 在同样的目录里找同名 desktop file，找不到就往 stderr 打一句 `Failed to register with host portal ... App info not found for 'vshot-settings'`。从源码树或 `build-qt/` 直接跑的副本没有装 desktop file，所以会一直看到这句话——那正是它该说的：这份副本没有桌面条目。因此 app id **只在 desktop file 确实装好时才声明**（用 `QStandardPaths::locate` 查 `ApplicationsLocation`），没装就不声明，窗口退回通用占位图标，也不再触发 portal 那条报错。
+
+`vshot-settings-check` 里有一节盯这条链：app id 与文件名是否一致、`Icon=` 指向的文件在不在源码树里、PKGBUILD 是否都装、以及**那句声明有没有那个「文件存在才声明」的防护**——最后一条是我加了防护后又回头补上的，因为原来的检查只看字面量，去掉防护照样绿。
 
 给 KWin 授权用的那份 `vshot.desktop` 是**另一个文件**，不能合并进来：它的 `Exec=` 必须精确指向 `/usr/bin/vshot`（KWin 按 pid 取 `/proc/<pid>/exe` 比对 `Exec=` 第一个词），而且是 `NoDisplay=true`，因为不带子命令直接跑 `vshot` 只会报「没给输出目标」。
 
@@ -361,7 +365,7 @@ vshot settings
 
 窗口只是普通窗口，不截图、不需要任何合成器协议，所以在一个 vshot 本来截不了图的合成器上也能用。装包后也可以直接从**应用菜单**里的「VShot Settings」打开（见[「应用菜单入口」](#应用菜单入口)）。`cli` 段的数值留空/留 0 表示「不设，用内置默认」，而不是把 0 存进去；`editor` 段则总是整段写出。保存是**合并写入**：本版不认识的键（新版 vshot 写的、或你自己加的）原样保留，不会因为存一次就被抹掉。
 
-窗口分两页，左边栏切换：**标注编辑器**（工具、颜色、线宽、线型、箭头、文本、马赛克）与**命令行默认值**（压缩、默认输出、pin 密度、滚动截图的各项）。每页是一列卡片，一行一项，标签在左、控件在右；两页在默认窗口尺寸下都**不需要滚动**。下拉框与数字框的箭头是自绘的（原生那套是带斜面的老式三角），所以控件外观与工具栏一致。
+窗口分两页，左边栏切换：**标注编辑器**（工具、颜色、线宽、线型、箭头、文本、马赛克）与**命令行默认值**（压缩、默认输出、pin 密度、滚动截图的各项）。每页是一列卡片，一行一项，标签在左、控件在右；两页在默认窗口尺寸下都**不需要滚动**。下拉框与数字框的箭头是自绘的（原生那套是带斜面的老式三角），所以控件外观与工具栏一致。画这些箭头时注意：**`paintEvent` 里 `QPainter` 的坐标系已经是逻辑像素**，Qt 早把输出缩放折进去了，再除一次 `devicePixelRatioF()` 会让坐标在 2 倍屏上全缩小一半、箭头挤到右上角——这个问题在 1 倍屏上完全看不出来，所以两种缩放都值得看一眼。
 
 ```json
 {

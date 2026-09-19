@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QStandardPaths>
 
 #include <cstdio>
 #include <memory>
@@ -78,10 +79,23 @@ int main(int argc, char **argv)
         // The desktop file this window's icon comes from.  Wayland has no
         // per-window icon: a compositor takes the application id the client
         // declares, finds `<id>.desktop` in the installed data directories and
-        // draws whatever `Icon=` names.  The id has to be set before the
-        // window is created, and it must match the installed file exactly or
-        // the window comes up with a generic placeholder.
-        QGuiApplication::setDesktopFileName(QStringLiteral("vshot-settings"));
+        // draws whatever `Icon=` names.  The id has to be set before the window
+        // is created.
+        //
+        // It is declared only when that file is actually installed.  The id is
+        // not just an icon lookup: Qt also hands it to the host portal, which
+        // resolves it against the same data directories and fails loudly when
+        // there is no such file -- "Failed to register with host portal ...
+        // App info not found for 'vshot-settings'" on stderr -- which is what a
+        // build run straight out of `build-qt/` or `target/` would print.
+        // Without the id the window is simply left with the compositor's
+        // generic placeholder, which is the honest answer for a copy that has
+        // no desktop entry.
+        const QString desktopFile = QStringLiteral("vshot-settings.desktop");
+        if (!QStandardPaths::locate(QStandardPaths::ApplicationsLocation, desktopFile)
+                 .isEmpty()) {
+            QGuiApplication::setDesktopFileName(QStringLiteral("vshot-settings"));
+        }
         QApplication::setQuitOnLastWindowClosed(true);
         vshot::initUiLanguage();
         return vshot::runSettingsWindow();
