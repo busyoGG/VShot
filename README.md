@@ -8,7 +8,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 
 已适配 Hyprland、niri、KWin/Plasma、Sway，以及任何提供 `wlr-screencopy` 的合成器（如 labwc）的基础截屏。
 
-> **验证程度不一**：Hyprland 全部功能现场实测；niri 的平铺与浮窗截图路径均已实机验证；KWin/Plasma 的 D-Bus 采集、窗口列表与长截图实测过，但 `--cursor`、滚动注入未验证；Sway 与 labwc **没有现场验证**。详见「合成器适配与验证状态」。
+> **验证程度不一**：Hyprland 全部功能现场实测；niri 的平铺与浮窗截图路径均已实机验证；KWin/Plasma 的 D-Bus 采集、窗口列表与长截图实测过，但 `--cursor`、滚动注入未验证；Sway 与 labwc **没有现场验证**。详见[「合成器适配与验证状态」](#合成器适配与验证状态)。
 
 ## 功能
 
@@ -24,7 +24,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 
 ## 安装（Arch Linux）
 
-`PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次安装同时提供 `/usr/bin/vshot`、`/usr/bin/vshot-qt-ui` 和给 KWin 授权用的 `/usr/share/applications/vshot.desktop`（见「KDE 授权」）：
+`PKGBUILD` 把 Rust CLI 和 Qt helper 打进同一个包，一次安装同时提供 `/usr/bin/vshot`、`/usr/bin/vshot-qt-ui` 和给 KWin 授权用的 `/usr/share/applications/vshot.desktop`（见[「KDE 授权」](#kde-授权)）：
 
 ```sh
 ./scripts/build-arch-package.sh
@@ -98,7 +98,7 @@ vshot pin --quit
 | `-o, --output PATH` | 写 PNG 到 PATH，展开 `%Y%m%d` 这类 strftime 格式；写完后把文件的 `file://` URI 复制进剪贴板。`-` 表示写 stdout 且不复制 |
 | `--clipboard` | 把 PNG 数据复制进剪贴板 |
 | `--pin` | 把图像 pin 到屏幕，不落盘（daemon 读入内存后立即删除临时文件） |
-| `-c, --cursor` | 请求合成器把光标画进每个输出帧。**`long` 不支持**（见「已知不稳定点」）；截图里没有光标最常见的原因见「光标（`--cursor`）」 |
+| `-c, --cursor` | 请求合成器把光标画进每个输出帧。**`long` 不支持**（见[「已知不稳定点」](#已知不稳定点)）；截图里没有光标最常见的原因见[「光标（`--cursor`）」](#光标--cursor) |
 | `--png-compression LEVEL` | `none` / `fastest` / `fast`（默认）/ `balanced` / `high`，全部无损，区别只在耗时与体积 |
 
 每次捕获必须且只能给一个输出目标。`region --geometry` 与 `--interactive` 互斥，不给 geometry 时默认交互选择（`--interactive` 用于显式声明这一意图）。
@@ -336,7 +336,7 @@ vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一
 - **KDE 窗口列表探针**——依赖 journald 收到 KWin 的 `console.info`。KWin 从 tty 起、日志只进那台 tty 时，无论等多久都取不到行。装了 `kdotool` 时优先走它（结果经 D-Bus 回给自己，不经 journal），绕开这个依赖。
 - **niri 的会话判定**——niri 不设 `XDG_CURRENT_DESKTOP`/`XDG_SESSION_DESKTOP`（从 TTY 手动起会话时是空的），所以判定改用 `NIRI_SOCKET` 文件名。判定出错时表现为 `window pick` 打开压暗 overlay 而不是 niri 的十字选窗，用 `VSHOT_SESSION_DEBUG=1` 看判成了谁。
 - **niri 的 pin 落点**——只能问"焦点窗口所在的输出"（niri 的 IPC 没有指针位置查询），所以**不跟随指针，只跟随键盘焦点**。
-- **pin daemon 与 screencopy**——不要用 `pkill`/`kill -9` 结束 daemon（见「pin daemon」），否则部分合成器会残留 layer surface 与其截屏会话，导致所有输出的 screencopy 永久阻塞。
+- **pin daemon 与 screencopy**——不要用 `pkill`/`kill -9` 结束 daemon（见[「pin daemon」](#pin-daemon)），否则部分合成器会残留 layer surface 与其截屏会话，导致所有输出的 screencopy 永久阻塞。
 
 ## 环境变量
 

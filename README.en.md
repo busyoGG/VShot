@@ -8,7 +8,7 @@ A Wayland screenshot tool written in Rust, with a Qt interactive UI and a reside
 
 Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any compositor providing `wlr-screencopy` (such as labwc).
 
-> **Verification varies**: every Hyprland feature was tested live; niri's tiled and floating window capture paths were both verified on a real session; KWin/Plasma's D-Bus capture, window list, and long screenshots were tested, but `--cursor` and scroll injection were not; Sway and labwc are **untested on a live session**. See "Compositor support and verification status".
+> **Verification varies**: every Hyprland feature was tested live; niri's tiled and floating window capture paths were both verified on a real session; KWin/Plasma's D-Bus capture, window list, and long screenshots were tested, but `--cursor` and scroll injection were not; Sway and labwc are **untested on a live session**. See ["Compositor support and verification status"](#compositor-support-and-verification-status).
 
 ## Features
 
@@ -24,7 +24,7 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 
 ## Install (Arch Linux)
 
-`PKGBUILD` builds the Rust CLI and the Qt helper into one package, so a single install provides `/usr/bin/vshot`, `/usr/bin/vshot-qt-ui`, and the `/usr/share/applications/vshot.desktop` that authorizes KWin (see "KDE authorization"):
+`PKGBUILD` builds the Rust CLI and the Qt helper into one package, so a single install provides `/usr/bin/vshot`, `/usr/bin/vshot-qt-ui`, and the `/usr/share/applications/vshot.desktop` that authorizes KWin (see ["KDE authorization"](#kde-authorization)):
 
 ```sh
 ./scripts/build-arch-package.sh
@@ -98,7 +98,7 @@ The global options apply to every capture:
 | `-o, --output PATH` | Write the PNG to PATH, expanding strftime formats like `%Y%m%d`; afterwards the file's `file://` URI is copied to the clipboard. `-` writes to stdout without copying |
 | `--clipboard` | Copy the PNG data to the clipboard |
 | `--pin` | Pin the image to the screen instead of writing it (the daemon deletes the temporary file once it is in memory) |
-| `-c, --cursor` | Ask the compositor to draw the cursor into every output frame. **Not supported by `long`** (see "Known rough edges"); for the most common reason a capture has no cursor, see "The cursor (`--cursor`)" |
+| `-c, --cursor` | Ask the compositor to draw the cursor into every output frame. **Not supported by `long`** (see ["Known rough edges"](#known-rough-edges)); for the most common reason a capture has no cursor, see ["The cursor (`--cursor`)"](#the-cursor---cursor) |
 | `--png-compression LEVEL` | `none` / `fastest` / `fast` (default) / `balanced` / `high`, all lossless, differing only in time and size |
 
 Every capture must name exactly one output target. `region --geometry` and `--interactive` are mutually exclusive; with no geometry the default is interactive selection (`--interactive` states that intent explicitly).
@@ -336,7 +336,7 @@ vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer"
 - **The KDE window list probe** — depends on journald receiving KWin's `console.info`. When KWin is started from a tty and its log goes only to that tty, no line can be retrieved no matter how long you wait. With `kdotool` installed vshot prefers it (the result comes back over D-Bus, not the journal), bypassing that dependency.
 - **niri session detection** — niri sets neither `XDG_CURRENT_DESKTOP` nor `XDG_SESSION_DESKTOP` (they are empty when a session is started manually from a TTY), so detection uses the `NIRI_SOCKET` filename instead. When it gets this wrong the symptom is `window pick` opening the dimming overlay instead of niri's crosshair picker; `VSHOT_SESSION_DEBUG=1` shows what it decided.
 - **niri pin landing** — it can only ask "the output the focused window is on" (niri's IPC has no pointer position query), so it **follows the keyboard focus, not the pointer**.
-- **pin daemon and screencopy** — do not end the daemon with `pkill`/`kill -9` (see "pin daemon"), or some compositors leave the layer surface and its screencopy session behind, making screencopy block forever on every output.
+- **pin daemon and screencopy** — do not end the daemon with `pkill`/`kill -9` (see ["pin daemon"](#pin-daemon)), or some compositors leave the layer surface and its screencopy session behind, making screencopy block forever on every output.
 
 ## Environment variables
 
