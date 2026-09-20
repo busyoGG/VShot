@@ -1,7 +1,10 @@
 // The settings window: an ordinary top-level dialog over the shared config
-// file, so the style the annotation editor remembers and the command-line
+// file, so the style a capture session starts from and the command-line
 // defaults the CLI falls back to can be looked at and changed in one place
 // instead of in a JSON file by hand.
+//
+// This window is the only thing that writes those values: a capture session
+// never does, so what is set here is exactly what every session opens with.
 //
 // It is deliberately *not* a layer surface like the capture overlay: there is
 // no capture in progress, no frozen frame to cover, and a normal window is what
@@ -23,6 +26,7 @@
 #include "settings_window.hpp"
 
 #include "config.hpp"
+#include "text_size.hpp"
 #include "i18n.hpp"
 
 #include <QApplication>
@@ -668,7 +672,7 @@ private:
         }
         selectChoice(toolBox_, config_.editor.tool);
         addRow(shape, uiTr("Opening tool"),
-               uiTr("Region capture only; picking and scrolling always open on Select"),
+               uiTr("The tool editing starts with; session changes are not saved here"),
                toolBox_, true);
 
         colorButton_ = new ColorButton(shape);
@@ -713,10 +717,10 @@ private:
         QWidget *text = addCard(page, uiTr("Text"));
         textSizeSpin_ = new ModernSpinBox(text);
         textSizeSpin_->setObjectName(QStringLiteral("textSize"));
-        textSizeSpin_->setRange(1, 64);
-        textSizeSpin_->setValue(static_cast<int>(config_.editor.textSize));
+        textSizeSpin_->setRange(kMinTextPixels, kMaxTextPixels);
+        textSizeSpin_->setValue(clampTextPixels(static_cast<int>(config_.editor.textSize)));
         textSizeSpin_->setMinimumWidth(120);
-        addRow(text, uiTr("Size"), uiTr("1-64"), textSizeSpin_, true);
+        addRow(text, uiTr("Size"), uiTr("Font height in pixels (7-448)"), textSizeSpin_, true);
 
         fontBox_ = new ModernComboBox(text);
         fontBox_->setObjectName(QStringLiteral("font"));
@@ -845,7 +849,8 @@ private:
         editor.dash = dashBox_->currentData().toString();
         editor.arrowSize = static_cast<std::uint32_t>(std::max(1, arrowSizeSpin_->value()));
         editor.arrowStyle = arrowStyleBox_->currentData().toString();
-        editor.textSize = static_cast<std::uint32_t>(std::max(1, textSizeSpin_->value()));
+        editor.textSize =
+            static_cast<std::uint32_t>(clampTextPixels(textSizeSpin_->value()));
         editor.font = fontBox_->currentData().toString();
         editor.mosaicShape = mosaicShapeBox_->currentData().toString();
         editor.mosaicStrength =

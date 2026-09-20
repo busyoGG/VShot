@@ -1,6 +1,6 @@
 # Maintainer: VShot contributors
 pkgname=vshot
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pin server'
 url='https://github.com/busyoGG/VShot'

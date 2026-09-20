@@ -49,7 +49,10 @@ struct Annotation {
     QVector<Point> points;
     Point origin;
     QString text;
-    std::uint32_t scale = 2;
+    // Font height in logical pixels, exactly as the size box shows it.  The
+    // legacy integer `scale` the JSON protocol carries is derived from this
+    // only when the result is written out (`textPixelsToScale`).
+    std::uint32_t textPixels = 14;
     QColor color{255, 64, 64, 255};
     std::uint32_t width = 1;
     // Line style: "solid" | "dashed" | "dotted".
@@ -74,7 +77,7 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
     if (first.kind != second.kind || first.tool != second.tool || first.dash != second.dash ||
         first.size != second.size || first.arrowStyle != second.arrowStyle ||
         first.mask != second.mask || first.strength != second.strength ||
-        first.scale != second.scale || first.color != second.color ||
+        first.textPixels != second.textPixels || first.color != second.color ||
         first.width != second.width || first.font != second.font ||
         first.deviceRatio != second.deviceRatio) {
         return false;
@@ -209,13 +212,19 @@ private:
     std::uint32_t textDeviceRatio_ = 1;
     Point textOrigin_;
     QString textEditFont_;
+    // Font height the open inline editor is drawing at, kept in step with the
+    // size box so changing the size while a label is being typed resizes it
+    // live instead of leaving the editor at the old height.
+    std::uint32_t textEditPixels_ = 0;
     Point pointer_;
     int pointerOutput_ = -1;
     Tool tool_ = Tool::Select;
     QColor currentColor_{255, 64, 64, 255};
     QString currentFont_;
     std::uint32_t currentWidth_ = 2;
-    std::uint32_t textSize_ = 2;
+    // Font height for the next label, in logical pixels -- the same number the
+    // size box shows.
+    std::uint32_t textSize_ = 14;
     QString currentDash_ = QStringLiteral("solid");
     std::uint32_t arrowSize_ = 1;
     QString currentArrowStyle_ = QStringLiteral("open");

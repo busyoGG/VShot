@@ -28,7 +28,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 
 ```sh
 ./scripts/build-arch-package.sh
-sudo pacman -U dist/vshot-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/vshot-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
 脚本把当前工作树（含未提交改动）快照到临时目录再调 `makepkg`，产物写到 `dist/`；也可以直接 `makepkg -si`。运行时依赖 `glibc`、`wayland`（通过 dlopen 使用 `libwayland-client`）、`qt6-base`、`layer-shell-qt`；文件输出、`--clipboard` 与 `vshot pin --clipboard` 需要可选依赖 `wl-clipboard`（写用 `wl-copy`，读用 `wl-paste`）。其它发行版按下面的源码方式构建。
@@ -135,7 +135,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 - 拖拽或调整时，光标旁显示 8x 放大镜与原生像素坐标，选区左上角显示 `宽 × 高`
 - **Enter**、选区内双击或工具栏 OK 确认；**Esc** 或右键取消整次截图（文本框内的 Esc 只关闭文本框）
 - 工具栏是磨砂浮动面板（背景为冻结画面的实时模糊采样），第一行为工具 Select、Rect、Ellipse、Arrow、Draw、Text、Mosaic 与 Undo、Redo、OK、Cancel；样式子面板按当前工具显隐，始终弹在命令栏背向选区的一侧，可以拖动固定位置，跟随选区跨屏移动
-- 样式项：颜色色板（含自定义取色器：HSV 渐变 + 十六进制输入）、线型 Solid/Dash/Dot、箭头头型 Open V/Filled、粗细 1-64、箭头大小 1-8、字号 1-64、马赛克形状 Rect/Ellip/Brush、马赛克程度 1-3、系统字体列表（每项按自身字形预览）
+- 样式项：颜色色板（含自定义取色器：HSV 渐变 + 十六进制输入）、线型 Solid/Dash/Dot、箭头头型 Open V/Filled、粗细 1-64、箭头大小 1-8、字号 7-448（直接就是像素高，和用户输入一致，内部换算成旧协议的整数刻度只在写结果时做一次）、马赛克形状 Rect/Ellip/Brush、马赛克程度 1-3、系统字体列表（每项按自身字形预览）
 - Arrow 是按下点到释放点的直线箭头；Draw 是自由绘制；Mosaic 的马赛克程度控制像素块大小与涂抹半径，选中已有马赛克后可直接改程度
 - **Select** 工具可点选任意标注：单击选中，拖动移动（文本同样），形状/线条/马赛克可拖把手缩放，Delete/Backspace 删除；样式修改即时应用到选中标注；双击文本重新编辑
 - **Ctrl+Z / Ctrl+Y**（或 Ctrl+Shift+Z）撤销/重做
@@ -357,7 +357,7 @@ vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一
 
 `vshot` 把两样东西记在 `$XDG_CONFIG_HOME/vshot/config.json`（缺省 `~/.config/vshot/config.json`）：**标注编辑器的样式**，以及**部分命令行参数的默认值**。文件是可选的——没有它、读不了它、或者内容坏了，都退回内置默认值，不会影响截图。
 
-改它有三种方式，怎么顺手怎么来：**手改文件**、在标注编辑器里直接调（样式会在会话结束时自动写回）、或者跑 **`vshot settings`** 开一个窗口改——窗口里两段都能改，保存即写盘。
+改它有两种方式：**手改文件**，或者跑 **`vshot settings`** 开一个窗口改——窗口里两段都能改，保存即写盘。**截图会话中的任何改动都不写回**：会话里选的颜色、调的线宽、切的工具都是这一次的工作状态，配置是每次会话的**重置起点**，只在你明确操作（设置窗口保存、手改文件）时变化。
 
 ```bash
 vshot settings
@@ -373,7 +373,7 @@ vshot settings
     "tool": "arrow",
     "color": "#ff8800ff",
     "width": 4,
-    "textSize": 6,
+    "textPixels": 28,
     "dash": "dotted",
     "arrowSize": 3,
     "arrowStyle": "filled",
@@ -392,14 +392,14 @@ vshot settings
 
 ### `editor`——编辑器样式
 
-每次区域截图或 pin 编辑结束时，编辑器把当前样式写回这里，下次打开就是上次离开时的样子。**取消截图也会保存**——你挑的颜色是你的，跟这次截图有没有成没关系。
+这个段描述的是**每次会话的起始样式**。会话中怎么改都不会写回——这里存的是重置值，不是上次的遗留；改它请用 `vshot settings` 或手改文件。
 
 | 键 | 取值 | 默认 |
 | --- | --- | --- |
 | `tool` | `select` / `rectangle` / `ellipse` / `arrow` / `pen` / `text` / `mosaic` | `select` |
 | `color` | `#rrggbb` 或 `#rrggbbaa` | `#ff4040ff` |
 | `width` | 1–64 | `2` |
-| `textSize` | 1–64 | `2` |
+| `textPixels` | 7–448（像素高） | `14` |
 | `dash` | `solid` / `dashed` / `dotted` | `solid` |
 | `arrowSize` | 1–8 | `1` |
 | `arrowStyle` | `open` / `filled` | `open` |
@@ -407,7 +407,11 @@ vshot settings
 | `mosaicStrength` | 1–3 | `2` |
 | `font` | 字体族名；空串用系统默认 | `""` |
 
-`tool` 只对**区域截图**生效：`window pick` 与滚动截图总是从 Select 打开（否则一次点击或一次拖拽就不再是挑选/框选）。取值超出范围的整数会被夹到范围内，不认识的名字按默认值处理——手改文件写错了不会报错，只是那一项不生效。
+`tool` 是**编辑状态**的起始工具，和其他样式一样**只在配置里**：会话中怎么切换都不写回。区域截图总是从 Select 打开——它的第一步是拖出选区，直接进绘图工具（比如 Text）会让第一次点击变成放置文本；`window pick` 与滚动截图同理永远从 Select 开始。取值超出范围的整数会被夹到范围内，不认识的名字按默认值处理——手改文件写错了不会报错，只是那一项不生效。
+
+**`textPixels` 的单位是像素**：你填 14，字就是 14 像素高，跟编辑器里那个数字框完全一致。旧协议里那个「字符格整数倍」的刻度（1–64，一格 7 像素）只在把结果写出去时换算一次，界面上看不到它。
+
+早期版本这里叫 `textSize`，存的是那个刻度。**旧文件会被自动迁移**：读到 `textSize` 就按刻度换算成像素（`2` → 14 px、`3` → 21 px），下次保存时写成 `textPixels`，旧键删掉。两个键同时存在时以 `textPixels` 为准。换键名而不是沿用，是因为 7–64 这一段两种解释都合法，靠猜会出错。
 
 ### `cli`——命令行默认值
 
@@ -469,18 +473,21 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置文件读写与设置窗口、剪贴板颜色解析与色卡渲染、pin 的图片自述密度、pin 描边、文字卡片留白、色卡右键菜单：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置文件读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度、pin 描边、文字卡片留白、色卡右键菜单：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
 build-qt/vshot-config-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-settings-check
+build-qt/vshot-text-size-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check
 build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 ```
+
+其中 `vshot-text-size-check` 盯的是字号那一套换算：面板上的数字就是文字像素高，而写进旧协议时投影回 5x7 回退字体能画的整数刻度（`ui/text_size.hpp`）。两端要对齐（7–448 正好是刻度 1–64），整倍数要能往返，中间值要**向最近刻度取整**而不是截断——截断会让 15px 的字在回退渲染下缩成 14px。
 
 其中 `vshot-config-check` 覆盖的是最容易静默出错的一块：保存时**合并写入**是否真的保住了本版不认识的键、清空一个值是否真的把它删掉、以及 `#rrggbbaa` 是否按 CSS 那套解析（Qt 自己会把它读成 `#aarrggbb`，于是「不透明橙色」变成紫色）。`vshot-settings-check` 则把设置窗口真建出来、逐个驱动它的控件，再回读配置文件——某一个字段接错了线，只有这样才看得出来。改窗口布局时这一项尤其值得跑：它靠控件名找控件，所以重排、换控件类都不会漏掉，只有真的把某个字段接错了才会红。
 

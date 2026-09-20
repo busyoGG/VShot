@@ -1,6 +1,7 @@
 #include "capture_overlay.hpp"
 #include "config.hpp"
 #include "i18n.hpp"
+#include "text_size.hpp"
 
 #include <LayerShellQt/Window>
 
@@ -71,7 +72,6 @@ constexpr int kCandidateRefreshIntervalMs = 150;
 // seeing an event, and the highlight must not keep describing what used to be
 // there.  Only the picker's lifetime pays for this.
 constexpr int kCandidateRefreshPollMs = 300;
-constexpr std::uint32_t kTextScale = 2;
 constexpr int kMaxUndoSteps = 100;
 constexpr int kLoupeRadius = 7;
 constexpr int kLoupeZoom = 8;
@@ -219,7 +219,8 @@ QFont textFont(const QString &family, int pixelSize)
 
 QFont annotationFont(const Annotation &annotation)
 {
-    return textFont(annotation.font, std::max(1, static_cast<int>(7 * annotation.scale)));
+    // The stored size is already the pixel height, so it goes straight in.
+    return textFont(annotation.font, std::max(1, static_cast<int>(annotation.textPixels)));
 }
 
 QSize textMetrics(const Annotation &annotation)
@@ -1746,12 +1747,12 @@ public:
         textLabel_ = new QLabel(uiTr("Text"), textGroup_);
         textSpin_ = new QSpinBox(textGroup_);
         textSpin_->setObjectName(QStringLiteral("textSizeSpinBox"));
-        textSpin_->setRange(1, 64);
+        textSpin_->setRange(kMinTextPixels, kMaxTextPixels);
         textSpin_->setSingleStep(1);
         textSpin_->setKeyboardTracking(false);
         textSpin_->setFixedSize(64, 22);
-        textSpin_->setValue(static_cast<int>(controller_->textSize_));
-        textSpin_->setToolTip(uiTr("Text size (1-64)"));
+        textSpin_->setValue(clampTextPixels(static_cast<int>(controller_->textSize_)));
+        textSpin_->setToolTip(uiTr("Text size in pixels (7-448)"));
         textGroup_->layout()->addWidget(textLabel_);
         textGroup_->layout()->addWidget(textSpin_);
 
@@ -1817,7 +1818,7 @@ public:
         connect(textSpin_, qOverload<int>(&QSpinBox::valueChanged), this,
                 [controller = controller_](int value) {
                     controller->beginStyleAdjustment();
-                    controller->setTextSize(static_cast<std::uint32_t>(value));
+                    controller->setTextSize(static_cast<std::uint32_t>(clampTextPixels(value)));
                 });
         connect(textSpin_, &QSpinBox::editingFinished, this,
                 [controller = controller_] { controller->endStyleAdjustment(); });
@@ -1965,7 +1966,7 @@ public:
         const QString arrowStyle = selected != nullptr ? selected->arrowStyle
                                                         : controller_->currentArrowStyle_;
         const QString font = selected != nullptr ? selected->font : controller_->currentFont_;
-        const std::uint32_t textSize = selected != nullptr ? selected->scale : controller_->textSize_;
+        const std::uint32_t textSize = selected != nullptr ? selected->textPixels : controller_->textSize_;
         const QString mask = selected != nullptr
             ? (selected->kind == Annotation::Kind::Stroke ? QStringLiteral("brush") : selected->mask)
             : controller_->mosaicShape_;
@@ -1989,12 +1990,19 @@ public:
             const QSignalBlocker strengthBlocker(strengthSlider_);
             widthSlider_->setValue(static_cast<int>(std::clamp(width, 1u, 64u)));
             arrowSlider_->setValue(static_cast<int>(std::clamp(size, 1u, 8u)));
-            textSpin_->setValue(static_cast<int>(std::clamp(textSize, 1u, 64u)));
+            textSpin_->setValue(clampTextPixels(static_cast<int>(textSize)));
             strengthSlider_->setValue(static_cast<int>(std::clamp(strength, 1u, 3u)));
         }
         widthLabel_->setText(uiTr("Width %1").arg(widthSlider_->value()));
         arrowLabel_->setText(uiTr("Arrow %1").arg(arrowSlider_->value()));
         strengthLabel_->setText(uiTr("Mosaic %1").arg(strengthSlider_->value()));
+        // While a label is being typed the size box must not take the keyboard:
+        // clicking it would blur the editor the user is typing in.  A spin box
+        // defaults to WheelFocus, so it is the one control on this bar whose
+        // policy is flipped rather than set once.  With no editor open it keeps
+        // the normal policy, so the value stays typeable.
+        textSpin_->setFocusPolicy(controller_->textEdit_ != nullptr ? Qt::NoFocus
+                                                                    : Qt::WheelFocus);
         layout()->activate();
         adjustSize();
     }
@@ -2485,10 +2493,7 @@ OverlayController::OverlayController(Session session)
     // Scrolling capture wants a rectangle, not an editor: the pixels it will
     // annotate only exist once the page has been scrolled and stitched.
     selectOnly_ = session_.mode == QStringLiteral("region-only");
-    // The style the user last left the editor in.  Only the drawing tools get
-    // their remembered tool back: a region session has always opened on Select
-    // so a fresh drag draws the rectangle, and a picking session on Select so
-    // the click picks; opening on, say, Mosaic would break both.
+    // The style the user last left the editor in.
     const EditorPreferences preferences = loadEditorPreferences();
     currentColor_ = preferences.color;
     currentFont_ = preferences.font;
@@ -2499,7 +2504,18 @@ OverlayController::OverlayController(Session session)
     currentArrowStyle_ = preferences.arrowStyle;
     mosaicShape_ = preferences.mosaicShape;
     mosaicStrength_ = preferences.mosaicStrength;
-    if (!selectOnly_ && !pickMode_) {
+    // The remembered tool is restored only where a tool is already meaningful:
+    // a session that starts in editing state -- one that arrives with its
+    // selection made (`beginPresetEdit`, the window picker's follow-up) and the
+    // pin editor, whose whole image is preselected in `beginPinEdit`.  A fresh
+    // region session must open on Select no matter what the file says -- its
+    // first step is dragging the rectangle, and opening on Text means the first
+    // click starts a label instead, which reads as "region capture is broken".
+    // Scrolling capture (`selectOnly_`) and picking (`pickMode_`) have their
+    // own reasons to stay on Select either way.
+    const bool startsInEdit =
+        session_.selection.has_value() || session_.mode == QStringLiteral("pin-edit");
+    if (startsInEdit && !selectOnly_ && !pickMode_) {
         const Tool remembered = toolForName(preferences.tool);
         if (remembered != Tool::Select) {
             tool_ = remembered;
@@ -3038,7 +3054,7 @@ void OverlayController::finishDrawing(Point point)
     }
     Annotation annotation;
     annotation.tool = toolName(drawingTool);
-    annotation.scale = kTextScale;
+    annotation.textPixels = textSize_;
     annotation.color = currentColor_;
     annotation.width = currentWidth_;
     annotation.dash = currentDash_;
@@ -3207,7 +3223,7 @@ void OverlayController::startTextEditor(CaptureOverlay *overlay, int index, Poin
     }
     // While re-editing, the editor mirrors the annotation's own style so the
     // user must not re-pick it after moving a label around.
-    const std::uint32_t editScale = cancelledText_.has_value() ? cancelledText_->scale : textSize_;
+    textEditPixels_ = cancelledText_.has_value() ? cancelledText_->textPixels : textSize_;
     const QColor editColor = cancelledText_.has_value() ? cancelledText_->color : currentColor_;
     textEditFont_ = cancelledText_.has_value() ? cancelledText_->font : currentFont_;
     textOutput_ = overlay->outputIndex();
@@ -3221,7 +3237,7 @@ void OverlayController::startTextEditor(CaptureOverlay *overlay, int index, Poin
         }
     });
     textEdit_->setText(initial);
-    QFont editorFont = textFont(textEditFont_, std::max(1, static_cast<int>(7 * editScale)));
+    QFont editorFont = textFont(textEditFont_, std::max(1, static_cast<int>(textEditPixels_)));
     textEdit_->setFont(editorFont);
     textEdit_->setStyleSheet(
         QStringLiteral("QLineEdit { color: %1; background: rgba(0, 0, 0, 140); "
@@ -3250,9 +3266,14 @@ void OverlayController::finishText(bool accept)
         return;
     }
     const QString value = textEdit_->text();
+    // Capture the height the editor is actually drawing at before the state is
+    // cleared: a size change made while the box was open lives here and in
+    // nowhere else (during a re-edit no annotation is selected to restyle).
+    const std::uint32_t editedPixels = textEditPixels_;
     textEdit_->hide();
     textEdit_->deleteLater();
     textEdit_ = nullptr;
+    textEditPixels_ = 0;
     if (accept && !value.isEmpty()) {
         Annotation annotation;
         annotation.kind = Annotation::Kind::Text;
@@ -3261,12 +3282,13 @@ void OverlayController::finishText(bool accept)
         annotation.text = value;
         if (cancelledText_.has_value()) {
             // Re-edits keep the label's own style unless the panel restyles
-            // it while editing; textEditFont_ tracks a live font change.
-            annotation.scale = cancelledText_->scale;
+            // it while editing; textEditFont_ tracks a live font change and
+            // textEditPixels_ a live size change.
+            annotation.textPixels = editedPixels > 0 ? editedPixels : cancelledText_->textPixels;
             annotation.color = cancelledText_->color;
             annotation.font = textEditFont_;
         } else {
-            annotation.scale = textSize_;
+            annotation.textPixels = textSize_;
             annotation.color = currentColor_;
             annotation.font = currentFont_;
         }
@@ -3956,10 +3978,13 @@ void OverlayController::setCurrentFont(const QString &family)
     // is what finishText commits.
     if (textEdit_ != nullptr) {
         textEditFont_ = currentFont_;
-        const std::uint32_t editScale =
-            cancelledText_.has_value() ? cancelledText_->scale : textSize_;
-        QFont editorFont = textFont(textEditFont_, std::max(1, static_cast<int>(7 * editScale)));
+        // The height comes from the size box's current value, which is also
+        // what setTextSize leaves in textEditPixels_ -- the two restyle paths
+        // have to agree or a font change would revert a size change.
+        QFont editorFont =
+            textFont(textEditFont_, std::max(1, static_cast<int>(textEditPixels_)));
         textEdit_->setFont(editorFont);
+        textEdit_->setFixedHeight(std::max(20, QFontMetrics(editorFont).height() + 6));
     }
     applyStyleToSelected([this](Annotation &annotation) {
         if (annotation.kind == Annotation::Kind::Text) {
@@ -4032,10 +4057,20 @@ void OverlayController::setTextSize(std::uint32_t size)
     if (finished_ || cancelled_) {
         return;
     }
-    textSize_ = std::clamp(size, 1u, 64u);
+    textSize_ = static_cast<std::uint32_t>(clampTextPixels(static_cast<int>(size)));
+    // Restyle an open editor live, the way a font change does: the height is
+    // what the size box is for, and seeing it change while typing is the point.
+    if (textEdit_ != nullptr) {
+        textEditPixels_ = textSize_;
+        QFont editorFont = textFont(textEditFont_, std::max(1, static_cast<int>(textEditPixels_)));
+        textEdit_->setFont(editorFont);
+        // Grow the box with the glyphs so a bigger size is not clipped.
+        const int height = std::max(20, QFontMetrics(editorFont).height() + 6);
+        textEdit_->setFixedHeight(height);
+    }
     applyStyleToSelected([this](Annotation &annotation) {
         if (annotation.kind == Annotation::Kind::Text) {
-            annotation.scale = textSize_;
+            annotation.textPixels = textSize_;
         }
     });
     updateAll();
@@ -4547,23 +4582,13 @@ void OverlayController::terminal(bool cancelled)
     }
     finished_ = true;
     cancelled_ = cancelled;
-    // Remember the style for the next session.  This is written once here
-    // rather than in every setter: a slider drag fires dozens of them, and the
-    // preference that matters is the one the session ended on.  It is saved on
-    // cancellation too -- a style the user picked is theirs whether or not the
-    // capture went through.
-    EditorPreferences preferences;
-    preferences.tool = toolName(tool_);
-    preferences.color = currentColor_;
-    preferences.font = currentFont_;
-    preferences.width = currentWidth_;
-    preferences.textSize = textSize_;
-    preferences.dash = currentDash_;
-    preferences.arrowSize = arrowSize_;
-    preferences.arrowStyle = currentArrowStyle_;
-    preferences.mosaicShape = mosaicShape_;
-    preferences.mosaicStrength = mosaicStrength_;
-    saveEditorPreferences(preferences);
+    // Nothing a session did is written back to the config: everything here --
+    // the tool, the colour, the width, the font size -- is the session's own
+    // working state, not a preference.  The config is the *reset* value every
+    // session starts from, and it changes only where the user can see and mean
+    // it: the settings window (`vshot settings`) or a hand edit.  Saving here
+    // would make one capture's improvisation silently redefine the next one's
+    // starting point.
     hideToolbar();
     removeTextEditor();
     if (terminalCallback_) {
@@ -4578,6 +4603,7 @@ void OverlayController::removeTextEditor()
         textEdit_->deleteLater();
         textEdit_ = nullptr;
     }
+    textEditPixels_ = 0;
 }
 
 bool OverlayController::isFinished() const
@@ -4676,7 +4702,12 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
             origin.insert(QStringLiteral("y"), static_cast<qint64>(annotation.origin.y));
             value.insert(QStringLiteral("origin"), origin);
             value.insert(QStringLiteral("text"), annotation.text);
-            value.insert(QStringLiteral("scale"), static_cast<qint64>(annotation.scale));
+            // The protocol still carries the legacy integer glyph multiple;
+            // it is derived from the pixel size here and nowhere else.  A
+            // helper that ships a bitmap below renders the exact size, so this
+            // only ever reaches the Rust fallback font.
+            value.insert(QStringLiteral("scale"), static_cast<qint64>(textPixelsToScale(
+                                                     static_cast<int>(annotation.textPixels))));
             value.insert(QStringLiteral("color"), annotation.color.name(QColor::HexRgb));
             if (!annotation.font.isEmpty()) {
                 value.insert(QStringLiteral("font"), annotation.font);
@@ -4699,8 +4730,9 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
                         QPainter bitmapPainter(&bitmap);
                         bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
                         bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
-                        QFont font = textFont(annotation.font,
-                                              std::max(1, 7 * static_cast<int>(annotation.scale) * scale));
+                        QFont font = textFont(
+                            annotation.font,
+                            std::max(1, static_cast<int>(annotation.textPixels) * scale));
                         bitmapPainter.setFont(font);
                         bitmapPainter.setPen(annotation.color);
                         const QStringList lines = annotation.text.split(QLatin1Char('\n'));

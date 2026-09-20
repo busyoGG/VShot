@@ -257,6 +257,8 @@ void checkRoundTripOfEveryField()
     written.editor.color = QColor(12, 34, 56, 200);
     written.editor.font = QStringLiteral("Noto Sans");
     written.editor.width = 9;
+    // A font height in pixels, and deliberately not a whole glyph multiple:
+    // the config file must not snap it to one.
     written.editor.textSize = 11;
     written.editor.dash = QStringLiteral("dotted");
     written.editor.arrowSize = 4;
@@ -365,6 +367,56 @@ void checkColorsUseTheCssSpelling()
            vshot::loadConfig().editor.color.name(QColor::HexArgb));
 }
 
+void checkTheLegacyTextSizeIsMigrated()
+{
+    std::printf("--- an old textSize is migrated, not reinterpreted ---------------\n");
+    // The size used to be the legacy glyph multiple (1-64); it is now a pixel
+    // height (7-448).  A file written before that stores `2` meaning 14 px, and
+    // reading it as two pixels would clamp it up to the 7 px floor -- a label
+    // the user set at 14 px would silently shrink.  So the old key is
+    // converted.  This matters because the two meanings overlap on 7-64, where
+    // a value is legal under either reading and no heuristic could separate
+    // them, which is why the new size lives under a different key.
+    writeConfig(QStringLiteral(R"({"editor": {"textSize": 2}})"));
+    expect(vshot::loadConfig().editor.textSize == 14,
+           "the old default 2 reads as the 14 px it meant",
+           QString::number(vshot::loadConfig().editor.textSize));
+
+    writeConfig(QStringLiteral(R"({"editor": {"textSize": 3}})"));
+    expect(vshot::loadConfig().editor.textSize == 21, "an old 3 reads as 21 px",
+           QString::number(vshot::loadConfig().editor.textSize));
+
+    writeConfig(QStringLiteral(R"({"editor": {"textSize": 64}})"));
+    expect(vshot::loadConfig().editor.textSize == 448, "the old maximum reads as 448 px",
+           QString::number(vshot::loadConfig().editor.textSize));
+
+    // The new key wins, so a file mid-write or hand-edited with both keys is
+    // read the way this build meant it.
+    writeConfig(QStringLiteral(R"({"editor": {"textPixels": 30, "textSize": 2}})"));
+    expect(vshot::loadConfig().editor.textSize == 30,
+           "the pixel key wins when a file carries both",
+           QString::number(vshot::loadConfig().editor.textSize));
+
+    // And the retired key is dropped on the next save, so the file does not
+    // keep a second, older answer to the same question.
+    writeConfig(QStringLiteral(R"({"editor": {"textSize": 3}})"));
+    vshot::Config config = vshot::loadConfig();
+    vshot::saveConfig(config);
+    const QJsonObject root = readConfig();
+    expect(!containsAt(root, "editor/textSize"),
+           "the retired key is gone after a save");
+    expect(numberAt(root, "editor/textPixels") == 21, "the migrated size was written",
+           QString::number(numberAt(root, "editor/textPixels")));
+    expect(vshot::loadConfig().editor.textSize == 21, "and it reads back unchanged");
+
+    // A pixel value that happens to sit in the old range must survive: writing
+    // 30 px then reading it must not turn it into 210 px.
+    writeConfig(QStringLiteral(R"({"editor": {"textPixels": 30}})"));
+    expect(vshot::loadConfig().editor.textSize == 30,
+           "a pixel size in the old range is not multiplied",
+           QString::number(vshot::loadConfig().editor.textSize));
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -388,6 +440,7 @@ int main(int argc, char **argv)
     checkUnknownKeysAreIgnored();
     checkBadValuesFallBackFieldByField();
     checkColorsUseTheCssSpelling();
+    checkTheLegacyTextSizeIsMigrated();
     checkEditorSaveKeepsTheCliSection();
     checkSettingsSaveKeepsWhatItDoesNotOwn();
     checkClearingAValueRemovesIt();

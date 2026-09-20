@@ -28,7 +28,7 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 
 ```sh
 ./scripts/build-arch-package.sh
-sudo pacman -U dist/vshot-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/vshot-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
 The script snapshots the current working tree (uncommitted changes included) into a temporary directory and runs `makepkg`, writing the result to `dist/`; `makepkg -si` works directly too. Runtime dependencies are `glibc`, `wayland` (uses `libwayland-client` through dlopen), `qt6-base`, and `layer-shell-qt`; file output, `--clipboard`, and `vshot pin --clipboard` need the optional `wl-clipboard` (writes via `wl-copy`, reads via `wl-paste`). For other distributions, build from source as below.
@@ -135,7 +135,7 @@ When `vshot region` gets no `--geometry`, the frozen frame fills each output and
 - While dragging or resizing, an 8x magnifier and native pixel coordinates appear next to the cursor, and the selection's `width × height` sits at its top-left corner
 - **Enter**, a double-click inside the selection, or the toolbar's OK confirms; **Esc** or right-click cancels the whole capture (Esc inside a text box only closes that box)
 - The toolbar is a frosted floating panel (its background is a live blur sample of the frozen frame). Its first row holds the tools Select, Rect, Ellipse, Arrow, Draw, Text, Mosaic plus Undo, Redo, OK, Cancel; style sub-panels appear according to the current tool, always pop out on the side of the command bar facing away from the selection, can be dragged to a fixed spot, and follow the selection across screens
-- Style entries: a color palette (with a custom picker: HSV gradient plus hex input), line style Solid/Dash/Dot, arrow head Open V/Filled, thickness 1-64, arrow size 1-8, font size 1-64, mosaic shape Rect/Ellip/Brush, mosaic strength 1-3, and a system font list (each entry previewed in its own glyphs)
+- Style entries: a color palette (with a custom picker: HSV gradient plus hex input), line style Solid/Dash/Dot, arrow head Open V/Filled, thickness 1-64, arrow size 1-8, font size 7-448 (the number *is* the pixel height, exactly as typed; the legacy integer the protocol carries is derived once, on the way out), mosaic shape Rect/Ellip/Brush, mosaic strength 1-3, and a system font list (each entry previewed in its own glyphs)
 - Arrow draws a straight arrow from press to release; Draw is freehand; the mosaic strength controls both the pixel block size and the brush radius, and selecting an existing mosaic lets you change the strength directly
 - The **Select** tool picks any annotation: click to select, drag to move (text too), shapes/lines/mosaics resize by their handles, Delete/Backspace removes it; style changes apply to the selected annotation immediately, and double-clicking text reopens it for editing
 - **Ctrl+Z / Ctrl+Y** (or Ctrl+Shift+Z) undo/redo
@@ -357,7 +357,7 @@ vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer"
 
 `vshot` remembers two things in `$XDG_CONFIG_HOME/vshot/config.json` (or `~/.config/vshot/config.json`): the **annotation editor's style**, and **defaults for some command-line flags**. The file is optional — missing, unreadable, or malformed all fall back to the built-in defaults and never affect a capture.
 
-There are three ways to change it, whichever suits you: **edit the file by hand**, adjust things in the annotation editor itself (its style is written back when a session ends), or run **`vshot settings`** for a window over both sections, saved as you press Save.
+There are two ways to change it: **edit the file by hand**, or run **`vshot settings`** for a window over both sections, saved as you press Save. **Nothing a capture session does is written back**: the colour you picked, the width you dragged to, the tool you switched to are that session's working state. The config is the *reset* value every session starts from, and it changes only when you say so — a settings-window save or a hand edit.
 
 ```bash
 vshot settings
@@ -373,7 +373,7 @@ The window has two pages, switched from the sidebar: **Annotation editor** (tool
     "tool": "arrow",
     "color": "#ff8800ff",
     "width": 4,
-    "textSize": 6,
+    "textPixels": 28,
     "dash": "dotted",
     "arrowSize": 3,
     "arrowStyle": "filled",
@@ -392,14 +392,14 @@ The window has two pages, switched from the sidebar: **Annotation editor** (tool
 
 ### `editor` — the editor's style
 
-At the end of every region capture or pin edit, the editor writes its current style back here, so the next session opens the way you left the last one. **Cancelling saves too** — a style you picked is yours whether or not that capture went through.
+This section is the style **every session starts from**. Nothing a session does is written back — this file holds the reset values, not the last session's leftovers; change them through `vshot settings` or a hand edit.
 
 | Key | Values | Default |
 | --- | --- | --- |
 | `tool` | `select` / `rectangle` / `ellipse` / `arrow` / `pen` / `text` / `mosaic` | `select` |
 | `color` | `#rrggbb` or `#rrggbbaa` | `#ff4040ff` |
 | `width` | 1–64 | `2` |
-| `textSize` | 1–64 | `2` |
+| `textPixels` | 7–448 (a pixel height) | `14` |
 | `dash` | `solid` / `dashed` / `dotted` | `solid` |
 | `arrowSize` | 1–8 | `1` |
 | `arrowStyle` | `open` / `filled` | `open` |
@@ -407,7 +407,11 @@ At the end of every region capture or pin edit, the editor writes its current st
 | `mosaicStrength` | 1–3 | `2` |
 | `font` | font family; an empty string uses the system default | `""` |
 
-`tool` applies to **region capture** only: `window pick` and scrolling capture always open on Select, or a single click or drag would stop being a pick or a selection. Out-of-range integers are clamped, and an unrecognized name falls back to the default — a typo in a hand-edited file costs you that one setting, not an error.
+`tool` is the tool an **editing** session starts with and, like every style here, it lives **only in the config**: nothing a session does is written back. A fresh region capture always opens on Select — its first step is dragging the rectangle, and opening straight onto a drawing tool (say Text) makes the first click place a label; `window pick` and scrolling capture stay on Select for the same reason. Out-of-range integers are clamped, and an unrecognized name falls back to the default — a typo in a hand-edited file costs you that one setting, not an error.
+
+**`textPixels` is a pixel height**: type 14 and the label is 14 pixels tall, exactly matching the number in the editor's size box. The legacy "glyph multiple" scale the JSON protocol still carries (1–64, one cell being 7 pixels) is derived once, on the way out, and never shown.
+
+Earlier versions called this key `textSize` and stored that multiple. **An old file is migrated automatically**: a `textSize` is converted on read (`2` → 14 px, `3` → 21 px), and the next save writes it as `textPixels` and drops the old key. When both are present, `textPixels` wins. The key was renamed rather than reused because 7–64 is a legal value under either reading, so no guess could tell them apart.
 
 ### `cli` — command-line defaults
 
@@ -469,18 +473,21 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config file reads and writes and the settings window, clipboard color parsing and color card rendering, a pin's self-declared density, pin outlines, text card padding, and the color card's right-click menu:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config file reads and writes and the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density, pin outlines, text card padding, and the color card's right-click menu:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
 build-qt/vshot-config-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-settings-check
+build-qt/vshot-text-size-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-color-check
 build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
 ```
+
+`vshot-text-size-check` pins the font-size conversion: the number on the panel *is* the pixel height, and writing it into the legacy protocol projects it back onto the whole glyph multiples the 5x7 fallback font can draw (`ui/text_size.hpp`). The two ends have to line up (7–448 is exactly scale 1–64), whole multiples have to round-trip, and a value in between has to round to the *nearest* multiple rather than truncate — truncating would shrink a 15 px label to 14 px whenever the fallback rendered it.
 
 `vshot-config-check` covers the part most likely to fail silently: whether a save really **merges** (keeping keys this build does not recognize), whether clearing a value really removes it, and whether `#rrggbbaa` parses as CSS (Qt itself reads that as `#aarrggbb`, turning "opaque orange" into purple). `vshot-settings-check` builds the real settings window, drives every one of its widgets, and reads the config file back — a field wired to the wrong member is visible only that way. It is worth running whenever the window's layout changes: it finds widgets by object name, so a re-layout or a switch to a different widget class does not hide anything, and it only goes red when a field is genuinely mis-wired.
 

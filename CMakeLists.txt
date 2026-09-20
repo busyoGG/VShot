@@ -12,6 +12,7 @@ add_executable(vshot-qt-ui
     ui/main.cpp
     ui/config.cpp
     ui/config.hpp
+    ui/text_size.hpp
     ui/session_protocol.cpp
     ui/session_protocol.hpp
     ui/capture_overlay.cpp
@@ -70,6 +71,20 @@ if(VSHOT_BUILD_CHECKS)
     target_compile_features(vshot-config-check PRIVATE cxx_std_17)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-config-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    # The text size check: the panel edits a pixel height and the label is that
+    # tall, while the legacy integer scale the protocol carries is a rounded
+    # projection of it. The two must agree at every glyph multiple and line up
+    # at both ends of the range. Pure arithmetic, so no platform plugin.
+    add_executable(vshot-text-size-check
+        ui/text_size_check.cpp
+        ui/text_size.hpp
+    )
+    target_link_libraries(vshot-text-size-check PRIVATE Qt6::Core)
+    target_compile_features(vshot-text-size-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-text-size-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     # The settings window check: it builds the real dialog and drives its

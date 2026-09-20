@@ -112,6 +112,9 @@ void checkEveryFieldReachesTheFile()
     find<QSpinBox>(dialog.get(), "arrowSize")->setValue(6);
     expect(choose(find<QComboBox>(dialog.get(), "arrowStyle"), QStringLiteral("filled")),
            "the arrow-head list offers filled");
+    // The text size is a font height in pixels now, so the check uses a value
+    // from that range -- and one that is *not* a whole glyph multiple, so a
+    // round trip through the config cannot quietly snap it to one.
     find<QSpinBox>(dialog.get(), "textSize")->setValue(31);
     expect(choose(find<QComboBox>(dialog.get(), "mosaicShape"), QStringLiteral("brush")),
            "the mosaic-shape list offers brush");
@@ -166,9 +169,11 @@ void checkEveryFieldReachesTheFile()
 void checkTheWindowOpensOnTheStoredValues()
 {
     std::printf("--- the window opens on what the file says ----------------------\n");
+    // The size is written under the pixel key, which is what this build
+    // produces; the legacy `textSize` (a glyph multiple) is checked separately.
     writeConfig(QStringLiteral(R"({
         "editor": {"tool": "ellipse", "width": 12, "dash": "dashed", "arrowStyle": "filled",
-                   "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textSize": 4},
+                   "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textPixels": 28},
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
                 "pin": {"density": 2}}
@@ -185,7 +190,7 @@ void checkTheWindowOpensOnTheStoredValues()
     expect(find<QSpinBox>(dialog.get(), "arrowSize")->value() == 2, "the arrow size box is right");
     expect(find<QComboBox>(dialog.get(), "arrowStyle")->currentData().toString() == QStringLiteral("filled"),
            "the arrow style box is right");
-    expect(find<QSpinBox>(dialog.get(), "textSize")->value() == 4, "the text size box is right");
+    expect(find<QSpinBox>(dialog.get(), "textSize")->value() == 28, "the text size box is right");
     expect(find<QComboBox>(dialog.get(), "mosaicShape")->currentData().toString() == QStringLiteral("ellipse"),
            "the mosaic shape box is right");
     expect(find<QSpinBox>(dialog.get(), "mosaicStrength")->value() == 1, "the mosaic strength box is right");

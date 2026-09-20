@@ -8,12 +8,13 @@
 
 namespace vshot {
 
-/// The editor's remembered style, as the user left it.
+/// The style a session starts from.
 ///
 /// Every field here has the same default the editor hard-codes, so a missing
 /// or unreadable config file leaves the tool behaving exactly as it did before
-/// this existed.  The values are the *starting* style for a new session; the
-/// style the user picks during a session is what gets written back.
+/// this existed.  These are *reset* values, not a record of the last session:
+/// nothing a capture does is written back, and the file changes only when the
+/// user means it -- a save in the settings window, or a hand edit.
 struct EditorPreferences {
     /// Tool the toolbar opens with: select | rectangle | ellipse | arrow | pen
     /// | text | mosaic.
@@ -21,7 +22,10 @@ struct EditorPreferences {
     QColor color{255, 64, 64, 255};
     QString font;
     std::uint32_t width = 2;
-    std::uint32_t textSize = 2;
+    /// Font height of a text label, **in pixels**: the same number the editor's
+    /// size box shows, so 14 means a 14-pixel label.  The legacy integer scale
+    /// the JSON protocol carries is derived from it in `ui/text_size.hpp`.
+    std::uint32_t textSize = 14;
     QString dash = QStringLiteral("solid");
     std::uint32_t arrowSize = 1;
     QString arrowStyle = QStringLiteral("open");

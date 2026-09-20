@@ -1,5 +1,7 @@
 #include "config.hpp"
 
+#include "text_size.hpp"
+
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -37,7 +39,9 @@ const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
 
 constexpr int kMaxWidth = 64;
-constexpr int kMaxTextSize = 64;
+// The text size is a pixel height, and its range comes from `ui/text_size.hpp`
+// (7 px, one glyph cell, to 448 px, the legacy scale's maximum).  It is not
+// repeated here as a literal so the two cannot drift.
 constexpr int kMaxArrowSize = 8;
 constexpr int kMaxMosaicStrength = 3;
 constexpr int kMaxDensity = 4;
@@ -177,6 +181,25 @@ void mergeSection(QJsonObject &root, const QString &name, const QJsonObject &sec
     root.insert(name, merged);
 }
 
+/// The `editor` keys this build has retired, dropped from the file on the next
+/// save so a stale one cannot be read as though it still meant something.
+///
+/// `textSize` is the legacy glyph multiple, read only to migrate a file written
+/// before the size became a pixel height (see `readEditor`).  Leaving it beside
+/// the new `textPixels` would be a second, older answer to the same question,
+/// and the next reader would have to guess which one wins.
+void dropRetiredEditorKeys(QJsonObject &root)
+{
+    QJsonObject editor = root.value(QStringLiteral("editor")).toObject();
+    if (editor.isEmpty()) {
+        return;
+    }
+    if (editor.contains(QStringLiteral("textPixels"))) {
+        editor.remove(QStringLiteral("textSize"));
+        root.insert(QStringLiteral("editor"), editor);
+    }
+}
+
 /// The `cli` leaves this build owns, as `(section, key)` pairs; `section` is
 /// empty for a key directly under `cli`.
 ///
@@ -242,7 +265,9 @@ void writeCliSection(QJsonObject &root, const QJsonObject &cli)
     } else {
         root.insert(QStringLiteral("cli"), merged);
     }
-}EditorPreferences readEditor(const QJsonObject &editor)
+}
+
+EditorPreferences readEditor(const QJsonObject &editor)
 {
     EditorPreferences preferences;
     preferences.tool =
@@ -251,8 +276,28 @@ void writeCliSection(QJsonObject &root, const QJsonObject &cli)
     preferences.font = readString(editor, QStringLiteral("font"), preferences.font);
     preferences.width =
         readBounded(editor, QStringLiteral("width"), preferences.width, kMaxWidth);
-    preferences.textSize =
-        readBounded(editor, QStringLiteral("textSize"), preferences.textSize, kMaxTextSize);
+    // The size is a pixel height, and that is what `textPixels` holds.
+    //
+    // A file written before this was true stores the legacy glyph multiple in
+    // `textSize` instead; it is migrated on read rather than reinterpreted, so
+    // a stored `2` (which meant 14 px) does not become two pixels and get
+    // clamped up to the 7 px floor.  The key was renamed rather than reused
+    // because the two meanings overlap on 7-64, where a value is a legal size
+    // under either reading and no heuristic could tell them apart.
+    if (editor.contains(QStringLiteral("textPixels"))) {
+        preferences.textSize = readBounded(editor, QStringLiteral("textPixels"),
+                                           preferences.textSize, kMaxTextPixels);
+    } else {
+        const QJsonValue legacy = editor.value(QStringLiteral("textSize"));
+        if (legacy.isDouble() && std::isfinite(legacy.toDouble())) {
+            const auto multiple = static_cast<long long>(legacy.toDouble());
+            if (multiple >= 1) {
+                preferences.textSize = static_cast<std::uint32_t>(
+                    vshot::scaleToPixels(static_cast<std::uint32_t>(
+                        std::min<long long>(multiple, kMaxTextPixels))));
+            }
+        }
+    }
     preferences.dash = readChoice(editor, QStringLiteral("dash"), preferences.dash, kDashNames);
     preferences.arrowSize = readBounded(editor, QStringLiteral("arrowSize"),
                                         preferences.arrowSize, kMaxArrowSize);
@@ -294,7 +339,10 @@ QJsonObject editorJson(const EditorPreferences &preferences)
     editor.insert(QStringLiteral("color"), colorText(preferences.color));
     editor.insert(QStringLiteral("font"), preferences.font);
     editor.insert(QStringLiteral("width"), static_cast<double>(preferences.width));
-    editor.insert(QStringLiteral("textSize"), static_cast<double>(preferences.textSize));
+    // `textPixels`, not the legacy `textSize`: the two name different things
+    // (a pixel height against a glyph multiple) and a file carrying both
+    // meanings under one key could not be read back correctly.  See readEditor.
+    editor.insert(QStringLiteral("textPixels"), static_cast<double>(preferences.textSize));
     editor.insert(QStringLiteral("dash"), preferences.dash);
     editor.insert(QStringLiteral("arrowSize"), static_cast<double>(preferences.arrowSize));
     editor.insert(QStringLiteral("arrowStyle"), preferences.arrowStyle);
@@ -448,6 +496,7 @@ bool saveConfig(const Config &config)
     }
     QJsonObject root = readRoot();
     mergeSection(root, QStringLiteral("editor"), editorJson(config.editor));
+    dropRetiredEditorKeys(root);
     writeCliSection(root, cliJson(config.cli));
     return writeRoot(root);
 }
@@ -464,6 +513,7 @@ bool saveEditorPreferences(const EditorPreferences &preferences)
     }
     QJsonObject root = readRoot();
     mergeSection(root, QStringLiteral("editor"), editorJson(preferences));
+    dropRetiredEditorKeys(root);
     return writeRoot(root);
 }
 
