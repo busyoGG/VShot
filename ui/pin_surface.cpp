@@ -52,7 +52,7 @@ constexpr double kOutlineWidthPx = 2.0;
 const QColor kIdleOutlineColor(192, 192, 192);
 const QColor kActiveOutlineColor(0, 0, 0);
 
-// The right-click menu of a color card, in logical pixels. The rows reuse the
+// The right-click menu of a pin, in logical pixels. The copy rows reuse the
 // card's own two fonts (label and value), so the menu reads as the same card
 // with one more thing to click.
 constexpr int kMenuRowPaddingY = 5;
@@ -584,10 +584,17 @@ void PinSurface::showBadge(quint64 id, const QString &text)
     update(localRect(entry->item));
 }
 
+void PinSurface::showMessage(quint64 id, const QString &text)
+{
+    // The same badge a copy confirmation uses: from the user's side a save and
+    // a copy report through the same corner of the same image.
+    showBadge(id, text);
+}
+
 void PinSurface::openMenu(quint64 id, const QPoint &anchor)
 {
     const Entry *entry = entryFor(id);
-    if (entry == nullptr || entry->item.colorRows.isEmpty()) {
+    if (entry == nullptr) {
         return;
     }
     const QRect was = menuRect_;
@@ -595,6 +602,12 @@ void PinSurface::openMenu(quint64 id, const QPoint &anchor)
     menuRows_ = entry->item.colorRows;
     menuHover_ = -1;
     menuRect_ = menuRectFor(anchor);
+    if (menuRect_.isEmpty()) {
+        // Nothing fits on this output: leaving menuId_ set would put the
+        // surface into a state no click could leave.
+        closeMenu();
+        return;
+    }
     // The keyboard is this surface's only while it has focus, and Esc is part
     // of using a menu: ask for it here rather than requiring a click first.
     setFocus(Qt::MouseFocusReason);
@@ -623,36 +636,53 @@ void PinSurface::closeMenu()
     }
 }
 
-QRect PinSurface::menuRectFor(const QPoint &anchor) const
+PinSurface::MenuLayout PinSurface::menuLayout() const
 {
     const QFontMetrics labelMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
     const QFontMetrics valueMetrics(QFontDatabase::systemFont(QFontDatabase::FixedFont));
     const QFontMetrics headingMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
-    qreal labelWidth = 0.0;
+    MenuLayout layout;
+    layout.rowHeight =
+        std::max(labelMetrics.height(), valueMetrics.height()) + 2 * kMenuRowPaddingY;
+    layout.copyRows = menuRows_.size();
+    layout.totalRows = layout.copyRows + 1; // + the `Save as…` row
+    // The heading belongs to the copy rows; a menu with none of them is a
+    // single action and needs no heading over it.
+    layout.headingHeight =
+        layout.copyRows > 0 ? headingMetrics.height() + 2 * kMenuHeadingPaddingY : 0;
+    layout.rowsTop = layout.headingHeight;
+    layout.actionTop = layout.rowsTop + layout.copyRows * layout.rowHeight;
+
     qreal valueWidth = 0.0;
     for (const ColorRow &row : menuRows_) {
-        labelWidth = std::max<qreal>(labelWidth, labelMetrics.horizontalAdvance(row.label));
+        layout.labelWidth = std::max<qreal>(layout.labelWidth,
+                                            labelMetrics.horizontalAdvance(row.label));
         valueWidth = std::max<qreal>(valueWidth, valueMetrics.horizontalAdvance(row.value));
     }
-    const int rowHeight = std::max(labelMetrics.height(), valueMetrics.height())
-        + 2 * kMenuRowPaddingY;
-    const int headingHeight = headingMetrics.height() + 2 * kMenuHeadingPaddingY;
     const qreal headingWidth = headingMetrics.horizontalAdvance(uiTr("Copy"));
-    // Wide enough for the widest row and for the heading, whichever is wider.
+    const qreal actionWidth = labelMetrics.horizontalAdvance(uiTr("Save as…"));
+    // Wide enough for the widest copy row and for either single-line row
+    // (heading, action), whichever is widest.
     const qreal contentWidth =
-        std::max(std::max(labelWidth + kMenuLabelGap + valueWidth, headingWidth), 1.0);
-    const int width = qCeil(contentWidth) + 2 * kMenuPaddingX;
-    const int height = headingHeight + menuRows_.size() * rowHeight;
+        std::max(std::max(layout.labelWidth + kMenuLabelGap + valueWidth, headingWidth),
+                 actionWidth);
+    layout.boxSize = QSize(qCeil(contentWidth) + 2 * kMenuPaddingX,
+                           layout.headingHeight + layout.totalRows * layout.rowHeight);
+    return layout;
+}
 
+QRect PinSurface::menuRectFor(const QPoint &anchor) const
+{
+    const MenuLayout layout = menuLayout();
     // Down and right of the pointer, the way a menu opens; flipped when that
     // would run off the output, and clamped so a pin at the very edge still
     // gets a usable menu (the pointer may sit anywhere inside it then).
-    QRect box(anchor + QPoint(kMenuCursorGap, kMenuCursorGap), QSize(width, height));
+    QRect box(anchor + QPoint(kMenuCursorGap, kMenuCursorGap), layout.boxSize);
     if (box.right() > rect().right()) {
-        box.moveLeft(anchor.x() - kMenuCursorGap - width);
+        box.moveLeft(anchor.x() - kMenuCursorGap - layout.boxSize.width());
     }
     if (box.bottom() > rect().bottom()) {
-        box.moveTop(anchor.y() - kMenuCursorGap - height);
+        box.moveTop(anchor.y() - kMenuCursorGap - layout.boxSize.height());
     }
     box = box.intersected(rect());
     return box.width() > 0 && box.height() > 0 ? box : QRect();
@@ -663,18 +693,16 @@ int PinSurface::menuRowAt(const QPoint &local) const
     if (menuId_ == 0 || menuRect_.isEmpty()) {
         return -1;
     }
-    const QFontMetrics labelMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
-    const QFontMetrics valueMetrics(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-    const QFontMetrics headingMetrics(QFontDatabase::systemFont(QFontDatabase::GeneralFont));
-    const int rowHeight = std::max(labelMetrics.height(), valueMetrics.height())
-        + 2 * kMenuRowPaddingY;
-    const int headingHeight = headingMetrics.height() + 2 * kMenuHeadingPaddingY;
-    const int offset = local.y() - menuRect_.top() - headingHeight;
+    const MenuLayout layout = menuLayout();
+    if (layout.rowHeight <= 0) {
+        return -1;
+    }
+    const int offset = local.y() - menuRect_.top() - layout.rowsTop;
     if (offset < 0) {
         return -1;
     }
-    const int row = offset / rowHeight;
-    return row >= 0 && row < menuRows_.size() ? row : -1;
+    const int row = offset / layout.rowHeight;
+    return row >= 0 && row < layout.totalRows ? row : -1;
 }
 
 void PinSurface::paintMenu(QPainter &painter)
@@ -682,20 +710,11 @@ void PinSurface::paintMenu(QPainter &painter)
     if (menuId_ == 0 || menuRect_.isEmpty()) {
         return;
     }
+    const MenuLayout layout = menuLayout();
     const QPalette palette = this->palette();
     const QFont labelFont = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
     const QFont valueFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    const QFontMetrics labelMetrics(labelFont);
-    const QFontMetrics valueMetrics(valueFont);
     const QFontMetrics headingMetrics(labelFont);
-    const int rowHeight = std::max(labelMetrics.height(), valueMetrics.height())
-        + 2 * kMenuRowPaddingY;
-    const int headingHeight = headingMetrics.height() + 2 * kMenuHeadingPaddingY;
-
-    qreal labelWidth = 0.0;
-    for (const ColorRow &row : menuRows_) {
-        labelWidth = std::max<qreal>(labelWidth, labelMetrics.horizontalAdvance(row.label));
-    }
 
     painter.save();
     painter.setRenderHint(QPainter::Antialiasing, true);
@@ -704,25 +723,29 @@ void PinSurface::paintMenu(QPainter &painter)
     painter.drawRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius,
                             kMenuRadius);
 
-    // The heading says what clicking a row does; the rows themselves stay the
-    // card's own label-and-value pairs, so the value that gets copied is the
-    // one the card prints.
     QColor dim = palette.color(QPalette::Text);
     dim.setAlpha(160);
-    painter.setFont(labelFont);
-    painter.setPen(dim);
-    painter.drawText(QRect(menuRect_.left() + kMenuPaddingX, menuRect_.top() + kMenuHeadingPaddingY,
-                           menuRect_.width() - 2 * kMenuPaddingX, headingMetrics.height()),
-                     Qt::AlignLeft | Qt::AlignVCenter, uiTr("Copy"));
-    painter.setPen(QPen(QColor(0, 0, 0, 40), 1.0));
-    const int separator = menuRect_.top() + headingHeight;
-    painter.drawLine(menuRect_.left() + 1, separator, menuRect_.right() - 1, separator);
+    if (layout.headingHeight > 0) {
+        // The heading says what clicking a row does; the rows themselves stay
+        // the card's own label-and-value pairs, so the value that gets copied
+        // is the one the card prints.
+        painter.setFont(labelFont);
+        painter.setPen(dim);
+        painter.drawText(QRect(menuRect_.left() + kMenuPaddingX,
+                               menuRect_.top() + kMenuHeadingPaddingY,
+                               menuRect_.width() - 2 * kMenuPaddingX,
+                               headingMetrics.height()),
+                         Qt::AlignLeft | Qt::AlignVCenter, uiTr("Copy"));
+        painter.setPen(QPen(QColor(0, 0, 0, 40), 1.0));
+        const int separator = menuRect_.top() + layout.headingHeight;
+        painter.drawLine(menuRect_.left() + 1, separator, menuRect_.right() - 1, separator);
+    }
 
     const qreal labelX = menuRect_.left() + kMenuPaddingX;
-    const qreal valueX = labelX + labelWidth + kMenuLabelGap;
-    for (int index = 0; index < menuRows_.size(); ++index) {
-        const QRect row(menuRect_.left(), separator + index * rowHeight, menuRect_.width(),
-                        rowHeight);
+    const qreal valueX = labelX + layout.labelWidth + kMenuLabelGap;
+    for (int index = 0; index < layout.copyRows; ++index) {
+        const QRect row(menuRect_.left(), menuRect_.top() + layout.rowsTop + index * layout.rowHeight,
+                        menuRect_.width(), layout.rowHeight);
         const bool hovered = index == menuHover_;
         if (hovered) {
             painter.setPen(Qt::NoPen);
@@ -735,7 +758,7 @@ void PinSurface::paintMenu(QPainter &painter)
         const QRect textBox(row.left(), row.top(), row.width(), row.height());
         painter.setFont(labelFont);
         painter.setPen(labelColor);
-        painter.drawText(QRectF(labelX, textBox.top(), labelWidth, textBox.height()),
+        painter.drawText(QRectF(labelX, textBox.top(), layout.labelWidth, textBox.height()),
                          Qt::AlignLeft | Qt::AlignVCenter, menuRows_.at(index).label);
         painter.setFont(valueFont);
         painter.setPen(valueColor);
@@ -744,6 +767,25 @@ void PinSurface::paintMenu(QPainter &painter)
                                 textBox.height()),
                          Qt::AlignLeft | Qt::AlignVCenter, menuRows_.at(index).value);
     }
+
+    // The action row: no label/value pair, and it sits under a separator so it
+    // does not read as one more format to copy.
+    const QRect action(menuRect_.left(), menuRect_.top() + layout.actionTop, menuRect_.width(),
+                       layout.rowHeight);
+    if (layout.copyRows > 0) {
+        painter.setPen(QPen(QColor(0, 0, 0, 40), 1.0));
+        painter.drawLine(menuRect_.left() + 1, action.top(), menuRect_.right() - 1, action.top());
+    }
+    if (menuHover_ == layout.copyRows) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(palette.color(QPalette::Highlight));
+        painter.drawRect(action);
+    }
+    painter.setFont(labelFont);
+    painter.setPen(menuHover_ == layout.copyRows ? palette.color(QPalette::HighlightedText)
+                                                : palette.color(QPalette::Text));
+    painter.drawText(action.adjusted(kMenuPaddingX, 0, -kMenuPaddingX, 0),
+                     Qt::AlignLeft | Qt::AlignVCenter, uiTr("Save as…"));
     painter.restore();
 }
 
@@ -766,6 +808,25 @@ void PinSurface::copyRow(int row)
                          : uiTr("Copy failed"));
 }
 
+void PinSurface::activateRow(int row)
+{
+    const int copyRows = menuRows_.size();
+    if (row < 0) {
+        return;
+    }
+    if (row < copyRows) {
+        copyRow(row);
+        return;
+    }
+    if (row == copyRows && saveRequested_) {
+        const quint64 id = menuId_;
+        const std::function<void(quint64)> save = saveRequested_;
+        // The daemon runs the dialog and writes the file; the badge that says
+        // how it went arrives over showMessage() once that is known.
+        save(id);
+    }
+}
+
 void PinSurface::mousePressEvent(QMouseEvent *event)
 {
     const QPoint local = event->position().toPoint();
@@ -780,7 +841,7 @@ void PinSurface::mousePressEvent(QMouseEvent *event)
             const int row = menuRowAt(local);
             // Order matters: the badge lands on the card, and closing the menu
             // must not repaint over it.
-            copyRow(row);
+            activateRow(row);
             closeMenu();
             // This press was the menu's, and it may be the first half of a
             // double-click: the menu is gone by the time the second half
@@ -796,13 +857,13 @@ void PinSurface::mousePressEvent(QMouseEvent *event)
         return;
     }
     // The right button is the card's: on a pinned color it opens the list of
-    // formats, each of which the menu can put back on the clipboard. The
-    // right button never picks or drags, so this cannot be confused with a
-    // left-click gesture.
+    // formats, each of which the menu can put back on the clipboard, plus the
+    // one action every pin has. The right button never picks or drags, so this
+    // cannot be confused with a left-click gesture.
     if (event->button() == Qt::RightButton) {
         const quint64 id = pinAt(local);
         const Entry *entry = entryFor(id);
-        if (entry != nullptr && !entry->item.colorRows.isEmpty()) {
+        if (entry != nullptr) {
             openMenu(id, local);
             event->accept();
             return;
@@ -926,8 +987,8 @@ void PinSurface::keyPressEvent(QKeyEvent *event)
     // While the menu is up it takes the three keys a menu is expected to take;
     // everything else falls through, so this surface's other shortcuts are not
     // shadowed by it.
-    if (menuId_ != 0 && !menuRows_.isEmpty()) {
-        const int count = menuRows_.size();
+    if (menuId_ != 0) {
+        const int count = menuRows_.size() + 1; // the copy rows plus `Save as…`
         switch (event->key()) {
         case Qt::Key_Escape:
             event->accept();
@@ -948,7 +1009,7 @@ void PinSurface::keyPressEvent(QKeyEvent *event)
         case Qt::Key_Enter:
             event->accept();
             if (menuHover_ >= 0) {
-                copyRow(menuHover_);
+                activateRow(menuHover_);
             }
             closeMenu();
             return;

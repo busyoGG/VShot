@@ -205,7 +205,7 @@ Alignment uses only the rows that **belong to the page**: runs of rows at the to
 - **Left click** raises the image to the front, so a clicked one is always above the rest when they overlap
 - Whichever image the pointer rests on gets a solid black outline; the others are light gray (2 logical pixels thick, not covering the image itself)
 - With the pointer over a pin and that screen holding the keyboard, press **Space** to enter the same annotation editor `vshot region` uses
-- Right-clicking a pinned **color card** opens a format menu; clicking an entry copies that value back to the clipboard (↑/↓ to move, Enter to copy, Esc to close; a badge flashes at the bottom-right once copied)
+- Right-clicking **any** pin opens a menu: a color card lists its formats first, and clicking one copies that value back to the clipboard (↑/↓ to move, Enter to copy, Esc to close; a badge flashes at the bottom-right once copied). The last row, **Save as…**, is there for every pin: it opens a save dialog and writes the image out as a PNG, then reports the result in the same badge
 
 A new pin lands on the **active output**: the screen the pointer is on first, then the output holding keyboard focus when the pointer cannot be read, then the primary output.
 

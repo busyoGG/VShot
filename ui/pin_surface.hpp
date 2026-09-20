@@ -114,6 +114,17 @@ public:
     {
         copyRequested_ = std::move(callback);
     }
+    // Invoked when the user picks `Save as…` out of a pin's right-click menu.
+    // The write itself belongs to the daemon: it owns the image, and the file
+    // dialog it opens is a plain toplevel, which this layer surface cannot be.
+    void setSaveCallback(std::function<void(quint64)> callback)
+    {
+        saveRequested_ = std::move(callback);
+    }
+    // Puts a transient message on a pin's corner from outside the surface. A
+    // save runs in a helper process, so its outcome is known long after the
+    // menu that started it has closed.
+    void showMessage(quint64 id, const QString &text);
 
 protected:
     bool event(QEvent *event) override;
@@ -145,6 +156,27 @@ private:
 
     // The image's rect in output-local logical pixels.
     QRect localRect(const Item &item) const;
+
+    // How the open menu's rows are laid out, in logical pixels relative to the
+    // menu's own top-left. Painting and hit-testing both read this, so a row
+    // can never be drawn where it cannot be clicked.
+    //
+    // The rows are the copy rows a color card offers, followed by one action
+    // row every pin has: `Save as…`. The heading exists only when there are
+    // copy rows to head -- an image pin's menu is that one action row.
+    struct MenuLayout {
+        int headingHeight = 0;
+        int rowHeight = 0;
+        // How many rows copy a format, and how many rows there are in total.
+        int copyRows = 0;
+        int totalRows = 0;
+        // The y of the first copy row and of the action row.
+        int rowsTop = 0;
+        int actionTop = 0;
+        qreal labelWidth = 0.0;
+        QSize boxSize;
+    };
+    MenuLayout menuLayout() const;
     // The image's rect in this surface's device pixels.
     QSize deviceTargetSize(const Entry &entry) const;
     // The image at this surface's device resolution, cached: painting the
@@ -198,6 +230,8 @@ private:
     void paintMenu(QPainter &painter);
     // Copies one row's value through the daemon and reports it in the badge.
     void copyRow(int row);
+    // Runs the row's action: the first row copies, the last saves.
+    void activateRow(int row);
 
     QVector<Entry> entries_;
     QScreen *screen_;
@@ -207,6 +241,7 @@ private:
     std::function<void(quint64)> closeRequested_;
     std::function<void(quint64)> editRequested_;
     std::function<bool(quint64, const QString &)> copyRequested_;
+    std::function<void(quint64)> saveRequested_;
 
     // The pin the user last clicked on this output: the one the zoom badge and
     // the Space edit shortcut belong to, and the only one drawn as focused.
@@ -221,8 +256,10 @@ private:
     // Where the badge was painted last, so clearing it does not repaint the
     // whole output.
     QRect badgeRect_;
-    // The open right-click menu: the pin it belongs to (0 while closed), its
-    // rows, where it is painted, and the row the pointer is over.
+    // The open right-click menu: the pin it belongs to (0 while closed), the
+    // copy rows it offers, where it is painted, and the row the pointer is
+    // over. Row indices run over `menuRows_` first and then the one action
+    // row, which is why `menuHover_` may equal `menuRows_.size()`.
     quint64 menuId_ = 0;
     QVector<ColorRow> menuRows_;
     QRect menuRect_;

@@ -231,7 +231,8 @@ int main(int argc, char **argv)
     card.density = 1;
     card.origin = base + QPoint(20, 20);
     card.colorRows = rows;
-    // A pin with no formats: the same right-click must leave it alone.
+    // A pin with no formats: the same right-click still gets the one action
+    // every pin has, but no copy rows.
     vshot::PinSurface::Item picture;
     picture.id = 2;
     picture.image = QImage(60, 60, QImage::Format_ARGB32_Premultiplied);
@@ -240,11 +241,13 @@ int main(int argc, char **argv)
 
     QVector<QString> copied;
     QVector<quint64> closed;
+    QVector<quint64> saved;
     bool copySucceeds = true;
     surface.setCopyCallback([&copied, &copySucceeds](quint64, const QString &value) {
         copied.append(value);
         return copySucceeds;
     });
+    surface.setSaveCallback([&saved](quint64 id) { saved.append(id); });
     // A close request is what a double-click on a pin means; recording them is
     // how the check tells "the menu kept the double-click" apart from "it
     // leaked through to the pin underneath".
@@ -277,9 +280,19 @@ int main(int argc, char **argv)
 
     std::printf("--- what the right button does ------------------------------------\n");
     expect(!hasBadge(paint(surface), badgeArea), "the card shows no badge until something is copied");
+    // A pin that offers no formats still gets a menu: it is the one action row
+    // every pin has. It opens over the pin (there is nowhere else it would go
+    // for a 60x60 image), so what says it is there is the paint, not a rect
+    // outside the pin areas.
+    const QRect pictureMenuArea(pictureRect.adjusted(-4, -4, 120, 120));
+    const QImage bare = paint(surface);
     sendClick(surface, pictureRect.center(), Qt::RightButton);
     QImage frame = paint(surface);
-    expect(paintedOutside(frame, pinAreas).isNull(), "a pin with no formats opens no menu");
+    leave(QStringLiteral("pin-menu-image.png"), frame);
+    expect(differingPixels(bare, frame, pictureMenuArea) > 200,
+           "a pin with no formats gets the save action",
+           QStringLiteral("%1 pixels painted").arg(differingPixels(bare, frame, pictureMenuArea)));
+    sendKey(surface, Qt::Key_Escape);
 
     // A click that lands on no pin at all is the other half of the same rule.
     sendClick(surface, QPoint(700, 40), Qt::RightButton);
@@ -321,8 +334,9 @@ int main(int argc, char **argv)
         }
         walk = now;
     }
-    expect(rowTop.size() == rows.size(), "moving down the menu crosses one row per format",
-           QStringLiteral("%1 changes for %2 rows").arg(rowTop.size()).arg(rows.size()));
+    expect(rowTop.size() == rows.size() + 1,
+           "moving down the menu crosses one row per format, then the action row",
+           QStringLiteral("%1 changes for %2 rows").arg(rowTop.size()).arg(rows.size() + 1));
 
     QVector<int> rowMid;
     QVector<int> rowSpan;
@@ -334,7 +348,9 @@ int main(int argc, char **argv)
     if (rowSpan.size() >= 2) {
         const int thinnest = *std::min_element(rowSpan.begin(), rowSpan.end());
         const int thickest = *std::max_element(rowSpan.begin(), rowSpan.end());
-        expect(thickest - thinnest <= 1, "every row is the same height",
+        // The action row sits under a separator line, which the walk reads as
+        // part of the row above it, so that one may be a pixel taller.
+        expect(thickest - thinnest <= 2, "every row is the same height",
                QStringLiteral("%1 vs %2 logical px").arg(thinnest).arg(thickest));
     }
 
@@ -350,8 +366,10 @@ int main(int argc, char **argv)
                 only = only && !isColor(lit, QPoint(menu.left() + 5, rowMid.at(other)), highlight);
             }
         }
+        const QString name = index < rows.size() ? rows.at(index).label
+                                                 : QStringLiteral("Save as…");
         expect(only, "only the row under the pointer is highlighted",
-               QStringLiteral("row %1 `%2`").arg(index).arg(rows.at(index).label));
+               QStringLiteral("row %1 `%2`").arg(index).arg(name));
     }
 
     std::printf("--- picking a row --------------------------------------------------\n");
@@ -359,8 +377,8 @@ int main(int argc, char **argv)
     // on an open menu is a dismissal, not an opening.
     sendKey(surface, Qt::Key_Escape);
     QImage afterPick;
-    if (rowMid.size() == rows.size()) {
-        for (int index = 0; index < rowMid.size(); ++index) {
+    if (rowMid.size() == rows.size() + 1) {
+        for (int index = 0; index < rows.size(); ++index) {
             sendClick(surface, anchor, Qt::RightButton); // reopen: a pick closes it
             sendMove(surface, QPoint(menu.left() + 5, rowMid.at(index)));
             sendClick(surface, QPoint(menu.left() + 5, rowMid.at(index)), Qt::LeftButton);
@@ -395,7 +413,7 @@ int main(int argc, char **argv)
 
     // Enter copies the highlighted row, which is the keyboard half of the same
     // interaction.
-    if (rowMid.size() == rows.size() && rows.size() >= 2) {
+    if (rowMid.size() == rows.size() + 1 && rows.size() >= 2) {
         sendClick(surface, anchor, Qt::RightButton);
         sendMove(surface, QPoint(menu.left() + 5, rowMid.at(1)));
         sendKey(surface, Qt::Key_Return);
@@ -422,12 +440,37 @@ int main(int argc, char **argv)
     expect(differingPixels(afterPick, afterFailure, badgeArea) > 4,
            "the badge says something else when the copy failed");
 
+    // The action row is not a copy row: clicking it must reach the save
+    // callback and nothing else. Enter on it is the same, which is what the
+    // keyboard walk would do if it ran off the last copy row.
+    std::printf("--- the save row ---------------------------------------------------\n");
+    if (rowMid.size() == rows.size() + 1) {
+        const int beforeSave = saved.size();
+        const int beforeCopy = copied.size();
+        sendClick(surface, anchor, Qt::RightButton);
+        sendClick(surface, QPoint(menu.left() + 5, rowMid.last()), Qt::LeftButton);
+        expect(saved.size() == beforeSave + 1 && saved.last() == card.id
+                   && copied.size() == beforeCopy,
+               "clicking `Save as…` asks the daemon to save that pin and copies nothing",
+               QStringLiteral("saved pin %1").arg(saved.isEmpty() ? 0 : saved.last()));
+
+        sendClick(surface, anchor, Qt::RightButton);
+        sendMove(surface, QPoint(menu.left() + 5, rowMid.last()));
+        sendKey(surface, Qt::Key_Return);
+        expect(saved.size() == beforeSave + 2 && copied.size() == beforeCopy,
+               "Enter on the save row saves too",
+               QStringLiteral("%1 saves").arg(saved.size() - beforeSave));
+        const QImage afterSave = paint(surface);
+        leave(QStringLiteral("pin-menu-save.png"), afterSave);
+        expect(paintedOutside(afterSave, pinAreas).isNull(), "picking the save row closes the menu");
+    }
+
     // A double-click on a row is a plausible way to use a menu, and its second
     // half arrives after the menu has closed -- right where a pin may be
     // sitting. It must copy once and leave that pin alone rather than read as
     // "double-click closes this pin".
     std::printf("--- a double-click on a row ----------------------------------------\n");
-    if (rowMid.size() == rows.size() && rows.size() >= 3) {
+    if (rowMid.size() == rows.size() + 1 && rows.size() >= 3) {
         const QPoint spot(menu.left() + 5, rowMid.at(2));
         vshot::PinSurface::Item covered;
         covered.id = 3;

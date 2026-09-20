@@ -221,7 +221,9 @@ is the one Space opens in the same editor as `vshot region`. Clicking a pin is w
 output the keyboard; the outline follows the pointer rather than the keyboard, because the \
 compositors in use never tell a layer surface that it has stopped being focused. A pin covers \
 every output it overlaps, so it can be \
-dragged from one monitor onto another. Right-clicking a pinned color card copies one of its formats.
+dragged from one monitor onto another. Right-clicking a pin opens its menu: a pinned color \
+card offers its formats to copy, and every pin offers `Save as…`, which writes the image out \
+as a PNG.
 
 Visibility control goes to the running daemon over its socket, \
 so --toggle/--show/--hide take effect at once and do not start a second daemon. Wayland \

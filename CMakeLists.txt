@@ -33,6 +33,8 @@ add_executable(vshot-qt-ui
     ui/pin_surface.hpp
     ui/pin_server.cpp
     ui/pin_server.hpp
+    ui/save_dialog.cpp
+    ui/save_dialog.hpp
     ui/text_card.cpp
     ui/text_card.hpp
 )

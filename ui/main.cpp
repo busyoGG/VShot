@@ -3,6 +3,7 @@
 #include "i18n.hpp"
 #include "pin_edit.hpp"
 #include "pin_server.hpp"
+#include "save_dialog.hpp"
 #include "session_protocol.hpp"
 #include "settings_window.hpp"
 
@@ -55,6 +56,12 @@ int main(int argc, char **argv)
     // integration is wanted depends on the mode.
     const bool settingsMode =
         argc == 2 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--settings");
+    // The save dialog is the other toplevel mode, and it needs the same
+    // treatment: it is a QFileDialog, i.e. a popup over a plain window, and the
+    // layer-shell integration would leave it unmapped exactly like the settings
+    // window.
+    const bool saveMode =
+        argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--save-dialog");
     // Every other mode draws a layer surface: the capture overlay, the picking
     // overlay, the scrolling-capture hint and the pin windows all anchor
     // themselves and must sit above ordinary windows.  The settings window is
@@ -64,7 +71,7 @@ int main(int argc, char **argv)
     // is wanted, and cleared where it would get in the way: a session that
     // exports it globally would otherwise leave this window invisible with no
     // error to show for it.
-    if (settingsMode) {
+    if (settingsMode || saveMode) {
         qunsetenv("QT_WAYLAND_SHELL_INTEGRATION");
     } else {
         qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
@@ -122,10 +129,17 @@ int main(int argc, char **argv)
         vshot::initUiLanguage();
         return vshot::runPinEdit(sessionPath);
     }
+    if (saveMode) {
+        const QString suggested = QString::fromLocal8Bit(argv[2]);
+        QApplication app(argc, argv);
+        QApplication::setQuitOnLastWindowClosed(true);
+        return vshot::runSaveDialog(suggested);
+    }
     if (argc != 3 || QString::fromLocal8Bit(argv[1]) != QStringLiteral("--session")) {
         reportError(QStringLiteral("usage: vshot-qt-ui --session <absolute-json-path>\n"
                                    "       vshot-qt-ui --settings\n"
                                    "       vshot-qt-ui --pin-edit <absolute-json-path>\n"
+                                   "       vshot-qt-ui --save-dialog <suggested-path>\n"
                                    "       vshot-qt-ui --pin-server <absolute-socket-path>"));
         return 2;
     }

@@ -86,8 +86,8 @@ niri 的截图调用；其下的矩形路线读取 Hyprland、Sway 或 KWin 的�
 里的东西 pin 出来——颜色（pin 成一张卡片，列出该颜色的 hex、RGB、HSL、HSV 与 CMYK）、图像，或
 渲染成卡片的文字（保留 HTML、markdown 或代码格式）。pin 出来的图可以拖动，滚轮绕图像中心缩放，
 双击关闭；光标停在哪张上、哪张就是黑边，按 Space 即进入与 `vshot region` 相同的标注编辑器；
---toggle/--show/--hide 控制所有 pin 的显隐。右键点击 pin 出来的色卡会弹出格式菜单，点哪一项就
-把那个值抄回剪贴板。
+--toggle/--show/--hide 控制所有 pin 的显隐。右键点击任意 pin 都会弹出菜单：色卡先列出它的各种
+格式，点哪一项就把那个值抄回剪贴板；所有 pin 的最后一行都是「另存为…」，把这张图写成 PNG。
 
 屏幕选区、挑窗与 pin 编辑器都由 Qt helper `vshot-qt-ui` 完成；VSHOT_QT_HELPER 可以指向另一份
 副本。其余环境变量：VSHOT_LANG（界面语言）、VSHOT_PIXEL_DEBUG=1（窗口识别看到了什么）、

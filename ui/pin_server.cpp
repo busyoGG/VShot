@@ -1,11 +1,13 @@
 #include "pin_density.hpp"
 #include "pin_server.hpp"
 #include "color_card.hpp"
+#include "i18n.hpp"
 #include "pin_surface.hpp"
 #include "text_card.hpp"
 
 #include <QColor>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -357,6 +359,11 @@ struct Pin {
     // Global logical top-left of the image.
     QPoint origin;
     QString label;
+    // Where the pixels came from, empty when they came from the clipboard
+    // rather than a file. `label` is what to call the pin in a log line; this
+    // is what the save dialog offers as its starting name, so a re-save lands
+    // beside the original instead of in the Pictures directory.
+    QString sourcePath;
     // The formats a pinned color card shows, empty for every other pin. Kept
     // here rather than re-derived when the menu opens: the card was rendered
     // from these rows, so the menu copies exactly what the card printed.
@@ -722,6 +729,9 @@ private:
         if (command == QStringLiteral("move")) {
             return movePin(request);
         }
+        if (command == QStringLiteral("save")) {
+            return savePin(request);
+        }
         if (command == QStringLiteral("toggle")) {
             setVisible(!allVisible_);
             return okReply();
@@ -908,6 +918,7 @@ wl-clipboard package"));
         pin->id = nextId_++;
         pin->image = image;
         pin->label = label;
+        pin->sourcePath = sourcePath;
         pin->colorRows = colorRows;
         const PinDensity density = resolveDensity(request, screen, image, sourcePath, sourceBytes);
         pin->density = density.value;
@@ -1153,6 +1164,129 @@ wl-clipboard package"));
         watcher->start();
     }
 
+    // What the save dialog opens with: the file the pin came from, so a re-save
+    // lands beside the original, and otherwise a timestamped `vshot-<date>.png`
+    // in the same shape the CLI writes.
+    static QString suggestedSaveName(const Pin &pin)
+    {
+        if (!pin.sourcePath.isEmpty()) {
+            const QString name = QFileInfo(pin.sourcePath).fileName();
+            if (!name.isEmpty()) {
+                return name;
+            }
+        }
+        return QStringLiteral("vshot-%1.png")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")));
+    }
+
+    // The helper executable, i.e. this program. It is needed to run the save
+    // dialog: that mode cannot live in this process, because this one is a
+    // layer-shell client and a layer surface cannot parent a popup.
+    QString helperPath() const
+    {
+        const QString override = QString::fromLocal8Bit(qgetenv("VSHOT_QT_HELPER"));
+        if (!override.isEmpty()) {
+            return override;
+        }
+        char buffer[4096];
+        const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+        if (length <= 0) {
+            return QString();
+        }
+        buffer[length] = '\0';
+        return QString::fromLocal8Bit(buffer);
+    }
+
+    // Saves one pin's pixels to a file the user picks. The dialog is a separate
+    // process -- this daemon is a layer-shell client, and a layer surface
+    // cannot parent a popup, which is what a file dialog is -- so this writes
+    // nothing itself: it runs the helper in its `--save-dialog` mode, takes the
+    // path the user chose, and writes the image there.
+    QJsonObject savePin(const QJsonObject &request)
+    {
+        Pin *pin = byId_.value(static_cast<quint64>(request.value(QStringLiteral("id")).toDouble()),
+                               nullptr);
+        if (pin == nullptr) {
+            return error(QStringLiteral("save names a pin that is not pinned"));
+        }
+        const QString suggested = request.value(QStringLiteral("suggested")).toString();
+        const QString helper = helperPath();
+        if (helper.isEmpty()) {
+            return error(QStringLiteral("cannot locate vshot-qt-ui for the save dialog; set "
+                                        "VSHOT_QT_HELPER"));
+        }
+        // The dialog is modal to nothing and the daemon must keep drawing, so
+        // it runs detached and its reply comes back through a signal. The pin
+        // id is carried in the closure: the user may have closed the pin by the
+        // time the dialog closes, and a save then has nowhere to report to.
+        const quint64 id = pin->id;
+        auto *dialog = new QProcess(this);
+        dialog->setProgram(helper);
+        dialog->setArguments({QStringLiteral("--save-dialog"), suggested});
+        dialog->setStandardInputFile(QProcess::nullDevice());
+        // The daemon's own environment names the layer-shell integration, and
+        // the dialog must not inherit it: it is a toplevel. `--save-dialog`
+        // clears it on its own, but a child that starts from a clean slate
+        // cannot be broken by a future change to that rule either.
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.remove(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"));
+        dialog->setProcessEnvironment(env);
+        connect(dialog, &QProcess::finished, this, [this, dialog, id](int code, QProcess::ExitStatus) {
+            const QByteArray out = dialog->readAllStandardOutput();
+            dialog->deleteLater();
+            QJsonParseError parseError;
+            const QJsonDocument document = QJsonDocument::fromJson(out.trimmed(), &parseError);
+            if (code != 0 || parseError.error != QJsonParseError::NoError || !document.isObject()
+                || !document.object().value(QStringLiteral("ok")).toBool()) {
+                return; // cancelled, or the dialog could not run at all
+            }
+            const QString path = document.object().value(QStringLiteral("path")).toString();
+            Pin *target = byId_.value(id, nullptr);
+            if (target == nullptr || path.isEmpty()) {
+                return;
+            }
+            const bool written = target->image.save(path, "PNG");
+            if (!written || debug_) {
+                qWarning("pin %llu: %s `%s`", static_cast<unsigned long long>(id),
+                         written ? "saved" : "could not save", qPrintable(path));
+            }
+            // The badge is a corner label on the image, so it names the file
+            // rather than spelling out where it went: a full path would be
+            // wider than most pins and get clipped to something unreadable.
+            announce(id, written ? uiTr("Saved %1").arg(QFileInfo(path).fileName())
+                                 : uiTr("Could not save the image"));
+        });
+        // A dialog that never starts (the helper went missing between the two
+        // halves of the round trip) still has to say so, or `Save as…` looks
+        // like it did nothing at all. Only `FailedToStart` is handled: it is
+        // the one error that comes without a `finished` afterwards, so the
+        // two cannot both report the same failure.
+        connect(dialog, &QProcess::errorOccurred, this,
+                [this, dialog, id](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart) {
+                        return;
+                    }
+                    qWarning("pin %llu: the save dialog could not be started",
+                             static_cast<unsigned long long>(id));
+                    announce(id, uiTr("Could not save the image"));
+                    dialog->deleteLater();
+                });
+        dialog->start();
+        return okReply();
+    }
+
+    // Puts `text` on `id`'s corner in every surface that shows that pin. A save
+    // runs in another process, so this is how its outcome reaches the user long
+    // after the menu that started it has closed.
+    void announce(quint64 id, const QString &text)
+    {
+        for (const QPointer<PinSurface> &surface : surfaces_) {
+            if (surface != nullptr) {
+                surface->showMessage(id, text);
+            }
+        }
+    }
+
     // Global logical top-left that keeps the image reachable: at least
     // kGrabMargin of it must stay on the output it overlaps most. When the
     // image is on no output at all, the nearest one is used, so a drag that
@@ -1246,6 +1380,16 @@ wl-clipboard package"));
             }
             return copied;
         });
+        // `Save as…` runs the dialog and writes the file; the surface only
+        // reports the outcome, through the same badge a copy uses.
+        surface->setSaveCallback([this](quint64 id) {
+            QJsonObject request;
+            request.insert(QStringLiteral("id"), static_cast<qint64>(id));
+            if (const Pin *pin = byId_.value(id, nullptr)) {
+                request.insert(QStringLiteral("suggested"), suggestedSaveName(*pin));
+            }
+            savePin(request);
+        });
         if (!surface->showLayerSurface()) {
             delete surface;
             return;
@@ -1298,6 +1442,7 @@ wl-clipboard package"));
         surface->setDragCallback({});
         surface->setZoomCallback({});
         surface->setCopyCallback({});
+        surface->setSaveCallback({});
         QObject::disconnect(surface, nullptr, this, nullptr);
         surface->setPinnedVisible(false);
         surface->hide();
