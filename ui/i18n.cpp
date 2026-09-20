@@ -68,6 +68,26 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Saved %1"), QString::fromUtf8("已保存 %1")},
         {QStringLiteral("Could not save the image"), QString::fromUtf8("图片保存失败")},
 
+        // Pasting an image into the annotation editor.
+        {QStringLiteral("Image"), QString::fromUtf8("图片")},
+        {QStringLiteral("Paste an image onto the capture (Ctrl+V for the clipboard)"),
+         QString::fromUtf8("把一张图片贴到截图上（Ctrl+V 贴剪贴板）")},
+        {QStringLiteral("Open an image"), QString::fromUtf8("打开图片")},
+        {QStringLiteral("Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff)"),
+         QString::fromUtf8("图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff)")},
+        {QStringLiteral("All files (*)"), QString::fromUtf8("所有文件 (*)")},
+        {QStringLiteral("Paste needs a selection to paste onto."),
+         QString::fromUtf8("要先有选区才能贴图。")},
+        {QStringLiteral("`wl-paste` was not found, so the clipboard cannot be read."),
+         QString::fromUtf8("找不到 `wl-paste`，读不了剪贴板。")},
+        {QStringLiteral("The clipboard holds no image."),
+         QString::fromUtf8("剪贴板里没有图片。")},
+        {QStringLiteral("The clipboard is empty."), QString::fromUtf8("剪贴板是空的。")},
+        {QStringLiteral("Cannot locate the vshot helper to open the file dialog."),
+         QString::fromUtf8("找不到 vshot helper，打不开文件对话框。")},
+        {QStringLiteral("Could not start the file dialog."),
+         QString::fromUtf8("文件对话框没能启动。")},
+
         // Tool tooltips.
         {QStringLiteral("Adjust selection; click an annotation to select, drag to "
                         "move, handles to resize, double-click text to re-edit"),

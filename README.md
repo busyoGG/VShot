@@ -139,6 +139,7 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 - Arrow 是按下点到释放点的直线箭头；Draw 是自由绘制；Mosaic 的马赛克程度控制像素块大小与涂抹半径，选中已有马赛克后可直接改程度
 - **Select** 工具可点选任意标注：单击选中，拖动移动（文本同样），形状/线条/马赛克可拖把手缩放，Delete/Backspace 删除；样式修改即时应用到选中标注；双击文本重新编辑
 - **Ctrl+Z / Ctrl+Y**（或 Ctrl+Shift+Z）撤销/重做
+- **贴图**：工具栏的「图片」按钮从磁盘挑一张，或 **Ctrl+V** 直接把剪贴板里的图贴进来——原尺寸落在选区正中，比选区大时等比缩小塞进去，贴完自动切到 Select 并选中它，接着就能拖动、用把手缩放，Ctrl+Z 一样能撤销
 - 标注以全局逻辑坐标传回 Rust，最终 PNG 由内置软件渲染重绘，与预览一致；文本由 Qt 按所选字体栅格化为位图后合成，因此字形完全一致
 
 界面语言默认跟随系统（`QLocale::system()`），可用 `VSHOT_LANG` 覆盖：以 `zh` 开头选中文，其它非空值选英文。语言在 helper 启动时确定，切换需重新运行。Rust CLI 的 `--help` 走同一套判定，`VSHOT_LANG=zh vshot --help` 即中文。
@@ -473,7 +474,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置文件读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度、pin 描边、文字卡片留白、色卡右键菜单：
+Qt helper 侧没有测试框架，只有**不需要合成器的离屏检查**（默认不构建，加 `-DVSHOT_BUILD_CHECKS=ON`），覆盖配置文件读写与设置窗口、字号换算、剪贴板颜色解析与色卡渲染、pin 的图片自述密度、pin 描边、文字卡片留白、色卡右键菜单、贴图的导出格式：
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -485,7 +486,10 @@ build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 ```
+
+其中 `vshot-paste-check` 盯的是贴图那条**跨语言的文件通道**：helper 把图片写成 `image-N.rgba` 原始 RGBA 并只在 JSON 里留路径，Rust 侧按路径读回来。通道两端是两种语言、两套类型，所以真正值得锁死的是字节本身——通道顺序（直通 alpha 的 RGBA8888，不是 BGRA 也不是预乘）、声明的宽高与文件长度是否一致（Rust 读的时候会按这个对照检查）、以及 JSON 里的 rect 是否就是像素被栅格化时用的那个 rect。任何一条错了在 helper 这边都看不出来，只会在最终 PNG 里表现为颜色错位或图像拉变形。摆位规则也一并测了：比选区大的图等比缩小后居中、小的保持原尺寸、贴完是选中态（把手可用），以及撤销/重做不会把像素弄丢——粘贴是一步历史，撤回来再重做的标注仍然带着自己的像素和 rect。最后一节走的是工具栏：真建出一块区域 overlay（只 create，不 show，layer surface 一次都不碰），走 `beginPresetEdit` 把命令栏立起来，再按 objectName 找到那个「图片」按钮。没有这一节的话，功能只剩 Ctrl+V 可达，而这里什么都不会红。
 
 其中 `vshot-text-size-check` 盯的是字号那一套换算：面板上的数字就是文字像素高，而写进旧协议时投影回 5x7 回退字体能画的整数刻度（`ui/text_size.hpp`）。两端要对齐（7–448 正好是刻度 1–64），整倍数要能往返，中间值要**向最近刻度取整**而不是截断——截断会让 15px 的字在回退渲染下缩成 14px。
 

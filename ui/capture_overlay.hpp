@@ -41,6 +41,12 @@ struct Annotation {
         Shape,
         Stroke,
         Text,
+        // A pasted image. `pixels` holds the source at its own resolution and
+        // `rect` is where it lands on the canvas: the two differ because a
+        // pasted image is scaled to fit inside the selection and the user can
+        // then resize it with the handles. The pixels travel to the renderer as
+        // a raw RGBA8888 file, the same way a text label's bitmap does.
+        Image,
     };
 
     Kind kind = Kind::Stroke;
@@ -70,6 +76,8 @@ struct Annotation {
     // Output scale the label was drawn on; the text bitmap is rasterized at
     // this device ratio.
     std::uint32_t deviceRatio = 1;
+    // The pasted image itself, at its own resolution (`Kind::Image` only).
+    QImage pixels;
 };
 
 inline bool annotationEquals(const Annotation &first, const Annotation &second)
@@ -88,6 +96,11 @@ inline bool annotationEquals(const Annotation &first, const Annotation &second)
     }
     if (first.points != second.points || first.origin.x != second.origin.x ||
         first.origin.y != second.origin.y || first.text != second.text) {
+        return false;
+    }
+    // Comparing pixel buffers would copy megabytes per undo snapshot; the cache
+    // key identifies the same image without touching it.
+    if (first.pixels.cacheKey() != second.pixels.cacheKey()) {
         return false;
     }
     return true;
@@ -137,6 +150,24 @@ public:
     void setTextSize(std::uint32_t size);
     void setMosaicShape(const QString &shape);
     void setMosaicStrength(std::uint32_t strength);
+    // Pastes an image into the selection: it lands centred at its natural size,
+    // shrunk to fit if it is larger than the canvas, and is left selected so
+    // the handles can resize it. `source` names the file it came from, empty
+    // for clipboard pixels, and is only used to report where it came from.
+    // Returns false when there is nothing to paste onto or the image is empty.
+    bool pasteImage(const QImage &image, const QString &source = QString());
+    // The same, reading whatever the clipboard holds: image data, or a local
+    // file path or URI list that points at an image. `error` is filled with
+    // why nothing was pasted, for the caller to report.
+    bool pasteFromClipboard(QString *error);
+    // Pastes an image chosen from disk. The dialog runs in a process of its
+    // own -- this one draws a layer surface, which cannot parent a popup -- so
+    // the file arrives back here asynchronously and the paste happens then.
+    // `error` is filled when the dialog cannot even be started.
+    bool pasteFromFile(QString *error);
+    // Whether a paste would have anything to work with, so the toolbar can
+    // disable its button rather than offering a no-op.
+    bool canPaste() const;
     void notifyPanelDragged();
     void undo();
     void redo();
@@ -258,6 +289,8 @@ private:
     bool cancelled_ = false;
     std::function<void()> terminalCallback_;
     mutable int textBitmapIndex_ = 0;
+    // The same counter for pasted images' pixel files, in the same directory.
+    mutable int imageBitmapIndex_ = 0;
     // Live pin window the editor drives in pin-edit mode. The daemon answers
     // exactly one request per connection and then closes, so each move gets a
     // fresh socket instead of a reconnected one.

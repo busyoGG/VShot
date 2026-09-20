@@ -120,7 +120,10 @@ while a magnifier and a size readout follow the pointer, then confirm with Enter
 double-click inside the selection or the toolbar's OK. Esc or a right-click cancels the \
 whole capture, except that Esc inside a text box only closes that box. The toolbar \
 annotates the frame with Rect, Ellipse, Arrow, Draw, Text and Mosaic: Ctrl+Z / Ctrl+Y undo \
-and redo, Delete removes the selected annotation, and the final PNG is re-rendered from the \
+and redo, Delete removes the selected annotation, and Ctrl+V pastes an image from the \
+clipboard while the toolbar's Image button picks one from disk. A pasted image lands centred \
+on the selection, shrunk to fit when it is larger, and comes up selected so its handles \
+resize it. The final PNG is re-rendered from the \
 annotations, so it matches the preview.
 
 VSHOT_QT_HELPER overrides which vshot-qt-ui is run, VSHOT_LANG its language (a value \

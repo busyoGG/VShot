@@ -1034,6 +1034,28 @@ fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
                 bitmap,
             })
         }
+        "image" => {
+            let rect = annotation
+                .rect
+                .ok_or_else(|| VshotError::Selection("image annotation has no rect".into()))?
+                .into_rect("image annotation rect")?;
+            // The pixels are mandatory: an image annotation with nothing to
+            // draw would be a silent no-op, and the helper only emits one when
+            // it has written the file.
+            let pixels = match (
+                annotation.bitmap_width,
+                annotation.bitmap_height,
+                annotation.bitmap.as_deref(),
+            ) {
+                (Some(width), Some(height), Some(path)) => read_text_bitmap(path, width, height)?,
+                _ => {
+                    return Err(VshotError::Selection(
+                        "image annotation must carry its pixels".into(),
+                    ))
+                }
+            };
+            Ok(Annotation::Image { rect, pixels })
+        }
         kind => Err(VshotError::Selection(format!(
             "Qt helper returned unknown annotation kind `{kind}`"
         ))),
@@ -1353,6 +1375,90 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_image_annotation_from_session_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image-0.rgba");
+        std::fs::write(&path, [255u8, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        let bytes = format!(
+            r##"{{"status":"ok","selection":{{"x":10,"y":20,"width":50,"height":50}},"annotations":[{{"kind":"image","rect":{{"x":12,"y":24,"width":4,"height":6}},"bitmap_width":2,"bitmap_height":1,"bitmap":"{}"}}]}}"##,
+            path.display()
+        )
+        .into_bytes();
+        let (_, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        match &annotations[0] {
+            Annotation::Image { rect, pixels } => {
+                assert_eq!(*rect, Rect::new(12, 24, 4, 6));
+                assert_eq!((pixels.width, pixels.height), (2, 1));
+                assert_eq!(pixels.pixels, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+            }
+            other => panic!("expected image annotation, got {other:?}"),
+        }
+        // A pasted image selects nothing, so the editor's tool follows it.
+        assert_eq!(annotations[0].tool(), EditorTool::Select);
+        // Pixels are mandatory: a rect alone would draw nothing at all.
+        assert!(
+            parse_result(
+                br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"image","rect":{"x":1,"y":2,"width":4,"height":6}}]}"#
+                    .to_vec(),
+                Rect::new(0, 0, 100, 100),
+            )
+            .is_err()
+        );
+        // So is the rect: without one the pasted image has nowhere to go.
+        assert!(
+            parse_result(
+                br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"image","bitmap_width":2,"bitmap_height":1,"bitmap":"/nonexistent"}]}"#
+                    .to_vec(),
+                Rect::new(0, 0, 100, 100),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pasted_image_round_trips_from_the_helpers_result_document() {
+        // The paste path exactly as the two processes exchange it: the helper
+        // writes the image beside its JSON, and vshot has to parse both and
+        // composite the pixels into the crop.
+        use crate::geometry::Size;
+        use crate::model::{Frame, ImageDocument};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image-0.rgba");
+        std::fs::write(
+            &path,
+            [
+                255, 0, 0, 255, 0, 255, 0, 255, //
+                0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        )
+        .unwrap();
+        let bytes = format!(
+            r##"{{"status":"ok","selection":{{"x":10,"y":20,"width":8,"height":8}},"annotations":[{{"kind":"image","rect":{{"x":12,"y":22,"width":4,"height":4}},"bitmap_width":2,"bitmap_height":2,"bitmap":"{}"}}]}}"##,
+            path.display()
+        )
+        .into_bytes();
+        let (selection, annotations) = parse_result(bytes, Rect::new(0, 0, 100, 100)).unwrap();
+        assert_eq!(selection, Rect::new(10, 20, 8, 8));
+        let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, 1, 1).unwrap();
+        let document = pipeline
+            .apply(ImageDocument::new(
+                Frame::solid(Size::new(8, 8), [0, 0, 0, 255]).unwrap(),
+            ))
+            .unwrap()
+            .into_frame();
+        // Global (12, 22) is local (2, 2) of the crop; the 2x2 source covers
+        // the 4x4 rect from there, one source pixel per 2x2 block.
+        assert_eq!(document.pixel(Point::new(2, 2)), Some([255, 0, 0, 255]));
+        assert_eq!(document.pixel(Point::new(3, 3)), Some([255, 0, 0, 255]));
+        assert_eq!(document.pixel(Point::new(4, 2)), Some([0, 255, 0, 255]));
+        assert_eq!(document.pixel(Point::new(5, 5)), Some([255, 255, 0, 255]));
+        // Nothing outside the rect is touched.
+        assert_eq!(document.pixel(Point::new(1, 1)), Some([0, 0, 0, 255]));
+        assert_eq!(document.pixel(Point::new(6, 6)), Some([0, 0, 0, 255]));
     }
 
     #[test]

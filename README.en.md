@@ -139,6 +139,7 @@ When `vshot region` gets no `--geometry`, the frozen frame fills each output and
 - Arrow draws a straight arrow from press to release; Draw is freehand; the mosaic strength controls both the pixel block size and the brush radius, and selecting an existing mosaic lets you change the strength directly
 - The **Select** tool picks any annotation: click to select, drag to move (text too), shapes/lines/mosaics resize by their handles, Delete/Backspace removes it; style changes apply to the selected annotation immediately, and double-clicking text reopens it for editing
 - **Ctrl+Z / Ctrl+Y** (or Ctrl+Shift+Z) undo/redo
+- **Pasting an image**: the toolbar's *Image* button picks one from disk, or **Ctrl+V** pastes whatever image the clipboard holds — it lands centred at its own size, shrunk to fit when it is larger than the selection, and comes up selected so it can be dragged and resized by its handles; Ctrl+Z undoes it like any other mark
 - Annotations come back to Rust in global logical coordinates and the final PNG is redrawn by the built-in software renderer, matching the preview; text is rasterized by Qt in the chosen font and composited as a bitmap, so the glyphs are identical
 
 The UI language follows the system by default (`QLocale::system()`) and can be overridden with `VSHOT_LANG`: a value starting with `zh` selects Chinese, any other non-empty value selects English. The language is fixed when the helper starts, so switching needs a rerun. The Rust CLI's `--help` uses the same rule, so `VSHOT_LANG=zh vshot --help` is Chinese.
@@ -473,7 +474,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ```
 
-The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config file reads and writes and the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density, pin outlines, text card padding, and the color card's right-click menu:
+The Qt helper has no test framework, only **offscreen checks that need no compositor** (not built by default; add `-DVSHOT_BUILD_CHECKS=ON`), covering config file reads and writes and the settings window, the text size conversion, clipboard color parsing and color card rendering, a pin's self-declared density, pin outlines, text card padding, the color card's right-click menu, and the export format of a pasted image:
 
 ```sh
 cmake -S . -B build-qt -DVSHOT_BUILD_CHECKS=ON && cmake --build build-qt
@@ -485,7 +486,10 @@ build-qt/vshot-pin-density-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-outline-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-text-card-check
 QT_QPA_PLATFORM=offscreen build-qt/vshot-pin-menu-check
+QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 ```
+
+`vshot-paste-check` pins the **cross-language file channel** an image paste travels over: the helper writes the pixels as raw RGBA into `image-N.rgba` and leaves only the path in the JSON, and Rust reads them back by that path. The two ends are two languages with two type systems, so what is worth locking down is the bytes themselves — the channel order (straight-alpha RGBA8888, not BGRA and not premultiplied), whether the declared dimensions agree with the file length (the Rust reader checks exactly that), and whether the rect in the JSON is the one the pixels were rasterized for. A mistake in any of them is invisible on the helper side and shows up only as wrong colours or a stretched image in the final PNG. It covers the placement rules as well: an image larger than the selection is shrunk to fit and centred, a smaller one keeps its own size, the paste arrives selected so its handles work, and undo/redo does not lose the pixels — a paste is one history step, and the annotation that comes back still carries its own pixels and rect. The last section goes through the toolbar: it creates a real region overlay (created only, never shown — no layer surface is touched), runs `beginPresetEdit` to put the command bar up, and finds the *Image* button on it by object name. Without that section the feature would be reachable from Ctrl+V alone, and nothing here would go red.
 
 `vshot-text-size-check` pins the font-size conversion: the number on the panel *is* the pixel height, and writing it into the legacy protocol projects it back onto the whole glyph multiples the 5x7 fallback font can draw (`ui/text_size.hpp`). The two ends have to line up (7–448 is exactly scale 1–64), whole multiples have to round-trip, and a value in between has to round to the *nearest* multiple rather than truncate — truncating would shrink a 15 px label to 14 px whenever the fallback rendered it.
 

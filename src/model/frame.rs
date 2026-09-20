@@ -2,7 +2,7 @@
 
 use image::{DynamicImage, ImageFormat};
 
-use crate::edit::{ArrowStyle, LineDash, TextBitmap};
+use crate::edit::{covered_span, ArrowStyle, LineDash, TextBitmap};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 
@@ -531,6 +531,87 @@ impl Frame {
                     i64::from(origin.y) + row,
                     [source[0], source[1], source[2], source[3]],
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Composites a pasted image into `rect`, rescaling it to that rect.
+    ///
+    /// Each destination pixel averages the source pixels it covers, weighted by
+    /// alpha, so a photo pasted at half size comes out as a proper reduction
+    /// rather than a nearest-neighbour sample of it. A rect equal to the
+    /// bitmap's own size takes the direct path: that is the common case when a
+    /// pasted image is not resized at all.
+    pub(crate) fn draw_bitmap_scaled(&mut self, rect: Rect, bitmap: &TextBitmap) -> Result<()> {
+        if bitmap.width == 0 || bitmap.height == 0 || rect.size.width == 0 || rect.size.height == 0
+        {
+            return Ok(());
+        }
+        let expected = (usize::try_from(bitmap.width).ok())
+            .and_then(|width| width.checked_mul(usize::try_from(bitmap.height).ok()?))
+            .and_then(|pixels| pixels.checked_mul(4));
+        let expected = expected
+            .ok_or_else(|| VshotError::InvalidGeometry("pasted image is too large".into()))?;
+        if bitmap.pixels.len() != expected {
+            return Err(VshotError::InvalidGeometry(
+                "pasted image payload does not match its dimensions".into(),
+            ));
+        }
+        if rect.size.width == bitmap.width && rect.size.height == bitmap.height {
+            return self.draw_bitmap(Point::new(rect.origin.x, rect.origin.y), bitmap);
+        }
+        let (left, top, right, bottom) = checked_rect_bounds(rect)?;
+        let Some((visible_left, visible_right)) = clip_range(left, right, self.size.width) else {
+            return Ok(());
+        };
+        let Some((visible_top, visible_bottom)) = clip_range(top, bottom, self.size.height) else {
+            return Ok(());
+        };
+        let source_width = u64::from(bitmap.width);
+        let source_height = u64::from(bitmap.height);
+        let target_width = u64::from(rect.size.width);
+        let target_height = u64::from(rect.size.height);
+        let stride = bitmap.width as usize * 4;
+        for y in visible_top..visible_bottom {
+            let target_row = (y - top) as u64;
+            let (source_top, source_bottom) =
+                covered_span(target_row, bitmap.height, source_height, target_height);
+            for x in visible_left..visible_right {
+                let target_column = (x - left) as u64;
+                let (source_left, source_right) =
+                    covered_span(target_column, bitmap.width, source_width, target_width);
+                let mut alpha_sum = 0u64;
+                let mut weighted = [0u64; 3];
+                let mut count = 0u64;
+                for row in source_top..source_bottom {
+                    for column in source_left..source_right {
+                        let offset = row as usize * stride + column as usize * 4;
+                        let Some(source) = bitmap.pixels.get(offset..offset + 4) else {
+                            continue;
+                        };
+                        let alpha = u64::from(source[3]);
+                        alpha_sum += alpha;
+                        for (channel, value) in weighted.iter_mut().enumerate() {
+                            *value += u64::from(source[channel]) * alpha;
+                        }
+                        count += 1;
+                    }
+                }
+                if count == 0 || alpha_sum == 0 {
+                    continue;
+                }
+                // Colour is divided by the alpha it accumulated rather than by
+                // the pixel count, so the transparent pixels around an edge do
+                // not drag the edge's colour toward black.
+                let alpha = (alpha_sum / count) as u8;
+                let color = [
+                    (weighted[0] / alpha_sum) as u8,
+                    (weighted[1] / alpha_sum) as u8,
+                    (weighted[2] / alpha_sum) as u8,
+                    alpha,
+                ];
+                self.blend_pixel_at(x, y, color);
             }
         }
         Ok(())
@@ -1755,5 +1836,113 @@ mod tests {
         frame.mosaic_ellipse(Rect::new(20, 20, 2, 2), 2).unwrap();
         frame.mosaic_brush(&[Point::new(-20, -20)], 2).unwrap();
         assert_eq!(frame, unchanged);
+    }
+
+    /// A 2x2 quadrant bitmap: red, green / blue, yellow at full alpha.
+    fn quadrants() -> TextBitmap {
+        TextBitmap {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        }
+    }
+
+    #[test]
+    fn draw_bitmap_scaled_enlarges_into_matching_quadrants() {
+        let mut frame = Frame::solid(Size::new(8, 8), [0, 0, 0, 255]).unwrap();
+        frame
+            .draw_bitmap_scaled(Rect::new(0, 0, 8, 8), &quadrants())
+            .unwrap();
+        // 8x8 over a 2x2 source is an exact 4x blow-up, so each destination
+        // pixel averages exactly one source pixel.
+        assert_eq!(frame.pixel(Point::new(0, 0)), Some([255, 0, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(7, 0)), Some([0, 255, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(0, 7)), Some([0, 0, 255, 255]));
+        assert_eq!(frame.pixel(Point::new(7, 7)), Some([255, 255, 0, 255]));
+    }
+
+    #[test]
+    fn draw_bitmap_scaled_reduces_by_averaging_the_pixels_it_covers() {
+        let mut frame = Frame::solid(Size::new(2, 1), [0, 0, 0, 255]).unwrap();
+        let bitmap = TextBitmap {
+            width: 4,
+            height: 1,
+            pixels: vec![
+                255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 255, 255,
+            ],
+        };
+        frame
+            .draw_bitmap_scaled(Rect::new(0, 0, 2, 1), &bitmap)
+            .unwrap();
+        // Halving 4 pixels to 2 averages red with blue at full alpha.
+        assert_eq!(frame.pixel(Point::new(0, 0)), Some([127, 0, 127, 255]));
+        assert_eq!(frame.pixel(Point::new(1, 0)), Some([127, 0, 127, 255]));
+    }
+
+    #[test]
+    fn draw_bitmap_scaled_at_its_own_size_matches_the_direct_blit() {
+        let rect = Rect::new(1, 1, 2, 2);
+        let mut scaled = Frame::solid(Size::new(4, 4), [0, 0, 0, 255]).unwrap();
+        scaled.draw_bitmap_scaled(rect, &quadrants()).unwrap();
+        let mut direct = Frame::solid(Size::new(4, 4), [0, 0, 0, 255]).unwrap();
+        direct.draw_bitmap(Point::new(1, 1), &quadrants()).unwrap();
+        assert_eq!(scaled, direct);
+        // Transparent source pixels leave the canvas untouched on both paths.
+        let opaque = Frame::solid(Size::new(4, 4), [9, 9, 9, 255]).unwrap();
+        let transparent = TextBitmap {
+            width: 1,
+            height: 1,
+            pixels: vec![1, 2, 3, 0],
+        };
+        assert_eq!(
+            {
+                let mut frame = opaque.clone();
+                frame
+                    .draw_bitmap_scaled(Rect::new(1, 1, 1, 1), &transparent)
+                    .unwrap();
+                frame
+            },
+            opaque
+        );
+    }
+
+    #[test]
+    fn draw_bitmap_scaled_clips_and_rejects_bad_payloads() {
+        let mut frame = Frame::solid(Size::new(4, 4), [0, 0, 0, 255]).unwrap();
+        // A rect starting at -4 covers dest 0..4 with its own columns 4..8,
+        // which is the bitmap's bottom-right quadrant and nothing else.
+        frame
+            .draw_bitmap_scaled(Rect::new(-4, -4, 8, 8), &quadrants())
+            .unwrap();
+        assert_eq!(frame.pixel(Point::new(0, 0)), Some([255, 255, 0, 255]));
+        assert_eq!(frame.pixel(Point::new(3, 3)), Some([255, 255, 0, 255]));
+        // A rect wholly inside draws only its own footprint.
+        let mut inside = Frame::solid(Size::new(8, 8), [0, 0, 0, 255]).unwrap();
+        inside
+            .draw_bitmap_scaled(Rect::new(0, 0, 8, 8), &quadrants())
+            .unwrap();
+        assert_eq!(inside.pixel(Point::new(0, 0)), Some([255, 0, 0, 255]));
+        assert_eq!(inside.pixel(Point::new(3, 3)), Some([255, 0, 0, 255]));
+        assert_eq!(inside.pixel(Point::new(4, 4)), Some([255, 255, 0, 255]));
+        // An off-canvas rect and a zero-sized one are no-ops.
+        let unchanged = frame.clone();
+        frame
+            .draw_bitmap_scaled(Rect::new(20, 20, 4, 4), &quadrants())
+            .unwrap();
+        frame
+            .draw_bitmap_scaled(Rect::new(0, 0, 0, 4), &quadrants())
+            .unwrap();
+        assert_eq!(frame, unchanged);
+        // A payload that disagrees with the declared dimensions is an error.
+        let broken = TextBitmap {
+            width: 2,
+            height: 2,
+            pixels: vec![0, 0, 0, 255],
+        };
+        assert!(frame
+            .draw_bitmap_scaled(Rect::new(0, 0, 8, 8), &broken)
+            .is_err());
     }
 }

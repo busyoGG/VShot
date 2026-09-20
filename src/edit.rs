@@ -166,9 +166,9 @@ impl TextBitmap {
         let height = resampled_length(self.height, source, target);
         let mut pixels = vec![0u8; width as usize * height as usize * 4];
         for y in 0..height {
-            let (top, bottom) = covered_span(y, self.height, source, target);
+            let (top, bottom) = covered_span(u64::from(y), self.height, source, target);
             for x in 0..width {
-                let (left, right) = covered_span(x, self.width, source, target);
+                let (left, right) = covered_span(u64::from(x), self.width, source, target);
                 let mut alpha_sum = 0u64;
                 let mut weighted = [0u64; 3];
                 let mut count = 0u64;
@@ -219,10 +219,10 @@ fn resampled_length(length: u32, source: u64, target: u64) -> u32 {
 /// Half-open source span the `index`-th target pixel covers.  The end is
 /// rounded up so a span can never come out empty — a target pixel covering less
 /// than one source pixel still has to take one.
-fn covered_span(index: u32, length: u32, source: u64, target: u64) -> (u64, u64) {
+pub(crate) fn covered_span(index: u64, length: u32, source: u64, target: u64) -> (u64, u64) {
     let length = u64::from(length);
-    let start = (u64::from(index) * source / target).min(length.saturating_sub(1));
-    let end = ((u64::from(index) + 1) * source).div_ceil(target);
+    let start = (index * source / target).min(length.saturating_sub(1));
+    let end = ((index + 1) * source).div_ceil(target);
     (start, end.clamp(start + 1, length))
 }
 
@@ -272,6 +272,13 @@ pub enum EditOperation {
     /// top-left corner in device pixels.
     Blit {
         origin: Point,
+        bitmap: TextBitmap,
+    },
+    /// Composites a pasted image into `rect`, rescaling it when the rect is not
+    /// the bitmap's own size -- which it generally is not, since the paste
+    /// shrinks to fit the canvas and the handles resize it afterwards.
+    BlitScaled {
+        rect: Rect,
         bitmap: TextBitmap,
     },
     Mosaic {
@@ -423,6 +430,12 @@ impl EditPipeline {
         self
     }
 
+    pub(crate) fn blit_scaled(mut self, rect: Rect, bitmap: TextBitmap) -> Self {
+        self.operations
+            .push(EditOperation::BlitScaled { rect, bitmap });
+        self
+    }
+
     pub(crate) fn mosaic(mut self, rect: Rect, block_size: u32) -> Self {
         self.operations
             .push(EditOperation::Mosaic { rect, block_size });
@@ -500,6 +513,9 @@ impl EditPipeline {
                     } => document.draw_text(*origin, text, *color, *scale)?,
                     EditOperation::Blit { origin, bitmap } => {
                         document.draw_bitmap(*origin, bitmap)?
+                    }
+                    EditOperation::BlitScaled { rect, bitmap } => {
+                        document.draw_bitmap_scaled(*rect, bitmap)?
                     }
                     EditOperation::Mosaic { rect, block_size } => {
                         document.mosaic(*rect, *block_size)?
@@ -603,6 +619,14 @@ pub fn pipeline_for_annotations(
                     }
                     _ => {}
                 }
+            }
+            Annotation::Image { rect, pixels } => {
+                // Both the destination rect and the image itself are in
+                // logical pixels of the scene the helper drew on; the frame is
+                // in device pixels of the output the selection came from, so
+                // both go through the same scale the other annotations use.
+                let rect = local_rect(rect, selection, scale)?;
+                pipeline = pipeline.blit_scaled(rect, pixels.clone());
             }
             Annotation::Text {
                 origin,
@@ -748,5 +772,61 @@ mod tests {
         assert_eq!(mosaic_brush_radius(1, 8), 2);
         assert_eq!(mosaic_brush_radius(3, 8), 8);
         assert_eq!(mosaic_brush_radius(3, 1), 2);
+    }
+
+    #[test]
+    fn a_pasted_image_is_scaled_to_its_rect_and_composited_there() {
+        let bitmap = TextBitmap {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        };
+        // The helper works in logical pixels of the scene it drew on; the frame
+        // is in device pixels of that scene, so an image annotation goes
+        // through the same conversion the other annotations do.
+        let pipeline = pipeline_for_annotations(
+            vec![crate::wayland::input::Annotation::Image {
+                rect: Rect::new(2, 3, 4, 5),
+                pixels: bitmap.clone(),
+            }],
+            Rect::new(0, 0, 20, 20),
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline.operations(),
+            [EditOperation::BlitScaled {
+                rect: Rect::new(4, 6, 8, 10),
+                bitmap,
+            }]
+        );
+
+        let frame = Frame::solid(Size::new(20, 20), [0, 0, 0, 255]).unwrap();
+        let document = pipeline
+            .apply(ImageDocument::new(frame))
+            .unwrap()
+            .into_frame();
+        // The source quadrants fill the destination, and nothing outside it is
+        // touched.
+        assert_eq!(
+            document.pixel(Point::new(4, 6)),
+            Some([255, 0, 0, 255]),
+            "top-left quadrant"
+        );
+        assert_eq!(
+            document.pixel(Point::new(11, 6)),
+            Some([0, 255, 0, 255]),
+            "top-right quadrant"
+        );
+        assert_eq!(
+            document.pixel(Point::new(11, 15)),
+            Some([255, 255, 0, 255]),
+            "bottom-right quadrant"
+        );
+        assert_eq!(document.pixel(Point::new(3, 6)), Some([0, 0, 0, 255]));
+        assert_eq!(document.pixel(Point::new(12, 6)), Some([0, 0, 0, 255]));
     }
 }

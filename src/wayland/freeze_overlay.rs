@@ -1186,6 +1186,12 @@ fn render_annotations(
                     _ => {}
                 }
             }
+            Annotation::Image { rect, pixels } => {
+                // Both the rect and the image are in the scene's logical
+                // pixels; the frame is in this output's device pixels.
+                let rect = map_rect(*rect, output, scale)?;
+                pipeline = pipeline.blit_scaled(rect, pixels.clone());
+            }
             Annotation::Text {
                 origin,
                 text,

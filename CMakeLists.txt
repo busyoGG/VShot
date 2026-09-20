@@ -33,8 +33,8 @@ add_executable(vshot-qt-ui
     ui/pin_surface.hpp
     ui/pin_server.cpp
     ui/pin_server.hpp
-    ui/save_dialog.cpp
-    ui/save_dialog.hpp
+    ui/file_dialog.cpp
+    ui/file_dialog.hpp
     ui/text_card.cpp
     ui/text_card.hpp
 )
@@ -204,5 +204,35 @@ if(VSHOT_BUILD_CHECKS)
     target_compile_features(vshot-pin-menu-check PRIVATE cxx_std_17)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-pin-menu-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    # The paste check: it builds a real editor controller over a made-up region
+    # session, pastes a synthetic image and reads back the pixels and the JSON
+    # the helper would hand the Rust renderer. That channel has two ends in two
+    # languages, so the bytes, their channel order and the declared dimensions
+    # are the contract worth locking down. Needs Widgets and the offscreen
+    # platform plugin, no compositor: no overlay is ever created.
+    add_executable(vshot-paste-check
+        ui/paste_check.cpp
+        ui/capture_overlay.cpp
+        ui/capture_overlay.hpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-paste-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-paste-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-paste-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endif()

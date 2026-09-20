@@ -18,6 +18,8 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QImage>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -32,6 +34,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPolygonF>
+#include <QProcess>
 #include <QPushButton>
 #include <QScreen>
 #include <QSignalBlocker>
@@ -43,6 +46,7 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QStringList>
+#include <QUrl>
 #include <QWindow>
 #include <QSocketNotifier>
 
@@ -1434,6 +1438,147 @@ private:
     QWidget *pressed_ = nullptr;
 };
 
+// An image read out of the clipboard, plus where it came from when the
+// clipboard named a file rather than carrying pixels.
+struct ClipboardImage {
+    bool installed = true; // `wl-paste` could be run at all
+    bool offered = false;  // something is copied
+    QImage image;
+    QString source;
+};
+
+// One `wl-paste` run. `false` means the program could not be started at all,
+// which is a different failure from an empty clipboard; `ok` says whether the
+// request itself succeeded.
+bool runWlPaste(const QStringList &arguments, QByteArray *bytes, bool *ok)
+{
+    constexpr int kTimeoutMs = 5000;
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-paste"));
+    process.setArguments(arguments);
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.start();
+    if (!process.waitForStarted(kTimeoutMs)) {
+        return false;
+    }
+    const bool finished = process.waitForFinished(kTimeoutMs);
+    if (!finished) {
+        // A clipboard owner that never answers must not hold the editor's
+        // event loop any longer than this.
+        process.kill();
+        process.waitForFinished(kTimeoutMs);
+    }
+    *bytes = process.readAllStandardOutput();
+    *ok = finished && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+    return true;
+}
+
+// The image encodings worth asking for, best first; any other `image/*` the
+// clipboard offers is taken after these.
+constexpr const char *kClipboardImageTypes[] = {
+    "image/png", "image/jpeg", "image/webp", "image/bmp", "image/tiff",
+};
+
+// Reads an image out of the clipboard the way the pin daemon does: through
+// `wl-paste`, not Qt's own clipboard. Qt implements only the wlroots
+// `zwlr_data_control_v1`, which a compositor offering the standardized
+// `ext_data_control_manager_v1` instead (KWin) leaves empty.
+//
+// Resolution order: image data first, then a copied file -- as a URI list, then
+// as a plain path. Copying a file in a file manager is the ordinary way to say
+// "this picture", and it puts a path on the clipboard rather than pixels.
+ClipboardImage readClipboardImage()
+{
+    ClipboardImage result;
+    QByteArray listed;
+    bool ok = false;
+    if (!runWlPaste({QStringLiteral("--list-types")}, &listed, &ok)) {
+        result.installed = false;
+        return result;
+    }
+    if (!ok) {
+        return result; // nothing is copied
+    }
+    result.offered = true;
+    QStringList types;
+    for (const QByteArray &line : listed.split('\n')) {
+        const QString type = QString::fromUtf8(line).trimmed();
+        if (!type.isEmpty() && !types.contains(type)) {
+            types.append(type);
+        }
+    }
+    const auto fetch = [&types](const QString &type) -> QByteArray {
+        if (!types.contains(type)) {
+            return QByteArray();
+        }
+        QByteArray bytes;
+        bool fetched = false;
+        if (!runWlPaste({QStringLiteral("--type"), type, QStringLiteral("--no-newline")}, &bytes,
+                        &fetched)
+            || !fetched) {
+            return QByteArray();
+        }
+        return bytes;
+    };
+
+    QString imageType;
+    for (const char *candidate : kClipboardImageTypes) {
+        const QString type = QLatin1String(candidate);
+        if (types.contains(type)) {
+            imageType = type;
+            break;
+        }
+    }
+    if (imageType.isEmpty()) {
+        for (const QString &type : types) {
+            if (type.startsWith(QLatin1String("image/"))) {
+                imageType = type;
+                break;
+            }
+        }
+    }
+    if (!imageType.isEmpty()) {
+        const QByteArray bytes = fetch(imageType);
+        if (!bytes.isEmpty()) {
+            result.image = QImage::fromData(bytes);
+            if (!result.image.isNull()) {
+                return result;
+            }
+        }
+    }
+
+    // A copied file: a file manager offers `text/uri-list`, and a terminal
+    // that copies a path offers plain text.
+    QStringList candidates;
+    for (const QUrl &url : QUrl::fromStringList(
+             QString::fromUtf8(fetch(QStringLiteral("text/uri-list")))
+                 .split(QLatin1Char('\n'), Qt::SkipEmptyParts))) {
+        if (url.isLocalFile()) {
+            candidates.append(url.toLocalFile());
+        }
+    }
+    for (const char *type : {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"}) {
+        const QString text = QString::fromUtf8(fetch(QLatin1String(type))).trimmed();
+        if (!text.isEmpty() && !text.contains(QLatin1Char('\n'))) {
+            candidates.append(text);
+            break;
+        }
+    }
+    for (const QString &path : candidates) {
+        QImageReader reader(path);
+        if (!reader.canRead()) {
+            continue;
+        }
+        const QImage image = reader.read();
+        if (!image.isNull()) {
+            result.image = image;
+            result.source = path;
+            return result;
+        }
+    }
+    return result;
+}
+
 } // namespace
 
 struct OverlayController::Gesture {
@@ -1577,6 +1722,20 @@ public:
         actionDivider->setCursor(Qt::ArrowCursor);
         toolLayout->addWidget(actionDivider);
         toolLayout->addSpacing(3);
+        // Paste sits with the actions rather than among the tools: it is not a
+        // mode the pointer stays in, it is one thing that happens when clicked.
+        // The button opens a file dialog; Ctrl+V takes whatever is on the
+        // clipboard. Both land in the same paste.
+        auto *paste = addActionButton(toolLayout, uiTr("Image"));
+        paste->setObjectName(QStringLiteral("pasteButton"));
+        paste->setToolTip(uiTr("Paste an image onto the capture (Ctrl+V for the clipboard)"));
+        connect(paste, &QPushButton::clicked, [controller = controller_] {
+            QString error;
+            if (!controller->pasteFromFile(&error)) {
+                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+                std::fflush(stderr);
+            }
+        });
         auto *ok = addActionButton(toolLayout, uiTr("OK"));
         ok->setObjectName(QStringLiteral("confirmButton"));
         ok->setToolTip(uiTr("Confirm capture (Enter)"));
@@ -2631,6 +2790,7 @@ void OverlayController::translateAnnotations(std::int32_t dx, std::int32_t dy)
     for (Annotation &annotation : annotations_) {
         switch (annotation.kind) {
         case Annotation::Kind::Shape:
+        case Annotation::Kind::Image:
             annotation.rect.x = static_cast<std::int32_t>(annotation.rect.x + dx);
             annotation.rect.y = static_cast<std::int32_t>(annotation.rect.y + dy);
             break;
@@ -3139,6 +3299,12 @@ bool OverlayController::annotationBounds(const Annotation &annotation, LogicalRe
     if (annotation.kind == Annotation::Kind::Shape) {
         *bounds = annotation.rect;
         return !bounds->isEmpty();
+    }
+    if (annotation.kind == Annotation::Kind::Image) {
+        // The rect is where the pixels were placed, which is not the image's
+        // own size: the paste fits it to the canvas and the handles resize it.
+        *bounds = annotation.rect;
+        return !annotation.pixels.isNull() && !bounds->isEmpty();
     }
     const bool hasText = !annotation.text.isEmpty();
     if (annotation.kind == Annotation::Kind::Text) {
@@ -3741,6 +3907,16 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
             undo();
         } else if (key == Qt::Key_Z || key == Qt::Key_Y) {
             redo();
+        } else if (key == Qt::Key_V) {
+            // Paste is the one action here that can fail for a reason the user
+            // needs told: an empty clipboard, or `wl-paste` missing. There is
+            // no status line on a frozen overlay, so the message goes to stderr
+            // where the CLI's own diagnostics already land.
+            QString error;
+            if (!pasteFromClipboard(&error)) {
+                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+                std::fflush(stderr);
+            }
         }
         return;
     }
@@ -4128,6 +4304,164 @@ void OverlayController::notifyPanelDragged()
     panelPinned_ = true;
 }
 
+bool OverlayController::pasteImage(const QImage &image, const QString &source)
+{
+    Q_UNUSED(source);
+    if (finished_ || cancelled_ || image.isNull() || !editing_ || !selection_.has_value()) {
+        return false;
+    }
+    const LogicalRect &canvas = *selection_;
+    if (canvas.width == 0 || canvas.height == 0) {
+        return false;
+    }
+    // The image is placed at its own pixel size, shrunk to fit the canvas when
+    // it is larger -- an oversized paste would land with its edges already
+    // outside the crop, which reads as a bug rather than as a placement. Small
+    // images stay their own size: blowing them up to fill the canvas would
+    // blur them and is not what "paste this here" means.
+    double fit = 1.0;
+    if (image.width() > 0 && image.height() > 0) {
+        fit = std::min(1.0, std::min(static_cast<double>(canvas.width) / image.width(),
+                                      static_cast<double>(canvas.height) / image.height()));
+    }
+    const int width = std::max(1, static_cast<int>(std::lround(image.width() * fit)));
+    const int height = std::max(1, static_cast<int>(std::lround(image.height() * fit)));
+
+    Annotation annotation;
+    annotation.kind = Annotation::Kind::Image;
+    annotation.tool = QStringLiteral("image");
+    annotation.pixels = image;
+    annotation.rect = LogicalRect{
+        static_cast<std::int32_t>(canvas.x + (static_cast<std::int64_t>(canvas.width) - width) / 2),
+        static_cast<std::int32_t>(canvas.y +
+                                  (static_cast<std::int64_t>(canvas.height) - height) / 2),
+        static_cast<std::uint32_t>(width),
+        static_cast<std::uint32_t>(height),
+    };
+    // The paste replaces whatever was selected: leaving the old selection on
+    // would make the handles resize the previous mark while the new image sits
+    // there looking like the thing that is selected.
+    QVector<Annotation> next = annotations_;
+    next.push_back(annotation);
+    mutateAnnotations(next);
+    // Selected, so the handles are up and the image can be moved or resized
+    // without a trip through the toolbar.
+    chooseTool(Tool::Select);
+    selectAnnotation(next.size() - 1);
+    return true;
+}
+
+bool OverlayController::canPaste() const
+{
+    return !finished_ && !cancelled_ && editing_ && selection_.has_value();
+}
+
+bool OverlayController::pasteFromFile(QString *error)
+{
+    if (!canPaste()) {
+        if (error != nullptr) {
+            *error = uiTr("Paste needs a selection to paste onto.");
+        }
+        return false;
+    }
+    // The helper is this program. It runs the dialog in a mode that clears the
+    // layer-shell integration, because a file dialog is a popup and a layer
+    // surface cannot parent one.
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        if (error != nullptr) {
+            *error = uiTr("Cannot locate the vshot helper to open the file dialog.");
+        }
+        return false;
+    }
+    buffer[length] = '\0';
+    const QString helper = QString::fromLocal8Bit(buffer);
+    // The controller is not a QObject, so the watcher is parented to the
+    // application: it has to outlive this call, and the overlay's own widgets
+    // can be torn down while the dialog is still up.
+    auto *dialog = new QProcess(qApp);
+    dialog->setProgram(helper);
+    dialog->setArguments({QStringLiteral("--open-dialog"), QString()});
+    dialog->setStandardInputFile(QProcess::nullDevice());
+    // The dialog must not inherit this process's layer-shell integration; its
+    // own mode clears it, and clearing it here too means a future change to
+    // that rule cannot break this path.
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.remove(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"));
+    dialog->setProcessEnvironment(env);
+    QObject::connect(dialog, &QProcess::finished, dialog,
+                     [this, dialog](int code, QProcess::ExitStatus) {
+                         const QByteArray out = dialog->readAllStandardOutput();
+                         dialog->deleteLater();
+                         QJsonParseError parseError;
+                         const QJsonDocument document =
+                             QJsonDocument::fromJson(out.trimmed(), &parseError);
+                         if (code != 0 || parseError.error != QJsonParseError::NoError
+                             || !document.isObject()
+                             || !document.object().value(QStringLiteral("ok")).toBool()) {
+                             return; // cancelled
+                         }
+                         const QString path =
+                             document.object().value(QStringLiteral("path")).toString();
+                         if (path.isEmpty()) {
+                             return;
+                         }
+                         QImageReader reader(path);
+                         const QImage image = reader.read();
+                         if (image.isNull()) {
+                             std::fprintf(stderr, "vshot-qt-ui: cannot read image `%s`\n",
+                                          qPrintable(path));
+                             std::fflush(stderr);
+                             return;
+                         }
+                         // The session may have been confirmed or cancelled
+                         // while the dialog was up; pasteImage checks that
+                         // itself and simply does nothing then.
+                         pasteImage(image, path);
+                     });
+    QObject::connect(dialog, &QProcess::errorOccurred, dialog,
+                     [dialog](QProcess::ProcessError failure) {
+                         if (failure != QProcess::FailedToStart) {
+                             return;
+                         }
+                         std::fprintf(stderr,
+                                      "vshot-qt-ui: could not start the file dialog\n");
+                         std::fflush(stderr);
+                         dialog->deleteLater();
+                     });
+    dialog->start();
+    return true;
+}
+
+bool OverlayController::pasteFromClipboard(QString *error)
+{
+    if (!canPaste()) {
+        if (error != nullptr) {
+            *error = uiTr("Paste needs a selection to paste onto.");
+        }
+        return false;
+    }
+    const ClipboardImage clipboard = readClipboardImage();
+    if (clipboard.installed == false) {
+        if (error != nullptr) {
+            *error = uiTr("`wl-paste` was not found, so the clipboard cannot be read.");
+        }
+        return false;
+    }
+    if (!clipboard.image.isNull()) {
+        return pasteImage(clipboard.image, clipboard.source);
+    }
+    if (error != nullptr) {
+        // Naming what was actually wrong is the difference between "the
+        // shortcut does nothing" and a user knowing to copy an image instead.
+        *error = clipboard.offered
+                     ? uiTr("The clipboard holds no image.")
+                     : uiTr("The clipboard is empty.");
+    }
+    return false;
+}
+
 void OverlayController::beginStyleAdjustment()
 {
     if (styleAdjustmentActive_ || selectedAnnotation_ < 0 ||
@@ -4456,6 +4790,11 @@ Annotation OverlayController::translatedAnnotation(const Annotation &original, i
         result.rect.x = static_cast<std::int32_t>(result.rect.x + clampedDx);
         result.rect.y = static_cast<std::int32_t>(result.rect.y + clampedDy);
         break;
+    case Annotation::Kind::Image:
+        // A pasted image moves as a whole, the same way a shape does.
+        result.rect.x = static_cast<std::int32_t>(result.rect.x + clampedDx);
+        result.rect.y = static_cast<std::int32_t>(result.rect.y + clampedDy);
+        break;
     case Annotation::Kind::Stroke:
         for (Point &point : result.points) {
             point.x = static_cast<std::int32_t>(point.x + clampedDx);
@@ -4474,7 +4813,9 @@ Annotation OverlayController::scaledAnnotation(const Annotation &original,
                                                const LogicalRect &newBounds) const
 {
     Annotation result = original;
-    if (original.kind == Annotation::Kind::Shape) {
+    if (original.kind == Annotation::Kind::Shape || original.kind == Annotation::Kind::Image) {
+        // A shape's rect *is* its geometry, and a pasted image's rect is where
+        // it sits and how big it is; both scale by taking the new rect.
         result.rect = newBounds;
         return result;
     }
@@ -4656,7 +4997,70 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
     QJsonArray outputAnnotations;
     for (const Annotation &annotation : annotations_) {
         QJsonObject value;
-        if (annotation.kind == Annotation::Kind::Shape) {
+        if (annotation.kind == Annotation::Kind::Image) {
+            // The pixels travel as a raw RGBA8888 file beside the session JSON,
+            // exactly like a text label's bitmap: the protocol carries paths,
+            // not megabytes of base64.
+            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
+            value.insert(QStringLiteral("tool"), QStringLiteral("image"));
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+            if (bitmapDirectory.isEmpty() || annotation.pixels.isNull()) {
+                // No directory to write into: the annotation cannot be handed
+                // over, so it is dropped rather than reported as a mark the
+                // renderer would then fail to find.
+                continue;
+            }
+            // Rasterize at the size the image occupies on the canvas, in scene
+            // device pixels -- the same contract a text bitmap is written
+            // under. The source is usually a different size entirely (a photo
+            // pasted small, or a screenshot pasted smaller than its pixels),
+            // and rendering it here means the file is bounded by the canvas
+            // rather than by the source, and that what travels is exactly what
+            // the preview showed.
+            const int scale = sceneScale();
+            const int width = static_cast<int>(annotation.rect.width) * scale;
+            const int height = static_cast<int>(annotation.rect.height) * scale;
+            if (width <= 0 || height <= 0
+                || static_cast<qint64>(width) * static_cast<qint64>(height) > 16LL * 1024 * 1024) {
+                if (error != nullptr) {
+                    *error = QStringLiteral("pasted image is too large to render (%1x%2)")
+                                 .arg(width)
+                                 .arg(height);
+                    return QJsonDocument();
+                }
+                continue;
+            }
+            const QImage pixels = annotation.pixels
+                                      .scaled(width, height, Qt::IgnoreAspectRatio,
+                                              Qt::SmoothTransformation)
+                                      .convertToFormat(QImage::Format_RGBA8888);
+            if (pixels.isNull()) {
+                continue;
+            }
+            const QString path = QStringLiteral("%1/image-%2.rgba")
+                                     .arg(bitmapDirectory)
+                                     .arg(imageBitmapIndex_++);
+            QFile file(path);
+            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                || file.write(reinterpret_cast<const char *>(pixels.constBits()),
+                              static_cast<qint64>(pixels.sizeInBytes()))
+                    != static_cast<qint64>(pixels.sizeInBytes())) {
+                if (error != nullptr) {
+                    *error = QStringLiteral("cannot write pasted image `%1`: %2")
+                                 .arg(path, file.errorString());
+                    return QJsonDocument();
+                }
+                continue;
+            }
+            value.insert(QStringLiteral("bitmap_width"), static_cast<qint64>(pixels.width()));
+            value.insert(QStringLiteral("bitmap_height"), static_cast<qint64>(pixels.height()));
+            value.insert(QStringLiteral("bitmap"), path);
+        } else if (annotation.kind == Annotation::Kind::Shape) {
             value.insert(QStringLiteral("kind"), QStringLiteral("shape"));
             value.insert(QStringLiteral("tool"), annotation.tool);
             value.insert(QStringLiteral("color"), annotation.color.name(QColor::HexRgb));
@@ -4840,6 +5244,15 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     auto drawAnnotation = [this, &output, overlay, painter](const Annotation &annotation) {
         const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
         const QPen annotationPen = penForAnnotation(annotation);
+        if (annotation.kind == Annotation::Kind::Image) {
+            if (annotation.pixels.isNull()) {
+                return;
+            }
+            const QRectF target = localRect(output, annotation.rect, overlay->size());
+            painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+            painter->drawImage(target, annotation.pixels);
+            return;
+        }
         if (annotation.kind == Annotation::Kind::Shape) {
             if (annotation.tool == QStringLiteral("mosaic")) {
                 drawMosaicAnnotation(painter, output, annotation.rect, annotation.mask,

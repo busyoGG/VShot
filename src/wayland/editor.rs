@@ -229,6 +229,12 @@ pub enum Annotation {
         /// the built-in 5x7 ASCII glyph renderer.
         bitmap: Option<TextBitmap>,
     },
+    /// A pasted image. `rect` is where it lands on the canvas, in global
+    /// logical pixels; `pixels` is the image at its own resolution, so the two
+    /// generally differ and the blit has to rescale. The pixels come from the
+    /// Qt helper as a raw RGBA8888 file, the same way a text label's bitmap
+    /// does.
+    Image { rect: Rect, pixels: TextBitmap },
 }
 
 pub const DEFAULT_ANNOTATION_COLOR: [u8; 4] = [255, 64, 64, 255];
@@ -277,20 +283,21 @@ impl Annotation {
             Self::Stroke { color, .. } | Self::Shape { color, .. } | Self::Text { color, .. } => {
                 *color
             }
+            Self::Image { .. } => DEFAULT_ANNOTATION_COLOR,
         }
     }
 
     pub const fn width(&self) -> u32 {
         match self {
             Self::Stroke { width, .. } | Self::Shape { width, .. } => *width,
-            Self::Text { .. } => DEFAULT_ANNOTATION_WIDTH,
+            Self::Text { .. } | Self::Image { .. } => DEFAULT_ANNOTATION_WIDTH,
         }
     }
 
     pub const fn dash(&self) -> LineDash {
         match self {
             Self::Stroke { dash, .. } | Self::Shape { dash, .. } => *dash,
-            Self::Text { .. } => LineDash::Solid,
+            Self::Text { .. } | Self::Image { .. } => LineDash::Solid,
         }
     }
 
@@ -298,7 +305,7 @@ impl Annotation {
     pub const fn head(&self) -> u32 {
         match self {
             Self::Stroke { head, .. } => *head,
-            Self::Shape { .. } | Self::Text { .. } => 1,
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => 1,
         }
     }
 
@@ -306,7 +313,7 @@ impl Annotation {
     pub const fn arrow_style(&self) -> ArrowStyle {
         match self {
             Self::Stroke { arrow_style, .. } => *arrow_style,
-            Self::Shape { .. } | Self::Text { .. } => ArrowStyle::Open,
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => ArrowStyle::Open,
         }
     }
 
@@ -322,7 +329,7 @@ impl Annotation {
     pub const fn strength(&self) -> u32 {
         match self {
             Self::Stroke { strength, .. } | Self::Shape { strength, .. } => *strength,
-            Self::Text { .. } => DEFAULT_MOSAIC_STRENGTH,
+            Self::Text { .. } | Self::Image { .. } => DEFAULT_MOSAIC_STRENGTH,
         }
     }
 
@@ -330,12 +337,14 @@ impl Annotation {
         match self {
             Self::Stroke { tool, .. } | Self::Shape { tool, .. } => *tool,
             Self::Text { .. } => EditorTool::Text,
+            Self::Image { .. } => EditorTool::Select,
         }
     }
 
     pub fn bounds(&self) -> Option<Rect> {
         match self {
             Self::Shape { rect, .. } => Some(*rect),
+            Self::Image { rect, .. } => Some(*rect),
             Self::Stroke { points, .. } => points_bounds(points),
             Self::Text {
                 origin,
@@ -349,7 +358,7 @@ impl Annotation {
     pub fn points(&self) -> &[Point] {
         match self {
             Self::Stroke { points, .. } => points,
-            Self::Shape { .. } | Self::Text { .. } => &[],
+            Self::Shape { .. } | Self::Text { .. } | Self::Image { .. } => &[],
         }
     }
 

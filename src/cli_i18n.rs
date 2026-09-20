@@ -103,7 +103,9 @@ VSHOT_PIN_SOCKET、VSHOT_PIN_DENSITY=N。
         r#"不给 --geometry 时，冻结场景交给 Qt overlay：拖出一个矩形，用八个手柄或方向键调整
 （按住 Shift 一次走 10px），放大镜与尺寸读数跟着指针走，然后 Enter、在选区内双击或工具栏的
 OK 确认。Esc 或右键取消整次截图——只有文本框里的 Esc 只关那个框。工具栏用矩形、椭圆、箭头、
-涂鸦、文本和马赛克标注这一帧：Ctrl+Z / Ctrl+Y 撤销与重做，Delete 删除选中的标注，最终 PNG
+涂鸦、文本和马赛克标注这一帧：Ctrl+Z / Ctrl+Y 撤销与重做，Delete 删除选中的标注，Ctrl+V 把
+剪贴板里的图片贴上来（工具栏的「图片」按钮从磁盘挑一张）。贴进来的图按原尺寸落在选区正中，
+比选区大时等比缩小，贴完是选中态，可以直接拖把手缩放。最终 PNG
 由标注重新渲染，因此与预览一致。
 
 VSHOT_QT_HELPER 指定运行哪一份 vshot-qt-ui，VSHOT_LANG 指定它的语言（以 `zh` 开头选中文，

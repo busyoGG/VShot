@@ -1,4 +1,4 @@
-#include "save_dialog.hpp"
+#include "file_dialog.hpp"
 
 #include "i18n.hpp"
 
@@ -15,8 +15,8 @@ namespace vshot {
 namespace {
 
 // The directory a dialog opens in, and the name it starts on. The caller's
-// suggestion is a file path when the pin came from one -- then its own
-// directory is the better guess, because that is where the user is working.
+// suggestion is a file path when the pin or the image came from one -- then its
+// own directory is the better guess, because that is where the user is working.
 QString initialPathFor(const QString &suggestedPath)
 {
     const QFileInfo suggested(suggestedPath);
@@ -46,6 +46,14 @@ void report(const QString &path)
     std::fflush(stdout);
 }
 
+// What an image to open may be. The readers Qt ships with cover these; the
+// filter is an aid, and a file outside it can still be typed in.
+QString imageFilter()
+{
+    return uiTr("Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff)") + QLatin1String(";;")
+        + uiTr("All files (*)");
+}
+
 } // namespace
 
 int runSaveDialog(const QString &suggestedPath)
@@ -64,6 +72,14 @@ int runSaveDialog(const QString &suggestedPath)
     // A name typed without an extension gets one, so the caller never has to
     // guess a format from a path.
     report(QFileInfo(path).suffix().isEmpty() ? path + QStringLiteral(".png") : path);
+    return 0;
+}
+
+int runOpenDialog(const QString &suggestedPath)
+{
+    initUiLanguage();
+    report(QFileDialog::getOpenFileName(nullptr, uiTr("Open an image"),
+                                        initialPathFor(suggestedPath), imageFilter()));
     return 0;
 }
 

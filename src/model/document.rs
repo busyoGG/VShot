@@ -108,6 +108,10 @@ impl ImageDocument {
         self.frame.draw_bitmap(origin, bitmap)
     }
 
+    pub(crate) fn draw_bitmap_scaled(&mut self, rect: Rect, bitmap: &TextBitmap) -> Result<()> {
+        self.frame.draw_bitmap_scaled(rect, bitmap)
+    }
+
     pub(crate) fn mosaic(&mut self, rect: Rect, block_size: u32) -> Result<()> {
         self.frame.mosaic(rect, block_size)
     }
