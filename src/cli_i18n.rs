@@ -36,6 +36,13 @@ fn language() -> Language {
     }
 }
 
+/// Whether this side should show Chinese, for the user-facing text outside
+/// `--help`: the notification `vshot ocr` finishes with (see `crate::notify`).
+/// The rule is the one above, in one place.
+pub(crate) fn prefers_chinese() -> bool {
+    language() == Language::Chinese
+}
+
 /// The locale as far as the plain environment reaches — the helper asks Qt,
 /// which reads the same variables.
 fn locale_language() -> Language {

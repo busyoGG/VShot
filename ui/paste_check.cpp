@@ -475,6 +475,33 @@ void checkTextButton()
     text->click();
     expect(text->text() == vshot::uiTr(QStringLiteral("Failed")),
            "a text read that cannot run reports failure", text->text());
+    // The button reports what it did by changing its label, and a tool button
+    // elides its text to the box it was given -- a longer word flashed in a box
+    // sized for a shorter one comes out cut off, which is what happened to the
+    // word shown when a read succeeds.  So the button is built wide enough for
+    // every label it can show, and that is what this checks: a button of the
+    // same class on the same parent, told to size itself for each of those
+    // labels, must not come out wider than the real one.
+    //
+    // The margin is thin -- the flashed word needs 43 of the button's 48 pixels
+    // on the font this machine resolves -- so this is a guard rather than a
+    // reproduction of the clipping a wider font produces.  What it pins is that
+    // the width was settled against the labels, not assumed from one of them.
+    for (const QString &label : {text->text(), vshot::uiTr(QStringLiteral("Copied")),
+                                 vshot::uiTr(QStringLiteral("Failed"))}) {
+        QToolButton reference(surface);
+        reference.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+        reference.setIcon(text->icon());
+        reference.setIconSize(text->iconSize());
+        reference.setText(label);
+        reference.adjustSize();
+        expect(text->width() >= reference.width(),
+               "the text button is wide enough for every label it can show",
+               QStringLiteral("%1 needs %2 px of a %3 px button")
+                   .arg(label)
+                   .arg(reference.width())
+                   .arg(text->width()));
+    }
 }
 
 } // namespace

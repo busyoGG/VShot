@@ -26,6 +26,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -143,6 +144,9 @@ void checkEveryFieldReachesTheFile()
     find<QSpinBox>(dialog.get(), "longIgnoreTop")->setValue(42);
     expect(choose(find<QComboBox>(dialog.get(), "longInject"), QStringLiteral("uinput")),
            "the scroll-backend list offers uinput");
+    // The notification switch is the one row whose field is not optional, so
+    // it is turned *off* here: on is what a mis-wired switch would leave it at.
+    find<QAbstractButton>(dialog.get(), "ocrNotify")->setChecked(false);
 
     // The pins' look.  The radius and the border width are set to values that
     // are neither the default nor each other, so a pair wired to the same
@@ -185,6 +189,7 @@ void checkEveryFieldReachesTheFile()
     expect(saved.cli.longTimeout == 99, "the scroll timeout reached the file");
     expect(saved.cli.longIgnoreTop == 42, "the scroll ignore-top reached the file");
     expect(saved.cli.longInject == QStringLiteral("uinput"), "the scroll backend reached the file");
+    expect(!saved.cli.ocrNotify, "the notification switch reached the file");
     expect(saved.pin.radius == 17, "the pin radius reached the file",
            QString::number(saved.pin.radius));
     expect(!saved.pin.shadow.enabled, "the pin shadow switch reached the file");
@@ -223,7 +228,7 @@ void checkTheWindowOpensOnTheStoredValues()
                    "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textPixels": 28},
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
-                "pin": {"density": 2}},
+                "pin": {"density": 2}, "ocr": {"notify": false}},
         "pin": {"radius": 9, "shadow": false, "shadowSize": 21, "shadowOffset": -7,
                 "shadowOpacity": 200, "borderWidth": 6,
                 "borderColor": "#112233", "activeBorderColor": "#445566"},
@@ -254,6 +259,8 @@ void checkTheWindowOpensOnTheStoredValues()
            "the scroll-backend box is right");
     expect(find<QSpinBox>(dialog.get(), "longTimeout")->value() == 45, "the timeout box is right");
     expect(find<QSpinBox>(dialog.get(), "pinDensity")->value() == 2, "the pin density box is right");
+    expect(!find<QAbstractButton>(dialog.get(), "ocrNotify")->isChecked(),
+           "the notification switch shows the stored off state");
     expect(find<QSpinBox>(dialog.get(), "pinRadius")->value() == 9, "the pin radius box is right");
     expect(!find<QAbstractButton>(dialog.get(), "pinShadow")->isChecked(),
            "the shadow switch shows the stored off state");
@@ -378,6 +385,56 @@ void checkCancelChangesNothing()
            "an unknown key survives a cancel");
 }
 
+void checkTheOcrEngineSurvivesASave()
+{
+    std::printf("--- saving the notification switch keeps the OCR engine ------------\n");
+    // The `ocr` section is mostly hand-written: the engine and its external
+    // command are not in this window, but the window's save is what rewrites
+    // the section around them.  A save that dropped `engine` would move a user
+    // who set up a GPU engine back onto the CPU without saying so.
+    writeConfig(QStringLiteral(R"({
+        "cli": {"ocr": {"engine": "external",
+                        "external": {"command": ["my-ocr", "--stdin"], "stdin": true,
+                                     "timeout": 12}}}
+    })"));
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    if (!dialog) {
+        return;
+    }
+    expect(find<QAbstractButton>(dialog.get(), "ocrNotify")->isChecked(),
+           "a file that says nothing about notifications opens with them on");
+    find<QAbstractButton>(dialog.get(), "ocrNotify")->setChecked(false);
+    find<QPushButton>(dialog.get(), "saveButton")->click();
+
+    QFile file(configPath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        std::printf("FAIL  the config file could not be read back\n");
+        ++failures;
+        return;
+    }
+    QJsonParseError error{};
+    const QJsonObject root = QJsonDocument::fromJson(file.readAll(), &error).object();
+    expect(error.error == QJsonParseError::NoError, "the saved file is valid JSON");
+    const QJsonObject ocr = root.value(QStringLiteral("cli"))
+                                .toObject()
+                                .value(QStringLiteral("ocr"))
+                                .toObject();
+    expect(ocr.value(QStringLiteral("notify")).isBool() &&
+               !ocr.value(QStringLiteral("notify")).toBool(),
+           "the switch was written as off");
+    expect(ocr.value(QStringLiteral("engine")).toString() == QStringLiteral("external"),
+           "the OCR engine survives a save", ocr.value(QStringLiteral("engine")).toString());
+    const QJsonObject external = ocr.value(QStringLiteral("external")).toObject();
+    expect(external.value(QStringLiteral("command")).toArray().size() == 2 &&
+               external.value(QStringLiteral("stdin")).toBool() &&
+               external.value(QStringLiteral("timeout")).toInt() == 12,
+           "the external command survives a save",
+           QStringLiteral("%1 args, stdin=%2, timeout=%3")
+               .arg(external.value(QStringLiteral("command")).toArray().size())
+               .arg(external.value(QStringLiteral("stdin")).toBool() ? 1 : 0)
+               .arg(external.value(QStringLiteral("timeout")).toInt()));
+}
+
 void checkTheDesktopEntryAndIconAgree()
 {
     std::printf("--- the launcher entry, the icon and the window agree --------------\n");
@@ -478,6 +535,7 @@ int main(int argc, char **argv)
     checkTheWindowOpensOnTheStoredValues();
     checkClearingOneColorLeavesTheOther();
     checkCancelChangesNothing();
+    checkTheOcrEngineSurvivesASave();
     checkTheDesktopEntryAndIconAgree();
 
     std::printf("--- result ---------------------------------------------------------\n");

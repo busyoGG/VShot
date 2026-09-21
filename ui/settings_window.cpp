@@ -984,6 +984,20 @@ private:
         selectChoice(injectBox_, config_.cli.longInject);
         addRow(scrolling, uiTr("Scroll backend"), QString(), injectBox_, false);
 
+        // The OCR engine itself is not here -- it is a command and a timeout,
+        // which the README documents for hand-editing -- but the notification
+        // is: it is the part of the feature a user wants to change *after*
+        // seeing it work, and that is what this window is for.
+        QWidget *recognition = addCard(page, uiTr("Text recognition"));
+        ocrNotifySwitch_ = new ModernSwitch(recognition);
+        ocrNotifySwitch_->setObjectName(QStringLiteral("ocrNotify"));
+        ocrNotifySwitch_->setChecked(config_.cli.ocrNotify);
+        ocrNotifySwitch_->setToolTip(uiTr("Shown with the result once recognition ends"));
+        addRow(recognition, uiTr("Notify when the text is ready"),
+               uiTr("A desktop notification with the text, or with why it failed; it "
+                    "needs a notification daemon"),
+               ocrNotifySwitch_, true);
+
         return scroll;
     }
 
@@ -1219,6 +1233,7 @@ private:
         cli.longTimeout = spinValue(timeoutSpin_);
         cli.longIgnoreTop = spinValue(ignoreTopSpin_);
         cli.longInject = injectBox_->currentData().toString();
+        cli.ocrNotify = ocrNotifySwitch_->isChecked();
 
         DialogPreferences &dialog = config.dialog;
         dialog.radius =
@@ -1276,6 +1291,7 @@ private:
     QSpinBox *timeoutSpin_ = nullptr;
     QSpinBox *ignoreTopSpin_ = nullptr;
     QComboBox *injectBox_ = nullptr;
+    ModernSwitch *ocrNotifySwitch_ = nullptr;
     ModernSpinBox *dialogRadiusSpin_ = nullptr;
     ModernSpinBox *dialogBorderWidthSpin_ = nullptr;
     ShadowControls dialogShadow_;

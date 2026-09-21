@@ -46,6 +46,9 @@ pub struct OcrDefaults {
     pub engine: Option<String>,
     /// Only read when `engine` is `external`.
     pub external: Option<OcrExternalDefaults>,
+    /// Whether a finished recognition raises a desktop notification.  Absent
+    /// means yes; the settings window writes it out.
+    pub notify: Option<bool>,
 }
 
 /// How to reach an OCR program the user runs themselves.
@@ -161,6 +164,22 @@ mod tests {
         assert!(file.cli.png_compression.is_none());
         assert!(file.cli.long.notches.is_none());
         assert!(file.cli.pin.density.is_none());
+    }
+
+    #[test]
+    fn the_ocr_section_carries_the_notification_switch() {
+        let file: ConfigFile = serde_json::from_str(
+            r#"{"cli":{"ocr":{"notify":false,"engine":"external","external":{"command":["x"]}}}}"#,
+        )
+        .expect("an ocr section parses");
+        assert_eq!(file.cli.ocr.notify, Some(false));
+        // The switch does not displace the rest of the section.
+        assert_eq!(file.cli.ocr.engine.as_deref(), Some("external"));
+        // Absent is not "off": the caller's own default -- on -- is what
+        // stands, which is what a file written before this key existed says.
+        let silent: ConfigFile =
+            serde_json::from_str(r#"{"cli":{"ocr":{"engine":"builtin"}}}"#).unwrap();
+        assert_eq!(silent.cli.ocr.notify, None);
     }
 
     #[test]

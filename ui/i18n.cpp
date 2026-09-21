@@ -256,6 +256,15 @@ const QHash<QString, QString> &chineseTable()
                         "headers"),
          QString::fromUtf8("每帧顶部不参与匹配的行数，用于吸顶表头")},
         {QStringLiteral("Scroll backend"), QString::fromUtf8("滚动后端")},
+        {QStringLiteral("Text recognition"), QString::fromUtf8("文本识别")},
+        {QStringLiteral("Notify when the text is ready"),
+         QString::fromUtf8("识别完成时通知")},
+        {QStringLiteral("A desktop notification with the text, or with why it failed; it "
+                        "needs a notification daemon"),
+         QString::fromUtf8("识别结束后弹一条桌面通知，给出文字或失败原因；"
+                           "需要通知服务")},
+        {QStringLiteral("Shown with the result once recognition ends"),
+         QString::fromUtf8("识别结束时随结果一起显示")},
         {QStringLiteral("File dialogs"), QString::fromUtf8("文件对话框")},
         {QStringLiteral("How the save and open windows are drawn. They are layer "
                         "surfaces, so the compositor draws them no decoration of its "

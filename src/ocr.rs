@@ -322,16 +322,18 @@ pub fn recognize(frame: &crate::model::Frame) -> Result<Vec<OcrLine>> {
 }
 
 /// The recognized lines joined into the text a caller prints or copies.
+///
+/// The lines are joined and nothing is added at the end.  A trailing newline
+/// here would be a stray blank line for every caller that copies the text
+/// somewhere (the clipboard, or a `| wl-copy` pipeline), and it is not this
+/// function's to add: `write_ocr_text` adds one back for stdout, which is the
+/// only destination where a line without an end looks wrong.
 pub fn join_lines(lines: &[OcrLine]) -> String {
-    let mut text = lines
+    lines
         .iter()
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
-        .join("\n");
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -347,6 +349,7 @@ mod tests {
                 stdin: None,
                 timeout: None,
             }),
+            notify: None,
         }
     }
 
@@ -359,6 +362,7 @@ mod tests {
         let named = OcrDefaults {
             engine: Some("builtin".into()),
             external: None,
+            notify: None,
         };
         assert_eq!(engine_from_config(&named).unwrap(), Engine::Builtin);
     }
@@ -383,6 +387,7 @@ mod tests {
         let missing = OcrDefaults {
             engine: Some("external".into()),
             external: None,
+            notify: None,
         };
         assert!(matches!(
             engine_from_config(&missing),
@@ -400,13 +405,16 @@ mod tests {
         let typo = OcrDefaults {
             engine: Some("gpu".into()),
             external: None,
+            notify: None,
         };
         let error = engine_from_config(&typo).unwrap_err();
         assert!(error.to_string().contains("gpu"), "{error}");
     }
 
     #[test]
-    fn lines_are_joined_with_a_trailing_newline() {
+    fn lines_are_joined_without_a_trailing_newline() {
+        // The end of the text is the end of the last line: anything a caller
+        // copies out is what was recognized, with no blank line appended.
         let lines = vec![
             OcrLine {
                 text: "first".into(),
@@ -417,7 +425,7 @@ mod tests {
                 rect: crate::geometry::Rect::new(0, 20, 10, 10),
             },
         ];
-        assert_eq!(join_lines(&lines), "first\nsecond\n");
+        assert_eq!(join_lines(&lines), "first\nsecond");
         assert_eq!(join_lines(&[]), "");
     }
 

@@ -8,6 +8,7 @@ mod geometry;
 mod inject;
 mod longshot;
 mod model;
+mod notify;
 mod ocr;
 mod output;
 mod pin;
@@ -394,8 +395,8 @@ fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination) -> Result<(
             VshotError::Ocr(format!("cannot read `{}`: {error}", path.display()))
         })?;
         let frame = Frame::from_png(&bytes)?;
-        let lines = ocr::recognize(&frame)?;
-        return write_ocr_text(&ocr::join_lines(&lines), destination);
+        let lines = ocr::recognize(&frame);
+        return finish_ocr(lines.map(|lines| ocr::join_lines(&lines)), destination);
     }
 
     let mut wayland = WaylandSession::connect()?;
@@ -432,7 +433,32 @@ fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination) -> Result<(
 
     let lines = ocr::recognize(&frame);
     cleanup?;
-    write_ocr_text(&ocr::join_lines(&lines?), destination)
+    finish_ocr(lines.map(|lines| ocr::join_lines(&lines)), destination)
+}
+
+/// Sends the recognized text where the request pointed, and says so once it is
+/// there.
+///
+/// The announcement is what makes a run from a keybinding usable: nothing else
+/// on screen changes when the text lands on the clipboard.  It is not part of
+/// the result — a session with no notification daemon still gets its text — so
+/// the failure of the recognition is reported here and returned as itself.
+fn finish_ocr(text: Result<String>, destination: cli::OcrDestination) -> Result<()> {
+    let to_clipboard = matches!(destination, cli::OcrDestination::Clipboard);
+    match text {
+        Ok(text) => {
+            let outcome = write_ocr_text(&text, destination);
+            match &outcome {
+                Ok(()) => notify::ocr_finished(&text, to_clipboard),
+                Err(error) => notify::ocr_failed(&error.to_string()),
+            }
+            outcome
+        }
+        Err(error) => {
+            notify::ocr_failed(&error.to_string());
+            Err(error)
+        }
+    }
 }
 
 /// Sends recognized text where the request pointed.
@@ -440,9 +466,19 @@ fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
     match destination {
         cli::OcrDestination::Stdout => {
             use std::io::Write as _;
-            print!("{text}");
-            std::io::stdout()
-                .flush()
+            let mut stdout = std::io::stdout();
+            // The newline that ends the last line is the terminal's, not the
+            // text's: `join_lines` joins without one so that what is copied or
+            // piped is exactly the recognized text, and stdout is the one
+            // destination where a line that does not end leaves the shell
+            // prompt sitting on the last line of the output.
+            let mut written = text.to_string();
+            if !written.is_empty() {
+                written.push('\n');
+            }
+            stdout
+                .write_all(written.as_bytes())
+                .and_then(|()| stdout.flush())
                 .map_err(|error| VshotError::Ocr(format!("cannot write to stdout: {error}")))
         }
         cli::OcrDestination::Clipboard => output::copy_text_to_clipboard(text),

@@ -19,7 +19,7 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 - **Long screenshot** — frame a scrolling region, and vshot sends the wheel, grabs frames, aligns them by content, and stitches one long image
 - **Pin overlay** — pin images or clipboard content to the screen: drag, wheel to zoom, double-click to close, one-key show/hide, Space to annotate
 - **Clipboard pinning** — colors, images, copied image files, plain text (rendered as a card as HTML / markdown / code / plain text)
-- **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button
+- **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button, with a desktop notification when it finishes
 - **Output targets** — file (with strftime paths), stdout, clipboard, or an on-screen pin; exactly one
 - **Bilingual UI** — the interface and `--help` follow the system language
 
@@ -29,7 +29,7 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 
 ```sh
 ./scripts/build-arch-package.sh
-sudo pacman -U dist/vshot-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/vshot-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 The script snapshots the current working tree (uncommitted changes included) into a temporary directory and runs `makepkg`, writing the result to `dist/`; `makepkg -si` works directly too. Runtime dependencies are `glibc`, `wayland` (uses `libwayland-client` through dlopen), `qt6-base`, `layer-shell-qt`, and **`onnxruntime`** (the OCR inference engine); file output, `--clipboard`, and `vshot pin --clipboard` need the optional `wl-clipboard` (writes via `wl-copy`, reads via `wl-paste`). The package also installs about 30 MB of OCR models under `/usr/share/vshot/models/`, which `makepkg` fetches and SHA-256-verifies. For other distributions, build from source as below.
@@ -156,7 +156,7 @@ When `vshot region` gets no `--geometry`, the frozen frame fills each output and
 - The **Select** tool picks any annotation: click to select, drag to move (text too), shapes/lines/mosaics resize by their handles, Delete/Backspace removes it; style changes apply to the selected annotation immediately, and double-clicking text reopens it for editing
 - **Ctrl+Z / Ctrl+Y** (or Ctrl+Shift+Z) undo/redo
 - **Pasting an image**: the toolbar's *Image* button picks one from disk, or **Ctrl+V** pastes whatever image the clipboard holds — it lands centred at its own size, shrunk to fit when it is larger than the selection, and comes up selected so it can be dragged and resized by its handles; Ctrl+Z undoes it like any other mark
-- **Reading text**: the toolbar's *Text+* button recognizes the text in the selection and puts it on the clipboard, the button itself flashing *Copied* or *Failed*; the recognition runs in a `vshot ocr --input` child process (see [OCR](#ocr))
+- **Reading text**: the toolbar's *Text+* button recognizes the text in the selection and puts it on the clipboard, the button itself flashing *Copied* or *Failed*, and a desktop notification follows (see [OCR](#ocr); `cli.ocr.notify` turns it off); the recognition runs in a `vshot ocr --input` child process
 - Annotations come back to Rust in global logical coordinates and the final PNG is redrawn by the built-in software renderer, matching the preview; text is rasterized by Qt in the chosen font and composited as a bitmap, so the glyphs are identical
 
 The UI language follows the system by default (`QLocale::system()`) and can be overridden with `VSHOT_LANG`: a value starting with `zh` selects Chinese, any other non-empty value selects English. The language is fixed when the helper starts, so switching needs a rerun. The Rust CLI's `--help` uses the same rule, so `VSHOT_LANG=zh vshot --help` is Chinese.
@@ -171,6 +171,14 @@ vshot ocr --clipboard        # the same, onto the clipboard
 vshot ocr --geometry '0,0 800x200'
 vshot ocr --input shot.png   # read an existing image file
 ```
+
+A finished recognition raises a **desktop notification** by default: the text it read (cut at 160 characters), or why it failed — when `vshot ocr` is started from a keybinding, nothing else says it is done. The notification is handed to whatever owns `org.freedesktop.Notifications` on the session bus, and **a session with no notification daemon still works**: it just misses the note (a line on stderr says so, and the text arrives all the same). The switch is on the settings window's *Text recognition* card, or in the file:
+
+```json
+{"cli": {"ocr": {"notify": false}}}
+```
+
+What lands on the clipboard is the recognized text itself, **with no trailing newline added**; one is added only for stdout, so the shell prompt does not end up on the last line of the output.
 
 Recognition uses **PaddleOCR's PP-OCR models** (the official models converted to ONNX) on ONNX Runtime, **on the CPU**, in this process. Measured end to end on a 720p screenshot of code: about **240 ms**, and 13 px text still reads correctly.
 
@@ -463,7 +471,7 @@ vshot settings
 
 The window is an ordinary window: it captures nothing and needs no compositor protocol, so it also works on a compositor vshot cannot otherwise capture. After installing the package you can also open it from the application menu as **VShot Settings** (see ["Application menu entry"](#application-menu-entry)). An empty or zero value in the `cli` section means "leave it unset, use the built-in default" rather than storing a zero; the `editor` section is always written whole. Saving **merges**: keys this build does not recognize — a newer vshot's, or your own — survive untouched instead of being wiped by a save.
 
-The window has four pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic), **Command-line defaults** (compression, default monitor, pin density, and the scrolling-capture settings), **File dialogs** (corner radius, border width and colour, and the shadow) and **Pin appearance** (corner radius, the shadow, border width, and the two border colours). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and they fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look. Saving **does not close the window**: a "Saved." note appears in the corner, so a value can be changed, saved, looked at and changed again without reopening anything. Cancel is now only "close".
+The window has four pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic), **Command-line defaults** (compression, default monitor, pin density, the scrolling-capture settings, and the notification a finished recognition raises), **File dialogs** (corner radius, border width and colour, and the shadow) and **Pin appearance** (corner radius, the shadow, border width, and the two border colours). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and they fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look. Saving **does not close the window**: a "Saved." note appears in the corner, so a value can be changed, saved, looked at and changed again without reopening anything. Cancel is now only "close".
 
 When drawing them, note that **the `QPainter` in a `paintEvent` already works in logical pixels**: Qt has folded the output's scale in, so dividing by `devicePixelRatioF()` as well would halve every coordinate on a scale-2 output and jam the chevron into the corner. That mistake is invisible at 1x, so it is worth looking at both scales.
 
@@ -545,10 +553,11 @@ command line > environment > config file > built-in default
 | `ocr.external.command` | the program to run when `engine` is `"external"` (an array) | none |
 | `ocr.external.stdin` | send the PNG on stdin instead of passing a path | `false` |
 | `ocr.external.timeout` | the external program's timeout, in seconds | `30` |
+| `ocr.notify` | a desktop notification when recognition ends | `true` |
 
 `pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid — a misspelled key costs you that one setting, and the rest still apply.
 
-`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor` and the common `cli` entries; the `ocr` section is edited by hand.
+`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries and the `ocr.notify` switch; `ocr.engine` and `ocr.external` are edited by hand. That switch **only ever writes "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say.
 
 `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 

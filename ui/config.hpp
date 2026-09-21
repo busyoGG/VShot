@@ -53,6 +53,12 @@ struct CliPreferences {
     std::uint32_t longIgnoreTop = 0;
     QString longInject;     ///< `auto` | `wlr` | `portal` | `uinput`
     std::uint32_t pinDensity = 0;
+    /// Whether a finished text recognition raises a desktop notification
+    /// (`cli.ocr.notify`).  Notifications are on when the file says nothing, so
+    /// the switch shows the state the engine will actually run in, and the
+    /// written key is the exception among these: only `false` is stored, since
+    /// an absent key already means on.
+    bool ocrNotify = true;
 };
 
 /// The look of the file dialogs.

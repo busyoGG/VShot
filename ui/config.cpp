@@ -272,7 +272,7 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
-    {"pin", "density"},
+    {"pin", "density"},      {"ocr", "notify"},
 };
 
 /// Removes `key` from `object`, leaving `object` possibly empty for the caller
@@ -384,6 +384,13 @@ CliPreferences readCli(const QJsonObject &cli)
 
     const QJsonObject pinSection = cli.value(QStringLiteral("pin")).toObject();
     preferences.pinDensity = readOptional(pinSection, QStringLiteral("density"), kMaxDensity);
+
+    // The `ocr` section holds the engine as well, which the settings window
+    // does not offer: only the notification is written back, and the merge in
+    // `writeCliSection` is what keeps `engine` and `external` beside it.
+    const QJsonObject ocrSection = cli.value(QStringLiteral("ocr")).toObject();
+    preferences.ocrNotify =
+        readFlag(ocrSection, QStringLiteral("notify"), preferences.ocrNotify);
     return preferences;
 }
 
@@ -412,7 +419,8 @@ QJsonObject editorJson(const EditorPreferences &preferences)
 /// The `cli` section as JSON.  Only the entries that carry a value are
 /// written: an empty string or a zero is how the settings window says "let the
 /// built-in default stand", and writing them out would freeze today's default
-/// into the file.
+/// into the file.  The notification switch follows the same rule in its own
+/// terms -- only "off" is written, because "on" is what an absent key means.
 QJsonObject cliJson(const CliPreferences &preferences)
 {
     QJsonObject cli;
@@ -451,6 +459,17 @@ QJsonObject cliJson(const CliPreferences &preferences)
         QJsonObject pinSection;
         pinSection.insert(QStringLiteral("density"), static_cast<double>(preferences.pinDensity));
         cli.insert(QStringLiteral("pin"), pinSection);
+    }
+    // Only the notification's *off* state is written.  Notifications are on
+    // when the key is absent, so writing `true` would put a key in the file
+    // that says nothing the file did not already say -- and, since a save with
+    // everything at its default is meant to leave no `cli` section behind, it
+    // would leave one.  The switch reads on/off rather than "set/unset" all the
+    // same; turning it back on clears the key.
+    if (!preferences.ocrNotify) {
+        QJsonObject ocrSection;
+        ocrSection.insert(QStringLiteral("notify"), false);
+        cli.insert(QStringLiteral("ocr"), ocrSection);
     }
     return cli;
 }

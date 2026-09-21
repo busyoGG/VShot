@@ -1797,7 +1797,8 @@ public:
         auto *text = addToolAction(toolLayout, uiTr("Text+"),
                                    recognizeTextIcon(QColor(230, 225, 229), devicePixelRatioF()),
                                    uiTr("Copy the text in the selection to the clipboard"),
-                                   QStringLiteral("ocrButton"));
+                                   QStringLiteral("ocrButton"),
+                                   {uiTr("Copied"), uiTr("Failed")});
         connect(text, &QToolButton::clicked, [controller = controller_, text] {
             QString error;
             if (!controller->copySelectionText(&error)) {
@@ -1805,7 +1806,9 @@ public:
                 std::fflush(stderr);
             }
             // The result is reported where the user is looking: the button
-            // itself, which is the thing they just clicked.
+            // itself, which is the thing they just clicked.  The width was
+            // settled for every label it can show when it was built, so the
+            // word is not elided now.
             text->setText(error.isEmpty() ? uiTr("Copied") : uiTr("Failed"));
             QTimer::singleShot(1200, text, [text, controller] {
                 if (controller->isFinished() || controller->isCancelled()) {
@@ -2633,7 +2636,7 @@ private:
         button->setText(label);
         button->setIcon(toolbarIcon(tool, QColor(230, 225, 229), devicePixelRatioF()));
         button->setIconSize(QSize(20, 20));
-        button->setFixedSize(48, 46);
+        button->setFixedSize(kToolButtonWidth, kToolButtonHeight);
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(toolTipForTool(tool));
@@ -2669,13 +2672,51 @@ private:
         return QString();
     }
 
+    // The width a button needs to draw every one of `labels` in full.
+    //
+    // A tool button elides its text to the box it was given, so one sized for
+    // the label it opens with cuts a longer one off.  That is what the text
+    // button did: it is built for "Text+" and then flashes "Copied" in the same
+    // box, and on a font that draws the word any wider than this one it comes
+    // out cut off.  Asking the style for each label's own size hint is asking it
+    // the same question it elides against, so the answer holds for whatever
+    // font and style are in force.  The tool buttons' own width is the floor, so
+    // a narrower label cannot shrink the row out of shape.
+    //
+    // This has to run before the width is fixed: a button at a fixed width
+    // reports that width back from `sizeHint`, so measuring afterwards would
+    // only ever confirm the width it already had.
+    static int widthForLabels(QToolButton *button, const QStringList &labels)
+    {
+        button->ensurePolished();
+        const QString shown = button->text();
+        int widest = kToolButtonWidth;
+        for (const QString &label : labels) {
+            button->setText(label);
+            widest = std::max(widest, button->sizeHint().width());
+        }
+        button->setText(shown);
+        return widest;
+    }
+
+    // The size every button in the tool row is built at, whether it enters a
+    // mode or does one thing.  A button that has to flash a longer label is
+    // widened past this; see `widthForLabels`.
+    static constexpr int kToolButtonWidth = 48;
+    static constexpr int kToolButtonHeight = 46;
+
     // A button in the tool row that does one thing instead of entering a mode,
     // laid out exactly like the tool buttons: same size, same text-under-icon
     // shape, same hover and press painting from ToolCardFrame.  Kept out of
     // `toolButtons_` because nothing stays selected: a paste and a text read
     // happen and are over.
+    //
+    // `alsoShows` names every label the button will show after `label`, so the
+    // box is wide enough for all of them from the start.  A button that changes
+    // its text is the one case where the size cannot be a constant.
     QToolButton *addToolAction(QHBoxLayout *layout, const QString &label, const QIcon &icon,
-                               const QString &tooltip, const QString &objectName)
+                               const QString &tooltip, const QString &objectName,
+                               const QStringList &alsoShows = QStringList())
     {
         auto *button = new QToolButton(this);
         button->setProperty("toolButton", true);
@@ -2683,12 +2724,14 @@ private:
         button->setText(label);
         button->setIcon(icon);
         button->setIconSize(QSize(20, 20));
-        button->setFixedSize(48, 46);
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(tooltip);
         button->setAccessibleName(label);
         button->setObjectName(objectName);
+        QStringList all;
+        all << label << alsoShows;
+        button->setFixedSize(widthForLabels(button, all), kToolButtonHeight);
         layout->addWidget(button);
         return button;
     }
