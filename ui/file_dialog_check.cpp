@@ -18,6 +18,7 @@
 #include "file_dialog.hpp"
 #include "config.hpp"
 #include "i18n.hpp"
+#include "shadow.hpp"
 
 #include <LayerShellQt/Window>
 
@@ -47,6 +48,8 @@
 #include <QTreeView>
 #include <QUrl>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -353,13 +356,38 @@ QImage renderDialog(QFileDialog *dialog, int width, int height)
     return canvas;
 }
 
-// The frame: a rounded rim, in a colour and at a weight the config decides.
+// The same, over nothing at all.  What the dialog paints is translucent in two
+// places -- the corners it rounds away and the shadow it casts -- and over an
+// opaque fill the second of those comes back as a colour shift rather than as
+// the alpha it really is.  The shadow is a falloff, so the alpha is the thing
+// worth reading.
+QImage renderDialogOnNothing(QFileDialog *dialog, int width, int height)
+{
+    dialog->resize(width, height);
+    dialog->show();
+    for (int i = 0; i < 8; ++i) {
+        QApplication::processEvents();
+    }
+    QImage canvas(dialog->size(), QImage::Format_ARGB32_Premultiplied);
+    canvas.fill(Qt::transparent);
+    QPainter painter(&canvas);
+    dialog->render(&painter);
+    painter.end();
+    return canvas;
+}
+
+// The frame: a rounded rim, in a colour and at a weight the config decides, and
+// the shadow the whole thing casts.
 //
 // The dialog is a layer surface, so no compositor draws it a border, and a
 // QFileDialog drops a stylesheet `border` even while it takes the `background`
 // from the same rule -- which is how the dialog ended up as a flat panel with
 // no edge at all.  Everything below is therefore about pixels the dialog
 // painted itself: there is no other thing to check.
+//
+// The window is bigger than the dialog by the shadow's reach, and the dialog's
+// contents are inset by the same amount, so every sample below is taken in the
+// dialog's own frame -- `vshot::ShadowStyle().band()` pixels in from the edge.
 void checkOuterStroke(const QString &pictures)
 {
     QFileDialog *dialog = vshot::createFileDialog(false, pictures + QStringLiteral("/x.png"));
@@ -382,11 +410,14 @@ void checkOuterStroke(const QString &pictures)
            QStringLiteral("corner rgba(%1,%2,%3,%4)")
                .arg(corner.red()).arg(corner.green()).arg(corner.blue()).arg(corner.alpha()));
 
-    // Down the left edge at mid-height is the straight part of the rim, away
-    // from both curves.
+    // The dialog's own frame: the window less the ring the shadow is painted
+    // in.  Read from the same place the dialog reads it, so a band that changed
+    // moves the samples with it rather than making them measure the shadow.
+    const int band = vshot::ShadowStyle().band();
+    const int left = band;
     const int midY = height / 2;
     QColor edgeAtMid;
-    for (int x = 0; x < 12; ++x) {
+    for (int x = left; x < left + 12; ++x) {
         const QColor candidate = canvas.pixelColor(x, midY);
         // The rim is the first opaque-but-not-the-surface pixel run; the
         // surface follows it.
@@ -395,7 +426,7 @@ void checkOuterStroke(const QString &pictures)
             break;
         }
     }
-    const QColor surface = canvas.pixelColor(8, midY);
+    const QColor surface = canvas.pixelColor(left + 8, midY);
     expect(edgeAtMid.alpha() == 255 && edgeAtMid != surface,
            "the dialog draws an edge its background does not swallow",
            QStringLiteral("edge %1 against the surface %2")
@@ -425,7 +456,131 @@ void checkOuterStroke(const QString &pictures)
     expect(surface.name() != edgeAtMid.name() && surface.name() != QStringLiteral("#ff00ff"),
            "the stroke is a rim, not a fill over the whole dialog",
            QStringLiteral("8px in: %1").arg(surface.name()));
+
+    // The shadow: the band between the window's edge and the dialog's is where
+    // it lives, and it has to be painted there -- a layer surface is clipped to
+    // the size it asks for, so a shadow drawn outside the window is a shadow
+    // nobody sees.  Read over nothing rather than over the magenta fill, since
+    // the falloff is an alpha and the fill would turn it into a colour.
+    const QImage bare = renderDialogOnNothing(dialog, 640, 420);
+    // An int rather than a QColor: a default-constructed QColor is invalid and
+    // its alpha() answers 255, so a maximum tracked in one would never be
+    // beaten by anything and every pixel would look like a solid black frame.
+    int heaviest = 0;
+    for (int x = 0; x < left; ++x) {
+        heaviest = std::max(heaviest, bare.pixelColor(x, midY).alpha());
+    }
+    expect(heaviest > 0,
+           "the dialog casts a shadow into the ring the window keeps for it",
+           QStringLiteral("heaviest in the band: alpha %1 at mid-height").arg(heaviest));
+    // A shadow is a falloff, not a slab: it is at its heaviest beside the
+    // dialog and fades to nothing by the window's edge, and no pixel of it is
+    // opaque -- an opaque band would be a black frame rather than a shadow.
+    const int atTheEdge = bare.pixelColor(0, midY).alpha();
+    expect(atTheEdge < heaviest && heaviest < 255,
+           "and it is a shadow, not a solid frame",
+           QStringLiteral("edge alpha %1, band alpha %2").arg(atTheEdge).arg(heaviest));
     delete dialog;
+}
+
+// The shadow's geometry, checked as arithmetic rather than as pixels: the band
+// is what decides how much room the window keeps and how far every repaint
+// region has to reach, and the two have to be the same number.
+void checkShadowGeometry()
+{
+    vshot::ShadowStyle shadow;
+    expect(shadow.band() == shadow.size + std::abs(shadow.offset) + 1,
+           "the band covers the blur's reach and the offset that moves it",
+           QStringLiteral("size %1, offset %2, band %3")
+               .arg(shadow.size).arg(shadow.offset).arg(shadow.band()));
+
+    // Off is off, whatever the numbers say: a user who turns the shadow off
+    // keeps the size they had tuned, and nothing is painted meanwhile.
+    vshot::ShadowStyle off = shadow;
+    off.enabled = false;
+    expect(off.band() == 0, "a shadow that is off takes no room",
+           QString::number(off.band()));
+    const vshot::ShadowBitmap none =
+        vshot::renderShadow(QSize(120, 80), 0, off, 1.0);
+    expect(none.image.isNull(), "and renders nothing");
+
+    // A zero size is a real setting too: no blur, and therefore nothing to
+    // paint either.
+    vshot::ShadowStyle flat = shadow;
+    flat.size = 0;
+    expect(flat.band() == std::abs(flat.offset) + 1,
+           "a shadow with no blur still keeps the room its offset moves it into",
+           QString::number(flat.band()));
+    expect(vshot::renderShadow(QSize(120, 80), 0, flat, 1.0).image.isNull(),
+           "but paints nothing");
+
+    // A rendered shadow is the shape's size plus the band on every side, and it
+    // is drawn at the shape's top-left less the size -- which is what puts the
+    // silhouette back on the shape rather than off by a band.
+    const vshot::ShadowBitmap bitmap =
+        vshot::renderShadow(QSize(120, 80), 0, shadow, 1.0);
+    expect(!bitmap.image.isNull(), "an ordinary shadow renders");
+    expect(bitmap.image.width() == 120 + 2 * shadow.size &&
+               bitmap.image.height() == 80 + 2 * shadow.size,
+           "the shadow is the shape plus the blur's reach on every side",
+           QStringLiteral("%1x%2").arg(bitmap.image.width()).arg(bitmap.image.height()));
+    expect(bitmap.origin == QPoint(-shadow.size, -shadow.size),
+           "and is drawn at the shape's own top-left less that reach",
+           QStringLiteral("%1,%2").arg(bitmap.origin.x()).arg(bitmap.origin.y()));
+
+    // The offset moves the shadow without changing the box: a shadow dropped
+    // further hangs lower inside the same image, which is what lets the repaint
+    // region be the same number on all four sides.
+    vshot::ShadowStyle dropped = shadow;
+    dropped.offset = 12;
+    const vshot::ShadowBitmap low = vshot::renderShadow(QSize(120, 80), 0, dropped, 1.0);
+    expect(low.image.size() == bitmap.image.size(),
+           "the offset does not change the room the shadow needs",
+           QStringLiteral("%1x%2").arg(low.image.width()).arg(low.image.height()));
+    expect(low.origin == bitmap.origin, "nor where it is drawn from");
+    // Weight below against weight above: with the shape dropped, the pixels
+    // under it are darker than the pixels over it.
+    const auto weight = [](const QImage &image, int top, int bottom) {
+        long total = 0;
+        for (int y = top; y < bottom; ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                total += qAlpha(image.pixel(x, y));
+            }
+        }
+        return total;
+    };
+    const int middle = low.image.height() / 2;
+    expect(weight(low.image, middle, low.image.height()) >
+               weight(low.image, 0, middle),
+           "and a positive offset puts the weight below the shape",
+           QStringLiteral("below %1, above %2")
+               .arg(weight(low.image, middle, low.image.height()))
+               .arg(weight(low.image, 0, middle)));
+
+    // The opacity is what the darkness comes from, so twice the alpha is a
+    // heavier shadow at the same size.
+    vshot::ShadowStyle faint = shadow;
+    faint.opacity = 40;
+    const vshot::ShadowBitmap light = vshot::renderShadow(QSize(120, 80), 0, faint, 1.0);
+    expect(weight(light.image, 0, light.image.height()) <
+               weight(bitmap.image, 0, bitmap.image.height()),
+           "a lower opacity is a lighter shadow",
+           QStringLiteral("light %1, default %2")
+               .arg(weight(light.image, 0, light.image.height()))
+               .arg(weight(bitmap.image, 0, bitmap.image.height())));
+
+    // A zero opacity paints nothing, the same as being switched off.
+    vshot::ShadowStyle invisible = shadow;
+    invisible.opacity = 0;
+    expect(vshot::renderShadow(QSize(120, 80), 0, invisible, 1.0).image.isNull(),
+           "an opacity of zero paints nothing");
+
+    // The ratio is folded in, so a 2x output gets a shadow twice the size in
+    // device pixels rather than one twice as soft.
+    const vshot::ShadowBitmap hidpi = vshot::renderShadow(QSize(120, 80), 0, shadow, 2.0);
+    expect(hidpi.image.width() == 2 * bitmap.image.width(),
+           "a 2x output renders the shadow at twice the device resolution",
+           QStringLiteral("%1 against %2").arg(hidpi.image.width()).arg(bitmap.image.width()));
 }
 
 // The frame follows the config: the radius, the weight and the colour are all
@@ -835,6 +990,7 @@ int main(int argc, char **argv)
     checkSaveDialogShape(pictures);
     checkStyleSheet(pictures);
     checkOuterStroke(pictures);
+    checkShadowGeometry();
     checkFrameFollowsConfig();
     checkSidebarPlaces(pictures);
     checkBookmarkReading();

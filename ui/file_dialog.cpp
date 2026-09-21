@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "i18n.hpp"
+#include "shadow.hpp"
 
 #include <LayerShellQt/Window>
 
@@ -22,6 +23,7 @@
 #include <QImageReader>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLayout>
 #include <QListView>
 #include <QPainter>
 #include <QPlatformSurfaceEvent>
@@ -383,7 +385,7 @@ QColor blend(const QColor &from, const QColor &to, double amount)
                   qRound(from.blue() * (1.0 - amount) + to.blue() * amount));
 }
 
-// The dialog, with its own rounded rim.
+// The dialog, with its own rounded rim and the shadow behind it.
 //
 // The rim is painted here because a stylesheet cannot supply it: a QFileDialog
 // takes the `background` out of a rule but drops the `border` of the same rule,
@@ -402,6 +404,14 @@ QColor blend(const QColor &from, const QColor &to, double amount)
 // Nothing else supplies a rim either: every vshot window is a layer surface,
 // and a layer surface gets no compositor decoration, so what is painted here is
 // the only thing separating the dialog from whatever is behind it.
+//
+// The shadow needs a margin inside the window rather than outside it: a layer
+// surface can only be as large as the size it asks the compositor for, so a
+// shadow painted past that edge would be clipped away.  The window is therefore
+// asked for the dialog's own size *plus* the shadow's reach on every side, the
+// dialog's contents are inset by the same amount, and the shadow is painted in
+// the ring that leaves.  `placeOnLayer` adds the same reach to the size it
+// requests; the two have to agree, which is why both ask `ShadowStyle::band`.
 class FramedFileDialog final : public QFileDialog {
 public:
     FramedFileDialog(const DialogPreferences &look, QWidget *parent, const QString &caption,
@@ -423,6 +433,38 @@ public:
         ink_ = palette().color(QPalette::WindowText);
     }
 
+    /// How far the dialog's own rectangle sits inside its window, in logical
+    /// pixels: the room the shadow is painted in.  Zero when the shadow is off,
+    /// and the window is then exactly the dialog.
+    int band() const { return look_.shadow.band(); }
+
+    /// Pushes the dialog's own contents in by the shadow's reach, so the ring it
+    /// is painted in holds nothing else.
+    ///
+    /// This is a method the caller has to call *after* it has finished setting
+    /// the dialog up rather than something the constructor does: QFileDialog's
+    /// own setters (accept mode, file mode, name filters) rebuild its layout and
+    /// put the margins back, so anything applied before them is lost.  It adds
+    /// to Qt's own 10px margin rather than replacing it, and is safe to call
+    /// twice -- the second call sees its own result and would double the band,
+    /// so the band applied is remembered and only the difference is added.
+    void applyBand()
+    {
+        const int band = this->band();
+        if (band == appliedBand_) {
+            return;
+        }
+        QLayout *own = layout();
+        if (own == nullptr) {
+            return;
+        }
+        const QMargins current = own->contentsMargins();
+        const int delta = band - appliedBand_;
+        own->setContentsMargins(current.left() + delta, current.top() + delta,
+                                current.right() + delta, current.bottom() + delta);
+        appliedBand_ = band;
+    }
+
 protected:
     void paintEvent(QPaintEvent *event) override
     {
@@ -434,17 +476,52 @@ protected:
         painter.fillRect(rect(), Qt::transparent);
         painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
-        const int radius = resolveDialogRadius(look_, size());
+        const int band = this->band();
+        // The dialog's own rect: the window less the ring the shadow lives in.
+        const QRectF frame = QRectF(rect()).adjusted(band, band, -band, -band);
+        const int radius = resolveDialogRadius(look_, frame.size().toSize());
         const int stroke = static_cast<int>(look_.borderWidth);
         // Half the stroke, so a stroke of any width lands with its centre line
-        // on the shape's own edge rather than bleeding outside the window.
+        // on the shape's own edge rather than bleeding outside it.
         const qreal inset = std::max<qreal>(0.0, stroke / 2.0);
-        const QRectF box = QRectF(rect()).adjusted(inset, inset, -inset, -inset);
+        const QRectF box = frame.adjusted(inset, inset, -inset, -inset);
 
         // Antialiasing is what makes the curve a curve; it is also what would
         // smudge a hairline, but a hairline is the one case where the shape is
         // a rectangle and there is no curve to smooth.
         painter.setRenderHint(QPainter::Antialiasing, radius > 0 || stroke > 1);
+
+        // The shadow, first: it belongs behind the dialog, and the dialog's own
+        // opaque surface covers all of it but the ring.
+        if (band > 0) {
+            const QSize shape = frame.size().toSize();
+            const qreal ratio = devicePixelRatioF();
+            // Built once and kept: a repaint of a dialog happens on every hover,
+            // every row of a list scrolling, every keystroke in the name box, and
+            // a blur of a 1100x720 window is not something to redo for each of
+            // them.  The key is everything the image depends on -- the size the
+            // dialog was given, its radius, and the scale -- so a resize or a
+            // config change rebuilds it and nothing else does.
+            const QString key = QStringLiteral("%1x%2/%3/%4/%5/%6/%7/%8")
+                                    .arg(shape.width())
+                                    .arg(shape.height())
+                                    .arg(radius)
+                                    .arg(look_.shadow.size)
+                                    .arg(look_.shadow.offset)
+                                    .arg(look_.shadow.opacity)
+                                    .arg(look_.shadow.enabled ? 1 : 0)
+                                    .arg(qRound(ratio * 100));
+            if (shadow_.image.isNull() || shadowKey_ != key) {
+                shadow_ = renderShadow(shape, radius, look_.shadow, ratio);
+                shadowKey_ = key;
+            }
+            if (!shadow_.image.isNull()) {
+                QImage image = shadow_.image;
+                image.setDevicePixelRatio(ratio);
+                painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+                painter.drawImage(frame.topLeft() + shadow_.origin, image);
+            }
+        }
 
         // The dialog's own surface, in the rounded shape.
         painter.setPen(Qt::NoPen);
@@ -474,7 +551,24 @@ private:
     DialogPreferences look_;
     QColor surface_;
     QColor ink_;
+    /// How much of the band this dialog has already added to its layout, so
+    /// [`applyBand`] can be called more than once without stacking up.
+    int appliedBand_ = 0;
+    /// The rendered shadow and the key it was built for; see the paint below.
+    ShadowBitmap shadow_;
+    QString shadowKey_;
 };
+
+// The room a dialog needs around itself for its shadow, in logical pixels.  A
+// helper rather than a member read because the placement code sees the dialog
+// as a plain QFileDialog: only `createFileDialog` builds the framed one, so the
+// cast always succeeds in the program, and a plain QFileDialog -- if one were
+// ever built -- simply gets no band.
+int dialogBand(const QFileDialog *dialog)
+{
+    const auto *framed = dynamic_cast<const FramedFileDialog *>(dialog);
+    return framed != nullptr ? framed->band() : 0;
+}
 
 // The dialog's own stylesheet.
 //
@@ -1055,9 +1149,18 @@ bool placeOnLayer(QFileDialog *dialog, QScreen *screen)
     // on a small screen and from growing absurd on a huge one.  The floor is
     // itself capped by the output: asking for more than the screen has would
     // only push the dialog's edges off it.
+    //
+    // These are the *dialog's* bounds; the surface is asked for them plus the
+    // ring the shadow is painted in, because a layer surface is clipped to the
+    // size it requests and the shadow would otherwise be cut off at the edge.
+    // The contents are inset by the same amount, so the dialog itself is the
+    // size these numbers say.
+    const int band = dialogBand(dialog);
     const int width = std::clamp(output.width() * 3 / 4, std::min(output.width(), 480), 1100);
     const int height = std::clamp(output.height() * 3 / 4, std::min(output.height(), 360), 720);
-    dialog->resize(width, height);
+    const int surfaceWidth = width + 2 * band;
+    const int surfaceHeight = height + 2 * band;
+    dialog->resize(surfaceWidth, surfaceHeight);
     layer->setLayer(LayerShellQt::Window::LayerOverlay);
     LayerShellQt::Window::Anchors anchors(LayerShellQt::Window::AnchorTop);
     anchors |= LayerShellQt::Window::AnchorLeft;
@@ -1072,10 +1175,10 @@ bool placeOnLayer(QFileDialog *dialog, QScreen *screen)
     layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
     layer->setActivateOnShow(true);
     layer->setScope(QLatin1String(kDialogScope));
-    layer->setDesiredSize(QSize(width, height));
+    layer->setDesiredSize(QSize(surfaceWidth, surfaceHeight));
     layer->setScreen(screen);
-    layer->setMargins(QMargins(std::max(0, (output.width() - width) / 2),
-                               std::max(0, (output.height() - height) / 2), 0, 0));
+    layer->setMargins(QMargins(std::max(0, (output.width() - surfaceWidth) / 2),
+                               std::max(0, (output.height() - surfaceHeight) / 2), 0, 0));
     return true;
 }
 
@@ -1180,6 +1283,10 @@ QFileDialog *createFileDialog(bool saving, const QString &suggestedPath)
     dialog->setStyleSheet(dialogStyleSheet(dialog));
     dressFileList(dialog);
     dressSidebar(dialog);
+    // And the ring the shadow is painted in, last: the setters above each
+    // rebuild QFileDialog's layout and put its margins back, so this is the
+    // first moment the inset survives.
+    dialog->applyBand();
     // The popups Qt raises from here on -- the address bar's completion list,
     // the file-type filter, the context menu and the rest -- each get a window
     // of their own, and the filter that keeps them from being stretched over

@@ -259,21 +259,61 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("File dialogs"), QString::fromUtf8("文件对话框")},
         {QStringLiteral("How the save and open windows are drawn. They are layer "
                         "surfaces, so the compositor draws them no decoration of its "
-                        "own and the rim below is the only edge they have."),
+                        "own and the rim and shadow below are the only things "
+                        "separating them from what is behind."),
          QString::fromUtf8("保存与打开窗口怎么画。它们是 layer surface，"
-                           "合成器不给它们画任何装饰，下面这道框就是它们唯一的边。")},
-        {QStringLiteral("Frame"), QString::fromUtf8("外框")},
+                           "合成器不给它们画任何装饰，下面这道框和阴影就是它们"
+                           "与背后内容之间唯一的东西。")},
+        {QStringLiteral("Shape"), QString::fromUtf8("形状")},
         {QStringLiteral("Corner radius"), QString::fromUtf8("圆角半径")},
-        {QStringLiteral("0 draws square corners"),
-         QString::fromUtf8("0 表示直角")},
+        {QStringLiteral("0 draws square corners; the painted corner stops at half the "
+                        "shorter side of the window"),
+         QString::fromUtf8("0 表示直角；实际画的圆角不会超过窗口短边的一半")},
+        {QStringLiteral("Frame"), QString::fromUtf8("外框")},
         {QStringLiteral("Border width"), QString::fromUtf8("边框宽度")},
         {QStringLiteral("0 draws no border at all"),
          QString::fromUtf8("0 表示完全不画边框")},
         {QStringLiteral("Border color"), QString::fromUtf8("边框颜色")},
         {QStringLiteral("Automatic derives one from the colour scheme"),
          QString::fromUtf8("自动：按配色方案推导")},
+        // The shadow's four rows are shared by the pin page and the file-dialog
+        // page, so each string here is the one both pages show.
+        {QStringLiteral("Shadow"), QString::fromUtf8("阴影")},
+        {QStringLiteral("Lifts it off whatever is behind it"),
+         QString::fromUtf8("把它从背后的内容上抬起来")},
+        {QStringLiteral("A soft shadow behind every one; turn it off for a hard edge"),
+         QString::fromUtf8("身后一道柔和的阴影；关掉就是硬边")},
+        {QStringLiteral("Shadow size"), QString::fromUtf8("阴影大小")},
+        {QStringLiteral("How far the blur reaches past the edge; 0 turns the blur off"),
+         QString::fromUtf8("模糊向外扩多远；0 表示不做模糊")},
+        {QStringLiteral("Shadow offset"), QString::fromUtf8("阴影偏移")},
+        {QStringLiteral("Drops the shadow below the edge; a negative value lifts it above"),
+         QString::fromUtf8("把阴影往下压；负数则往上抬")},
+        {QStringLiteral("Shadow opacity"), QString::fromUtf8("阴影浓度")},
+        {QStringLiteral("0-255; the blur spreads this rather than adding to it"),
+         QString::fromUtf8("0-255；模糊只是把它摊开，不会加深")},
         {QStringLiteral("Follow the colour scheme instead of a colour of its own"),
          QString::fromUtf8("跟随配色方案，不用自己的颜色")},
+        {QStringLiteral("Pin appearance"), QString::fromUtf8("Pin 浮层")},
+        {QStringLiteral("How a pinned image is drawn. A pin is a layer surface with "
+                        "nothing but the image in it, so its corners, the shadow "
+                        "behind it and the line around it are all vshot's to draw."),
+         QString::fromUtf8("pin 图怎么画。pin 是只装着图片的 layer surface，"
+                           "所以它的圆角、身下的阴影和外面那道线都得 vshot 自己画。")},
+        {QStringLiteral("0 draws square corners, which is what a screenshot usually wants"),
+         QString::fromUtf8("0 表示直角，截图一般就该是直角")},
+        {QStringLiteral("0 draws square corners, which is what a screenshot usually wants; the "
+                        "painted corner stops at half the shorter side of the image"),
+         QString::fromUtf8("0 表示直角，截图一般就该是直角；实际画的圆角不会超过图片短边的一半")},
+        {QStringLiteral("Border"), QString::fromUtf8("边框")},
+        {QStringLiteral("0 draws no border at all"), QString::fromUtf8("0 表示完全不画边框")},
+        {QStringLiteral("Automatic uses the built-in light grey"),
+         QString::fromUtf8("自动：用内置的浅灰")},
+        {QStringLiteral("Active border color"), QString::fromUtf8("激活时边框颜色")},
+        {QStringLiteral("The pin the keyboard would act on; automatic uses black"),
+         QString::fromUtf8("键盘会作用到的那张 pin；自动即黑色")},
+        {QStringLiteral("Use the built-in colour instead of one of its own"),
+         QString::fromUtf8("用内置颜色，不用自己的颜色")},
     };
     return table;
 }

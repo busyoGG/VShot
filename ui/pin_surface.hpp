@@ -1,7 +1,9 @@
 #pragma once
 
 #include "color_card.hpp"
+#include "shadow.hpp"
 
+#include <QColor>
 #include <QHash>
 #include <QImage>
 #include <QPoint>
@@ -12,6 +14,8 @@
 #include <QWidget>
 
 #include <functional>
+
+#include <cstdint>
 
 class QScreen;
 
@@ -59,6 +63,32 @@ public:
     };
 
     explicit PinSurface(QScreen *screen);
+
+    // How a pin is drawn: its corners, the shadow behind it and the stroke
+    // around it.  Every value here is already resolved -- the config layer
+    // decides what an absent setting means -- because a surface has no business
+    // reading a preferences file, and two surfaces on two outputs have to agree
+    // on what they are drawing.
+    //
+    // The radius is a wish rather than a promise: a corner wider than half the
+    // image would turn it into a lozenge, so it is clamped against the size the
+    // pin actually has, which changes with every zoom step.
+    struct Style {
+        std::uint32_t radius = 0;
+        /// The shadow behind every pin.  A whole `ShadowStyle` rather than a
+        /// flag, because its size, its offset and its darkness are the user's
+        /// to tune; `enabled` is the master switch.
+        ShadowStyle shadow;
+        std::uint32_t borderWidth = 2;
+        /// Stroke of a pin the keyboard would not act on.
+        QColor borderColor{192, 192, 192};
+        /// Stroke of the pin the keyboard would act on.
+        QColor activeBorderColor{0, 0, 0};
+    };
+
+    /// Replaces the look of every pin this surface paints.  Called before the
+    /// first pin arrives and again when the daemon reloads its config.
+    void setStyle(const Style &style);
 
     // Maps the widget onto its layer-shell surface. Returns false when
     // LayerShellQt is unavailable.
@@ -152,6 +182,12 @@ private:
         QImage render;
         qint64 renderKey = 0; // source cache key the copy was made from
         QSize renderTarget;   // device-pixel size the copy was made for
+        // The shadow under this pin, at this surface's device resolution, and
+        // the key it was built for.  A 4K pin's shadow is worth keeping across
+        // the frames of a drag, and a zoom step is the only thing that changes
+        // the key.
+        QImage shadow;
+        QString shadowKey;
     };
 
     // The image's rect in output-local logical pixels.
@@ -184,6 +220,16 @@ private:
     // filter, which softens a 4K capture pinned on a 1080p output. Scaling
     // once here uses Qt's area filter instead.
     const QImage &renderSource(Entry &entry);
+    // Paints the shadow under one pin, building it on first use and re-using it
+    // while the pin's size and radius are unchanged.
+    void paintShadow(QPainter &painter, Entry &entry, const QRect &target, int radius);
+    // How far this surface's paint reaches past a pin's own rect, which is what
+    // every repaint region has to be grown by.  Depends on the style, so it is
+    // asked for rather than being a constant.
+    int bleed() const;
+    // A pin's rect grown by [`bleed`], i.e. the region that has to be repainted
+    // when the pin moves, changes or goes away.
+    QRect dirtyRect(const QRect &pin) const;
     // The id of the frontmost pin whose rect covers `local`, 0 for none.
     quint64 pinAt(const QPoint &local) const;
     // The entry of a pin, null when this output does not show it.
@@ -234,6 +280,7 @@ private:
     void activateRow(int row);
 
     QVector<Entry> entries_;
+    Style style_;
     QScreen *screen_;
     std::function<void(quint64)> picked_;
     std::function<void(quint64, QPoint)> dragMoved_;

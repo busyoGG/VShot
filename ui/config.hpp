@@ -1,5 +1,7 @@
 #pragma once
 
+#include "shadow.hpp"
+
 #include <QColor>
 #include <QPalette>
 #include <QSize>
@@ -57,8 +59,9 @@ struct CliPreferences {
 ///
 /// These live in the config file rather than in the dialog's code because the
 /// dialog is a layer surface: a compositor draws no decoration on one, so the
-/// rim this describes is the only thing separating the dialog from whatever is
-/// behind it, and how heavy it should be is the user's call rather than ours.
+/// rim and the shadow this describes are the only things separating the dialog
+/// from whatever is behind it, and how heavy they should be is the user's call
+/// rather than ours.
 struct DialogPreferences {
     /// Corner radius, in logical pixels.  Zero is a plain rectangle.
     std::uint32_t radius = 12;
@@ -68,13 +71,68 @@ struct DialogPreferences {
     /// palette" -- which is what follows a light or dark colour scheme without
     /// the user having to spell out a colour for each.
     QColor borderColor;
+    /// The shadow the dialog casts, in the same terms a pin's is described in:
+    /// one set of numbers for both, so tuning one does not mean learning a
+    /// second vocabulary for the other.
+    ShadowStyle shadow;
 };
 
-/// Both sections of the shared config file.
+/// The ceiling on a pin's corner radius and on its border width, in logical
+/// pixels.  They live here rather than in `config.cpp` because the settings
+/// window has to offer the same range the loader accepts: a value the file
+/// takes but the window cannot show would come back clamped the next time that
+/// page was saved.
+constexpr int kMaxPinRadius = 512;
+constexpr int kMaxPinBorderWidth = 8;
+/// The same ceilings for the file dialog's frame.  They live beside the pin's
+/// for the same reason: the settings window has to offer the range the loader
+/// accepts, and a hand-written value past what the window can show would come
+/// back clamped the next time that page was saved.
+constexpr int kMaxDialogRadius = 48;
+constexpr int kMaxDialogBorderWidth = 8;
+/// The same ceilings for a shadow's blur reach, its drop, and its alpha.  They
+/// are shared by the pin and the dialog, which is the point: one pair of
+/// numbers describes both, and the settings window offers one range for each.
+constexpr int kMaxShadowSize = 64;
+constexpr int kMaxShadowOffset = 32;
+constexpr int kMaxShadowOpacity = 255;
+
+/// The look of a pinned image.
+///
+/// A pin has no decoration from anyone else either -- it is a layer surface
+/// with nothing but the image in it -- so its corners, the shadow that lifts it
+/// off what is behind it and the stroke that says where it ends are all ours to
+/// draw, and how much of each is a matter of what the user has on screen behind
+/// them.
+///
+/// This is a different thing from `cli.pin`, which is the *density* a capture
+/// is pinned at; that one is a command-line default, this one is how the result
+/// looks.
+struct PinPreferences {
+    /// Corner radius in logical pixels.  Zero -- the default -- draws square
+    /// corners, which is what a screenshot wants: it is a picture of a window,
+    /// not a card.
+    std::uint32_t radius = 0;
+    /// The soft shadow behind every pin, on by default: a screenshot pinned
+    /// over a window of its own colour is otherwise impossible to place.
+    ShadowStyle shadow;
+    /// Stroke width of the rim, in logical pixels.  Zero draws no rim at all.
+    std::uint32_t borderWidth = 2;
+    /// The rim's colour on every pin that is not the one the keyboard would act
+    /// on.  The default is invalid, meaning the built-in light grey.
+    QColor borderColor;
+    /// The rim's colour on the pin the keyboard would act on -- the one the
+    /// user last clicked on this output.  The default is invalid, meaning the
+    /// built-in black.
+    QColor activeBorderColor;
+};
+
+/// Every section of the shared config file.
 struct Config {
     EditorPreferences editor;
     CliPreferences cli;
     DialogPreferences dialog;
+    PinPreferences pin;
 };
 
 /// The absolute path of the config file: `$XDG_CONFIG_HOME/vshot/config.json`,
@@ -115,6 +173,18 @@ bool saveEditorPreferences(const EditorPreferences &preferences);
 
 /// The file dialogs' half of [`loadConfig`].
 DialogPreferences loadDialogPreferences();
+
+/// The pins' half of [`loadConfig`].
+PinPreferences loadPinPreferences();
+
+/// The rim colour a pin uses in one of its two states: the user's own when the
+/// file carries one, and otherwise the built-in.  Read through one function so
+/// "which colour is this pin" cannot be answered two ways in two places.
+///
+/// The corner radius has no such reader: it is clamped against the painted
+/// image's size, which only the surface knows -- see `paintRadius` in
+/// `pin_surface.cpp`.
+QColor resolvePinBorderColor(const PinPreferences &preferences, bool active);
 
 /// The radius a dialog should use, never past what its own size can carry.  A
 /// corner wider than half the shorter side would turn the rim inside out, which

@@ -30,6 +30,7 @@
 #include "i18n.hpp"
 
 #include <QApplication>
+#include <QAbstractButton>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDialog>
@@ -278,6 +279,43 @@ private:
     }
 };
 
+/// A two-state switch: a pill that slides rather than a tick box.
+///
+/// Drawn here for the same reason the chevrons are -- the platform's check
+/// indicator is a beveled box that belongs to a different decade than the rest
+/// of this window -- and because a switch reads as "this is on" at a glance in
+/// a row where the label is already carrying the meaning.
+class ModernSwitch final : public QAbstractButton {
+public:
+    explicit ModernSwitch(QWidget *parent = nullptr)
+        : QAbstractButton(parent)
+    {
+        setCheckable(true);
+        setCursor(Qt::PointingHandCursor);
+        setFixedWidth(44);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        const qreal height = 22.0;
+        const QRectF track(0.0, (this->height() - height) / 2.0, width(), height);
+        const qreal radius = height / 2.0;
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(isChecked() ? QColor(kAccent) : QColor(kControlBorder));
+        painter.drawRoundedRect(track, radius, radius);
+        // The knob: inset from the track, and at whichever end the state says.
+        const qreal inset = 3.0;
+        const qreal knob = height - 2 * inset;
+        const qreal x = isChecked() ? track.right() - inset - knob : track.left() + inset;
+        painter.setBrush(isChecked() ? QColor(kAccentInk) : QColor(kInkDim));
+        painter.drawEllipse(QRectF(x, track.top() + inset, knob, knob));
+    }
+};
+
 /// A combo box whose entries are the same names the config file accepts, with
 /// a leading entry for "the file says nothing".
 ModernComboBox *choiceBox(QWidget *parent, const QStringList &values, const QString &emptyLabel)
@@ -505,6 +543,75 @@ void addPageHeading(QWidget *page, const QString &title, const QString &hint)
     pageLayout->addWidget(header);
 }
 
+/// The four rows that describe a shadow, on whichever card they are given.
+///
+/// A pin and a file dialog cast the same shadow -- the config file describes
+/// both with one set of keys -- so the rows are built once and used twice
+/// rather than written out twice and left to drift apart.  `prefix` is what
+/// keeps their object names apart, which is what the offline check drives them
+/// by; it also keeps the two sets of spin boxes from being wired to the same
+/// member by a copy-paste.
+struct ShadowControls {
+    ModernSwitch *enabled = nullptr;
+    ModernSpinBox *size = nullptr;
+    ModernSpinBox *offset = nullptr;
+    ModernSpinBox *opacity = nullptr;
+
+    void build(QWidget *card, const ShadowStyle &shadow, const QString &prefix)
+    {
+        enabled = new ModernSwitch(card);
+        enabled->setObjectName(prefix + QStringLiteral("Shadow"));
+        enabled->setChecked(shadow.enabled);
+        enabled->setToolTip(uiTr("Lifts it off whatever is behind it"));
+        addRow(card, uiTr("Shadow"),
+               uiTr("A soft shadow behind every one; turn it off for a hard edge"),
+               enabled, true);
+
+        size = new ModernSpinBox(card);
+        size->setObjectName(prefix + QStringLiteral("ShadowSize"));
+        size->setRange(0, static_cast<int>(kMaxShadowSize));
+        size->setMinimumWidth(120);
+        size->setValue(shadow.size);
+        size->setSuffix(uiTr(" px"));
+        addRow(card, uiTr("Shadow size"),
+               uiTr("How far the blur reaches past the edge; 0 turns the blur off"),
+               size, false);
+
+        // The one control in this window that takes a negative number: the
+        // offset is what says which way the light comes from, and a shadow
+        // above the shape is a shadow cast by something below it.
+        offset = new ModernSpinBox(card);
+        offset->setObjectName(prefix + QStringLiteral("ShadowOffset"));
+        offset->setRange(-static_cast<int>(kMaxShadowOffset),
+                         static_cast<int>(kMaxShadowOffset));
+        offset->setMinimumWidth(120);
+        offset->setValue(shadow.offset);
+        offset->setSuffix(uiTr(" px"));
+        addRow(card, uiTr("Shadow offset"),
+               uiTr("Drops the shadow below the edge; a negative value lifts it above"),
+               offset, false);
+
+        opacity = new ModernSpinBox(card);
+        opacity->setObjectName(prefix + QStringLiteral("ShadowOpacity"));
+        opacity->setRange(0, static_cast<int>(kMaxShadowOpacity));
+        opacity->setMinimumWidth(120);
+        opacity->setValue(shadow.opacity);
+        addRow(card, uiTr("Shadow opacity"),
+               uiTr("0-255; the blur spreads this rather than adding to it"),
+               opacity, false);
+    }
+
+    ShadowStyle read() const
+    {
+        ShadowStyle shadow;
+        shadow.enabled = enabled->isChecked();
+        shadow.size = size->value();
+        shadow.offset = offset->value();
+        shadow.opacity = opacity->value();
+        return shadow;
+    }
+};
+
 /// The sidebar's section icons, drawn here rather than shipped as files, the
 /// way the toolbar draws its own.
 QIcon sectionIcon(int index, const QColor &color)
@@ -530,7 +637,7 @@ QIcon sectionIcon(int index, const QColor &color)
         painter.drawLine(QPointF(4.0, 5.5), QPointF(8.0, 9.0));
         painter.drawLine(QPointF(8.0, 9.0), QPointF(4.0, 12.5));
         painter.drawLine(QPointF(10.0, 13.0), QPointF(15.0, 13.0));
-    } else {
+    } else if (index == 2) {
         // A window with a rounded top-left corner and a title strip: the
         // file dialog's own shape, which is what this section configures.
         QPainterPath frame;
@@ -542,6 +649,13 @@ QIcon sectionIcon(int index, const QColor &color)
         frame.closeSubpath();
         painter.drawPath(frame);
         painter.drawLine(QPointF(3.0, 7.0), QPointF(15.0, 7.0));
+    } else {
+        // A pushpin: the pin overlay, which is what this section configures.
+        painter.drawLine(QPointF(9.0, 3.0), QPointF(15.0, 3.0));
+        painter.drawLine(QPointF(12.0, 3.0), QPointF(12.0, 8.5));
+        painter.drawLine(QPointF(12.0, 8.5), QPointF(15.0, 11.0));
+        painter.drawLine(QPointF(15.0, 11.0), QPointF(9.0, 11.0));
+        painter.drawLine(QPointF(9.0, 11.0), QPointF(9.0, 16.0));
     }
     return QIcon(pixmap);
 }
@@ -587,12 +701,15 @@ public:
                                               uiTr("Command-line defaults")));
         sidebar_->addItem(new QListWidgetItem(sectionIcon(2, QColor(kInkDim)),
                                               uiTr("File dialogs")));
+        sidebar_->addItem(new QListWidgetItem(sectionIcon(3, QColor(kInkDim)),
+                                              uiTr("Pin appearance")));
         bodyLayout->addWidget(sidebar_, 0);
 
         pages_ = new QStackedWidget(body);
         pages_->addWidget(buildEditorPage());
         pages_->addWidget(buildCliPage());
         pages_->addWidget(buildDialogPage());
+        pages_->addWidget(buildPinPage());
         bodyLayout->addWidget(pages_, 1);
 
         connect(sidebar_, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -877,55 +994,186 @@ private:
         addPageHeading(page, uiTr("File dialogs"),
                        uiTr("How the save and open windows are drawn. They are layer "
                             "surfaces, so the compositor draws them no decoration of its "
-                            "own and the rim below is the only edge they have."));
+                            "own and the rim and shadow below are the only things "
+                            "separating them from what is behind."));
 
-        QWidget *frame = addCard(page, uiTr("Frame"));
+        QWidget *shape = addCard(page, uiTr("Shape"));
         // Both spin boxes stop at 0 and say what that means, rather than using
         // the optional-spin shape the CLI page uses: there is no "unset" here,
         // only a size, and 0 is a legitimate one for each.
-        radiusSpin_ = new QSpinBox(frame);
-        radiusSpin_->setObjectName(QStringLiteral("dialogRadius"));
-        radiusSpin_->setRange(0, 48);
-        radiusSpin_->setMinimumWidth(120);
-        radiusSpin_->setValue(static_cast<int>(config_.dialog.radius));
-        radiusSpin_->setSuffix(uiTr(" px"));
-        addRow(frame, uiTr("Corner radius"),
-               uiTr("0 draws square corners"), radiusSpin_, true);
+        //
+        // The ceiling is the config layer's, not a round number picked here: a
+        // value the file accepts has to be reachable from the window, or a
+        // hand-written radius would come back clamped the next time this page
+        // was saved.
+        dialogRadiusSpin_ = new ModernSpinBox(shape);
+        dialogRadiusSpin_->setObjectName(QStringLiteral("dialogRadius"));
+        dialogRadiusSpin_->setRange(0, static_cast<int>(kMaxDialogRadius));
+        dialogRadiusSpin_->setMinimumWidth(120);
+        dialogRadiusSpin_->setValue(static_cast<int>(config_.dialog.radius));
+        dialogRadiusSpin_->setSuffix(uiTr(" px"));
+        addRow(shape, uiTr("Corner radius"),
+               uiTr("0 draws square corners; the painted corner stops at half the "
+                    "shorter side of the window"),
+               dialogRadiusSpin_, true);
 
-        borderWidthSpin_ = new QSpinBox(frame);
-        borderWidthSpin_->setObjectName(QStringLiteral("dialogBorderWidth"));
-        borderWidthSpin_->setRange(0, 8);
-        borderWidthSpin_->setMinimumWidth(120);
-        borderWidthSpin_->setValue(static_cast<int>(config_.dialog.borderWidth));
-        borderWidthSpin_->setSuffix(uiTr(" px"));
+        QWidget *frame = addCard(page, uiTr("Frame"));
+        dialogBorderWidthSpin_ = new ModernSpinBox(frame);
+        dialogBorderWidthSpin_->setObjectName(QStringLiteral("dialogBorderWidth"));
+        dialogBorderWidthSpin_->setRange(0, static_cast<int>(kMaxDialogBorderWidth));
+        dialogBorderWidthSpin_->setMinimumWidth(120);
+        dialogBorderWidthSpin_->setValue(static_cast<int>(config_.dialog.borderWidth));
+        dialogBorderWidthSpin_->setSuffix(uiTr(" px"));
         addRow(frame, uiTr("Border width"),
-               uiTr("0 draws no border at all"), borderWidthSpin_, false);
+               uiTr("0 draws no border at all"), dialogBorderWidthSpin_, true);
 
         borderColorButton_ = new ColorButton(frame, uiTr("Border color"));
+        borderColorButton_->setObjectName(QStringLiteral("dialogBorderColorButton"));
         borderColorButton_->onColorChanged = [this](const QColor &chosen) {
             borderColor_ = chosen;
         };
         setBorderColor(config_.dialog.borderColor);
-        autoClear_ = new QPushButton(uiTr("Automatic"), frame);
-        autoClear_->setObjectName(QStringLiteral("clearColor"));
-        autoClear_->setFixedHeight(kControlHeight);
-        autoClear_->setToolTip(
-            uiTr("Follow the colour scheme instead of a colour of its own"));
+        autoClear_ = automaticButton(frame);
+        autoClear_->setObjectName(QStringLiteral("dialogBorderColorClear"));
         connect(autoClear_, &QPushButton::clicked, this, [this] {
             // An invalid colour is exactly how the config says "derive one",
             // so clearing the button is clearing the setting.
             setBorderColor(QColor());
         });
-        auto *colorRow = new QWidget(frame);
-        auto *colorRowLayout = new QHBoxLayout(colorRow);
-        colorRowLayout->setContentsMargins(0, 0, 0, 0);
-        colorRowLayout->setSpacing(8);
-        colorRowLayout->addWidget(borderColorButton_);
-        colorRowLayout->addWidget(autoClear_);
         addRow(frame, uiTr("Border color"),
-               uiTr("Automatic derives one from the colour scheme"), colorRow, false);
+               uiTr("Automatic derives one from the colour scheme"),
+               colorRow(borderColorButton_, autoClear_), false);
+
+        // The shadow shares its card with the rim because the two are one
+        // thing to look at: the rim is where the dialog ends and the shadow is
+        // what it casts, and a user tuning one is looking at the other.
+        QWidget *shadow = addCard(page, uiTr("Shadow"));
+        dialogShadow_.build(shadow, config_.dialog.shadow, QStringLiteral("dialog"));
 
         return scroll;
+    }
+
+    QWidget *buildPinPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("Pin appearance"),
+                       uiTr("How a pinned image is drawn. A pin is a layer surface with "
+                            "nothing but the image in it, so its corners, the shadow "
+                            "behind it and the line around it are all vshot's to draw."));
+
+        QWidget *shape = addCard(page, uiTr("Shape"));
+        // The radius has no "unset" state, unlike the CLI page's options: zero
+        // is the default and means square corners, which is what a screenshot
+        // wants. So this is a plain spin box that stops at zero and says what
+        // that means, the way the dialog page's pair does.
+        //
+        // The ceiling is the config layer's, not a round number picked here: a
+        // value the file accepts has to be reachable from the window, or a
+        // hand-written radius would come back clamped the next time this page
+        // was saved.
+        pinRadiusSpin_ = new ModernSpinBox(shape);
+        pinRadiusSpin_->setObjectName(QStringLiteral("pinRadius"));
+        pinRadiusSpin_->setRange(0, static_cast<int>(vshot::kMaxPinRadius));
+        pinRadiusSpin_->setMinimumWidth(120);
+        pinRadiusSpin_->setValue(static_cast<int>(config_.pin.radius));
+        pinRadiusSpin_->setSuffix(uiTr(" px"));
+        addRow(shape, uiTr("Corner radius"),
+               uiTr("0 draws square corners, which is what a screenshot usually wants; the "
+                    "painted corner stops at half the shorter side of the image"),
+               pinRadiusSpin_, true);
+
+        // The shadow gets a card of its own rather than sitting in the shape
+        // card: it is four rows, and it is the same four rows the file dialog
+        // page has, so the two read alike.
+        QWidget *shadow = addCard(page, uiTr("Shadow"));
+        pinShadow_.build(shadow, config_.pin.shadow, QStringLiteral("pin"));
+
+        QWidget *frame = addCard(page, uiTr("Border"));
+        pinBorderWidthSpin_ = new ModernSpinBox(frame);
+        pinBorderWidthSpin_->setObjectName(QStringLiteral("pinBorderWidth"));
+        pinBorderWidthSpin_->setRange(0, static_cast<int>(vshot::kMaxPinBorderWidth));
+        pinBorderWidthSpin_->setMinimumWidth(120);
+        pinBorderWidthSpin_->setValue(static_cast<int>(config_.pin.borderWidth));
+        pinBorderWidthSpin_->setSuffix(uiTr(" px"));
+        addRow(frame, uiTr("Border width"),
+               uiTr("0 draws no border at all"), pinBorderWidthSpin_, true);
+
+        // Two colours, because a pin has two states and the colour is how it
+        // says which one it is in: the picked pin -- the one a key press would
+        // reach -- against every other.
+        pinBorderColorButton_ = new ColorButton(frame, uiTr("Border color"));
+        pinBorderColorButton_->setObjectName(QStringLiteral("pinBorderColorButton"));
+        pinBorderColorButton_->onColorChanged = [this](const QColor &chosen) {
+            pinBorderColor_ = chosen;
+        };
+        setPinColor(false, config_.pin.borderColor);
+        auto *clearBorder = automaticButton(frame);
+        clearBorder->setObjectName(QStringLiteral("pinBorderColorClear"));
+        connect(clearBorder, &QPushButton::clicked, this, [this] {
+            setPinColor(false, QColor());
+        });
+        addRow(frame, uiTr("Border color"),
+               uiTr("Automatic uses the built-in light grey"), colorRow(pinBorderColorButton_,
+                                                                         clearBorder),
+               false);
+
+        pinActiveColorButton_ = new ColorButton(frame, uiTr("Active border color"));
+        pinActiveColorButton_->setObjectName(QStringLiteral("pinActiveColorButton"));
+        pinActiveColorButton_->onColorChanged = [this](const QColor &chosen) {
+            pinActiveColorColor_ = chosen;
+        };
+        setPinColor(true, config_.pin.activeBorderColor);
+        auto *clearActive = automaticButton(frame);
+        clearActive->setObjectName(QStringLiteral("pinActiveColorClear"));
+        connect(clearActive, &QPushButton::clicked, this, [this] {
+            setPinColor(true, QColor());
+        });
+        addRow(frame, uiTr("Active border color"),
+               uiTr("The pin the keyboard would act on; automatic uses black"),
+               colorRow(pinActiveColorButton_, clearActive), false);
+
+        return scroll;
+    }
+
+    /// A colour button plus the button that gives it back to the built-in
+    /// colour, laid out as one control for [`addRow`].
+    QWidget *colorRow(ColorButton *button, QPushButton *clear)
+    {
+        auto *row = new QWidget(button->parentWidget());
+        auto *layout = new QHBoxLayout(row);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(8);
+        button->setParent(row);
+        clear->setParent(row);
+        layout->addWidget(button);
+        layout->addWidget(clear);
+        return row;
+    }
+
+    QPushButton *automaticButton(QWidget *parent)
+    {
+        auto *button = new QPushButton(uiTr("Automatic"), parent);
+        button->setObjectName(QStringLiteral("clearColor"));
+        button->setFixedHeight(kControlHeight);
+        button->setToolTip(uiTr("Use the built-in colour instead of one of its own"));
+        return button;
+    }
+
+    /// Shows one of the pin's two rim colours, or the automatic state when
+    /// `color` is invalid.  The pair share this so the two rows cannot be wired
+    /// the same one by accident.
+    void setPinColor(bool active, const QColor &color)
+    {
+        ColorButton *button = active ? pinActiveColorButton_ : pinBorderColorButton_;
+        (active ? pinActiveColorColor_ : pinBorderColor_) = color;
+        if (color.isValid()) {
+            button->setColor(color);
+        } else {
+            button->setText(uiTr("Automatic"));
+            button->setIcon(QIcon());
+        }
+        button->setEnabled(true);
     }
 
     /// Shows a rim colour, or the automatic state when `color` is invalid.
@@ -973,9 +1221,19 @@ private:
         cli.longInject = injectBox_->currentData().toString();
 
         DialogPreferences &dialog = config.dialog;
-        dialog.radius = static_cast<std::uint32_t>(std::max(0, radiusSpin_->value()));
-        dialog.borderWidth = static_cast<std::uint32_t>(std::max(0, borderWidthSpin_->value()));
+        dialog.radius =
+            static_cast<std::uint32_t>(std::max(0, dialogRadiusSpin_->value()));
+        dialog.borderWidth =
+            static_cast<std::uint32_t>(std::max(0, dialogBorderWidthSpin_->value()));
         dialog.borderColor = borderColor_;
+        dialog.shadow = dialogShadow_.read();
+
+        PinPreferences &pin = config.pin;
+        pin.radius = static_cast<std::uint32_t>(std::max(0, pinRadiusSpin_->value()));
+        pin.shadow = pinShadow_.read();
+        pin.borderWidth = static_cast<std::uint32_t>(std::max(0, pinBorderWidthSpin_->value()));
+        pin.borderColor = pinBorderColor_;
+        pin.activeBorderColor = pinActiveColorColor_;
 
         if (!saveConfig(config)) {
             status_->setProperty("error", true);
@@ -986,10 +1244,14 @@ private:
         }
         config_ = config;
         status_->setProperty("error", false);
+        // The window stays open on purpose: saving is not dismissing.  The
+        // settings are meant to be tried and re-tried -- change a colour, save,
+        // look at the result, come back and change it again -- and a window
+        // that vanished on every save would have to be reopened for each one.
+        // Cancel still closes it, and now means only "close".
         status_->setText(uiTr("Saved."));
         status_->style()->unpolish(status_);
         status_->style()->polish(status_);
-        accept();
     }
 
     Config config_;
@@ -1014,11 +1276,19 @@ private:
     QSpinBox *timeoutSpin_ = nullptr;
     QSpinBox *ignoreTopSpin_ = nullptr;
     QComboBox *injectBox_ = nullptr;
-    QSpinBox *radiusSpin_ = nullptr;
-    QSpinBox *borderWidthSpin_ = nullptr;
+    ModernSpinBox *dialogRadiusSpin_ = nullptr;
+    ModernSpinBox *dialogBorderWidthSpin_ = nullptr;
+    ShadowControls dialogShadow_;
     ColorButton *borderColorButton_ = nullptr;
     QPushButton *autoClear_ = nullptr;
     QColor borderColor_;
+    ModernSpinBox *pinRadiusSpin_ = nullptr;
+    ShadowControls pinShadow_;
+    ModernSpinBox *pinBorderWidthSpin_ = nullptr;
+    ColorButton *pinBorderColorButton_ = nullptr;
+    ColorButton *pinActiveColorButton_ = nullptr;
+    QColor pinBorderColor_;
+    QColor pinActiveColorColor_;
     QLabel *status_ = nullptr;
 };
 

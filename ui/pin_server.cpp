@@ -1,6 +1,7 @@
 #include "pin_density.hpp"
 #include "pin_server.hpp"
 #include "color_card.hpp"
+#include "config.hpp"
 #include "i18n.hpp"
 #include "pin_surface.hpp"
 #include "text_card.hpp"
@@ -972,6 +973,9 @@ wl-clipboard package"));
             armIdleQuit();
             return error(QStringLiteral("could not create a layer-shell pin surface"));
         }
+        // The look is taken from the file as it is now: the daemon may have been
+        // up since before the user changed it.
+        reloadStyle();
         // Appended, so it is painted last: a new pin lands in front of the pins
         // that were already there.
         pins_.push_back(pin);
@@ -1334,6 +1338,29 @@ wl-clipboard package"));
         return std::max(dx, dy);
     }
 
+    // How the pins are drawn, read from the config file.  An absent colour
+    // means "the built-in one", the same resolution the dialog's rim does.
+    //
+    // This is re-read rather than cached for the daemon's whole life: the
+    // daemon stays up for as long as anything is pinned, so a user who edits
+    // the file (or saves in the settings window) gets the look they just asked
+    // for on the next pin they add.  Every surface is handed the same style, so
+    // two outputs can never disagree about what a pin looks like.
+    void reloadStyle()
+    {
+        const PinPreferences preferences = loadPinPreferences();
+        style_.radius = preferences.radius;
+        style_.shadow = preferences.shadow;
+        style_.borderWidth = preferences.borderWidth;
+        style_.borderColor = resolvePinBorderColor(preferences, false);
+        style_.activeBorderColor = resolvePinBorderColor(preferences, true);
+        for (const QPointer<PinSurface> &surface : surfaces_) {
+            if (surface != nullptr) {
+                surface->setStyle(style_);
+            }
+        }
+    }
+
     // Creates the stack's surface on one output.
     void addSurface(QScreen *screen)
     {
@@ -1341,6 +1368,7 @@ wl-clipboard package"));
             return;
         }
         auto *surface = new PinSurface(screen);
+        surface->setStyle(style_);
         // Every gesture names the pin it is about: the surface paints and
         // hit-tests the whole stack, so the daemon looks the pin up by id.
         surface->setPickCallback([this](quint64 id) {
@@ -1564,6 +1592,10 @@ wl-clipboard package"));
     // a surface can be dismissed by the compositor on its own (an output going
     // away), which would leave a bare pointer behind.
     QHash<QScreen *, QPointer<PinSurface>> surfaces_;
+    // The look every surface is drawing, kept so a surface created later (a new
+    // output, or the first pin after the daemon has been idle) starts from the
+    // same style as the ones already up.
+    PinSurface::Style style_;
     quint64 nextId_ = 1;
     Pin *editingPin_ = nullptr;
     bool allVisible_ = true;

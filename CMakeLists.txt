@@ -35,6 +35,8 @@ add_executable(vshot-qt-ui
     ui/pin_server.hpp
     ui/file_dialog.cpp
     ui/file_dialog.hpp
+    ui/shadow.cpp
+    ui/shadow.hpp
     ui/text_card.cpp
     ui/text_card.hpp
 )
@@ -99,6 +101,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/settings_window.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shadow.cpp
+        ui/shadow.hpp
         ui/i18n.cpp
         ui/i18n.hpp
     )
@@ -153,6 +157,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/pin_surface.hpp
         ui/i18n.cpp
         ui/i18n.hpp
+        ui/shadow.cpp
+        ui/shadow.hpp
     )
     target_link_libraries(vshot-pin-outline-check PRIVATE
         Qt6::Core
@@ -194,6 +200,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/color_card.hpp
         ui/i18n.cpp
         ui/i18n.hpp
+        ui/shadow.cpp
+        ui/shadow.hpp
     )
     target_link_libraries(vshot-pin-menu-check PRIVATE
         Qt6::Core
@@ -247,6 +255,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/file_dialog_check.cpp
         ui/file_dialog.cpp
         ui/file_dialog.hpp
+        ui/shadow.cpp
+        ui/shadow.hpp
         ui/config.cpp
         ui/config.hpp
         ui/text_size.hpp

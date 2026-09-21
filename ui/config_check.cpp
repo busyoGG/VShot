@@ -207,7 +207,8 @@ void checkSettingsSaveKeepsWhatItDoesNotOwn()
         "editor": {"tool": "arrow"},
         "cli": {"png-compression": "high", "future-key": 7,
                 "long": {"notches": 2, "future-long-key": 9},
-                "pin": {"density": 2, "future-pin-key": 3}}
+                "pin": {"density": 2, "future-pin-key": 3}},
+        "dialog": {"radius": 7, "future-dialog-key": 5}
     })"));
     vshot::Config config = vshot::loadConfig();
     config.cli.pngCompression = QStringLiteral("balanced");
@@ -224,6 +225,15 @@ void checkSettingsSaveKeepsWhatItDoesNotOwn()
     expect(numberAt(root, "cli/long/future-long-key") == 9, "an unknown nested cli key is kept");
     expect(numberAt(root, "cli/pin/future-pin-key") == 3,
            "an unknown pin key is kept beside a cleared density");
+    // The `dialog` and `pin` sections are written whole, so a key this build
+    // does not know is *not* kept in them -- unlike `cli`, which is merged leaf
+    // by leaf.  Saying so here is what stops a later change from quietly making
+    // the two behave the same way in one direction or the other.
+    expect(!root.contains(QStringLiteral("dialog")) ||
+               !root.value(QStringLiteral("dialog"))
+                    .toObject()
+                    .contains(QStringLiteral("future-dialog-key")),
+           "a section written whole does not carry unknown keys forward");
 }
 
 void checkClearingAValueRemovesIt()
@@ -274,6 +284,18 @@ void checkRoundTripOfEveryField()
     written.cli.longIgnoreTop = 42;
     written.cli.longInject = QStringLiteral("uinput");
     written.cli.pinDensity = 3;
+    written.pin.radius = 12;
+    written.pin.shadow.enabled = false;
+    written.pin.shadow.size = 21;
+    written.pin.shadow.offset = -7;
+    written.pin.shadow.opacity = 200;
+    written.dialog.shadow.enabled = true;
+    written.dialog.shadow.size = 9;
+    written.dialog.shadow.offset = 5;
+    written.dialog.shadow.opacity = 77;
+    written.pin.borderWidth = 3;
+    written.pin.borderColor = QColor(1, 2, 3, 255);
+    written.pin.activeBorderColor = QColor(4, 5, 6, 200);
 
     vshot::saveConfig(written);
     const vshot::Config read = vshot::loadConfig();
@@ -299,6 +321,53 @@ void checkRoundTripOfEveryField()
     expect(read.cli.longIgnoreTop == written.cli.longIgnoreTop, "cli.long.ignore-top round-trips");
     expect(read.cli.longInject == written.cli.longInject, "cli.long.inject round-trips");
     expect(read.cli.pinDensity == written.cli.pinDensity, "cli.pin.density round-trips");
+    expect(read.pin.radius == written.pin.radius, "pin.radius round-trips",
+           QString::number(read.pin.radius));
+    expect(read.pin.shadow.enabled == written.pin.shadow.enabled,
+           "pin.shadow round-trips");
+    expect(read.pin.shadow.size == written.pin.shadow.size &&
+               read.pin.shadow.offset == written.pin.shadow.offset &&
+               read.pin.shadow.opacity == written.pin.shadow.opacity,
+           "the pin shadow's size, offset and opacity round-trip",
+           QStringLiteral("%1/%2/%3")
+               .arg(read.pin.shadow.size)
+               .arg(read.pin.shadow.offset)
+               .arg(read.pin.shadow.opacity));
+    expect(read.dialog.shadow.enabled == written.dialog.shadow.enabled &&
+               read.dialog.shadow.size == written.dialog.shadow.size &&
+               read.dialog.shadow.offset == written.dialog.shadow.offset &&
+               read.dialog.shadow.opacity == written.dialog.shadow.opacity,
+           "the dialog shadow round-trips, and is not the pin's",
+           QStringLiteral("%1/%2/%3/%4")
+               .arg(read.dialog.shadow.enabled ? 1 : 0)
+               .arg(read.dialog.shadow.size)
+               .arg(read.dialog.shadow.offset)
+               .arg(read.dialog.shadow.opacity));
+    expect(read.pin.shadow.size != read.dialog.shadow.size,
+           "the two sections' shadows are read apart");
+    expect(read.pin.borderWidth == written.pin.borderWidth, "pin.borderWidth round-trips",
+           QString::number(read.pin.borderWidth));
+    expect(read.pin.borderColor == written.pin.borderColor, "pin.borderColor round-trips",
+           read.pin.borderColor.name(QColor::HexArgb));
+    expect(read.pin.activeBorderColor == written.pin.activeBorderColor,
+           "pin.activeBorderColor round-trips",
+           read.pin.activeBorderColor.name(QColor::HexArgb));
+    // Zero is a real setting for both of these -- square corners, no rim -- and
+    // it has to come back as zero rather than as the built-in default.
+    {
+        vshot::Config bare = written;
+        bare.pin.radius = 0;
+        bare.pin.borderWidth = 0;
+        bare.pin.shadow.enabled = true;
+        vshot::saveConfig(bare);
+        const vshot::Config zeroed = vshot::loadConfig();
+        expect(zeroed.pin.radius == 0 && zeroed.pin.borderWidth == 0 &&
+                   zeroed.pin.shadow.enabled,
+               "a written zero is a setting, not an absent one",
+               QStringLiteral("radius %1, width %2")
+                   .arg(zeroed.pin.radius)
+                   .arg(zeroed.pin.borderWidth));
+    }
 
     // The names the settings window offers have to be the names the loader
     // accepts, or a value picked in the UI would be silently dropped on the

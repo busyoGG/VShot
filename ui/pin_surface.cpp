@@ -10,6 +10,7 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
 #include <QRegion>
 #include <QScreen>
@@ -38,19 +39,21 @@ bool focusTrace()
 
 // The outline's stroke is centered on the image edge and reaches 1px outside
 // it; every repaint region must include that bleed (plus a pixel of slack),
-// or stale border pixels survive at the previous position.
-constexpr int kOutlineBleedPx = 3;
+// or stale border pixels survive at the previous position.  Wider strokes and
+// the shadow reach further, so this is the floor the per-surface margin is
+// computed from rather than the value itself -- see `bleed`.
+constexpr int kMinBleedPx = 3;
 
-// The pin outline, in both of its states: a solid, fully opaque stroke of one
-// colour. Idle pins are light grey — enough to tell an image apart from a
-// background of its own colour, quiet enough to ignore — and the pin the
-// keyboard would act on is black, which is unmistakable on light content
-// without needing the second, contrasting ring the two-tone edge used to
-// carry. Both states share the width below, so a focus change is a pure
-// recolour: the border never shifts or changes weight under the pointer.
-constexpr double kOutlineWidthPx = 2.0;
-const QColor kIdleOutlineColor(192, 192, 192);
-const QColor kActiveOutlineColor(0, 0, 0);
+// The shadow a pin casts is described by `ShadowStyle` (in `ui/shadow.hpp`),
+// which the config layer fills in: it is on by default while the corners are
+// square, because a screenshot pinned over a window of its own colour is
+// otherwise impossible to place -- there is no edge to see.
+
+// The pin's rim: the values themselves live in `Style` (in the header) and are
+// resolved by the config layer, so a surface is handed a complete style and
+// never invents one of its own.  Both states share one width, so a focus change
+// is a pure recolour -- the border never shifts or changes weight under the
+// pointer.
 
 // The right-click menu of a pin, in logical pixels. The copy rows reuse the
 // card's own two fonts (label and value), so the menu reads as the same card
@@ -62,9 +65,24 @@ constexpr qreal kMenuRadius = 6.0;
 constexpr int kMenuHeadingPaddingY = 4;
 constexpr int kMenuCursorGap = 4;  // menu offset from the pointer
 
-QRect expandOutline(const QRect &rect)
+QRect expandOutline(const QRect &rect, int bleed)
 {
-    return rect.adjusted(-kOutlineBleedPx, -kOutlineBleedPx, kOutlineBleedPx, kOutlineBleedPx);
+    return rect.adjusted(-bleed, -bleed, bleed, bleed);
+}
+
+// The shadow under one pin lives in `ui/shadow.cpp`; the falloff it is built
+// from is shared with the file dialog's frame, which casts one too.
+
+
+/// The corner radius a pin can actually carry: never past half the shorter side
+/// of the painted image, where a corner would stop being a corner and start
+/// being a lozenge.  The same rule the dialog's rim follows, against the
+/// image's own size -- which changes with every zoom step, so this is asked at
+/// paint time rather than stored.
+int paintRadius(std::uint32_t radius, const QSize &size)
+{
+    const int most = std::max(0, std::min(size.width(), size.height()) / 2);
+    return std::min(static_cast<int>(radius), most);
 }
 
 // Wayland has no "no input here" request: an unset input region means the
@@ -117,6 +135,18 @@ PinSurface::PinSurface(QScreen *screen)
     }
 }
 
+void PinSurface::setStyle(const Style &style)
+{
+    style_ = style;
+    // Every pin is drawn differently now, and a wider stroke or a shadow
+    // reaches further than the last one did -- so the whole surface is
+    // repainted rather than the pins' own rects, which would leave the old
+    // paint's outer edge behind.
+    if (surfaceReady_) {
+        update();
+    }
+}
+
 bool PinSurface::showLayerSurface()
 {
     winId();
@@ -158,7 +188,6 @@ void PinSurface::setPinnedVisible(bool visible)
     visible_ = visible;
     setVisible(visible);
 }
-
 QRect PinSurface::localRect(const Item &item) const
 {
     const QPoint origin = screen_ != nullptr ? screen_->geometry().topLeft() : QPoint(0, 0);
@@ -202,24 +231,30 @@ void PinSurface::setPins(const QVector<Item> &pins)
             entry.render = before.render;
             entry.renderKey = before.renderKey;
             entry.renderTarget = before.renderTarget;
+            // The shadow is carried over for the same reason and with the same
+            // care: a drag changes only the origin, so the built image is still
+            // valid -- and rebuilding it per motion event would cost more than
+            // the scaling this line sits beside.
+            entry.shadow = before.shadow;
+            entry.shadowKey = before.shadowKey;
             const QRect was = localRect(before.item);
             if (was != after) {
-                dirty |= expandOutline(was);
+                dirty |= dirtyRect(was);
             }
             // The pixels can be replaced without the rect moving at all (pin
             // edit writes an annotated image back in place), so the rect alone
             // does not say whether there is anything to repaint.
             if (before.item.image.cacheKey() != item.image.cacheKey() || was != after) {
-                dirty |= expandOutline(after);
+                dirty |= dirtyRect(after);
             }
         } else {
-            dirty |= expandOutline(after);
+            dirty |= dirtyRect(after);
         }
         next.append(entry);
     }
     for (const Entry &entry : entries_) {
         if (!ids.contains(entry.item.id)) {
-            dirty |= expandOutline(localRect(entry.item));
+            dirty |= dirtyRect(localRect(entry.item));
         }
     }
     // A reorder changes what covers what without moving or recoloring anything,
@@ -231,7 +266,7 @@ void PinSurface::setPins(const QVector<Item> &pins)
     }
     if (reordered) {
         for (const Entry &entry : next) {
-            dirty |= expandOutline(localRect(entry.item));
+            dirty |= dirtyRect(localRect(entry.item));
         }
     }
 
@@ -361,9 +396,24 @@ void PinSurface::traceFocus(const QString &what) const
 QRect PinSurface::pickedOutline() const
 {
     if (const Entry *entry = entryFor(pickedId_)) {
-        return expandOutline(localRect(entry->item));
+        return dirtyRect(localRect(entry->item));
     }
     return QRect();
+}
+
+// How far a pin's paint reaches past its own rect: the stroke is centred on the
+// edge, and the shadow's blur reaches a spread in every direction.  Every
+// repaint region is grown by this, or stale pixels survive at the previous
+// position -- which for a shadow means a dark smear trailing a drag.
+int PinSurface::bleed() const
+{
+    const int stroke = static_cast<int>(style_.borderWidth) / 2 + 1;
+    return std::max(kMinBleedPx, std::max(stroke, style_.shadow.band()));
+}
+
+QRect PinSurface::dirtyRect(const QRect &pin) const
+{
+    return expandOutline(pin, bleed());
 }
 
 bool PinSurface::event(QEvent *event)
@@ -479,6 +529,39 @@ void PinSurface::leaveEvent(QEvent *event)
     QWidget::leaveEvent(event);
 }
 
+void PinSurface::paintShadow(QPainter &painter, Entry &entry, const QRect &target, int radius)
+{
+    const qreal ratio = std::max<qreal>(1.0, devicePixelRatioF());
+    // The key covers everything the built image depends on, so a drag (which
+    // changes only the origin) re-uses it while a zoom step or a config change
+    // rebuilds it.
+    const QString key = QStringLiteral("%1x%2/%3/%4/%5/%6")
+                            .arg(target.width())
+                            .arg(target.height())
+                            .arg(radius)
+                            .arg(style_.shadow.size)
+                            .arg(style_.shadow.opacity)
+                            .arg(qRound(ratio * 100));
+    if (entry.shadow.isNull() || entry.shadowKey != key) {
+        entry.shadow = renderShadow(target.size(), radius, style_.shadow, ratio).image;
+        entry.shadowKey = key;
+    }
+    if (entry.shadow.isNull()) {
+        return;
+    }
+    // Drawn at the pin's own top-left less the room the blur needs, so the
+    // silhouette inside the image lands exactly on the pin -- with the offset
+    // already baked into the silhouette, which is what makes the shadow hang
+    // below the image.  The image carries its device ratio, which is what maps
+    // its device pixels onto that logical rect on a scaled output.
+    QImage shadow = entry.shadow;
+    shadow.setDevicePixelRatio(ratio);
+    painter.save();
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    painter.drawImage(target.topLeft() - QPoint(style_.shadow.size, style_.shadow.size), shadow);
+    painter.restore();
+}
+
 void PinSurface::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
@@ -499,25 +582,64 @@ void PinSurface::paintEvent(QPaintEvent *event)
             // Every visible pixel of this image lives on another output.
             continue;
         }
+        const bool focused = hasFocus_ && entry.item.id == pickedId_;
+        // The corners, clamped to what this pin's size can carry: a radius past
+        // half the shorter side turns the image into a lozenge.
+        const int radius = paintRadius(style_.radius, target.size());
+        // The shadow goes down first and only under this pin -- the pins behind
+        // it have already been painted, and a shadow drawn over them would read
+        // as a smudge rather than as depth.  A shadow of no size, or one turned
+        // off, paints nothing at all.
+        if (style_.shadow.enabled && style_.shadow.size > 0 && style_.shadow.opacity > 0) {
+            paintShadow(painter, entry, target, radius);
+        }
         // renderSource() is already at this surface's device resolution when
         // the source is denser or coarser than the output, so this is a 1:1
         // blit then.
-        painter.drawImage(target, renderSource(entry));
+        if (radius > 0) {
+            // Clipping to the rounded silhouette is what actually rounds the
+            // image: drawImage has no radius of its own, and painting a
+            // rounded rect of the right colour over the corners would show
+            // through wherever the image is translucent.
+            QPainterPath clip;
+            clip.addRoundedRect(QRectF(target), radius, radius);
+            painter.save();
+            painter.setClipPath(clip, Qt::IntersectClip);
+            painter.drawImage(target, renderSource(entry));
+            painter.restore();
+        } else {
+            painter.drawImage(target, renderSource(entry));
+        }
+        if (style_.borderWidth == 0) {
+            // No rim wanted: the pin is the image and nothing else.
+            continue;
+        }
         // A thin outline keeps a pinned image distinguishable from identical
         // content behind it, and its colour says whether the pin is the one a
-        // key press would act on: black while this output holds the keyboard
-        // and that pin was the last one clicked, light grey otherwise.
-        const bool focused = hasFocus_ && entry.item.id == pickedId_;
-        // Whole-pixel rect edges with an even pen width put both stroke lines
-        // on whole device pixels, so the edge stays crisp instead of fading
-        // over two rows. Centred that way the stroke sits one pixel outside
-        // the image on each side — which also keeps it from degenerating on a
-        // one-pixel pin, where an inward stroke would have no room at all. A
-        // pin flush against the edge of its output simply loses that outer
-        // pixel row, the same as it did before.
+        // key press would act on.  A stroke wider than one pixel is centred on
+        // the edge, which also keeps it from degenerating on a one-pixel pin,
+        // where an inward stroke would have no room at all.  A pin flush
+        // against the edge of its output simply loses the outer half.
         const QRectF edge(target.x(), target.y(), target.width(), target.height());
-        painter.setPen(QPen(focused ? kActiveOutlineColor : kIdleOutlineColor, kOutlineWidthPx));
-        painter.drawRect(edge);
+        const QColor color =
+            focused ? style_.activeBorderColor : style_.borderColor;
+        // Antialiasing off for a square pin with a thin stroke: on, Qt would
+        // fade the stroke over two rows at every edge and the pin would read as
+        // blurry rather than as outlined.
+        const bool rounded = radius > 0;
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing, rounded);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(color, style_.borderWidth));
+        if (rounded) {
+            // Centred on the edge, exactly as the square case is: the outer
+            // half of the stroke is meant to be seen, which is what keeps a
+            // rounded pin the same size as a square one of the same image.
+            painter.drawRoundedRect(edge, radius, radius);
+        } else {
+            painter.drawRect(edge);
+        }
+        painter.restore();
     }
     // Above every pin: the menu belongs to one of them but must never end up
     // under another.

@@ -47,9 +47,12 @@ constexpr int kMaxMosaicStrength = 3;
 constexpr int kMaxDensity = 4;
 // The dialog's rim.  A radius past half the window's shorter side would stop
 // being a corner and start being a lozenge, so the ceiling is well inside that;
-// the stroke stops before it eats the dialog's own margins.
-constexpr int kMaxDialogRadius = 48;
-constexpr int kMaxDialogBorderWidth = 8;
+// the stroke stops before it eats the dialog's own margins.  Both live in
+// `config.hpp` where the settings window can see them.
+// A radius larger than any pin can carry.  What is actually painted is clamped
+// to half the shorter side of the image where the pin is drawn -- the size is
+// the daemon's and changes with every wheel step, so it cannot be checked here.
+// The value itself is in `config.hpp`, where the settings window can see it.
 
 /// Reads a non-negative integer, clamped into `[1, max]`; anything absent or
 /// of the wrong type keeps `fallback`.
@@ -69,6 +72,55 @@ std::uint32_t readBounded(const QJsonObject &object, const QString &key, std::ui
         return fallback;
     }
     return static_cast<std::uint32_t>(std::min<long long>(rounded, max));
+}
+
+/// Like [`readBounded`] but a zero is a value rather than an absent one.
+///
+/// The pin's corner radius and its rim width are both settings whose most
+/// useful value is 0 -- square corners, no rim -- so "the file says 0" and "the
+/// file says nothing" cannot be the same answer.  An absent key keeps the
+/// fallback; a written 0 keeps the 0.
+std::uint32_t readWhole(const QJsonObject &object, const QString &key, std::uint32_t fallback,
+                        std::uint32_t max)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return fallback;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return fallback;
+    }
+    const auto rounded = static_cast<long long>(raw);
+    if (rounded < 0) {
+        return fallback;
+    }
+    return static_cast<std::uint32_t>(std::min<long long>(rounded, max));
+}
+
+/// Reads a boolean, keeping `fallback` for anything that is not one.
+bool readFlag(const QJsonObject &object, const QString &key, bool fallback)
+{
+    const QJsonValue value = object.value(key);
+    return value.isBool() ? value.toBool() : fallback;
+}
+
+/// Reads an integer that may be negative, clamped into `[-max, max]`.
+///
+/// The shadow's offset is the one value in the file with a meaning on both
+/// sides of zero -- it is what says whether the light comes from above or from
+/// below -- so it cannot go through the non-negative readers above.
+int readSigned(const QJsonObject &object, const QString &key, int fallback, int max)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return fallback;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return fallback;
+    }
+    return static_cast<int>(std::clamp<long long>(static_cast<long long>(raw), -max, max));
 }
 
 /// Like [`readBounded`] but for a value that may legitimately be zero, which
@@ -485,6 +537,39 @@ QColor parseColorText(const QString &text)
     }
 }
 
+/// The shadow, read out of one section.  The keys are spelled the same in the
+/// `pin` and the `dialog` section, and every one of them is optional: an absent
+/// key keeps the default, so a hand-written section only has to say what it
+/// wants different.
+///
+/// A zero size is a real setting -- it means no blur reach at all -- but the
+/// shadow's *off* state is the boolean, not a zero: that way a user can turn
+/// the shadow off and back on without having lost the size they had tuned.
+ShadowStyle readShadow(const QJsonObject &section, const ShadowStyle &fallback)
+{
+    ShadowStyle shadow = fallback;
+    shadow.enabled = readFlag(section, QStringLiteral("shadow"), shadow.enabled);
+    shadow.size = static_cast<int>(
+        readWhole(section, QStringLiteral("shadowSize"), static_cast<std::uint32_t>(shadow.size),
+                  kMaxShadowSize));
+    // Signed, and the one value here that may be negative: a negative offset
+    // puts the shadow above the shape instead of below it.
+    shadow.offset = static_cast<int>(
+        readSigned(section, QStringLiteral("shadowOffset"), shadow.offset, kMaxShadowOffset));
+    shadow.opacity = static_cast<int>(
+        readWhole(section, QStringLiteral("shadowOpacity"),
+                  static_cast<std::uint32_t>(shadow.opacity), kMaxShadowOpacity));
+    return shadow;
+}
+
+void writeShadow(QJsonObject &section, const ShadowStyle &shadow)
+{
+    section.insert(QStringLiteral("shadow"), shadow.enabled);
+    section.insert(QStringLiteral("shadowSize"), shadow.size);
+    section.insert(QStringLiteral("shadowOffset"), shadow.offset);
+    section.insert(QStringLiteral("shadowOpacity"), shadow.opacity);
+}
+
 /// The `dialog` section of the file.  Like the editor's, it is written whole:
 /// it describes a complete look rather than a set of overrides.
 DialogPreferences readDialog(const QJsonObject &dialog)
@@ -499,6 +584,7 @@ DialogPreferences readDialog(const QJsonObject &dialog)
     // signal the dialog reads to pick a palette colour of its own.
     preferences.borderColor =
         readColor(dialog, QStringLiteral("borderColor"), preferences.borderColor);
+    preferences.shadow = readShadow(dialog, preferences.shadow);
     return preferences;
 }
 
@@ -514,7 +600,49 @@ QJsonObject dialogJson(const DialogPreferences &preferences)
     if (preferences.borderColor.isValid()) {
         dialog.insert(QStringLiteral("borderColor"), colorText(preferences.borderColor));
     }
+    writeShadow(dialog, preferences.shadow);
     return dialog;
+}
+
+/// The `pin` section of the file.  Written whole, like the other two: it
+/// describes a complete look rather than a set of overrides, and a key the user
+/// cleared has to leave the file rather than be merged back in.
+PinPreferences readPin(const QJsonObject &pin)
+{
+    PinPreferences preferences;
+    // The stored radius is a wish, clamped only against a ceiling that keeps a
+    // nonsense value out of the file.  What a pin can actually carry depends on
+    // its own size, which changes with every zoom step, so that clamp is
+    // applied where the pin is drawn rather than here.
+    preferences.radius =
+        readWhole(pin, QStringLiteral("radius"), preferences.radius, kMaxPinRadius);
+    preferences.shadow = readShadow(pin, preferences.shadow);
+    preferences.borderWidth = readWhole(pin, QStringLiteral("borderWidth"),
+                                        preferences.borderWidth, kMaxPinBorderWidth);
+    // Invalid means "use the built-in colour", exactly as in the dialog's rim:
+    // the stroke has a good default and the file only has to say something when
+    // the user wants a different one.
+    preferences.borderColor =
+        readColor(pin, QStringLiteral("borderColor"), preferences.borderColor);
+    preferences.activeBorderColor =
+        readColor(pin, QStringLiteral("activeBorderColor"), preferences.activeBorderColor);
+    return preferences;
+}
+
+QJsonObject pinJson(const PinPreferences &preferences)
+{
+    QJsonObject pin;
+    pin.insert(QStringLiteral("radius"), static_cast<double>(preferences.radius));
+    writeShadow(pin, preferences.shadow);
+    pin.insert(QStringLiteral("borderWidth"), static_cast<double>(preferences.borderWidth));
+    if (preferences.borderColor.isValid()) {
+        pin.insert(QStringLiteral("borderColor"), colorText(preferences.borderColor));
+    }
+    if (preferences.activeBorderColor.isValid()) {
+        pin.insert(QStringLiteral("activeBorderColor"),
+                   colorText(preferences.activeBorderColor));
+    }
+    return pin;
 }
 
 Config loadConfig()
@@ -524,6 +652,7 @@ Config loadConfig()
     config.editor = readEditor(root.value(QStringLiteral("editor")).toObject());
     config.cli = readCli(root.value(QStringLiteral("cli")).toObject());
     config.dialog = readDialog(root.value(QStringLiteral("dialog")).toObject());
+    config.pin = readPin(root.value(QStringLiteral("pin")).toObject());
     return config;
 }
 
@@ -540,6 +669,7 @@ bool saveConfig(const Config &config)
     // user removed by clearing the colour has to disappear rather than be
     // merged back in.
     root.insert(QStringLiteral("dialog"), dialogJson(config.dialog));
+    root.insert(QStringLiteral("pin"), pinJson(config.pin));
     return writeRoot(root);
 }
 
@@ -562,6 +692,23 @@ bool saveEditorPreferences(const EditorPreferences &preferences)
 DialogPreferences loadDialogPreferences()
 {
     return loadConfig().dialog;
+}
+
+PinPreferences loadPinPreferences()
+{
+    return loadConfig().pin;
+}
+
+/// The rim colour a pin uses in one of its two states: the user's own when the
+/// file carries one, and otherwise the built-in.  A single reader for both
+/// states, so "which colour is this pin" cannot be answered two ways.
+QColor resolvePinBorderColor(const PinPreferences &preferences, bool active)
+{
+    const QColor &chosen = active ? preferences.activeBorderColor : preferences.borderColor;
+    if (chosen.isValid()) {
+        return chosen;
+    }
+    return active ? QColor(0, 0, 0) : QColor(192, 192, 192);
 }
 
 bool saveDialogPreferences(const DialogPreferences &preferences)

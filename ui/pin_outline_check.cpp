@@ -1,14 +1,20 @@
-// Offline check for the pin outline: the stroke a pinned image carries, and
-// how it says which pin the keyboard would act on. It paints a real
-// PinSurface offscreen and samples the border pixels, so what is checked is
-// the pixels Qt actually produces rather than the constants' values.
+// Offline check for the pin outline: the stroke a pinned image carries, how it
+// says which pin the keyboard would act on, and the look the config file can
+// change -- the corner radius, the shadow and the stroke's width and colour.
+// It paints a real PinSurface offscreen and samples the border pixels, so what
+// is checked is the pixels Qt actually produces rather than the constants'
+// values.
 //
-// The property worth locking down is that the outline is a solid, fully
-// opaque stroke of one colour -- light grey while a pin is idle, black while
-// it is the pin this output last clicked -- with both states sharing one
-// geometry, so a focus change can only ever recolour and never shift the edge
-// or change its weight. A two-tone ring with a translucent outer edge used to
-// serve the same purpose and read as noise on light content.
+// The property worth locking down is that the stroke is a solid, fully opaque
+// line of one colour -- light grey while a pin is idle, black while it is the
+// pin this output last clicked -- with both states sharing one geometry, so a
+// focus change can only ever recolour and never shift the edge or change its
+// weight. A two-tone ring with a translucent outer edge used to serve the same
+// purpose and read as noise on light content.
+//
+// The shadow is the one thing that deliberately paints outside the pin, and the
+// geometry half of this check turns it off so that "nothing is painted beyond
+// the stroke" stays a meaningful measurement; the look half turns it back on.
 //
 // Built only with `-DVSHOT_BUILD_CHECKS=ON`. Unlike the density check this one
 // needs Qt Widgets and the offscreen platform plugin (run it with
@@ -162,6 +168,12 @@ int main(int argc, char **argv)
     vshot::PinSurface surface(screen);
     surface.resize(420, 300);
     surface.show();
+    // The geometry half of this check is about the stroke, so the shadow -- the
+    // one thing that paints outside a pin on purpose -- is off for it.  The
+    // look half at the end turns it back on and checks it separately.
+    vshot::PinSurface::Style plain;
+    plain.shadow.enabled = false;
+    surface.setStyle(plain);
     // The offscreen platform never activates a window by itself, and
     // QWidget::activateWindow() only asks the platform for it (requestActivate,
     // which offscreen drops on the floor), so the harness has to say so
@@ -285,6 +297,181 @@ int main(int argc, char **argv)
     const QImage hovered = paint(surface);
     expectActive("moving between pins moves the black edge", hovered, QPoint(219, 20));
     expectIdle("and the pin it left is grey", hovered, QPoint(60, 19));
+
+    std::printf("--- the look the config file sets ----------------------------------\n");
+    // What the settings window and the `pin` section of the config file can
+    // change, checked as pixels: a rounded pin, a wider stroke, the user's own
+    // two colours, and the shadow that is on by default.
+    //
+    // The pins are put back to their default state first, since the walk above
+    // left the pointer hovering one of them.
+    moveAway(surface);
+    vshot::PinSurface::Style styled;
+    styled.radius = 16;
+    styled.shadow.enabled = true;
+    styled.borderWidth = 4;
+    styled.borderColor = QColor(0, 200, 0);
+    styled.activeBorderColor = QColor(0, 0, 255);
+    surface.setStyle(styled);
+    const QImage rounded = paint(surface);
+    leave(QStringLiteral("pin-outline-styled.png"), rounded);
+
+    // The corner is now cut away: the pixel just inside the rect's top-left
+    // corner is no longer the image, and the one further in still is.  That is
+    // what "rounded" means as a pixel.  (The shadow is on in this phase, so
+    // what the corner holds is shadow rather than nothing.)
+    const QColor corner = rounded.pixelColor(
+        QPoint(qRound(21 * rounded.devicePixelRatio()),
+               qRound(21 * rounded.devicePixelRatio())));
+    expectPixel("and the image is there a little further in", rounded, QPoint(30, 30), 255, 255,
+                255, 255);
+    if (corner.red() == 255 && corner.green() == 255 && corner.blue() == 255) {
+        std::printf("FAIL  %-48s the corner is still the image\n",
+                    "a rounded pin has its corner cut away");
+        ++failures;
+    } else {
+        std::printf("ok    %-48s rgba(%d, %d, %d, %d)\n",
+                    "a rounded pin has its corner cut away", corner.red(), corner.green(),
+                    corner.blue(), corner.alpha());
+    }
+
+    // The stroke is the user's own colour and the width they asked for: 4px
+    // centred on the edge covers 2 outside and 2 inside.
+    expectPixel("the idle stroke uses the configured colour", rounded, QPoint(60, 18), 0, 200, 0,
+                255);
+    expectPixel("a 4px stroke reaches 2px inside the edge", rounded, QPoint(60, 21), 0, 200, 0,
+                255);
+    // Two pixels further out is past the stroke: whatever is there, it is not
+    // the stroke's colour.
+    const QColor beyond = rounded.pixelColor(
+        QPoint(qRound(60 * rounded.devicePixelRatio()),
+               qRound(16 * rounded.devicePixelRatio())));
+    if (beyond.green() > 150 && beyond.red() < 100) {
+        std::printf("FAIL  %-48s the stroke reaches further than its width\n",
+                    "a 4px stroke stops where it should");
+        ++failures;
+    } else {
+        std::printf("ok    %-48s rgba(%d, %d, %d, %d)\n", "a 4px stroke stops where it should",
+                    beyond.red(), beyond.green(), beyond.blue(), beyond.alpha());
+    }
+
+    // The shadow is the one thing painted outside the pin: with it on there is
+    // something below the stroke, and with it off there is not.
+    moveOnto(surface, QPoint(60, 60), base + QPoint(60, 60));
+    const QImage withShadow = paint(surface);
+    vshot::PinSurface::Style noShadow = styled;
+    noShadow.shadow.enabled = false;
+    surface.setStyle(noShadow);
+    const QImage withoutShadow = paint(surface);
+    leave(QStringLiteral("pin-outline-shadow.png"), withShadow);
+    leave(QStringLiteral("pin-outline-no-shadow.png"), withoutShadow);
+    // Sampled below the pin, past the stroke: the shadow's own pixels live
+    // there, and with the shadow off that band is empty.
+    const QPoint below(60, 128);
+    expectPixel("the shadow switched off paints nothing at all", withoutShadow, below, 0, 0, 0, 0);
+    const QColor shadowPixel = withShadow.pixelColor(
+        QPoint(qRound(below.x() * withShadow.devicePixelRatio()),
+               qRound(below.y() * withShadow.devicePixelRatio())));
+    if (shadowPixel.alpha() > 0) {
+        std::printf("ok    %-48s alpha %d\n", "a shadow paints below the pin",
+                    shadowPixel.alpha());
+    } else {
+        std::printf("FAIL  %-48s nothing painted below the pin\n",
+                    "a shadow paints below the pin");
+        ++failures;
+    }
+
+    // The shadow's own numbers are the user's, so each has to reach the pixels.
+    // Measured as weight -- the sum of the alphas over a band -- rather than as
+    // one pixel, because a shadow is a falloff and any single pixel of it moves
+    // when the blur changes.  The band is the gap between the white pin and the
+    // black one below it: everything else on this surface is opaque and would
+    // drown the shadow out.
+    const auto weight = [](const QImage &image, int fromY, int toY) {
+        long total = 0;
+        for (int y = fromY; y < toY && y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                total += qAlpha(image.pixel(x, y));
+            }
+        }
+        return total;
+    };
+    const int bandTop = 122;
+    const int bandBottom = 156;
+    vshot::PinSurface::Style faint = styled;
+    faint.shadow.opacity = 40;
+    surface.setStyle(faint);
+    const QImage faintShadow = paint(surface);
+    if (weight(faintShadow, bandTop, bandBottom) < weight(withShadow, bandTop, bandBottom)) {
+        std::printf("ok    %-48s %ld against %ld\n", "a lower opacity is a lighter shadow",
+                    weight(faintShadow, bandTop, bandBottom),
+                    weight(withShadow, bandTop, bandBottom));
+    } else {
+        std::printf("FAIL  %-48s %ld against %ld\n", "a lower opacity is a lighter shadow",
+                    weight(faintShadow, bandTop, bandBottom),
+                    weight(withShadow, bandTop, bandBottom));
+        ++failures;
+    }
+
+    // A bigger size is a softer, further-reaching shadow.  Measured as the
+    // number of partially transparent pixels on the whole surface, because a
+    // shadow is the only thing here that is neither nothing nor opaque: a wider
+    // reach covers more pixels, and no single column or band can be used -- the
+    // pins below the white one cast their own shadows into the same rows.
+    const auto shadowPixels = [](const QImage &image) {
+        long count = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                const int alpha = qAlpha(image.pixel(x, y));
+                if (alpha > 0 && alpha < 255) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    };
+    vshot::PinSurface::Style wide = styled;
+    wide.shadow.size = 30;
+    surface.setStyle(wide);
+    const QImage wideShadow = paint(surface);
+    const long nearPixels = shadowPixels(withShadow);
+    const long farPixels = shadowPixels(wideShadow);
+    if (farPixels > nearPixels) {
+        std::printf("ok    %-48s %ld px against %ld px\n", "a larger size reaches further out",
+                    farPixels, nearPixels);
+    } else {
+        std::printf("FAIL  %-48s %ld px against %ld px\n", "a larger size reaches further out",
+                    farPixels, nearPixels);
+        ++failures;
+    }
+
+    // And a size of zero paints nothing, the same as switching it off: the
+    // offset is what a blur-less shadow would still have to draw, and there is
+    // nothing to draw with.
+    vshot::PinSurface::Style flat = styled;
+    flat.shadow.size = 0;
+    surface.setStyle(flat);
+    expectPixel("a shadow with no blur paints nothing", paint(surface), below, 0, 0, 0, 0);
+    surface.setStyle(styled);
+
+    // The active pin takes the second configured colour: the pointer is on the
+    // white pin, so it is the one wearing the active stroke.
+    expectPixel("the active stroke uses its own configured colour", withShadow, QPoint(60, 18), 0,
+                0, 255, 255);
+    expectPixel("the pin that is not picked keeps the idle colour", withShadow, QPoint(60, 159),
+                0, 200, 0, 255);
+
+    // A pin with no stroke at all is the image and nothing else, and a pin with
+    // square corners has its corner pixel back -- both are settings the user
+    // can pick, so both are checked.
+    vshot::PinSurface::Style bare;
+    bare.shadow.enabled = false;
+    bare.borderWidth = 0;
+    surface.setStyle(bare);
+    const QImage square = paint(surface);
+    expectPixel("a square pin has its corner pixel", square, QPoint(21, 21), 255, 255, 255, 255);
+    expectTransparent("and a pin with no stroke paints nothing outside itself", square,
+                      QPoint(60, 19));
 
     std::printf("--- result ---------------------------------------------------------\n");
     std::printf("%s (%d failure(s))\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);

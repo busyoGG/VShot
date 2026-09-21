@@ -301,6 +301,7 @@ Alignment uses only the rows that **belong to the page**: runs of rows at the to
 - **Double-click** closes that image
 - **Left click** raises the image to the front, so a clicked one is always above the rest when they overlap
 - Whichever image the pointer rests on gets a solid black outline; the others are light gray (2 logical pixels thick, not covering the image itself)
+- **Its look is configurable**: corner radius, the shadow (its size, its drop and its darkness), border width and the two border colours live in the config file (square corners with a shadow by default) — see [`pin` — how a pinned image looks](#pin--how-a-pinned-image-looks)
 - With the pointer over a pin and that screen holding the keyboard, press **Space** to enter the same annotation editor `vshot region` uses
 - Right-clicking **any** pin opens a menu: a color card lists its formats first, and clicking one copies that value back to the clipboard (↑/↓ to move, Enter to copy, Esc to close; a badge flashes at the bottom-right once copied). The last row, **Save as…**, is there for every pin: it opens a save dialog and writes the image out as a PNG, then reports the result in the same badge
 
@@ -462,7 +463,9 @@ vshot settings
 
 The window is an ordinary window: it captures nothing and needs no compositor protocol, so it also works on a compositor vshot cannot otherwise capture. After installing the package you can also open it from the application menu as **VShot Settings** (see ["Application menu entry"](#application-menu-entry)). An empty or zero value in the `cli` section means "leave it unset, use the built-in default" rather than storing a zero; the `editor` section is always written whole. Saving **merges**: keys this build does not recognize — a newer vshot's, or your own — survive untouched instead of being wiped by a save.
 
-The window has two pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic) and **Command-line defaults** (compression, default monitor, pin density, and the scrolling-capture settings). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and both fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look. When drawing them, note that **the `QPainter` in a `paintEvent` already works in logical pixels**: Qt has folded the output's scale in, so dividing by `devicePixelRatioF()` as well would halve every coordinate on a scale-2 output and jam the chevron into the corner. That mistake is invisible at 1x, so it is worth looking at both scales.
+The window has four pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic), **Command-line defaults** (compression, default monitor, pin density, and the scrolling-capture settings), **File dialogs** (corner radius, border width and colour, and the shadow) and **Pin appearance** (corner radius, the shadow, border width, and the two border colours). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and they fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look. Saving **does not close the window**: a "Saved." note appears in the corner, so a value can be changed, saved, looked at and changed again without reopening anything. Cancel is now only "close".
+
+When drawing them, note that **the `QPainter` in a `paintEvent` already works in logical pixels**: Qt has folded the output's scale in, so dividing by `devicePixelRatioF()` as well would halve every coordinate on a scale-2 output and jam the chevron into the corner. That mistake is invisible at 1x, so it is worth looking at both scales.
 
 ```json
 {
@@ -484,6 +487,14 @@ The window has two pages, switched from the sidebar: **Annotation editor** (tool
     "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
     "pin": { "density": 2 },
     "ocr": { "engine": "builtin" }
+  },
+  "dialog": {
+    "radius": 12, "borderWidth": 1, "borderColor": "#5a626e",
+    "shadow": true, "shadowSize": 14, "shadowOffset": 3, "shadowOpacity": 120
+  },
+  "pin": {
+    "radius": 0, "borderWidth": 2, "borderColor": "#c0c0c0",
+    "shadow": true, "shadowSize": 14, "shadowOffset": 3, "shadowOpacity": 120
   }
 }
 ```
@@ -540,6 +551,47 @@ command line > environment > config file > built-in default
 `ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor` and the common `cli` entries; the `ocr` section is edited by hand.
 
 `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
+
+### `dialog` — the file dialogs' look
+
+The save and open windows (a pin's **Save as…**, pasting a local image in the editor) are **layer surfaces**, and a compositor draws no decoration on one — so the rim and the shadow this section describes are the only things separating them from whatever is behind.
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `radius` | 0–48, logical pixels | `12` |
+| `borderWidth` | 0–8, logical pixels; 0 draws no rim at all | `1` |
+| `borderColor` | `#rrggbb`; **leave it out** to derive one from the colour scheme | none |
+| `shadow` | `true` / `false` | `true` |
+| `shadowSize` | 0–64, logical pixels | `14` |
+| `shadowOffset` | -32–32, logical pixels | `3` |
+| `shadowOpacity` | 0–255 | `120` |
+
+With no `borderColor` the rim is derived from the dialog's own colours — a stroke a little darker than the surface — so it reads as an edge under a light or a dark scheme without a second value to keep in step. Write one and that is what is used.
+
+The shadow's four keys are **the same set the `pin` section has**, with the same meaning, the same ranges and the same defaults (see below). A layer surface can only be the size it asks the compositor for, so the shadow is painted in a ring the window keeps inside itself: the window is the dialog plus that ring on every side, the dialog's contents are inset by the same amount, and the shadow lands in what is left. `shadowSize` is therefore also how much smaller the dialog is than its window — it is the ring's width, not something added outside it.
+
+### `pin` — how a pinned image looks
+
+A pin is a layer surface with nothing but the image in it, so its corners, the shadow behind it and the line around it are all vshot's to draw. This section is **not** the same thing as `cli.pin`: that one is a pin's *size* (its source density, a command-line default), this one is how it *looks*.
+
+| Key | Values | Default |
+| --- | --- | --- |
+| `radius` | 0–512, logical pixels; 0 is a square corner | `0` |
+| `shadow` | `true` / `false` | `true` |
+| `shadowSize` | 0–64, logical pixels; 0 means no blur | `14` |
+| `shadowOffset` | -32–32, logical pixels; negative lifts the shadow above | `3` |
+| `shadowOpacity` | 0–255 | `120` |
+| `borderWidth` | 0–8, logical pixels; 0 draws no border at all | `2` |
+| `borderColor` | the border on an idle pin; the built-in light grey `#c0c0c0` when absent | none |
+| `activeBorderColor` | the border on the pin the pointer is over while that output holds the keyboard; the built-in black when absent | none |
+
+The default is **square corners with a shadow**: a screenshot is a picture of a window, and rounding it would cut into what it shows — while a screenshot pinned over a window of its own colour has no visible edge at all without one.
+
+The shadow's three numeric keys: `shadowSize` is how far the blur reaches past the edge, which is what its softness is; `shadowOffset` is how far the whole shadow is dropped — light comes from above, hence the default of 3, and a negative value puts it above the pin instead. `shadowOpacity` is the shadow's darkness; the blur spreads it rather than adding to it. `shadow` is the master switch, and **turning it off keeps the numbers**, so it can be turned off for a moment and back on with the size still there. A `shadowSize` of 0 is no blur, and paints nothing either.
+
+`radius` is a ceiling rather than a promise: what is actually painted is clamped to half the image's shorter side, past which a corner stops being a corner and becomes a lozenge. A pin's size changes with every wheel step, so that can only be decided at paint time. The border is **centred on the image edge**, half outside and half in, so changing its width leaves a rounded pin and a square one the same size.
+
+The shadow is built once and cached — blurred at a third of the size and scaled back up, since a soft shadow has no detail to lose and a full-size blur of a 4K pin would cost more per frame than drawing the pin did. A drag re-uses it; a zoom step or a config change rebuilds it. **A config change takes effect on the next `vshot pin`**: the daemon stays up while anything is pinned, but it re-reads the file every time a pin is added, so there is no need to restart it by hand.
 
 ## Environment variables
 
@@ -598,6 +650,8 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 `vshot-text-size-check` pins the font-size conversion: the number on the panel *is* the pixel height, and writing it into the legacy protocol projects it back onto the whole glyph multiples the 5x7 fallback font can draw (`ui/text_size.hpp`). The two ends have to line up (7–448 is exactly scale 1–64), whole multiples have to round-trip, and a value in between has to round to the *nearest* multiple rather than truncate — truncating would shrink a 15 px label to 14 px whenever the fallback rendered it.
 
 `vshot-config-check` covers the part most likely to fail silently: whether a save really **merges** (keeping keys this build does not recognize), whether clearing a value really removes it, and whether `#rrggbbaa` parses as CSS (Qt itself reads that as `#aarrggbb`, turning "opaque orange" into purple). `vshot-settings-check` builds the real settings window, drives every one of its widgets, and reads the config file back — a field wired to the wrong member is visible only that way. It is worth running whenever the window's layout changes: it finds widgets by object name, so a re-layout or a switch to a different widget class does not hide anything, and it only goes red when a field is genuinely mis-wired.
+
+`vshot-pin-outline-check` pins down a pin's **pixels**: that the stroke is a solid, fully opaque line rather than a two-tone ring with a translucent outer edge, that both of its states share one geometry (so a focus change can only recolour and never shift the edge or change its weight), and everything the config file can change — that a corner radius really cuts the corner away, that a 4px stroke lands exactly 2px either side of the edge, and that the shadow paints outside the pin and nowhere when it is off. **This is the one place that goes red when the shadow arrives**: the other two pin checks measure the right-click menu as "whatever is painted outside the pins", so they turn the shadow off explicitly — without that, a shadow that is on by default makes them fail for reasons that have nothing to do with what they test, which is exactly how this was found.
 
 There are also 5 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (needs a running KWin; a headless KWin suffices, see the comments in `src/capture/kwin.rs`, with a virtual output named `Virtual-0`, 1024x768, no pointer capability, so it only covers the D-Bus capture layer), the active output probe (needs any real session), `/dev/uinput` scroll injection (needs write access), and **the built-in OCR engine reading drawn text** (needs those 30 MB of models on disk, which `cargo test` has nowhere to fetch them from). To run them:
 

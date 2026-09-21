@@ -19,6 +19,8 @@
 #include "settings_window.hpp"
 
 #include <QApplication>
+#include <QAbstractButton>
+#include <QColor>
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
@@ -91,6 +93,16 @@ bool choose(QComboBox *box, const QString &value)
     return true;
 }
 
+/// The colour a swatch button is showing, read off its own text -- the hex it
+/// displays.  A colour button is a QPushButton with no public colour getter, so
+/// the text is the honest thing to read: it is what the user sees, and it is
+/// what a button wired to the wrong field would show the wrong value of.
+QColor colorOf(QDialog *dialog, const char *name)
+{
+    QPushButton *button = find<QPushButton>(dialog, name);
+    return button == nullptr ? QColor() : vshot::parseColorText(button->text());
+}
+
 void checkEveryFieldReachesTheFile()
 {
     std::printf("--- every field the window shows reaches the file ---------------\n");
@@ -132,6 +144,21 @@ void checkEveryFieldReachesTheFile()
     expect(choose(find<QComboBox>(dialog.get(), "longInject"), QStringLiteral("uinput")),
            "the scroll-backend list offers uinput");
 
+    // The pins' look.  The radius and the border width are set to values that
+    // are neither the default nor each other, so a pair wired to the same
+    // member cannot pass.
+    find<QSpinBox>(dialog.get(), "pinRadius")->setValue(17);
+    find<QAbstractButton>(dialog.get(), "pinShadow")->setChecked(false);
+    find<QSpinBox>(dialog.get(), "pinBorderWidth")->setValue(5);
+    find<QSpinBox>(dialog.get(), "pinShadowSize")->setValue(23);
+    find<QSpinBox>(dialog.get(), "pinShadowOffset")->setValue(-6);
+    find<QSpinBox>(dialog.get(), "pinShadowOpacity")->setValue(200);
+    find<QSpinBox>(dialog.get(), "dialogRadius")->setValue(19);
+    find<QSpinBox>(dialog.get(), "dialogBorderWidth")->setValue(3);
+    find<QSpinBox>(dialog.get(), "dialogShadowSize")->setValue(11);
+    find<QSpinBox>(dialog.get(), "dialogShadowOffset")->setValue(4);
+    find<QSpinBox>(dialog.get(), "dialogShadowOpacity")->setValue(90);
+
     QPushButton *save = find<QPushButton>(dialog.get(), "saveButton");
     if (save != nullptr) {
         save->click();
@@ -158,6 +185,26 @@ void checkEveryFieldReachesTheFile()
     expect(saved.cli.longTimeout == 99, "the scroll timeout reached the file");
     expect(saved.cli.longIgnoreTop == 42, "the scroll ignore-top reached the file");
     expect(saved.cli.longInject == QStringLiteral("uinput"), "the scroll backend reached the file");
+    expect(saved.pin.radius == 17, "the pin radius reached the file",
+           QString::number(saved.pin.radius));
+    expect(!saved.pin.shadow.enabled, "the pin shadow switch reached the file");
+    expect(saved.pin.shadow.size == 23 && saved.pin.shadow.offset == -6 &&
+               saved.pin.shadow.opacity == 200,
+           "the pin shadow's numbers reached the file",
+           QStringLiteral("%1/%2/%3")
+               .arg(saved.pin.shadow.size)
+               .arg(saved.pin.shadow.offset)
+               .arg(saved.pin.shadow.opacity));
+    expect(saved.dialog.shadow.enabled && saved.dialog.shadow.size == 11 &&
+               saved.dialog.shadow.offset == 4 && saved.dialog.shadow.opacity == 90,
+           "the dialog shadow's numbers reached the file",
+           QStringLiteral("%1/%2/%3/%4")
+               .arg(saved.dialog.shadow.enabled ? 1 : 0)
+               .arg(saved.dialog.shadow.size)
+               .arg(saved.dialog.shadow.offset)
+               .arg(saved.dialog.shadow.opacity));
+    expect(saved.pin.borderWidth == 5, "the pin border width reached the file",
+           QString::number(saved.pin.borderWidth));
 
     // The neighbouring rows must not have been crossed: this is what tells a
     // correct wiring apart from one that writes every value somewhere.
@@ -176,7 +223,11 @@ void checkTheWindowOpensOnTheStoredValues()
                    "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textPixels": 28},
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
-                "pin": {"density": 2}}
+                "pin": {"density": 2}},
+        "pin": {"radius": 9, "shadow": false, "shadowSize": 21, "shadowOffset": -7,
+                "shadowOpacity": 200, "borderWidth": 6,
+                "borderColor": "#112233", "activeBorderColor": "#445566"},
+        "dialog": {"radius": 7, "shadowSize": 9, "shadowOffset": 5, "shadowOpacity": 77}
     })"));
     std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
     if (!dialog) {
@@ -203,6 +254,38 @@ void checkTheWindowOpensOnTheStoredValues()
            "the scroll-backend box is right");
     expect(find<QSpinBox>(dialog.get(), "longTimeout")->value() == 45, "the timeout box is right");
     expect(find<QSpinBox>(dialog.get(), "pinDensity")->value() == 2, "the pin density box is right");
+    expect(find<QSpinBox>(dialog.get(), "pinRadius")->value() == 9, "the pin radius box is right");
+    expect(!find<QAbstractButton>(dialog.get(), "pinShadow")->isChecked(),
+           "the shadow switch shows the stored off state");
+    expect(find<QSpinBox>(dialog.get(), "pinShadowSize")->value() == 21 &&
+               find<QSpinBox>(dialog.get(), "pinShadowOffset")->value() == -7 &&
+               find<QSpinBox>(dialog.get(), "pinShadowOpacity")->value() == 200,
+           "the pin shadow boxes show the stored numbers",
+           QStringLiteral("%1/%2/%3")
+               .arg(find<QSpinBox>(dialog.get(), "pinShadowSize")->value())
+               .arg(find<QSpinBox>(dialog.get(), "pinShadowOffset")->value())
+               .arg(find<QSpinBox>(dialog.get(), "pinShadowOpacity")->value()));
+    expect(find<QSpinBox>(dialog.get(), "dialogRadius")->value() == 7,
+           "the dialog radius box is right");
+    expect(find<QSpinBox>(dialog.get(), "dialogShadowSize")->value() == 9 &&
+               find<QSpinBox>(dialog.get(), "dialogShadowOffset")->value() == 5 &&
+               find<QSpinBox>(dialog.get(), "dialogShadowOpacity")->value() == 77,
+           "the dialog shadow boxes show the stored numbers",
+           QStringLiteral("%1/%2/%3")
+               .arg(find<QSpinBox>(dialog.get(), "dialogShadowSize")->value())
+               .arg(find<QSpinBox>(dialog.get(), "dialogShadowOffset")->value())
+               .arg(find<QSpinBox>(dialog.get(), "dialogShadowOpacity")->value()));
+    expect(find<QSpinBox>(dialog.get(), "pinBorderWidth")->value() == 6,
+           "the pin border width box is right");
+    // The two colours are shown on their own buttons, and each has to be the
+    // one its own row carries: they are the same widget class in neighbouring
+    // rows, which is exactly the mix-up this check exists to catch.
+    expect(colorOf(dialog.get(), "pinBorderColorButton") == QColor(0x11, 0x22, 0x33),
+           "the border colour button shows the stored border colour",
+           colorOf(dialog.get(), "pinBorderColorButton").name());
+    expect(colorOf(dialog.get(), "pinActiveColorButton") == QColor(0x44, 0x55, 0x66),
+           "the active colour button shows the stored active colour",
+           colorOf(dialog.get(), "pinActiveColorButton").name());
 
     // A field the file says nothing about shows the "not set" entry, and the
     // spin boxes show their special text rather than a real zero.
@@ -210,6 +293,48 @@ void checkTheWindowOpensOnTheStoredValues()
            "an unset height limit reads as unset");
     expect(!find<QSpinBox>(dialog.get(), "longMaxHeight")->specialValueText().isEmpty(),
            "an unset spin box says so instead of showing a zero");
+}
+
+void checkClearingOneColorLeavesTheOther()
+{
+    std::printf("--- clearing one pin colour leaves the other ---------------------\n");
+    writeConfig(QStringLiteral(R"({
+        "pin": {"borderColor": "#112233", "activeBorderColor": "#445566"}
+    })"));
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    if (!dialog) {
+        return;
+    }
+    // Clearing the idle colour is what "Automatic" does on that row, and the
+    // active colour -- a different field with its own button -- has to survive
+    // it.  Two buttons of the same class in neighbouring rows is precisely the
+    // shape that gets wired to the same member by accident.
+    find<QPushButton>(dialog.get(), "pinBorderColorClear")->click();
+    find<QPushButton>(dialog.get(), "saveButton")->click();
+
+    const vshot::Config saved = vshot::loadConfig();
+    expect(!saved.pin.borderColor.isValid(),
+           "the cleared colour is stored as automatic", saved.pin.borderColor.name());
+    expect(saved.pin.activeBorderColor == QColor(0x44, 0x55, 0x66),
+           "the other colour is untouched", saved.pin.activeBorderColor.name());
+
+    // And the reverse, from a fresh window: clearing the active colour leaves
+    // the idle one alone.
+    writeConfig(QStringLiteral(R"({
+        "pin": {"borderColor": "#112233", "activeBorderColor": "#445566"}
+    })"));
+    std::unique_ptr<QDialog> second(vshot::createSettingsDialog());
+    if (!second) {
+        return;
+    }
+    find<QPushButton>(second.get(), "pinActiveColorClear")->click();
+    find<QPushButton>(second.get(), "saveButton")->click();
+    const vshot::Config reread = vshot::loadConfig();
+    expect(reread.pin.borderColor == QColor(0x11, 0x22, 0x33),
+           "clearing the active colour leaves the idle one", reread.pin.borderColor.name());
+    expect(!reread.pin.activeBorderColor.isValid(),
+           "and the active colour is the one that went automatic",
+           reread.pin.activeBorderColor.name());
 }
 
 void checkCancelChangesNothing()
@@ -351,6 +476,7 @@ int main(int argc, char **argv)
 
     checkEveryFieldReachesTheFile();
     checkTheWindowOpensOnTheStoredValues();
+    checkClearingOneColorLeavesTheOther();
     checkCancelChangesNothing();
     checkTheDesktopEntryAndIconAgree();
 

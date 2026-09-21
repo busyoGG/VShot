@@ -215,6 +215,12 @@ int main(int argc, char **argv)
     vshot::PinSurface surface(screen);
     surface.resize(900, 700);
     surface.show();
+    // The shadow is off for this check: it paints outside the pins by design,
+    // and this check measures the menu as "whatever is painted outside the
+    // pins".  What the shadow itself looks like is the outline check's job.
+    vshot::PinSurface::Style style;
+    style.shadow.enabled = false;
+    surface.setStyle(style);
     // The offscreen platform never activates a window by itself, and
     // activateWindow() only asks for it (a request offscreen drops), so the
     // harness has to say so -- the menu's keys go to the focused widget.
