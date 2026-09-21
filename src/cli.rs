@@ -88,7 +88,8 @@ pub struct Cli {
         conflicts_with_all = ["clipboard", "pin"]
     )]
     pub output: Option<PathBuf>,
-    /// Copy PNG bytes to the Wayland clipboard.
+    /// Copy the result to the Wayland clipboard: PNG bytes for a capture, the
+    /// recognized text for `vshot ocr`.
     #[arg(long, global = true, conflicts_with = "output")]
     pub clipboard: bool,
     /// Pin the captured image on screen instead of writing it anywhere.
@@ -287,6 +288,36 @@ are not given. Nothing is captured and no compositor protocol is needed beyond s
 so this also works under a compositor vshot cannot otherwise capture."
     )]
     Settings,
+
+    /// Read the text out of a region of the screen.
+    #[command(
+        after_help = "Without --geometry the frozen scene is handed to the Qt overlay to frame \
+the text, exactly as `vshot region` does but without the annotation editor: pick a rectangle, \
+press Enter, and its text comes back. The text goes to stdout, or to the clipboard with \
+--clipboard. --input reads an image file instead of the screen, which is also how the \
+annotation editor's text tool gets its text.\n\n\
+Recognition runs PaddleOCR's PP-OCR models (the ONNX conversions of them) on ONNX Runtime, on \
+the CPU, in this process. The models are installed under /usr/share/vshot/models and are \
+looked for beside the executable as well, so a source checkout works without installing \
+anything.\n\n\
+To use a GPU, point `ocr.engine` at an external program in \
+$XDG_CONFIG_HOME/vshot/config.json: it is handed a PNG and writes the text on stdout, and \
+vshot never links a GPU runtime itself. See the README's OCR section for the shape of that \
+entry."
+    )]
+    Ocr {
+        /// Fixed global geometry in `x,y widthxheight` form.
+        #[arg(long, conflicts_with = "interactive", allow_hyphen_values = true)]
+        geometry: Option<String>,
+        /// Explicitly request pointer-driven selection. This is the default when geometry is omitted.
+        #[arg(long, conflicts_with = "geometry")]
+        interactive: bool,
+        /// Read an image from this file instead of capturing the screen. This
+        /// is what the annotation editor's text tool uses: it hands over the
+        /// part of the frame that was framed, and gets the text back.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "interactive"])]
+        input: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -421,6 +452,30 @@ pub enum Action {
     PinApply(std::path::PathBuf),
     /// Show the settings window and wait for it to close.
     Settings,
+    /// Read the text out of a region, to stdout or the clipboard.
+    Ocr {
+        /// Fixed region, `None` to frame it interactively, or a file to read.
+        source: OcrSource,
+        destination: OcrDestination,
+    },
+}
+
+/// Where `vshot ocr` gets its image.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OcrSource {
+    /// A region of the frozen screen, framed interactively.
+    Screen,
+    /// A fixed region of the frozen screen.
+    Geometry(Rect),
+    /// An image file on disk.
+    File(PathBuf),
+}
+
+/// Where recognized text goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OcrDestination {
+    Stdout,
+    Clipboard,
 }
 
 /// The parser, with the help output in the language `VSHOT_LANG` (or the
@@ -450,6 +505,36 @@ impl Cli {
                 ));
             }
             return Ok(Action::Settings);
+        }
+        if let Command::Ocr {
+            geometry,
+            interactive: _,
+            input,
+        } = &self.command
+        {
+            // The text is the whole result, so the only destination that makes
+            // sense is stdout or the clipboard; --output would write an image,
+            // which is `vshot region`'s job, and --pin has nothing to pin.
+            if self.output.is_some() || self.pin {
+                return Err(VshotError::InvalidDestination(
+                    "--output and --pin do not apply to the ocr subcommand; the text goes to \
+                     stdout, or to the clipboard with --clipboard"
+                        .into(),
+                ));
+            }
+            let source = match (input, geometry) {
+                (Some(path), _) => OcrSource::File(path.clone()),
+                (None, Some(geometry)) => OcrSource::Geometry(parse_geometry(geometry)?),
+                (None, None) => OcrSource::Screen,
+            };
+            return Ok(Action::Ocr {
+                source,
+                destination: if self.clipboard {
+                    OcrDestination::Clipboard
+                } else {
+                    OcrDestination::Stdout
+                },
+            });
         }
         if let Command::Pin {
             files,
@@ -580,6 +665,11 @@ impl Cli {
             Command::Settings => {
                 return Err(VshotError::InvalidDestination(
                     "the settings subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Ocr { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the ocr subcommand is not a capture target".into(),
                 ))
             }
         };

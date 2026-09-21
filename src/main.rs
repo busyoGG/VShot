@@ -8,6 +8,7 @@ mod geometry;
 mod inject;
 mod longshot;
 mod model;
+mod ocr;
 mod output;
 mod pin;
 mod qt_overlay;
@@ -73,6 +74,10 @@ fn run() -> Result<()> {
             // capture, no scene, no Wayland connection of our own.
             return qt_overlay::run_settings();
         }
+        Action::Ocr {
+            source,
+            destination,
+        } => return run_ocr(source, destination),
         Action::Capture(request) => request,
     };
     let mut wayland = WaylandSession::connect()?;
@@ -373,6 +378,75 @@ events all look the same from here",
     };
 
     finish_capture(edits, frame, density, &request, &mut wayland)
+}
+
+/// Reads the text out of a region of the screen, or out of an image file.
+///
+/// The capture half is `vshot region`'s: the scene is frozen, the overlay
+/// frames the text, and the frame is cropped.  What differs is what happens
+/// next — no annotation editor, no PNG, just the recognized text going to
+/// stdout or the clipboard.
+fn run_ocr(source: cli::OcrSource, destination: cli::OcrDestination) -> Result<()> {
+    // A file needs no compositor at all, so it takes the shortest path: the
+    // annotation editor's text tool goes through here, and it has no scene.
+    if let cli::OcrSource::File(path) = &source {
+        let bytes = std::fs::read(path).map_err(|error| {
+            VshotError::Ocr(format!("cannot read `{}`: {error}", path.display()))
+        })?;
+        let frame = Frame::from_png(&bytes)?;
+        let lines = ocr::recognize(&frame)?;
+        return write_ocr_text(&ocr::join_lines(&lines), destination);
+    }
+
+    let mut wayland = WaylandSession::connect()?;
+    let topology = wayland.output_infos()?;
+    let mut capture = Capturer::connect()?;
+    let scene = capture_scene(&mut capture, &topology, false)?;
+
+    let geometry = match source {
+        cli::OcrSource::Geometry(geometry) => geometry,
+        cli::OcrSource::Screen => {
+            // Framing the text is the whole interaction: `select_region` runs
+            // the overlay in its select-only mode, so there is no toolbar and
+            // Enter ends the session rather than opening an editor.
+            wayland.set_scene(scene.clone());
+            let picked = qt_overlay::select_region(&scene);
+            wayland.show_frozen(false)?;
+            let cleanup = wayland.destroy_overlays();
+            // A cancelled pick and a cleanup failure are both reported after
+            // the overlays are gone, so the desktop is never left frozen.
+            let geometry =
+                picked.and_then(|geometry| selection::validate_selection(&scene, geometry));
+            cleanup?;
+            geometry?
+        }
+        cli::OcrSource::File(_) => unreachable!("handled above"),
+    };
+
+    let geometry = selection::validate_selection(&scene, geometry)?;
+    let (frame, _density) = crop_native(&scene, geometry)?;
+    // The overlays have to be gone before the text is printed: an error path
+    // that leaves them mapped would freeze the desktop behind the output.
+    wayland.show_frozen(false)?;
+    let cleanup = wayland.destroy_overlays();
+
+    let lines = ocr::recognize(&frame);
+    cleanup?;
+    write_ocr_text(&ocr::join_lines(&lines?), destination)
+}
+
+/// Sends recognized text where the request pointed.
+fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
+    match destination {
+        cli::OcrDestination::Stdout => {
+            use std::io::Write as _;
+            print!("{text}");
+            std::io::stdout()
+                .flush()
+                .map_err(|error| VshotError::Ocr(format!("cannot write to stdout: {error}")))
+        }
+        cli::OcrDestination::Clipboard => output::copy_text_to_clipboard(text),
+    }
 }
 
 /// Renders the annotations into the captured frame and writes it where the

@@ -168,6 +168,12 @@ public:
     // Whether a paste would have anything to work with, so the toolbar can
     // disable its button rather than offering a no-op.
     bool canPaste() const;
+    // Reads the text in the selection and puts it on the clipboard. The
+    // recognition itself runs in a `vshot ocr --input` child, because the
+    // engine is on the Rust side and this process draws a layer surface that
+    // cannot be blocked on a model load. `error` is filled when there is
+    // nothing to read, the child cannot be started, or it fails.
+    bool copySelectionText(QString *error);
     void notifyPanelDragged();
     void undo();
     void redo();

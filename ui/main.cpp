@@ -56,24 +56,23 @@ int main(int argc, char **argv)
     // integration is wanted depends on the mode.
     const bool settingsMode =
         argc == 2 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--settings");
-    // The file dialogs are the other toplevel modes, and they need the same
-    // treatment: each is a QFileDialog, i.e. a popup over a plain window, and
-    // the layer-shell integration would leave it unmapped exactly like the
-    // settings window.
+    // A file dialog is a layer surface like every other vshot window, so it
+    // keeps the layer-shell integration.  It has to: the frozen frame it is
+    // opened over is a layer surface, and a compositor draws a layer above
+    // every ordinary window, so a dialog opened as a toplevel would sit behind
+    // the frame -- invisible and unable to take a click.  Its arguments are the
+    // suggested path and, optionally, the output to open on.
     const bool saveMode =
-        argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--save-dialog");
+        argc >= 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--save-dialog");
     const bool openMode =
-        argc == 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--open-dialog");
-    // Every other mode draws a layer surface: the capture overlay, the picking
-    // overlay, the scrolling-capture hint and the pin windows all anchor
-    // themselves and must sit above ordinary windows.  The settings window is
-    // the exception -- it is a plain toplevel dialog, and a dialog under the
-    // layer-shell integration is created and then never mapped, because there
-    // is no layer surface to map it as.  So the override is set only where it
-    // is wanted, and cleared where it would get in the way: a session that
-    // exports it globally would otherwise leave this window invisible with no
-    // error to show for it.
-    if (settingsMode || saveMode || openMode) {
+        argc >= 3 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--open-dialog");
+    // The settings window is the exception: it is a plain toplevel dialog, and
+    // a dialog under the layer-shell integration is created and then never
+    // mapped, because there is no layer surface to map it as.  So the override
+    // is set for every mode but that one -- and cleared there, so a session
+    // that exports it globally cannot hide the window with no error to show
+    // for it.
+    if (settingsMode) {
         qunsetenv("QT_WAYLAND_SHELL_INTEGRATION");
     } else {
         qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
@@ -133,16 +132,18 @@ int main(int argc, char **argv)
     }
     if (saveMode || openMode) {
         const QString suggested = QString::fromLocal8Bit(argv[2]);
+        const QString screenName = argc > 3 ? QString::fromLocal8Bit(argv[3]) : QString();
         QApplication app(argc, argv);
         QApplication::setQuitOnLastWindowClosed(true);
-        return saveMode ? vshot::runSaveDialog(suggested) : vshot::runOpenDialog(suggested);
+        return saveMode ? vshot::runSaveDialog(suggested, screenName)
+                        : vshot::runOpenDialog(suggested, screenName);
     }
     if (argc != 3 || QString::fromLocal8Bit(argv[1]) != QStringLiteral("--session")) {
         reportError(QStringLiteral("usage: vshot-qt-ui --session <absolute-json-path>\n"
                                    "       vshot-qt-ui --settings\n"
                                    "       vshot-qt-ui --pin-edit <absolute-json-path>\n"
-                                   "       vshot-qt-ui --save-dialog <suggested-path>\n"
-                                   "       vshot-qt-ui --open-dialog <suggested-path>\n"
+                                   "       vshot-qt-ui --save-dialog <suggested-path> [output]\n"
+                                   "       vshot-qt-ui --open-dialog <suggested-path> [output]\n"
                                    "       vshot-qt-ui --pin-server <absolute-socket-path>"));
         return 2;
     }

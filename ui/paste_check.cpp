@@ -35,6 +35,7 @@
 #include <QColor>
 #include <QDir>
 #include <QFile>
+#include <QFrame>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -44,6 +45,7 @@
 #include <QScreen>
 #include <QString>
 #include <QTemporaryDir>
+#include <QToolButton>
 
 #include <cstdio>
 #include <utility>
@@ -284,6 +286,70 @@ void checkRefusals()
            "an image annotation is dropped when there is nowhere to write its pixels");
 }
 
+// A pasted image has to be selectable and draggable, which means the hit test
+// has to know about image annotations at all.  A paste carries no points -- it
+// is a rect and a pixel buffer -- so if the hit test only walks strokes, a
+// pasted image is unhittable no matter how visible it is: it cannot be picked
+// up, moved or resized, and clicking it does nothing at all.
+//
+// Driven through the real press/move/release path rather than by calling the
+// hit test directly, because what has to work is the whole gesture: the press
+// selects the image, the move drags it, the release commits it.
+void checkPastedImageMoves()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    // The offscreen plugin's screen is 400x400, so the session matches it
+    // one-to-one and a logical pixel is a pixel here.
+    const vshot::LogicalRect canvas{40, 50, 60, 40};
+    vshot::OverlayController controller(editingSession(1, canvas));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    // Twice the canvas in both directions, so the paste shrinks to fill it
+    // exactly.  The image has to be comfortably larger than the resize handles:
+    // a 2x2 paste would put its own centre within a handle's reach and a drag
+    // from there would resize the image instead of moving it.
+    QImage source(120, 80, QImage::Format_ARGB32);
+    source.fill(QColor(20, 140, 200));
+    controller.pasteImage(source);
+    expect(controller.annotations().size() == 1, "the image is pasted");
+    if (controller.annotations().size() != 1) {
+        return;
+    }
+    const vshot::LogicalRect before = controller.annotations().at(0).rect;
+    expect(before.width == canvas.width && before.height == canvas.height,
+           "an oversized paste fills the canvas",
+           QStringLiteral("%1x%2").arg(before.width).arg(before.height));
+
+    // Press in the middle of the image -- far from every handle -- and drag by
+    // 10 logical pixels right and down.
+    const QPointF inside(before.x + before.width / 2.0, before.y + before.height / 2.0);
+    controller.press(overlay, inside, Qt::LeftButton, Qt::NoModifier);
+    controller.move(overlay, inside + QPointF(10, 10), Qt::LeftButton, Qt::NoModifier);
+    controller.release(overlay, inside + QPointF(10, 10), Qt::LeftButton, Qt::NoModifier);
+
+    const vshot::LogicalRect after = controller.annotations().at(0).rect;
+    expect(after.x == before.x + 10 && after.y == before.y + 10,
+           "dragging the image moves it by the drag delta",
+           QStringLiteral("was %1,%2 now %3,%4")
+               .arg(before.x)
+               .arg(before.y)
+               .arg(after.x)
+               .arg(after.y));
+    expect(after.width == before.width && after.height == before.height,
+           "the drag does not resize the image");
+    expect(!controller.annotations().at(0).pixels.isNull(),
+           "the moved image still carries its pixels");
+}
+
 // The paste is one undo step, and undoing it must not lose the pixels: the
 // annotation equality test skips the buffer and compares cache keys, which is
 // exactly the shortcut that could make a restored paste come back empty.
@@ -332,7 +398,7 @@ void checkToolbarButton()
         expect(false, "the toolbar has a command surface");
         return;
     }
-    auto *paste = surface->findChild<QPushButton *>(QStringLiteral("pasteButton"));
+    auto *paste = surface->findChild<QToolButton *>(QStringLiteral("pasteButton"));
     expect(paste != nullptr, "the toolbar carries a paste button");
     if (paste == nullptr) {
         return;
@@ -341,18 +407,74 @@ void checkToolbarButton()
            "the paste button is labelled", paste->text());
     expect(!paste->toolTip().isEmpty(), "the paste button explains itself", paste->toolTip());
     expect(paste->isVisibleTo(surface), "the paste button is on the visible toolbar");
-    // It sits among the actions, after the tools: the buttons the user clicks
-    // once, not a mode the pointer stays in.
+    expect(!paste->icon().isNull(), "the paste button draws its own icon");
+    expect(paste->toolButtonStyle() == Qt::ToolButtonTextUnderIcon,
+           "the paste button is drawn like the tool buttons");
+    expect(paste->property("toolButton").toBool(),
+           "the paste button carries the tool-button property the frame paints by");
+    // It sits in the tool row beside the tools: it is the same kind of thing to
+    // click, and a second row of text buttons only made the bar taller.
     auto *confirm = surface->findChild<QPushButton *>(QStringLiteral("confirmButton"));
     expect(confirm != nullptr && paste->parentWidget() == confirm->parentWidget(),
-           "the paste button shares the action row with OK");
+           "the paste button shares the command row with OK");
     if (confirm == nullptr) {
         return;
     }
-    // Before OK in that row: the row reads tools, undo/redo, Image, OK, Cancel.
+    // Before OK in that row: the row reads tools, Image, Text+, undo/redo, OK,
+    // Cancel.
     QLayout *row = confirm->parentWidget() != nullptr ? confirm->parentWidget()->layout() : nullptr;
     expect(row != nullptr && row->indexOf(paste) >= 0 && row->indexOf(confirm) > row->indexOf(paste),
            "the paste button sits before OK in that row");
+    // And in the tools' own stretch of the row: ahead of the first divider,
+    // which is what separates the tools from undo/redo.
+    auto *divider = surface->findChild<QFrame *>(QStringLiteral("toolbarDivider"));
+    expect(divider != nullptr && row->indexOf(paste) < row->indexOf(divider),
+           "the paste button sits with the tools, before the first divider");
+}
+
+// The text tool's entry point: the button has to be on the command bar next to
+// the paste button, and it must be wired to something -- an object name found
+// here but a button that does nothing would still pass every other check.
+void checkTextButton()
+{
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    vshot::OverlayController controller(editingSession(1, vshot::LogicalRect{40, 50, 60, 40}));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    auto *surface = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
+    if (surface == nullptr) {
+        expect(false, "the toolbar has a command surface");
+        return;
+    }
+    auto *text = surface->findChild<QToolButton *>(QStringLiteral("ocrButton"));
+    expect(text != nullptr, "the toolbar carries a text button");
+    if (text == nullptr) {
+        return;
+    }
+    expect(text->text() == vshot::uiTr(QStringLiteral("Text+")),
+           "the text button is labelled", text->text());
+    expect(!text->toolTip().isEmpty(), "the text button explains itself", text->toolTip());
+    expect(!text->icon().isNull(), "the text button draws its own icon");
+    expect(text->toolButtonStyle() == Qt::ToolButtonTextUnderIcon,
+           "the text button is drawn like the tool buttons");
+    expect(text->property("toolButton").toBool(),
+           "the text button carries the tool-button property the frame paints by");
+    // Clicking it with a session that has a selection must not crash and must
+    // report a failure rather than claiming a copy: there is no `vshot` child
+    // to run under the offscreen platform, and a silent success here would be
+    // the worst outcome -- the user would paste stale clipboard contents.
+    text->click();
+    expect(text->text() == vshot::uiTr(QStringLiteral("Failed")),
+           "a text read that cannot run reports failure", text->text());
 }
 
 } // namespace
@@ -364,8 +486,10 @@ int main(int argc, char **argv)
     checkWireFormat();
     checkShrinkToFit();
     checkRefusals();
+    checkPastedImageMoves();
     checkUndoKeepsPixels();
     checkToolbarButton();
+    checkTextButton();
 
     if (failures != 0) {
         std::printf("\n%d check(s) failed\n", failures);

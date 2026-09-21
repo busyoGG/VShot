@@ -11,6 +11,22 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 memmap2 = "0.9.11"
+# OCR, for `vshot ocr` and the editor's text tool. `oar-ocr` runs PaddleOCR's
+# own PP-OCR models (converted to ONNX) on ONNX Runtime, and the ONNX Runtime
+# it links against is the system one rather than a downloaded copy, so the
+# binary stays small and the runtime stays whatever the distribution ships.
+# `default-features = false` drops the automatic ONNX Runtime download; the
+# `ort` line below restores only what this side needs.
+oar-ocr = { version = "0.9.2", default-features = false }
+# `oar-ocr` pins `ort` itself but without the provider features; the explicit
+# dependency is what turns on `pkg-config`, so the system `libonnxruntime` is
+# found instead of one being fetched at build time.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "pkg-config",
+] }
 # The `image` encoder cannot state a pixel density, so PNGs that have to carry
 # one are encoded directly; already in the graph via `image`.
 png = "0.18"

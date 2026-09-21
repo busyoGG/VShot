@@ -45,6 +45,11 @@ constexpr int kMaxWidth = 64;
 constexpr int kMaxArrowSize = 8;
 constexpr int kMaxMosaicStrength = 3;
 constexpr int kMaxDensity = 4;
+// The dialog's rim.  A radius past half the window's shorter side would stop
+// being a corner and start being a lozenge, so the ceiling is well inside that;
+// the stroke stops before it eats the dialog's own margins.
+constexpr int kMaxDialogRadius = 48;
+constexpr int kMaxDialogBorderWidth = 8;
 
 /// Reads a non-negative integer, clamped into `[1, max]`; anything absent or
 /// of the wrong type keeps `fallback`.
@@ -480,12 +485,45 @@ QColor parseColorText(const QString &text)
     }
 }
 
+/// The `dialog` section of the file.  Like the editor's, it is written whole:
+/// it describes a complete look rather than a set of overrides.
+DialogPreferences readDialog(const QJsonObject &dialog)
+{
+    DialogPreferences preferences;
+    preferences.radius = readBounded(dialog, QStringLiteral("radius"), preferences.radius,
+                                     kMaxDialogRadius);
+    preferences.borderWidth = readBounded(dialog, QStringLiteral("borderWidth"),
+                                          preferences.borderWidth, kMaxDialogBorderWidth);
+    // Absent, not merely unparseable, is what means "derive it": an invalid or
+    // missing colour leaves the invalid QColor in place, and that is the
+    // signal the dialog reads to pick a palette colour of its own.
+    preferences.borderColor =
+        readColor(dialog, QStringLiteral("borderColor"), preferences.borderColor);
+    return preferences;
+}
+
+QJsonObject dialogJson(const DialogPreferences &preferences)
+{
+    QJsonObject dialog;
+    dialog.insert(QStringLiteral("radius"), static_cast<double>(preferences.radius));
+    dialog.insert(QStringLiteral("borderWidth"),
+                  static_cast<double>(preferences.borderWidth));
+    // Only when it is a real colour: its absence is how the file says "derive
+    // one from the palette", and writing a null or a placeholder would turn
+    // that into a colour the dialog then has to invent a meaning for.
+    if (preferences.borderColor.isValid()) {
+        dialog.insert(QStringLiteral("borderColor"), colorText(preferences.borderColor));
+    }
+    return dialog;
+}
+
 Config loadConfig()
 {
     Config config;
     const QJsonObject root = readRoot();
     config.editor = readEditor(root.value(QStringLiteral("editor")).toObject());
     config.cli = readCli(root.value(QStringLiteral("cli")).toObject());
+    config.dialog = readDialog(root.value(QStringLiteral("dialog")).toObject());
     return config;
 }
 
@@ -498,6 +536,10 @@ bool saveConfig(const Config &config)
     mergeSection(root, QStringLiteral("editor"), editorJson(config.editor));
     dropRetiredEditorKeys(root);
     writeCliSection(root, cliJson(config.cli));
+    // Wholesale, like `editor`: the section is a complete look, and a key the
+    // user removed by clearing the colour has to disappear rather than be
+    // merged back in.
+    root.insert(QStringLiteral("dialog"), dialogJson(config.dialog));
     return writeRoot(root);
 }
 
@@ -515,6 +557,46 @@ bool saveEditorPreferences(const EditorPreferences &preferences)
     mergeSection(root, QStringLiteral("editor"), editorJson(preferences));
     dropRetiredEditorKeys(root);
     return writeRoot(root);
+}
+
+DialogPreferences loadDialogPreferences()
+{
+    return loadConfig().dialog;
+}
+
+bool saveDialogPreferences(const DialogPreferences &preferences)
+{
+    if (configFilePath().isEmpty()) {
+        return false;
+    }
+    QJsonObject root = readRoot();
+    root.insert(QStringLiteral("dialog"), dialogJson(preferences));
+    return writeRoot(root);
+}
+
+int resolveDialogRadius(const DialogPreferences &preferences, const QSize &size)
+{
+    // Half the shorter side is where a corner becomes a lozenge; one pixel
+    // short of that keeps a rectangle a rectangle at any stored value.
+    const int most = std::max(0, std::min(size.width(), size.height()) / 2 - 1);
+    return std::min(static_cast<int>(preferences.radius), most);
+}
+
+QColor resolveDialogBorderColor(const DialogPreferences &preferences, const QColor &surface,
+                                const QColor &text)
+{
+    if (preferences.borderColor.isValid()) {
+        return preferences.borderColor;
+    }
+    // A third of the way from the dialog's own colour to its text: darker on a
+    // light scheme, lighter on a dark one, so the edge reads as an edge either
+    // way without a second constant to keep in step.
+    const auto blend = [](const QColor &from, const QColor &to, double amount) {
+        return QColor(qRound(from.red() * (1.0 - amount) + to.red() * amount),
+                      qRound(from.green() * (1.0 - amount) + to.green() * amount),
+                      qRound(from.blue() * (1.0 - amount) + to.blue() * amount));
+    };
+    return blend(surface, text, 0.35);
 }
 
 const QStringList &toolNames()

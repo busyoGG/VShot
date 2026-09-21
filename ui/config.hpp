@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QColor>
+#include <QPalette>
+#include <QSize>
 #include <QString>
 #include <QStringList>
 
@@ -51,10 +53,28 @@ struct CliPreferences {
     std::uint32_t pinDensity = 0;
 };
 
+/// The look of the file dialogs.
+///
+/// These live in the config file rather than in the dialog's code because the
+/// dialog is a layer surface: a compositor draws no decoration on one, so the
+/// rim this describes is the only thing separating the dialog from whatever is
+/// behind it, and how heavy it should be is the user's call rather than ours.
+struct DialogPreferences {
+    /// Corner radius, in logical pixels.  Zero is a plain rectangle.
+    std::uint32_t radius = 12;
+    /// Stroke width of the rim, in logical pixels.  Zero draws no rim at all.
+    std::uint32_t borderWidth = 1;
+    /// The rim's colour.  The default is invalid, meaning "derive one from the
+    /// palette" -- which is what follows a light or dark colour scheme without
+    /// the user having to spell out a colour for each.
+    QColor borderColor;
+};
+
 /// Both sections of the shared config file.
 struct Config {
     EditorPreferences editor;
     CliPreferences cli;
+    DialogPreferences dialog;
 };
 
 /// The absolute path of the config file: `$XDG_CONFIG_HOME/vshot/config.json`,
@@ -92,6 +112,25 @@ EditorPreferences loadEditorPreferences();
 /// Writes the editor's half, leaving everything else in the file alone.
 /// Returns false on the same terms as [`saveConfig`].
 bool saveEditorPreferences(const EditorPreferences &preferences);
+
+/// The file dialogs' half of [`loadConfig`].
+DialogPreferences loadDialogPreferences();
+
+/// The radius a dialog should use, never past what its own size can carry.  A
+/// corner wider than half the shorter side would turn the rim inside out, which
+/// is what a hand-written 48 would do to a dialog on a short screen.
+int resolveDialogRadius(const DialogPreferences &preferences, const QSize &size);
+
+/// The rim's colour.  The preferences' own colour when they carry one, and
+/// otherwise a stroke derived from the dialog's own colours: a third of the way
+/// from `surface` to `text`, so it is darker on a light scheme and lighter on a
+/// dark one without a second constant to keep in step.
+///
+/// Both colours are passed in rather than read from a palette because the
+/// dialog's stylesheet destroys the surface colour on the way in -- see
+/// FramedFileDialog, which captures it before that happens.
+QColor resolveDialogBorderColor(const DialogPreferences &preferences, const QColor &surface,
+                                const QColor &text);
 
 /// The accepted values for each enumerated field, in the order the settings
 /// window should offer them.  The loaders use the same lists, so a value the

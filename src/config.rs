@@ -35,6 +35,35 @@ pub struct CliDefaults {
     pub monitor: Option<String>,
     pub long: LongDefaults,
     pub pin: PinDefaults,
+    pub ocr: OcrDefaults,
+}
+
+/// Text recognition, used by `vshot ocr` and the editor's text tool.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct OcrDefaults {
+    /// `builtin` (the default) or `external`.
+    pub engine: Option<String>,
+    /// Only read when `engine` is `external`.
+    pub external: Option<OcrExternalDefaults>,
+}
+
+/// How to reach an OCR program the user runs themselves.
+///
+/// This is the way to use a GPU without vshot linking a GPU runtime: the
+/// program may be anything that reads a PNG and writes text, and vshot only
+/// has to start it and read its stdout.  A user with a ROCm or CUDA build of
+/// ONNX Runtime — or a machine elsewhere on the network — points this at it.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct OcrExternalDefaults {
+    /// The program and its arguments, as an array.  The image's path is
+    /// appended unless `stdin` is set.
+    pub command: Option<Vec<String>>,
+    /// Send the PNG on stdin instead of naming a file on the command line.
+    pub stdin: Option<bool>,
+    /// Seconds to wait before giving up.  Defaults to 30.
+    pub timeout: Option<u64>,
 }
 
 /// Defaults for `vshot long`.

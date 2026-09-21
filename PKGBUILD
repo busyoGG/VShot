@@ -6,14 +6,40 @@ pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pi
 url='https://github.com/busyoGG/VShot'
 arch=('x86_64')
 license=('MIT')
-depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt')
-makedepends=('rust' 'cargo' 'cmake' 'gcc')
+# `onnxruntime` is a virtual provide: all six Arch variants (cpu, cuda,
+# opt-cuda, rocm, opt-rocm) declare `Provides: onnxruntime` and conflict with
+# each other, so a system has exactly one.  Naming the virtual package rather
+# than `onnxruntime-cpu` means a user who already has a GPU build installed
+# satisfies this without pacman tearing that build -- and the rccl, migraphx
+# and rocm-hip-sdk packages behind it -- back out.  A fresh install gets to
+# pick; the CPU build is the one the README recommends, because it is about
+# 46 MB against well over a gigabyte.
+#
+# What is actually used is only the shared library and its `.pc` file, which
+# every variant ships: `ort-sys` finds it through pkg-config and links it
+# dynamically.  The provider it offers is not selected by anything here, so a
+# GPU build runs the OCR on the CPU exactly like the CPU one does.
+depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt' 'onnxruntime')
+makedepends=('rust' 'cargo' 'cmake' 'gcc' 'pkgconf')
 optdepends=('wl-clipboard: clipboard input and output support')
-source=()
-sha256sums=()
+# PaddleOCR's PP-OCRv6 models, converted to ONNX by RapidOCR, plus the
+# character dictionary oar-ocr reads them with.  They are downloaded rather
+# than committed: 30 MB of weights do not belong in the source tree, and the
+# package installs them under /usr/share/vshot/models where the binary looks.
+_model_base='https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6'
+source=(
+    "vshot-det.onnx::$_model_base/det/PP-OCRv6_det_small.onnx"
+    "vshot-rec.onnx::$_model_base/rec/PP-OCRv6_rec_small.onnx"
+    "vshot-dict.txt::https://github.com/GreatV/oar-ocr/releases/download/v0.7.0/ppocrv6_dict.txt"
+)
+sha256sums=('090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f'
+            '6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884'
+            'b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d')
 
 build() {
     cd "$startdir"
+    # `pkg-config` is how ort-sys finds the system ONNX Runtime; without it the
+    # crate tries to download one of its own.
     cargo build --release --locked
     cmake -S . -B build-qt \
         -DCMAKE_BUILD_TYPE=Release \
@@ -25,6 +51,10 @@ package() {
     cd "$startdir"
     install -Dm755 target/release/vshot "$pkgdir/usr/bin/vshot"
     install -Dm755 build-qt/vshot-qt-ui "$pkgdir/usr/bin/vshot-qt-ui"
+    # The OCR models, under the names `src/ocr.rs` looks for.
+    install -Dm644 "$srcdir/vshot-det.onnx" "$pkgdir/usr/share/vshot/models/det.onnx"
+    install -Dm644 "$srcdir/vshot-rec.onnx" "$pkgdir/usr/share/vshot/models/rec.onnx"
+    install -Dm644 "$srcdir/vshot-dict.txt" "$pkgdir/usr/share/vshot/models/dict.txt"
     # Authorizes the CLI for KWin's restricted ScreenShot2 D-Bus interface.
     install -Dm644 "$startdir/vshot.desktop" "$pkgdir/usr/share/applications/vshot.desktop"
     # The launcher entry the application menu shows: it opens the settings

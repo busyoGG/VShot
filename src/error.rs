@@ -74,6 +74,8 @@ pub enum VshotError {
     Clipboard(String),
     #[error("pin failed: {0}")]
     Pin(String),
+    #[error("text recognition failed: {0}")]
+    Ocr(String),
     /// Scrolling capture: the frames could not be stitched, or what was asked
     /// of the stitcher makes no sense (a region too small, an ignore-top that
     /// covers the whole frame).

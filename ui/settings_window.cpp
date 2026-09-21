@@ -56,6 +56,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <functional>
 
 namespace vshot {
 namespace {
@@ -353,8 +354,9 @@ QPixmap colorChip(const QColor &color)
 /// extra top-level window would lose the keyboard grab.
 class ColorButton final : public QPushButton {
 public:
-    explicit ColorButton(QWidget *parent)
+    explicit ColorButton(QWidget *parent, const QString &title = QString())
         : QPushButton(parent)
+        , title_(title.isEmpty() ? uiTr("Annotation color") : title)
     {
         setObjectName(QStringLiteral("swatch"));
         setCursor(Qt::PointingHandCursor);
@@ -362,9 +364,12 @@ public:
         setMinimumWidth(132);
         connect(this, &QPushButton::clicked, this, [this] {
             const QColor chosen = QColorDialog::getColor(
-                color_, this, uiTr("Annotation color"), QColorDialog::ShowAlphaChannel);
+                color_, this, title_, QColorDialog::ShowAlphaChannel);
             if (chosen.isValid()) {
                 setColor(chosen);
+                if (onColorChanged) {
+                    onColorChanged(chosen);
+                }
             }
         });
     }
@@ -372,15 +377,26 @@ public:
     void setColor(const QColor &color)
     {
         color_ = color;
+        if (!color.isValid()) {
+            setText(QString());
+            setIcon(QIcon());
+            return;
+        }
         setText(vshot::colorText(color));
         setIcon(QIcon(colorChip(color)));
         setIconSize(QSize(16, 16));
-        setToolTip(uiTr("Annotation color"));
+        setToolTip(title_);
     }
 
     QColor color() const { return color_; }
 
+    /// Emitted when the picker hands back a new colour, so a page that has to
+    /// do something else with it (remember it in its own state, say) hears
+    /// about it.  Not emitted by `setColor`, which is the caller's own doing.
+    std::function<void(const QColor &)> onColorChanged;
+
 private:
+    QString title_;
     QColor color_{255, 64, 64, 255};
 };
 
@@ -509,11 +525,23 @@ QIcon sectionIcon(int index, const QColor &color)
         painter.drawLine(QPointF(15.0, 7.0), QPointF(5.5, 16.5));
         painter.drawLine(QPointF(5.5, 16.5), QPointF(3.0, 17.0));
         painter.drawLine(QPointF(3.0, 17.0), QPointF(3.5, 14.5));
-    } else {
+    } else if (index == 1) {
         // A chevron prompt: the command line.
         painter.drawLine(QPointF(4.0, 5.5), QPointF(8.0, 9.0));
         painter.drawLine(QPointF(8.0, 9.0), QPointF(4.0, 12.5));
         painter.drawLine(QPointF(10.0, 13.0), QPointF(15.0, 13.0));
+    } else {
+        // A window with a rounded top-left corner and a title strip: the
+        // file dialog's own shape, which is what this section configures.
+        QPainterPath frame;
+        frame.moveTo(3.0, 8.0);
+        frame.quadTo(3.0, 3.0, 8.0, 3.0);
+        frame.lineTo(15.0, 3.0);
+        frame.lineTo(15.0, 15.0);
+        frame.lineTo(3.0, 15.0);
+        frame.closeSubpath();
+        painter.drawPath(frame);
+        painter.drawLine(QPointF(3.0, 7.0), QPointF(15.0, 7.0));
     }
     return QIcon(pixmap);
 }
@@ -557,11 +585,14 @@ public:
                                               uiTr("Annotation editor")));
         sidebar_->addItem(new QListWidgetItem(sectionIcon(1, QColor(kInkDim)),
                                               uiTr("Command-line defaults")));
+        sidebar_->addItem(new QListWidgetItem(sectionIcon(2, QColor(kInkDim)),
+                                              uiTr("File dialogs")));
         bodyLayout->addWidget(sidebar_, 0);
 
         pages_ = new QStackedWidget(body);
         pages_->addWidget(buildEditorPage());
         pages_->addWidget(buildCliPage());
+        pages_->addWidget(buildDialogPage());
         bodyLayout->addWidget(pages_, 1);
 
         connect(sidebar_, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -839,6 +870,80 @@ private:
         return scroll;
     }
 
+    QWidget *buildDialogPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("File dialogs"),
+                       uiTr("How the save and open windows are drawn. They are layer "
+                            "surfaces, so the compositor draws them no decoration of its "
+                            "own and the rim below is the only edge they have."));
+
+        QWidget *frame = addCard(page, uiTr("Frame"));
+        // Both spin boxes stop at 0 and say what that means, rather than using
+        // the optional-spin shape the CLI page uses: there is no "unset" here,
+        // only a size, and 0 is a legitimate one for each.
+        radiusSpin_ = new QSpinBox(frame);
+        radiusSpin_->setObjectName(QStringLiteral("dialogRadius"));
+        radiusSpin_->setRange(0, 48);
+        radiusSpin_->setMinimumWidth(120);
+        radiusSpin_->setValue(static_cast<int>(config_.dialog.radius));
+        radiusSpin_->setSuffix(uiTr(" px"));
+        addRow(frame, uiTr("Corner radius"),
+               uiTr("0 draws square corners"), radiusSpin_, true);
+
+        borderWidthSpin_ = new QSpinBox(frame);
+        borderWidthSpin_->setObjectName(QStringLiteral("dialogBorderWidth"));
+        borderWidthSpin_->setRange(0, 8);
+        borderWidthSpin_->setMinimumWidth(120);
+        borderWidthSpin_->setValue(static_cast<int>(config_.dialog.borderWidth));
+        borderWidthSpin_->setSuffix(uiTr(" px"));
+        addRow(frame, uiTr("Border width"),
+               uiTr("0 draws no border at all"), borderWidthSpin_, false);
+
+        borderColorButton_ = new ColorButton(frame, uiTr("Border color"));
+        borderColorButton_->onColorChanged = [this](const QColor &chosen) {
+            borderColor_ = chosen;
+        };
+        setBorderColor(config_.dialog.borderColor);
+        autoClear_ = new QPushButton(uiTr("Automatic"), frame);
+        autoClear_->setObjectName(QStringLiteral("clearColor"));
+        autoClear_->setFixedHeight(kControlHeight);
+        autoClear_->setToolTip(
+            uiTr("Follow the colour scheme instead of a colour of its own"));
+        connect(autoClear_, &QPushButton::clicked, this, [this] {
+            // An invalid colour is exactly how the config says "derive one",
+            // so clearing the button is clearing the setting.
+            setBorderColor(QColor());
+        });
+        auto *colorRow = new QWidget(frame);
+        auto *colorRowLayout = new QHBoxLayout(colorRow);
+        colorRowLayout->setContentsMargins(0, 0, 0, 0);
+        colorRowLayout->setSpacing(8);
+        colorRowLayout->addWidget(borderColorButton_);
+        colorRowLayout->addWidget(autoClear_);
+        addRow(frame, uiTr("Border color"),
+               uiTr("Automatic derives one from the colour scheme"), colorRow, false);
+
+        return scroll;
+    }
+
+    /// Shows a rim colour, or the automatic state when `color` is invalid.
+    void setBorderColor(const QColor &color)
+    {
+        borderColor_ = color;
+        if (color.isValid()) {
+            borderColorButton_->setColor(color);
+            borderColorButton_->setEnabled(true);
+        } else {
+            // No colour chosen: the button still opens the picker, which is how
+            // one gets chosen, but it carries no swatch to read.
+            borderColorButton_->setText(uiTr("Automatic"));
+            borderColorButton_->setIcon(QIcon());
+            borderColorButton_->setEnabled(true);
+        }
+    }
+
     void save()
     {
         Config config = config_;
@@ -866,6 +971,11 @@ private:
         cli.longTimeout = spinValue(timeoutSpin_);
         cli.longIgnoreTop = spinValue(ignoreTopSpin_);
         cli.longInject = injectBox_->currentData().toString();
+
+        DialogPreferences &dialog = config.dialog;
+        dialog.radius = static_cast<std::uint32_t>(std::max(0, radiusSpin_->value()));
+        dialog.borderWidth = static_cast<std::uint32_t>(std::max(0, borderWidthSpin_->value()));
+        dialog.borderColor = borderColor_;
 
         if (!saveConfig(config)) {
             status_->setProperty("error", true);
@@ -904,6 +1014,11 @@ private:
     QSpinBox *timeoutSpin_ = nullptr;
     QSpinBox *ignoreTopSpin_ = nullptr;
     QComboBox *injectBox_ = nullptr;
+    QSpinBox *radiusSpin_ = nullptr;
+    QSpinBox *borderWidthSpin_ = nullptr;
+    ColorButton *borderColorButton_ = nullptr;
+    QPushButton *autoClear_ = nullptr;
+    QColor borderColor_;
     QLabel *status_ = nullptr;
 };
 

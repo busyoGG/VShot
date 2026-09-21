@@ -19,6 +19,7 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 - **Long screenshot** — frame a scrolling region, and vshot sends the wheel, grabs frames, aligns them by content, and stitches one long image
 - **Pin overlay** — pin images or clipboard content to the screen: drag, wheel to zoom, double-click to close, one-key show/hide, Space to annotate
 - **Clipboard pinning** — colors, images, copied image files, plain text (rendered as a card as HTML / markdown / code / plain text)
+- **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button
 - **Output targets** — file (with strftime paths), stdout, clipboard, or an on-screen pin; exactly one
 - **Bilingual UI** — the interface and `--help` follow the system language
 
@@ -31,7 +32,15 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 sudo pacman -U dist/vshot-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
-The script snapshots the current working tree (uncommitted changes included) into a temporary directory and runs `makepkg`, writing the result to `dist/`; `makepkg -si` works directly too. Runtime dependencies are `glibc`, `wayland` (uses `libwayland-client` through dlopen), `qt6-base`, and `layer-shell-qt`; file output, `--clipboard`, and `vshot pin --clipboard` need the optional `wl-clipboard` (writes via `wl-copy`, reads via `wl-paste`). For other distributions, build from source as below.
+The script snapshots the current working tree (uncommitted changes included) into a temporary directory and runs `makepkg`, writing the result to `dist/`; `makepkg -si` works directly too. Runtime dependencies are `glibc`, `wayland` (uses `libwayland-client` through dlopen), `qt6-base`, `layer-shell-qt`, and **`onnxruntime`** (the OCR inference engine); file output, `--clipboard`, and `vshot pin --clipboard` need the optional `wl-clipboard` (writes via `wl-copy`, reads via `wl-paste`). The package also installs about 30 MB of OCR models under `/usr/share/vshot/models/`, which `makepkg` fetches and SHA-256-verifies. For other distributions, build from source as below.
+
+Those 30 MB are downloaded on the **first** build only. The models are cached in `$XDG_CACHE_HOME/vshot/makepkg-sources` (usually `~/.cache/vshot/makepkg-sources`) and every later build takes them from there, with or without a network. A fixed cache directory is needed because `makepkg`'s own source cache lives inside the directory it builds in, and this script builds in a fresh `mktemp -d` each time -- so the default cache disappears along with the previous run's temporary tree and the download happens again. Set `SRCDEST` and that is used instead. To force a re-download, delete the directory; the next build fetches the files again. If `models/` already holds the three files, copying them in skips even the first download, since the checksums match:
+
+```sh
+mkdir -p ~/.cache/vshot/makepkg-sources && cp models/* ~/.cache/vshot/makepkg-sources/
+```
+
+`onnxruntime` is a **virtual package** on Arch: all six variants (`onnxruntime-cpu`, `onnxruntime-cuda`, `onnxruntime-rocm`, …) declare `Provides: onnxruntime` and conflict with each other, so a system has exactly one. Depending on the virtual name rather than on `onnxruntime-cpu` means **someone who already has a GPU variant installed does not have to tear it out** for vshot — removing it would take `rccl`, `migraphx` and `rocm-hip-sdk` with it. vshot uses only the shared library and the `.pc` file, which every variant ships, and nothing here selects a GPU provider, so a GPU variant runs the OCR on the CPU exactly like the CPU one. A fresh install lets pacman pick; `onnxruntime-cpu` is the recommended choice (about 46 MB with cpuinfo and protobuf, against well over a gigabyte for the GPU builds).
 
 ## Application menu entry
 
@@ -52,6 +61,8 @@ cargo build --release --locked                                # Rust CLI
 cmake -S . -B build-qt -DCMAKE_BUILD_TYPE=Release             # Qt helper
 cmake --build build-qt --parallel
 ```
+
+OCR needs **ONNX Runtime's development files**: `ort-sys` finds `libonnxruntime.pc` through `pkg-config` (on Arch every one of the six variants ships it, together with the library and the headers), and links against the system copy rather than downloading another at build time. Without it the build fails and says why. The models live in the source tree's `models/` (`det.onnx` / `rec.onnx` / `dict.txt`, see [OCR](#ocr)); the build works without them, but `vshot ocr` then reports at runtime that it cannot find them.
 
 Interactive features look for the helper in this order: the `VSHOT_QT_HELPER` environment variable, the directory holding the `vshot` executable, its relative `../build-qt/` and `../../build-qt/`, then `PATH`. You can also point at it explicitly:
 
@@ -104,6 +115,11 @@ vshot pin --quit
 
 # Settings: a window for the editor style and the command-line defaults
 vshot settings
+
+# OCR: read the text out of a region of the screen
+vshot ocr                                   # frame a region, text to stdout
+vshot ocr --clipboard                       # the same, onto the clipboard
+vshot ocr --input shot.png                  # read an existing image file
 ```
 
 The global options apply to every capture:
@@ -140,9 +156,89 @@ When `vshot region` gets no `--geometry`, the frozen frame fills each output and
 - The **Select** tool picks any annotation: click to select, drag to move (text too), shapes/lines/mosaics resize by their handles, Delete/Backspace removes it; style changes apply to the selected annotation immediately, and double-clicking text reopens it for editing
 - **Ctrl+Z / Ctrl+Y** (or Ctrl+Shift+Z) undo/redo
 - **Pasting an image**: the toolbar's *Image* button picks one from disk, or **Ctrl+V** pastes whatever image the clipboard holds — it lands centred at its own size, shrunk to fit when it is larger than the selection, and comes up selected so it can be dragged and resized by its handles; Ctrl+Z undoes it like any other mark
+- **Reading text**: the toolbar's *Text+* button recognizes the text in the selection and puts it on the clipboard, the button itself flashing *Copied* or *Failed*; the recognition runs in a `vshot ocr --input` child process (see [OCR](#ocr))
 - Annotations come back to Rust in global logical coordinates and the final PNG is redrawn by the built-in software renderer, matching the preview; text is rasterized by Qt in the chosen font and composited as a bitmap, so the glyphs are identical
 
 The UI language follows the system by default (`QLocale::system()`) and can be overridden with `VSHOT_LANG`: a value starting with `zh` selects Chinese, any other non-empty value selects English. The language is fixed when the helper starts, so switching needs a rerun. The Rust CLI's `--help` uses the same rule, so `VSHOT_LANG=zh vshot --help` is Chinese.
+
+## OCR
+
+`vshot ocr` reads the text out of a region of the screen. With no arguments it asks you to frame it:
+
+```sh
+vshot ocr                    # frame a region, text to stdout
+vshot ocr --clipboard        # the same, onto the clipboard
+vshot ocr --geometry '0,0 800x200'
+vshot ocr --input shot.png   # read an existing image file
+```
+
+Recognition uses **PaddleOCR's PP-OCR models** (the official models converted to ONNX) on ONNX Runtime, **on the CPU**, in this process. Measured end to end on a 720p screenshot of code: about **240 ms**, and 13 px text still reads correctly.
+
+The models are the `PP-OCRv6_small` tier, about 30 MB:
+
+| File | Size | Role |
+|---|---|---|
+| `det.onnx` | 9.4 MB | text detection (language-independent) |
+| `rec.onnx` | 20.3 MB | text recognition |
+| `dict.txt` | 73 KB | the 18708-character alphabet |
+
+The package installs them under `/usr/share/vshot/models/`; a source checkout keeps them in `models/` (`vshot ocr` walks up from the executable, so `target/release/vshot` and `target/release/deps/vshot-*` both find it). **They are not committed** — the PKGBUILD fetches and SHA-256-verifies them through `source=()`.
+
+### Why the default is the CPU
+
+Because it is fast enough, and the GPU costs are out of proportion:
+
+- Measured on the recognition model: **4.0 ms on the CPU against 2.2 ms on the GPU** — invisible inside a 240 ms run
+- On Arch, `onnxruntime-opt-rocm` depends on `rocm-hip-sdk` plus `rccl` (446 MB) and `migraphx` (787 MB) — **1.2 GB for those two alone**, before rocm-hip-sdk's twenty-odd packages. Dragging a screenshot tool's dependency list to 2 GB to save 1.8 ms is not a trade worth making.
+
+So `depends` names the virtual package `onnxruntime` rather than pinning `onnxruntime-cpu` (about 46 MB with cpuinfo and protobuf) — see [Install](#install-arch-linux): pinning it would force anyone with a GPU variant to remove it, taking a whole chain of ROCm packages with it, when all vshot uses from that variant is the shared library and the `.pc` file.
+
+### Using a GPU: the external engine
+
+To reach a GPU, point vshot at **a program of your own**. It is handed a PNG, it writes the text on stdout, and vshot only starts it and reads that stdout — **vshot itself never links a GPU runtime**:
+
+```json
+{
+  "cli": {
+    "ocr": {
+      "engine": "external",
+      "external": {
+        "command": ["/usr/bin/my-ocr", "--stdin"],
+        "stdin": true,
+        "timeout": 30
+      }
+    }
+  }
+}
+```
+
+- `command`: the program and its arguments, as an **array** (no shell, so arguments with spaces need no escaping)
+- `stdin`: `true` sends the PNG on stdin; absent or `false` appends the temporary PNG's **path** as the last argument instead
+- `timeout`: seconds, 30 by default; on expiry the child is killed rather than left to hang the capture
+
+What that program is does not matter — a Python `rapidocr` on the ROCm wheels, a `curl` to a service on another machine, another ONNX Runtime build with CUDA. Here is one with Python rapidocr:
+
+```sh
+#!/bin/sh
+# /usr/local/bin/my-ocr — reads a PNG on stdin, writes text on stdout
+exec /path/to/venv/bin/python -c '
+import sys
+from rapidocr import RapidOCR
+from PIL import Image
+import io
+img = Image.open(io.BytesIO(sys.stdin.buffer.read()))
+result = RapidOCR()(img)
+for text in (result.txts or []):
+    print(text)
+'
+```
+
+```json
+{"cli": {"ocr": {"engine": "external",
+                 "external": {"command": ["/usr/local/bin/my-ocr"], "stdin": true}}}}
+```
+
+**A misconfiguration is an error, never a silent fall back to the CPU**: `engine: "external"` with no `command`, a command that will not start, or a program exiting non-zero each produce a specific message (including whatever the program wrote to stderr). Someone who configured a GPU engine wants to hear that it did not run, not to be handed CPU output they did not ask for.
 
 ## Capturing windows
 
@@ -386,7 +482,8 @@ The window has two pages, switched from the sidebar: **Annotation editor** (tool
     "png-compression": "high",
     "monitor": "DP-2",
     "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
-    "pin": { "density": 2 }
+    "pin": { "density": 2 },
+    "ocr": { "engine": "builtin" }
   }
 }
 ```
@@ -433,8 +530,14 @@ command line > environment > config file > built-in default
 | `long.ignore-top` | `long --ignore-top` | `0` |
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | inferred |
+| `ocr.engine` | which engine `vshot ocr` uses | `builtin` |
+| `ocr.external.command` | the program to run when `engine` is `"external"` (an array) | none |
+| `ocr.external.stdin` | send the PNG on stdin instead of passing a path | `false` |
+| `ocr.external.timeout` | the external program's timeout, in seconds | `30` |
 
 `pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid — a misspelled key costs you that one setting, and the rest still apply.
+
+`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor` and the common `cli` entries; the `ocr` section is edited by hand.
 
 `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 
@@ -447,6 +550,7 @@ command line > environment > config file > built-in default
 | `VSHOT_PIXEL_DEBUG=1` | What each level of window pixel detection saw |
 | `VSHOT_SESSION_DEBUG=1` | Which compositor this session was judged to be, and on what basis |
 | `VSHOT_LONG_DEBUG_DIR=<dir>` | Write every long-screenshot frame and every stitch decision to disk |
+| `VSHOT_OCR_MODELS=<dir>` | OCR model directory, overriding `/usr/share/vshot/models` and the search beside the executable |
 | `VSHOT_PIN_SOCKET` | The socket path the pin daemon listens on |
 | `VSHOT_PIN_DENSITY=N` | The source density of every pinned image, same as `--density` |
 | `VSHOT_PIN_DEBUG=1` | The daemon prints every pin's density decision |
@@ -495,11 +599,14 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 
 `vshot-config-check` covers the part most likely to fail silently: whether a save really **merges** (keeping keys this build does not recognize), whether clearing a value really removes it, and whether `#rrggbbaa` parses as CSS (Qt itself reads that as `#aarrggbb`, turning "opaque orange" into purple). `vshot-settings-check` builds the real settings window, drives every one of its widgets, and reads the config file back — a field wired to the wrong member is visible only that way. It is worth running whenever the window's layout changes: it finds widgets by object name, so a re-layout or a switch to a different widget class does not hide anything, and it only goes red when a field is genuinely mis-wired.
 
-There are also 4 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (needs a running KWin; a headless KWin suffices, see the comments in `src/capture/kwin.rs`, with a virtual output named `Virtual-0`, 1024x768, no pointer capability, so it only covers the D-Bus capture layer), the active output probe (needs any real session), and `/dev/uinput` scroll injection (needs write access). To run them:
+There are also 5 integration tests that are **not run** by default (`#[ignore]`), needing a real environment: KWin's D-Bus capture and backend selection (needs a running KWin; a headless KWin suffices, see the comments in `src/capture/kwin.rs`, with a virtual output named `Virtual-0`, 1024x768, no pointer capability, so it only covers the D-Bus capture layer), the active output probe (needs any real session), `/dev/uinput` scroll injection (needs write access), and **the built-in OCR engine reading drawn text** (needs those 30 MB of models on disk, which `cargo test` has nowhere to fetch them from). To run them:
 
 ```sh
 cargo test -- --ignored              # all of them
+cargo test --release ocr:: -- --ignored --nocapture   # just the OCR one
 ```
+
+The OCR test looks for the models in the source tree's `models/` by default, and `VSHOT_OCR_MODELS=<dir>` points it elsewhere. It covers what no unit test can: that the models load, that the pipeline is wired the right way round, and that the characters come back in one piece. The text is **drawn** with the editor's own software renderer rather than typed, so it travels the path a screenshot's text does.
 
 Starting a headless KWin:
 

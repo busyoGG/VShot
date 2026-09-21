@@ -235,4 +235,32 @@ if(VSHOT_BUILD_CHECKS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vshot-paste-check PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+
+    # The file dialog check: the look of the one window Qt draws for us.  It
+    # builds the real dialog through the same builder the helper uses and reads
+    # the widget tree back, because both things it guards -- the palette-driven
+    # stylesheet and the thumbnail grid -- fail silently when they go missing.
+    # The thumbnail is compared to the picture it was decoded from, so a themed
+    # mime icon standing in for the real image is what it catches.  It carries
+    # config.cpp because the dialog's rim is a setting the user owns.
+    add_executable(vshot-file-dialog-check
+        ui/file_dialog_check.cpp
+        ui/file_dialog.cpp
+        ui/file_dialog.hpp
+        ui/config.cpp
+        ui/config.hpp
+        ui/text_size.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
+    )
+    target_link_libraries(vshot-file-dialog-check PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        LayerShellQt::Interface
+    )
+    target_compile_features(vshot-file-dialog-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-file-dialog-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()

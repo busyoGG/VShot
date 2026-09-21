@@ -1197,11 +1197,11 @@ wl-clipboard package"));
         return QString::fromLocal8Bit(buffer);
     }
 
-    // Saves one pin's pixels to a file the user picks. The dialog is a separate
-    // process -- this daemon is a layer-shell client, and a layer surface
-    // cannot parent a popup, which is what a file dialog is -- so this writes
-    // nothing itself: it runs the helper in its `--save-dialog` mode, takes the
-    // path the user chose, and writes the image there.
+    // Saves one pin's pixels to a file the user picks. The dialog runs in a
+    // process of its own -- this daemon has an event loop of its own to keep,
+    // and the answer comes back over the pipe -- but it is a layer surface just
+    // like the pins are, which is what puts it above them instead of behind
+    // them.
     QJsonObject savePin(const QJsonObject &request)
     {
         Pin *pin = byId_.value(static_cast<quint64>(request.value(QStringLiteral("id")).toDouble()),
@@ -1215,6 +1215,10 @@ wl-clipboard package"));
             return error(QStringLiteral("cannot locate vshot-qt-ui for the save dialog; set "
                                         "VSHOT_QT_HELPER"));
         }
+        // The dialog opens on the output the pin is on, so it lands in front of
+        // the user rather than on whichever screen the compositor favours.
+        QScreen *pinScreen = QGuiApplication::screenAt(pin->globalRect().center());
+        const QString outputName = pinScreen != nullptr ? pinScreen->name() : QString();
         // The dialog is modal to nothing and the daemon must keep drawing, so
         // it runs detached and its reply comes back through a signal. The pin
         // id is carried in the closure: the user may have closed the pin by the
@@ -1222,15 +1226,8 @@ wl-clipboard package"));
         const quint64 id = pin->id;
         auto *dialog = new QProcess(this);
         dialog->setProgram(helper);
-        dialog->setArguments({QStringLiteral("--save-dialog"), suggested});
+        dialog->setArguments({QStringLiteral("--save-dialog"), suggested, outputName});
         dialog->setStandardInputFile(QProcess::nullDevice());
-        // The daemon's own environment names the layer-shell integration, and
-        // the dialog must not inherit it: it is a toplevel. `--save-dialog`
-        // clears it on its own, but a child that starts from a clean slate
-        // cannot be broken by a future change to that rule either.
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        env.remove(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"));
-        dialog->setProcessEnvironment(env);
         connect(dialog, &QProcess::finished, this, [this, dialog, id](int code, QProcess::ExitStatus) {
             const QByteArray out = dialog->readAllStandardOutput();
             dialog->deleteLater();

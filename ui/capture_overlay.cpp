@@ -43,6 +43,7 @@
 #include <QSpinBox>
 #include <QStyle>
 #include <QStyledItemDelegate>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QToolButton>
 #include <QStringList>
@@ -339,6 +340,58 @@ QFont pillFont()
     font.setPixelSize(13);
     font.setBold(true);
     return font;
+}
+
+// The paste-image action's icon: a framed picture with a horizon and a sun,
+// the shape everyone reads as "an image file".
+QIcon pasteIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRatio = 1.0)
+{
+    const qreal ratio = std::max(1.0, devicePixelRatio);
+    QPixmap pixmap(qRound(24 * ratio), qRound(24 * ratio));
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(3.5, 5.5, 17, 13), 2.5, 2.5);
+    // The horizon and the peak, drawn as one polyline inside the frame.
+    painter.drawPolyline(QPolygonF{QPointF(4, 16), QPointF(9, 11), QPointF(13, 15), QPointF(16, 12),
+                                   QPointF(20, 16)});
+    painter.setBrush(color);
+    painter.setPen(Qt::NoPen);
+    painter.drawEllipse(QPointF(8.5, 9.0), 1.4, 1.4);
+    return QIcon(pixmap);
+}
+
+// The text-recognition action's icon: corner brackets around two text lines,
+// which is what "read the text in this box" looks like.
+QIcon recognizeTextIcon(const QColor &color = QColor(230, 225, 229),
+                        qreal devicePixelRatio = 1.0)
+{
+    const qreal ratio = std::max(1.0, devicePixelRatio);
+    QPixmap pixmap(qRound(24 * ratio), qRound(24 * ratio));
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    constexpr qreal inset = 3.5;
+    constexpr qreal arm = 4.0;
+    const qreal right = 24.0 - inset;
+    const qreal bottom = 24.0 - inset;
+    painter.drawPolyline(QPolygonF{QPointF(inset + arm, inset), QPointF(inset, inset),
+                                   QPointF(inset, inset + arm)});
+    painter.drawPolyline(QPolygonF{QPointF(right - arm, inset), QPointF(right, inset),
+                                   QPointF(right, inset + arm)});
+    painter.drawPolyline(QPolygonF{QPointF(inset, bottom - arm), QPointF(inset, bottom),
+                                   QPointF(inset + arm, bottom)});
+    painter.drawPolyline(QPolygonF{QPointF(right, bottom - arm), QPointF(right, bottom),
+                                   QPointF(right - arm, bottom)});
+    painter.drawLine(QPointF(8.5, 10.5), QPointF(15.5, 10.5));
+    painter.drawLine(QPointF(8.5, 14.0), QPointF(13.0, 14.0));
+    return QIcon(pixmap);
 }
 
 // Draws a dark rounded label (dimensions, pixel coordinates) anchored at `anchor`
@@ -1447,6 +1500,10 @@ struct ClipboardImage {
     QString source;
 };
 
+// How long a clipboard helper is given to start and to answer.  Both `wl-paste`
+// and `wl-copy` are small programs that either answer at once or not at all.
+constexpr int kClipboardProcessTimeoutMs = 5000;
+
 // One `wl-paste` run. `false` means the program could not be started at all,
 // which is a different failure from an empty clipboard; `ok` says whether the
 // request itself succeeded.
@@ -1473,12 +1530,41 @@ bool runWlPaste(const QStringList &arguments, QByteArray *bytes, bool *ok)
     return true;
 }
 
+// Puts `text` on the clipboard through `wl-copy`, the writing counterpart of
+// the `wl-paste` above -- and, like it, used instead of Qt's own clipboard,
+// which is unreliable under this compositor setup.  The daemon has its own
+// copy of this; the two processes share no code.
+//
+// `wl-copy` forks and the child stays alive as the selection owner, so only
+// the short-lived process started here is waited for: the copy outlives the
+// call.
+bool runWlCopy(const QString &text)
+{
+    constexpr int kTimeoutMs = 5000;
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-copy"));
+    // `--` ends the options: a value is content, never a switch.
+    process.setArguments({QStringLiteral("--")});
+    process.start();
+    if (!process.waitForStarted(kTimeoutMs)) {
+        return false;
+    }
+    process.write(text.toUtf8());
+    process.closeWriteChannel();
+    const bool finished = process.waitForFinished(kTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(kTimeoutMs);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
 // The image encodings worth asking for, best first; any other `image/*` the
 // clipboard offers is taken after these.
 constexpr const char *kClipboardImageTypes[] = {
     "image/png", "image/jpeg", "image/webp", "image/bmp", "image/tiff",
 };
-
 // Reads an image out of the clipboard the way the pin daemon does: through
 // `wl-paste`, not Qt's own clipboard. Qt implements only the wlroots
 // `zwlr_data_control_v1`, which a compositor offering the standardized
@@ -1685,6 +1771,52 @@ public:
         addTool(toolLayout, uiTr("Draw"), Tool::Pen);
         addTool(toolLayout, uiTr("Text"), Tool::Text);
         addTool(toolLayout, uiTr("Mosaic"), Tool::Mosaic);
+        // The two one-shot actions sit at the end of the tool row, drawn the
+        // same way: they are the same kind of thing to click, and a second row
+        // of text buttons beside them only made the bar taller.  They are not
+        // modes -- nothing stays selected -- so they are kept out of
+        // `toolButtons_`, which is what the active-state pass walks.
+        //
+        // Paste takes an image off disk through the file dialog; Ctrl+V takes
+        // whatever is on the clipboard.  Both land in the same paste.
+        auto *paste = addToolAction(toolLayout, uiTr("Image"), pasteIcon(QColor(230, 225, 229),
+                                                                       devicePixelRatioF()),
+                                    uiTr("Paste an image onto the capture (Ctrl+V for the "
+                                         "clipboard)"),
+                                    QStringLiteral("pasteButton"));
+        connect(paste, &QToolButton::clicked, [controller = controller_] {
+            QString error;
+            if (!controller->pasteFromFile(&error)) {
+                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+                std::fflush(stderr);
+            }
+        });
+        // Text recognition reads the selection and leaves the text on the
+        // clipboard, and the capture itself is unchanged -- which is why it is
+        // an action and not a mode.
+        auto *text = addToolAction(toolLayout, uiTr("Text+"),
+                                   recognizeTextIcon(QColor(230, 225, 229), devicePixelRatioF()),
+                                   uiTr("Copy the text in the selection to the clipboard"),
+                                   QStringLiteral("ocrButton"));
+        connect(text, &QToolButton::clicked, [controller = controller_, text] {
+            QString error;
+            if (!controller->copySelectionText(&error)) {
+                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+                std::fflush(stderr);
+            }
+            // The result is reported where the user is looking: the button
+            // itself, which is the thing they just clicked.
+            text->setText(error.isEmpty() ? uiTr("Copied") : uiTr("Failed"));
+            QTimer::singleShot(1200, text, [text, controller] {
+                if (controller->isFinished() || controller->isCancelled()) {
+                    return;
+                }
+                text->setText(uiTr("Text+"));
+            });
+        });
+        // Every button in this row, the two above included, gets the frame's
+        // hover and press painting; it finds them by type, so this has to run
+        // after the last one was added.
         for (QToolButton *button : toolSurface->findChildren<QToolButton *>()) {
             button->installEventFilter(toolSurface);
         }
@@ -1722,20 +1854,6 @@ public:
         actionDivider->setCursor(Qt::ArrowCursor);
         toolLayout->addWidget(actionDivider);
         toolLayout->addSpacing(3);
-        // Paste sits with the actions rather than among the tools: it is not a
-        // mode the pointer stays in, it is one thing that happens when clicked.
-        // The button opens a file dialog; Ctrl+V takes whatever is on the
-        // clipboard. Both land in the same paste.
-        auto *paste = addActionButton(toolLayout, uiTr("Image"));
-        paste->setObjectName(QStringLiteral("pasteButton"));
-        paste->setToolTip(uiTr("Paste an image onto the capture (Ctrl+V for the clipboard)"));
-        connect(paste, &QPushButton::clicked, [controller = controller_] {
-            QString error;
-            if (!controller->pasteFromFile(&error)) {
-                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
-                std::fflush(stderr);
-            }
-        });
         auto *ok = addActionButton(toolLayout, uiTr("OK"));
         ok->setObjectName(QStringLiteral("confirmButton"));
         ok->setToolTip(uiTr("Confirm capture (Enter)"));
@@ -2549,6 +2667,30 @@ private:
             return uiTr("Pixelate an area: rectangle, ellipse or freehand brush");
         }
         return QString();
+    }
+
+    // A button in the tool row that does one thing instead of entering a mode,
+    // laid out exactly like the tool buttons: same size, same text-under-icon
+    // shape, same hover and press painting from ToolCardFrame.  Kept out of
+    // `toolButtons_` because nothing stays selected: a paste and a text read
+    // happen and are over.
+    QToolButton *addToolAction(QHBoxLayout *layout, const QString &label, const QIcon &icon,
+                               const QString &tooltip, const QString &objectName)
+    {
+        auto *button = new QToolButton(this);
+        button->setProperty("toolButton", true);
+        button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+        button->setText(label);
+        button->setIcon(icon);
+        button->setIconSize(QSize(20, 20));
+        button->setFixedSize(48, 46);
+        button->setCursor(Qt::PointingHandCursor);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->setToolTip(tooltip);
+        button->setAccessibleName(label);
+        button->setObjectName(objectName);
+        layout->addWidget(button);
+        return button;
     }
 
     OverlayController *controller_;
@@ -4356,6 +4498,145 @@ bool OverlayController::canPaste() const
     return !finished_ && !cancelled_ && editing_ && selection_.has_value();
 }
 
+bool OverlayController::copySelectionText(QString *error)
+{
+    if (!canPaste()) {
+        if (error != nullptr) {
+            *error = uiTr("Reading text needs a selection to read from.");
+        }
+        return false;
+    }
+    const LogicalRect &canvas = *selection_;
+    if (canvas.isEmpty()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection is empty.");
+        }
+        return false;
+    }
+    // The pixels come from the output the selection sits on, at that output's
+    // own scale -- the same source the mosaic preview reads, so what is
+    // recognized is what the user sees under the rectangle.
+    const int index = outputContaining(canvas);
+    if (index < 0 || index >= session_.outputs.size()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection is on no output.");
+        }
+        return false;
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (output.image.isNull()) {
+        if (error != nullptr) {
+            *error = uiTr("The captured frame is not available.");
+        }
+        return false;
+    }
+    // The rect is clipped to the output: a selection dragged past the edge of
+    // its screen has no pixels beyond it to read.
+    const QRect source = sourceRect(output, canvas)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection has no pixels on this output.");
+        }
+        return false;
+    }
+    const QImage pixels = output.image.copy(source);
+    if (pixels.isNull()) {
+        if (error != nullptr) {
+            *error = uiTr("The selection has no pixels on this output.");
+        }
+        return false;
+    }
+
+    QTemporaryDir directory;
+    if (!directory.isValid()) {
+        if (error != nullptr) {
+            *error = uiTr("Cannot create a temporary directory for the text.");
+        }
+        return false;
+    }
+    const QString path = directory.filePath(QStringLiteral("selection.png"));
+    if (!pixels.save(path, "PNG")) {
+        if (error != nullptr) {
+            *error = uiTr("Cannot write the selection to read its text.");
+        }
+        return false;
+    }
+
+    // The engine lives in `vshot`, which is a sibling of this helper: the
+    // same discovery the file dialog uses, for the same reason (this process
+    // is the helper, so its own path names the program to run).
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        if (error != nullptr) {
+            *error = uiTr("Cannot locate vshot to read the text.");
+        }
+        return false;
+    }
+    buffer[length] = '\0';
+    const QString helper = QString::fromLocal8Bit(buffer);
+    // `vshot` is the same binary with the helper's directory walked back one
+    // level: installed layouts put both in /usr/bin, and a source checkout has
+    // `build-qt/vshot-qt-ui` beside `target/release/vshot`.
+    QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
+    if (!QFileInfo::exists(program)) {
+        const QString beside =
+            QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
+        if (QFileInfo::exists(beside)) {
+            program = QDir::cleanPath(beside);
+        } else {
+            program = QStringLiteral("vshot");
+        }
+    }
+
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments({QStringLiteral("ocr"), QStringLiteral("--input"), path});
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.start();
+    if (!process.waitForStarted(kClipboardProcessTimeoutMs)) {
+        if (error != nullptr) {
+            *error = uiTr("Cannot start vshot to read the text.");
+        }
+        return false;
+    }
+    // A model load takes a moment on the first run and the recognition itself
+    // is a fraction of a second, so the wait is generous compared to the
+    // clipboard's; a hang still has to end, hence the deadline.
+    const int ocrTimeoutMs = 60 * 1000;
+    if (!process.waitForFinished(ocrTimeoutMs)) {
+        process.kill();
+        process.waitForFinished(kClipboardProcessTimeoutMs);
+        if (error != nullptr) {
+            *error = uiTr("Reading the text took too long.");
+        }
+        return false;
+    }
+    const QByteArray output_bytes = process.readAllStandardOutput();
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        if (error != nullptr) {
+            const QString stderr = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            *error = stderr.isEmpty() ? uiTr("Reading the text failed.") : stderr;
+        }
+        return false;
+    }
+    const QString text = QString::fromUtf8(output_bytes).trimmed();
+    if (text.isEmpty()) {
+        if (error != nullptr) {
+            *error = uiTr("No text was found in the selection.");
+        }
+        return false;
+    }
+    if (!runWlCopy(text)) {
+        if (error != nullptr) {
+            *error = uiTr("Cannot copy the text to the clipboard.");
+        }
+        return false;
+    }
+    return true;
+}
+
 bool OverlayController::pasteFromFile(QString *error)
 {
     if (!canPaste()) {
@@ -4364,9 +4645,11 @@ bool OverlayController::pasteFromFile(QString *error)
         }
         return false;
     }
-    // The helper is this program. It runs the dialog in a mode that clears the
-    // layer-shell integration, because a file dialog is a popup and a layer
-    // surface cannot parent one.
+    // The helper is this program.  It runs the dialog in a process of its own
+    // because that process has to be free of this one's event loop, not because
+    // the dialog is a different kind of window: it is a layer surface like this
+    // overlay, mapped after it, which is what puts it above the frozen frame
+    // instead of behind it.
     char buffer[4096];
     const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
     if (length <= 0) {
@@ -4377,19 +4660,19 @@ bool OverlayController::pasteFromFile(QString *error)
     }
     buffer[length] = '\0';
     const QString helper = QString::fromLocal8Bit(buffer);
+    // The dialog opens on the output the user is annotating, so it lands in
+    // front of them rather than on whichever screen the compositor favours.
+    const int outputIndex = outputIndexForSelection();
+    const QString outputName = outputIndex >= 0 && outputIndex < session_.outputs.size()
+        ? session_.outputs.at(outputIndex).name
+        : QString();
     // The controller is not a QObject, so the watcher is parented to the
     // application: it has to outlive this call, and the overlay's own widgets
     // can be torn down while the dialog is still up.
     auto *dialog = new QProcess(qApp);
     dialog->setProgram(helper);
-    dialog->setArguments({QStringLiteral("--open-dialog"), QString()});
+    dialog->setArguments({QStringLiteral("--open-dialog"), QString(), outputName});
     dialog->setStandardInputFile(QProcess::nullDevice());
-    // The dialog must not inherit this process's layer-shell integration; its
-    // own mode clears it, and clearing it here too means a future change to
-    // that rule cannot break this path.
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.remove(QStringLiteral("QT_WAYLAND_SHELL_INTEGRATION"));
-    dialog->setProcessEnvironment(env);
     QObject::connect(dialog, &QProcess::finished, dialog,
                      [this, dialog](int code, QProcess::ExitStatus) {
                          const QByteArray out = dialog->readAllStandardOutput();
@@ -4567,6 +4850,18 @@ int OverlayController::annotationHitAt(Point point) const
                 if (dx * dx + dy * dy <= 1.0) {
                     return index;
                 }
+            }
+            continue;
+        }
+        if (annotation.kind == Annotation::Kind::Image) {
+            // A pasted image is its own box: hit anywhere inside the rect it was
+            // placed at, so it can be picked up and moved like any other mark.
+            // Without this arm it would fall through to the stroke walk below
+            // and never match -- a pasted image has no points -- which left the
+            // paste impossible to select or drag.
+            if (point.x >= bounds.x && point.x < bounds.right() &&
+                point.y >= bounds.y && point.y < bounds.bottom()) {
+                return index;
             }
             continue;
         }

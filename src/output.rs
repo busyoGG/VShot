@@ -68,6 +68,12 @@ fn copy_to_clipboard(bytes: &[u8]) -> Result<()> {
     copy_bytes_to_clipboard(bytes, "image/png")
 }
 
+/// Puts recognized text on the clipboard.  `text/plain` is what a paste into
+/// an editor asks for; `wl-copy` keeps serving it until the next copy.
+pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    copy_bytes_to_clipboard(text.as_bytes(), "text/plain")
+}
+
 fn copy_file_to_clipboard(path: &Path) -> Result<()> {
     let absolute = path.canonicalize().map_err(|source| {
         VshotError::Clipboard(format!(

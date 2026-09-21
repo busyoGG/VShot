@@ -17,6 +17,24 @@ mkdir -p "$output_dir"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+# Where makepkg keeps the sources it downloads.
+#
+# This script builds in a fresh `mktemp -d` every run, and makepkg's own source
+# cache -- its default `SRCDEST` -- is *inside the directory it is building in*.
+# That is fine for a package built in place twice; here the directory is gone by
+# the next run, so every build starts with an empty cache and re-downloads the
+# OCR models.  They are 30 MB and their checksums never change, so a fixed cache
+# outside the throwaway tree is what makes the download happen once.
+#
+# `XDG_CACHE_HOME` rather than the project, because this is a cache: it can be
+# deleted at any time and the next build will simply fetch the files again.
+# Setting it in the environment lets a user's own `SRCDEST` (or a `makepkg.conf`
+# that names one) still take precedence, since makepkg reads the environment
+# first.
+: "${XDG_CACHE_HOME:=$HOME/.cache}"
+source_cache=${SRCDEST:-$XDG_CACHE_HOME/vshot/makepkg-sources}
+mkdir -p "$source_cache"
+
 # Build from a clean working-tree snapshot while retaining uncommitted packaging changes.
 tar \
     --exclude='./.git' \
@@ -31,7 +49,7 @@ tar \
 makepkg_args=(--force --clean --noconfirm)
 (
     cd "$tmp_dir"
-    makepkg "${makepkg_args[@]}"
+    SRCDEST="$source_cache" makepkg "${makepkg_args[@]}"
 )
 
 shopt -s nullglob

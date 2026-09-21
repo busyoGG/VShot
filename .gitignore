@@ -8,3 +8,8 @@
 /.Trash-0/
 /.workbuddy/
 /log.txt
+# The OCR models: 30 MB of weights, fetched by the PKGBUILD rather than
+# committed. `vshot ocr` looks for them here in a source checkout.
+/models/
+# The scratch area OCR work was measured in.
+/.ocr-lab/

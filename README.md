@@ -19,6 +19,7 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 - **长截图**——框选会滚动的内容，自动发滚轮、逐帧抓取、按内容对齐拼成一张长图
 - **pin 浮层**——把图片或剪贴板内容钉在屏幕上：拖动、滚轮缩放、双击关闭、一键显隐、Space 进标注编辑
 - **剪贴板贴图**——颜色、图片、复制的图片文件、纯文本（按 HTML / markdown / 代码 / 普通文本渲染成卡片）
+- **OCR 取字**——框选一块区域把文字读出来（中英日），走 `vshot ocr`，编辑器工具栏里也有「取字」按钮
 - **输出目标**——文件（支持 strftime 路径）、stdout、剪贴板、屏幕 pin，四选一
 - **中英双语**——界面与 `--help` 都跟随系统语言
 
@@ -31,7 +32,15 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 sudo pacman -U dist/vshot-0.1.1-1-x86_64.pkg.tar.zst
 ```
 
-脚本把当前工作树（含未提交改动）快照到临时目录再调 `makepkg`，产物写到 `dist/`；也可以直接 `makepkg -si`。运行时依赖 `glibc`、`wayland`（通过 dlopen 使用 `libwayland-client`）、`qt6-base`、`layer-shell-qt`；文件输出、`--clipboard` 与 `vshot pin --clipboard` 需要可选依赖 `wl-clipboard`（写用 `wl-copy`，读用 `wl-paste`）。其它发行版按下面的源码方式构建。
+脚本把当前工作树（含未提交改动）快照到临时目录再调 `makepkg`，产物写到 `dist/`；也可以直接 `makepkg -si`。运行时依赖 `glibc`、`wayland`（通过 dlopen 使用 `libwayland-client`）、`qt6-base`、`layer-shell-qt`，以及 **`onnxruntime`**（OCR 的推理引擎）；文件输出、`--clipboard` 与 `vshot pin --clipboard` 需要可选依赖 `wl-clipboard`（写用 `wl-copy`，读用 `wl-paste`）。包同时装入约 30 MB 的 OCR 模型（`/usr/share/vshot/models/`，由 `makepkg` 下载并校验 SHA-256）。其它发行版按下面的源码方式构建。
+
+那 30 MB 只在**第一次**构建时下载。模型缓存在 `$XDG_CACHE_HOME/vshot/makepkg-sources`（通常是 `~/.cache/vshot/makepkg-sources`），此后每次构建都从那里取，联网与否都不影响。之所以要专门给一个固定的缓存目录：`makepkg` 默认的源码缓存就在它构建的目录里，而这个脚本每次都在一个全新的 `mktemp -d` 里构建，于是默认缓存随上一次的临时目录一起消失——每次都得重下。设了 `SRCDEST` 环境变量就用你的，没有就用上面那个。想重新下载删掉该目录即可（下一次构建会重新取）。若本地 `models/` 已经有了这三个文件，也可以直接拷进缓存来省掉首次下载，文件校验和对得上：
+
+```sh
+mkdir -p ~/.cache/vshot/makepkg-sources && cp models/* ~/.cache/vshot/makepkg-sources/
+```
+
+`onnxruntime` 在 Arch 上是**虚拟包**：`onnxruntime-cpu`、`onnxruntime-cuda`、`onnxruntime-rocm` 等六个变体都声明 `Provides: onnxruntime` 且互相冲突，所以系统里只会有一个。依赖写成虚拟包名而不是 `onnxruntime-cpu`，是为了让**已经装了某个 GPU 变体的人不必为 vshot 卸掉它**——卸它会连带带走 `rccl`、`migraphx`、`rocm-hip-sdk` 那一串。vshot 只用其中的共享库和 `.pc` 文件（每个变体都有），也没有任何地方去选 GPU provider，所以 GPU 变体跑 OCR 时一样走 CPU。全新安装时 pacman 会让你挑一个，推荐 `onnxruntime-cpu`（连 cpuinfo、protobuf 一起约 46 MB，而 GPU 变体动辄上 GB）。
 
 ## 应用菜单入口
 
@@ -52,6 +61,8 @@ cargo build --release --locked                                # Rust CLI
 cmake -S . -B build-qt -DCMAKE_BUILD_TYPE=Release             # Qt helper
 cmake --build build-qt --parallel
 ```
+
+OCR 要 **`onnxruntime` 的开发文件**：`ort-sys` 通过 `pkg-config` 找 `libonnxruntime.pc`（Arch 上六个变体包都提供它——库、头文件与 `.pc` 在一起），链接的是系统那一份而不是构建时另下一份。缺了它构建会失败并说明原因。模型放在源码树的 `models/`（`det.onnx` / `rec.onnx` / `dict.txt`，见[「OCR 取字」](#ocr-取字)）；不装它们也能构建，只是 `vshot ocr` 会在运行时说找不到。
 
 交互功能会按顺序找 helper：`VSHOT_QT_HELPER` 环境变量、`vshot` 可执行文件同目录、其相对的 `../build-qt/` 与 `../../build-qt/`、最后 `PATH`。也可以显式指定：
 
@@ -104,6 +115,11 @@ vshot pin --quit
 
 # 设置：开窗口改编辑器样式与命令行默认值（写进 config.json）
 vshot settings
+
+# OCR：把屏幕上某块区域的文字读出来
+vshot ocr                                   # 框选，文字到 stdout
+vshot ocr --clipboard                       # 同上，进剪贴板
+vshot ocr --input shot.png                  # 读一个已有的图片文件
 ```
 
 全局参数对所有捕获生效：
@@ -140,9 +156,89 @@ vshot all --output 'shots/capture-%Y%m%d-%H%M%S.final.png'
 - **Select** 工具可点选任意标注：单击选中，拖动移动（文本同样），形状/线条/马赛克可拖把手缩放，Delete/Backspace 删除；样式修改即时应用到选中标注；双击文本重新编辑
 - **Ctrl+Z / Ctrl+Y**（或 Ctrl+Shift+Z）撤销/重做
 - **贴图**：工具栏的「图片」按钮从磁盘挑一张，或 **Ctrl+V** 直接把剪贴板里的图贴进来——原尺寸落在选区正中，比选区大时等比缩小塞进去，贴完自动切到 Select 并选中它，接着就能拖动、用把手缩放，Ctrl+Z 一样能撤销
+- **取字**：工具栏的「取字」按钮把选区里的文字读出来放进剪贴板，按钮自己会闪一下「已复制」或「失败」；读取本身跑在 `vshot ocr --input` 子进程里（见[「OCR 取字」](#ocr-取字)）
 - 标注以全局逻辑坐标传回 Rust，最终 PNG 由内置软件渲染重绘，与预览一致；文本由 Qt 按所选字体栅格化为位图后合成，因此字形完全一致
 
 界面语言默认跟随系统（`QLocale::system()`），可用 `VSHOT_LANG` 覆盖：以 `zh` 开头选中文，其它非空值选英文。语言在 helper 启动时确定，切换需重新运行。Rust CLI 的 `--help` 走同一套判定，`VSHOT_LANG=zh vshot --help` 即中文。
+
+## OCR 取字
+
+`vshot ocr` 把屏幕上某块区域的文字读出来。不给参数就是框选：
+
+```sh
+vshot ocr                    # 框一块区域，文字到 stdout
+vshot ocr --clipboard        # 同上，进剪贴板
+vshot ocr --geometry '0,0 800x200'
+vshot ocr --input shot.png   # 读一个已有的图片文件
+```
+
+识别用 **PaddleOCR 的 PP-OCR 模型**（官方模型转成的 ONNX 版本），跑在本进程的 ONNX Runtime 上，**用 CPU**。实测一张 720p 代码截图端到端约 **240 ms**，13px 的小字也认得准。
+
+模型是 `PP-OCRv6_small` 这一档，约 30 MB：
+
+| 文件 | 大小 | 作用 |
+|---|---|---|
+| `det.onnx` | 9.4 MB | 文本检测（语种无关） |
+| `rec.onnx` | 20.3 MB | 文本识别 |
+| `dict.txt` | 73 KB | 18708 字的字符表 |
+
+装包后它们在 `/usr/share/vshot/models/`；源码树里放在 `models/`（`vshot ocr` 会从可执行文件逐级往上找，所以 `target/release/vshot` 和 `target/release/deps/vshot-*` 都找得到）。**这三个文件不进 git**，PKGBUILD 用 `source=()` 下载并校验 SHA-256。
+
+### 为什么默认是 CPU
+
+因为它够快，而 GPU 的代价不成比例：
+
+- 实测识别模型 **CPU 4.0 ms vs GPU 2.2 ms**——在 240 ms 的总耗时里看不出来
+- 而 Arch 上 `onnxruntime-opt-rocm` 的依赖链是 `rocm-hip-sdk` + `rccl`（446 MB）+ `migraphx`（787 MB），**光这两个就 1.2 GB**，还没算 rocm-hip-sdk 展开的二十几个包。把一个截图工具的依赖撑到 2 GB 换 1.8 ms，不划算。
+
+所以 `depends` 里写的是虚拟包 `onnxruntime`，而不是钉死 `onnxruntime-cpu`（连 cpuinfo、protobuf 一起约 46 MB）——理由见[「安装」](#安装arch-linux)：钉死会逼已经装了 GPU 变体的人卸掉它，连带带走一整串 ROCm 包，而 vshot 从那个变体里用到的只是共享库和 `.pc`。
+
+### 用 GPU：外接引擎
+
+要给 GPU 留口子，就指向一个**你自己的程序**。vshot 给它一张 PNG，它把文字按行写到 stdout，vshot 只负责启动它和读 stdout——**vshot 自己永远不链接 GPU 运行时**：
+
+```json
+{
+  "cli": {
+    "ocr": {
+      "engine": "external",
+      "external": {
+        "command": ["/usr/bin/my-ocr", "--stdin"],
+        "stdin": true,
+        "timeout": 30
+      }
+    }
+  }
+}
+```
+
+- `command`：程序与参数，**数组**形式（不走 shell，所以参数里有空格也不用转义）
+- `stdin`：`true` 就把 PNG 走 stdin 送过去；不给或 `false` 则把临时 PNG 的**路径**作为最后一个参数附上
+- `timeout`：秒，默认 30；超时会杀掉子进程，不会挂住截图
+
+这个程序可以是什么都行——一个用 ROCm wheel 的 Python `rapidocr`、一个 `curl` 到另一台机器上的服务、一份带 CUDA 的 ONNX Runtime。举一个用 Python rapidocr 的例子：
+
+```sh
+#!/bin/sh
+# /usr/local/bin/my-ocr —— 吃 stdin 的 PNG，吐文字
+exec /path/to/venv/bin/python -c '
+import sys
+from rapidocr import RapidOCR
+from PIL import Image
+import io
+img = Image.open(io.BytesIO(sys.stdin.buffer.read()))
+result = RapidOCR()(img)
+for text in (result.txts or []):
+    print(text)
+'
+```
+
+```json
+{"cli": {"ocr": {"engine": "external",
+                 "external": {"command": ["/usr/local/bin/my-ocr"], "stdin": true}}}}
+```
+
+**配置错了会直接报错，不会静默退回 CPU**：写了 `engine: "external"` 却没给 `command`、或者命令跑不起来、或者程序非零退出，都是明确的错误信息（外部程序写到 stderr 的内容会一并带上）。一个配了 GPU 引擎的人想知道它没跑起来，而不是拿到一份自己没要的 CPU 结果。
 
 ## 截取窗口
 
@@ -386,7 +482,8 @@ vshot settings
     "png-compression": "high",
     "monitor": "DP-2",
     "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
-    "pin": { "density": 2 }
+    "pin": { "density": 2 },
+    "ocr": { "engine": "builtin" }
   }
 }
 ```
@@ -433,8 +530,14 @@ vshot settings
 | `long.ignore-top` | `long --ignore-top` | `0` |
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | 自动推断 |
+| `ocr.engine` | `vshot ocr` 用哪个引擎 | `builtin` |
+| `ocr.external.command` | `engine: "external"` 时跑的程序（数组） | 无 |
+| `ocr.external.stdin` | 把 PNG 走 stdin 而不是给路径 | `false` |
+| `ocr.external.timeout` | 外部程序的超时（秒） | `30` |
 
 `pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效——一个键写错只损失那一个键，其余照常生效。
+
+`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口只覆盖 `editor` 与常用的 `cli` 项，`ocr` 这一段要手改文件。
 
 `color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）。注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 
@@ -447,6 +550,7 @@ vshot settings
 | `VSHOT_PIXEL_DEBUG=1` | 窗口像素识别每一级看到了什么 |
 | `VSHOT_SESSION_DEBUG=1` | 本次会话被判成了哪个合成器、依据是什么 |
 | `VSHOT_LONG_DEBUG_DIR=<dir>` | 长截图落盘每一帧与每次拼接决定 |
+| `VSHOT_OCR_MODELS=<dir>` | OCR 模型目录，覆盖 `/usr/share/vshot/models` 与可执行文件旁的查找 |
 | `VSHOT_PIN_SOCKET` | pin daemon 监听的 socket 路径 |
 | `VSHOT_PIN_DENSITY=N` | 每张 pin 图的来源密度，等同 `--density` |
 | `VSHOT_PIN_DEBUG=1` | daemon 打印每张 pin 的密度判定 |
@@ -495,11 +599,14 @@ QT_QPA_PLATFORM=offscreen build-qt/vshot-paste-check
 
 其中 `vshot-config-check` 覆盖的是最容易静默出错的一块：保存时**合并写入**是否真的保住了本版不认识的键、清空一个值是否真的把它删掉、以及 `#rrggbbaa` 是否按 CSS 那套解析（Qt 自己会把它读成 `#aarrggbb`，于是「不透明橙色」变成紫色）。`vshot-settings-check` 则把设置窗口真建出来、逐个驱动它的控件，再回读配置文件——某一个字段接错了线，只有这样才看得出来。改窗口布局时这一项尤其值得跑：它靠控件名找控件，所以重排、换控件类都不会漏掉，只有真的把某个字段接错了才会红。
 
-另有 4 个默认**不执行**（`#[ignore]`）的集成测试，需要真实环境：KWin 的 D-Bus 采集与后端选择（需要跑着的 KWin，起无头 KWin 即可，见 `src/capture/kwin.rs` 的注释，虚拟输出名 `Virtual-0`、1024x768、无 pointer capability，所以只覆盖到 D-Bus 采集这一层）、活跃输出探针（需要任一真实会话）、`/dev/uinput` 滚动注入（需要写权限）。跑法：
+另有 5 个默认**不执行**（`#[ignore]`）的集成测试，需要真实环境：KWin 的 D-Bus 采集与后端选择（需要跑着的 KWin，起无头 KWin 即可，见 `src/capture/kwin.rs` 的注释，虚拟输出名 `Virtual-0`、1024x768、无 pointer capability，所以只覆盖到 D-Bus 采集这一层）、活跃输出探针（需要任一真实会话）、`/dev/uinput` 滚动注入（需要写权限）、以及**内置 OCR 引擎读一张画出来的文字**（需要那 30 MB 模型在盘上，`cargo test` 没地方去下）。跑法：
 
 ```sh
 cargo test -- --ignored              # 全部
+cargo test --release ocr:: -- --ignored --nocapture   # 只跑 OCR
 ```
+
+OCR 那一项默认在源码树的 `models/` 里找模型，也可以用 `VSHOT_OCR_MODELS=<dir>` 指到别处。它验的是单元测试碰不到的那一段：模型能不能加载、整条流水线的方向对不对、字符回来时是不是完整的。文字是用编辑器那套软件渲染器**画**出来的（不是打进去的），所以走的正是截图里文字的路径。
 
 无头 KWin 的启动方式：
 

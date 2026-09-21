@@ -197,6 +197,20 @@ niri 画的一个十字（无高亮）来指认窗口；点中的窗口由 niri 
 下次没写出来的参数也按你挑的默认值走。它不截任何图，除了显示一个窗口之外不需要任何合成器协议，
 所以在一个 vshot 本来截不了图的合成器上也能用。"#,
     ),
+    (
+        "ocr",
+        "把屏幕上某块区域的文字读出来",
+        r#"不给 --geometry 时，冻结场景交给 Qt overlay 框住文字——和 `vshot region` 一样，只是没有
+标注编辑器：框一个矩形，按 Enter，它的文字就回来了。文字写到 stdout，加 --clipboard 则进剪贴板。
+--input 改为读一个图片文件，标注编辑器里的「取字」按钮走的也是这条路。
+
+识别用的是 PaddleOCR 自己的 PP-OCR 模型（转换出来的 ONNX 版本），跑在本进程的 ONNX Runtime 上，
+用 CPU。模型装在 /usr/share/vshot/models，也在可执行文件旁边找，所以源码树里不装任何东西也能跑。
+
+要用 GPU，就把 $XDG_CONFIG_HOME/vshot/config.json 里的 `ocr.engine` 指向一个外部程序：vshot 给它
+一张 PNG，它把文字写到 stdout，vshot 自己不链接任何 GPU 运行时。那个配置项长什么样，见 README 的
+OCR 一节。"#,
+    ),
 ];
 
 /// `(argument id, Chinese help)`.
@@ -210,7 +224,7 @@ const ARGS: &[(&str, &str)] = &[
         "output",
         "把 PNG 写到 PATH，展开 `%Y%m%d` 这类 strftime 格式；写完后把文件 URI 复制进 Wayland 剪贴板。填 `-` 则写到 stdout。",
     ),
-    ("clipboard", "把 PNG 复制进 Wayland 剪贴板。"),
+    ("clipboard", "把结果复制进 Wayland 剪贴板：截图是 PNG 字节，`vshot ocr` 是识别出的文字。"),
     ("pin", "把截到的图像 pin 到屏幕上，而不是写到任何地方。"),
     (
         "png_compression",
@@ -218,6 +232,10 @@ const ARGS: &[(&str, &str)] = &[
     ),
     ("geometry", "固定的全局矩形，格式为 `x,y 宽x高`。"),
     ("interactive", "明确要求用指针选区。不给 --geometry 时这就是默认行为。"),
+    (
+        "input",
+        "改为读这个文件里的图片，而不是截屏。标注编辑器的取字按钮用的就是这条路。",
+    ),
     ("name", "输出名；`current` 表示指针所在的那块输出。"),
     ("notches", "捕获滚动时一次发送的滚轮格数。"),
     ("max_height", "拼接结果的高度上限，单位像素。"),
