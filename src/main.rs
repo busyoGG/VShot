@@ -287,10 +287,7 @@ fn run() -> Result<()> {
                 if candidates.is_empty() {
                     candidates = capture::detect_window_candidates(&scene)
                         .into_iter()
-                        .map(|geometry| WindowCandidate {
-                            geometry,
-                            label: String::new(),
-                        })
+                        .map(|geometry| WindowCandidate::unlabelled(geometry, String::new()))
                         .collect();
                 }
                 if candidates.is_empty() {

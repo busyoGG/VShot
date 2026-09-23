@@ -125,6 +125,7 @@ vshot ocr --input shot.png                  # read an existing image file
 vshot record monitor eDP-1 --output clip.mp4    # one output
 vshot record monitor --fps 30                   # the output you are on (NAME defaults to current)
 vshot record all                                # every output, default video dir
+vshot record window                             # one window's own pixels, occlusion and all
 vshot record stop                               # stop the recording that runs
 vshot record monitor current --duration 30      # stop itself after 30 seconds
 ```
@@ -317,9 +318,12 @@ ScreenShot2 on Plasma) and encoding happens on the GPU's media engine.
 vshot record monitor eDP-1 --output clip.mp4    # one output; NAME as in `vshot monitor`
 vshot record monitor                            # NAME defaults to `current`: where you are
 vshot record all                                # every output, composed at its position
-vshot record monitor current --encoder hevc     # codec: h264 (default) / hevc / av1
-vshot record monitor current --fps 120          # aim for 120 fps (1-240, default 60)
-vshot record monitor current --duration 60      # stop by itself after 60 seconds
+vshot record window                             # one window's own pixels (not the area it covers)
+vshot record window firefox                     # by app id or title
+vshot record window --pick                      # click the window to record
+vshot record monitor --encoder hevc             # codec: h264 (default) / hevc / av1
+vshot record monitor --fps 120                  # aim for 120 fps (1-240, default 60)
+vshot record monitor --duration 60              # stop by itself after 60 seconds
 vshot record stop                               # stop the running recording
 ```
 
@@ -331,6 +335,26 @@ vshot record stop                               # stop the running recording
   pointer where the compositor reports that (Hyprland), the focused output
   otherwise. When nothing answers, vshot says so and points at `monitor NAME`
   and `all`.
+
+- **A window recording is not a recording of the area a window covers.**
+  `record window` records the window's *own pixels*, which the compositor
+  copies out itself (`ext_image_copy_capture_v1`, with the window's
+  `ext_foreign_toplevel_handle_v1` as the source). So a window that is covered
+  by another one records whole, one dragged half off the screen records whole,
+  nothing behind it ever appears, and a window on a workspace that is not even
+  visible records all the same — measured: a Discord window on a hidden
+  workspace OCR'd back as Discord, while a screen recording of the same area
+  showed the window that was actually there. Name the window by app id or
+  title (whole name first, then a case-insensitive substring), `--pick` it with
+  a click, or leave it out for the focused one. A compositor without these
+  protocols is told to record a screen instead.
+- **Two ways a window recording ends by itself.** If the window is *resized*
+  or *closed* while recording, the recording ends there: the file is finished
+  properly (trailer written) and stderr says why. One MP4 holds one frame size,
+  and the encoder would refuse the frames a resize brings, so stopping there
+  beats writing a broken file. If the window's output is off, disabled or
+  disconnected, no frame ever arrives; that is reported after a few seconds
+  rather than waited on forever.
 
 - **Stopping.** `vshot record stop` (no display needed, so it binds to a
   compositor keybinding) or Ctrl+C in the terminal that started it. Both

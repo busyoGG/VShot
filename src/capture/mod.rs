@@ -4,6 +4,7 @@ pub mod kwin;
 pub mod niri;
 pub mod window;
 pub mod window_blend;
+pub mod window_copy;
 pub mod window_pixel;
 pub mod wlr;
 

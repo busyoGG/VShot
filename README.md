@@ -125,6 +125,7 @@ vshot ocr --input shot.png                  # 读一个已有的图片文件
 vshot record monitor eDP-1 --output clip.mp4    # 录一块屏
 vshot record monitor --fps 30                   # 你当前所在的那块（NAME 省略即 current），30fps
 vshot record all                                # 整个桌面，默认存视频目录
+vshot record window                             # 焦点窗口自己的像素，盖住也录得完整
 vshot record stop                               # 停止正在进行的录制
 vshot record monitor current --duration 30      # 录 30 秒自动停
 ```
@@ -317,9 +318,12 @@ for text in (result.txts or []):
 vshot record monitor eDP-1 --output clip.mp4    # 一块屏；NAME 同 `vshot monitor`
 vshot record monitor                            # NAME 省略即 `current`：你当前所在的那块
 vshot record all                                # 多屏按逻辑位置拼合
-vshot record monitor current --encoder hevc     # 编码器：h264（默认）/ hevc / av1
-vshot record monitor current --fps 120          # 瞄准 120fps（1-240，默认 60）
-vshot record monitor current --duration 60      # 60 秒后自动停
+vshot record window                             # 焦点窗口自己的像素（不是它所在的屏幕区域）
+vshot record window firefox                     # 按 app id 或标题选窗口
+vshot record window --pick                      # 点选一扇窗来录
+vshot record monitor --encoder hevc             # 编码器：h264（默认）/ hevc / av1
+vshot record monitor --fps 120                  # 瞄准 120fps（1-240，默认 60）
+vshot record monitor --duration 60              # 60 秒后自动停
 vshot record stop                               # 停止（读取 pid 文件发信号）
 ```
 
@@ -328,6 +332,18 @@ vshot record stop                               # 停止（读取 pid 文件发�
   （`hyprctl` / `swaymsg` / `niri msg` / KWin 的 D-Bus，与 pin 判断落点用的是同一个查询）：
   合成器能报指针位置时（Hyprland）就是指针所在的那块，否则是焦点所在的那块。都不报告时
   会明确报错，让你用 `monitor NAME` 或 `all`。
+
+- **窗口录屏 ≠ 窗口区域录屏**：`record window` 录的是窗口**自己的像素**，由合成器把窗口本身
+  复制出来（`ext_image_copy_capture_v1`，源是窗口的 `ext_foreign_toplevel_handle_v1`）。
+  所以：被别的窗口盖住的窗口录出来是完整的；被拖到屏幕外一半的窗口也是完整的；窗口背后有
+  什么都不出现在视频里；窗口在**别的工作区、甚至当前屏幕上看不到**时照样录得到（实测：录一个
+  在隐藏工作区上的 Discord 窗口，OCR 出的是 Discord 自己的内容，而同位置录屏得到的是别的
+  窗口）。窗口怎么指定：给 app id 或标题（先整名，再大小写不敏感的子串），`--pick` 点选，
+  不写就是焦点那扇。合成器没有这套协议时会明确说明，让你改录屏幕。
+- **窗口录屏的两种自然结束**：录制中窗口被**缩放**，或窗口被**关闭**，录制就在那里结束——
+  文件正常收尾（trailer 完整），stderr 说明原因。一个 MP4 只有一种帧尺寸，缩放后的帧编码器
+  不会接受，所以与其写坏文件不如在那里结束。窗口所在输出如果**关着/禁用/断开**，永远不会有帧
+  送过来，这种情况几秒后会报错而不是一直等。
 
 - **录制怎么停**：`vshot record stop`（不需要显示器，可直接绑快捷键），或启动它的终端里
   按 Ctrl+C。两种方式都会先把文件正常收尾（libavformat 写完 trailer、采样表与索引）再退出，

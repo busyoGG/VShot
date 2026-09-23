@@ -65,6 +65,7 @@ use crate::wayland::WaylandSession;
 use self::avcodec::{Recorder, VideoCodec};
 
 pub mod avcodec;
+mod window;
 
 /// How many times per second frames are taken at most.  The loop always
 /// tries to keep up with this; a slower screen just produces fewer frames.
@@ -85,6 +86,26 @@ pub enum RecordTarget {
     /// Every output, composed at its logical position — the video shape of
     /// `vshot all`.
     All,
+    /// One window's *own pixels*, not the screen area it covers: the
+    /// compositor copies the window itself, so a window that is covered by
+    /// another one, or dragged half off the screen, still records whole.  That
+    /// is the difference between this and recording the rectangle the window
+    /// sits in, which is what a screen recording of that area would give.
+    Window(WindowTarget),
+}
+
+/// Which window `record window` records.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WindowTarget {
+    /// The focused window, resolved through the compositor's own active-window
+    /// query and matched against its window list.
+    Active,
+    /// The window the user clicks, through the same picker `vshot window pick`
+    /// shows.
+    Pick,
+    /// A window whose app id or title matches this text: the whole name, else
+    /// a case-insensitive substring of either.
+    Filter(String),
 }
 
 /// A parsed recording request.
@@ -267,6 +288,12 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             "a recording is already running (pid {pid}); stop it with `vshot record stop` first"
         )));
     }
+    // A window recording has a different frame source — the compositor's own
+    // copy of one window — so it runs its own loop; everything around it (the
+    // output path, the stop signal, the pid file, the report) is shared.
+    if let RecordTarget::Window(target) = &request.target {
+        return window::run(request, target);
+    }
 
     // --- the frame source and its geometry --------------------------------
     let wayland = WaylandSession::connect()?;
@@ -334,33 +361,13 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
                 (encoded_width, encoded_height),
             )
         }
+        // Handled at the top of `run`: a window recording has its own frame
+        // source and its own loop.
+        RecordTarget::Window(_) => unreachable!("window recordings run their own loop"),
     };
 
     // --- the output path --------------------------------------------------
-    let path = resolve_output_path(request.output.as_deref())?;
-    // The default videos directory is vshot's own choice, so it gets made if
-    // it is missing — `~/.config/user-dirs.dirs` can name one that no desktop
-    // has created yet.  A path the user named is theirs: a missing directory
-    // there is a mistake worth an error of our own rather than the muxer's
-    // bare "No such file or directory".
-    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(directory) if request.output.is_none() => {
-            std::fs::create_dir_all(directory).map_err(|source| {
-                VshotError::Recording(format!(
-                    "could not create the videos directory {}: {source}",
-                    directory.display()
-                ))
-            })?;
-        }
-        Some(directory) if !directory.is_dir() => {
-            return Err(VshotError::Recording(format!(
-                "the directory {} does not exist (create it, or drop --output to record into the \
-                 videos directory)",
-                directory.display()
-            )));
-        }
-        _ => {}
-    }
+    let path = prepare_output_path(request)?;
 
     // --- the encoder and muxer --------------------------------------------
     let (encoded_width, encoded_height) = geometry;
@@ -440,14 +447,7 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     }
 
     // --- stopping ---------------------------------------------------------
-    let interrupted = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone())
-        .and_then(|_| {
-            signal_hook::flag::register(signal_hook::consts::SIGTERM, interrupted.clone())
-        })
-        .map_err(|error| {
-            VshotError::Recording(format!("could not install the stop handler: {error}"))
-        })?;
+    let interrupted = install_stop_handler()?;
 
     write_pid_file()?;
     // The loop writes the file and reports what went into it; the pid file
@@ -463,6 +463,59 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     );
     let _ = std::fs::remove_file(pid_file());
 
+    report_outcome(outcome, &path)
+}
+
+/// The output path, with its directory made when vshot chose it and an error
+/// of ours when the user's own directory is missing.  Shared by every
+/// recording shape.
+fn prepare_output_path(request: &RecordRequest) -> Result<std::path::PathBuf> {
+    let path = resolve_output_path(request.output.as_deref())?;
+    // The default videos directory is vshot's own choice, so it gets made if
+    // it is missing — `~/.config/user-dirs.dirs` can name one that no desktop
+    // has created yet.  A path the user named is theirs: a missing directory
+    // there is a mistake worth an error of our own rather than the muxer's
+    // bare "No such file or directory".
+    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(directory) if request.output.is_none() => {
+            std::fs::create_dir_all(directory).map_err(|source| {
+                VshotError::Recording(format!(
+                    "could not create the videos directory {}: {source}",
+                    directory.display()
+                ))
+            })?;
+        }
+        Some(directory) if !directory.is_dir() => {
+            return Err(VshotError::Recording(format!(
+                "the directory {} does not exist (create it, or drop --output to record into the \
+                 videos directory)",
+                directory.display()
+            )));
+        }
+        _ => {}
+    }
+    Ok(path)
+}
+
+/// Installs the SIGINT/SIGTERM flag every recording shape stops on.
+pub(crate) fn install_stop_handler() -> Result<Arc<AtomicBool>> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone())
+        .and_then(|_| {
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, interrupted.clone())
+        })
+        .map_err(|error| {
+            VshotError::Recording(format!("could not install the stop handler: {error}"))
+        })?;
+    Ok(interrupted)
+}
+
+/// Reports a finished recording: the frame count and length on stderr, a
+/// desktop notification, and the failure path when the loop gave up.
+pub(crate) fn report_outcome(
+    outcome: Result<(usize, f64)>,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf> {
     let (frames, seconds) = match outcome {
         Ok(done) => done,
         Err(error) => {
@@ -474,8 +527,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
         "vshot: recorded {frames} frames ({seconds:.1}s) into {}",
         path.display()
     );
-    crate::notify::recording_finished(&path, frames, seconds);
-    Ok(path)
+    crate::notify::recording_finished(path, frames, seconds);
+    Ok(path.to_path_buf())
 }
 
 /// The output `current` means: the one the compositor says the user is on.

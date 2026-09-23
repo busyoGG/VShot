@@ -203,39 +203,11 @@ typedef struct VshotGbmBuffer {
     int height;
 } VshotGbmBuffer;
 
-// Allocates one dma-buf of the requested format and size, preferring a
-// linear layout (what screencopy buffers use and what the VAAPI import
-// expects), falling back to a plain renderable allocation.  Outputs the
-// descriptor facts on success.
-void *vshot_gbm_buffer_create(int width, int height, unsigned fourcc, uint64_t *modifier_out,
-                              int *fd_out, unsigned *stride_out, unsigned *offset_out) {
-    gbm_api = load_gbm();
-    if (!gbm_api) {
-        return NULL;
-    }
-    struct gbm_device *device = ensure_gbm_device();
-    if (!device) {
-        return NULL;
-    }
-    if (width <= 0 || height <= 0) {
-        snprintf(gbm_error, sizeof(gbm_error), "invalid buffer size %dx%d", width, height);
-        return NULL;
-    }
-    struct gbm_bo *bo = NULL;
-    if (gbm_api->bo_create_with_modifiers) {
-        const uint64_t linear = 0; // DRM_FORMAT_MOD_LINEAR
-        bo = gbm_api->bo_create_with_modifiers(device, (uint32_t)width, (uint32_t)height, fourcc,
-                                               &linear, 1);
-    }
-    if (!bo) {
-        // GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING = 0x2 | 0x4
-        bo = gbm_api->bo_create(device, (uint32_t)width, (uint32_t)height, fourcc, 0x2 | 0x4);
-    }
-    if (!bo) {
-        snprintf(gbm_error, sizeof(gbm_error),
-                 "could not allocate a %dx%d dma-buf (fourcc 0x%08x)", width, height, fourcc);
-        return NULL;
-    }
+// Wraps a freshly allocated BO in the handle the caller gets: the fd is
+// exported here and owned by the handle, and the descriptor facts are read
+// back from the driver.  On failure the BO is destroyed and NULL returned.
+static void *wrap_gbm_bo(struct gbm_bo *bo, int width, int height, uint64_t *modifier_out,
+                         int *fd_out, unsigned *stride_out, unsigned *offset_out) {
     int fd = gbm_api->bo_get_fd(bo);
     if (fd < 0) {
         gbm_api->bo_destroy(bo);
@@ -269,6 +241,85 @@ void *vshot_gbm_buffer_create(int width, int height, unsigned fourcc, uint64_t *
         *offset_out = buffer->offset;
     }
     return buffer;
+}
+
+// Allocates one dma-buf of the requested format and size, preferring a
+// linear layout (what screencopy buffers use and what the VAAPI import
+// expects), falling back to a plain renderable allocation.  Outputs the
+// descriptor facts on success.
+void *vshot_gbm_buffer_create(int width, int height, unsigned fourcc, uint64_t *modifier_out,
+                              int *fd_out, unsigned *stride_out, unsigned *offset_out) {
+    gbm_api = load_gbm();
+    if (!gbm_api) {
+        return NULL;
+    }
+    struct gbm_device *device = ensure_gbm_device();
+    if (!device) {
+        return NULL;
+    }
+    if (width <= 0 || height <= 0) {
+        snprintf(gbm_error, sizeof(gbm_error), "invalid buffer size %dx%d", width, height);
+        return NULL;
+    }
+    struct gbm_bo *bo = NULL;
+    if (gbm_api->bo_create_with_modifiers) {
+        const uint64_t linear = 0; // DRM_FORMAT_MOD_LINEAR
+        bo = gbm_api->bo_create_with_modifiers(device, (uint32_t)width, (uint32_t)height, fourcc,
+                                               &linear, 1);
+    }
+    if (!bo) {
+        // GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING = 0x2 | 0x4
+        bo = gbm_api->bo_create(device, (uint32_t)width, (uint32_t)height, fourcc, 0x2 | 0x4);
+    }
+    if (!bo) {
+        snprintf(gbm_error, sizeof(gbm_error),
+                 "could not allocate a %dx%d dma-buf (fourcc 0x%08x)", width, height, fourcc);
+        return NULL;
+    }
+    return wrap_gbm_bo(bo, width, height, modifier_out, fd_out, stride_out, offset_out);
+}
+
+// Allocates one dma-buf from the modifiers the compositor advertised, which
+// is what an `ext_image_copy_capture` client has to do: there the client is
+// the side that allocates the buffer a window gets copied into, so the
+// modifier has to be one the compositor can import.  GBM picks the first
+// modifier of the list it can allocate for the format.
+void *vshot_gbm_buffer_create_with_modifiers(int width, int height, unsigned fourcc,
+                                             const uint64_t *modifiers, int count,
+                                             uint64_t *modifier_out, int *fd_out,
+                                             unsigned *stride_out, unsigned *offset_out) {
+    gbm_api = load_gbm();
+    if (!gbm_api) {
+        return NULL;
+    }
+    struct gbm_device *device = ensure_gbm_device();
+    if (!device) {
+        return NULL;
+    }
+    if (width <= 0 || height <= 0) {
+        snprintf(gbm_error, sizeof(gbm_error), "invalid buffer size %dx%d", width, height);
+        return NULL;
+    }
+    if (!modifiers || count <= 0) {
+        snprintf(gbm_error, sizeof(gbm_error),
+                 "the compositor offered no dma-buf modifier for a %dx%d buffer", width, height);
+        return NULL;
+    }
+    if (!gbm_api->bo_create_with_modifiers) {
+        snprintf(gbm_error, sizeof(gbm_error),
+                 "this libgbm cannot allocate by modifier, which a window capture needs");
+        return NULL;
+    }
+    struct gbm_bo *bo = gbm_api->bo_create_with_modifiers(
+        device, (uint32_t)width, (uint32_t)height, fourcc, modifiers, count);
+    if (!bo) {
+        snprintf(gbm_error, sizeof(gbm_error),
+                 "could not allocate a %dx%d dma-buf (fourcc 0x%08x) with any of the %d modifiers "
+                 "the compositor offered",
+                 width, height, fourcc, count);
+        return NULL;
+    }
+    return wrap_gbm_bo(bo, width, height, modifier_out, fd_out, stride_out, offset_out);
 }
 
 int vshot_gbm_buffer_fd(void *handle) {

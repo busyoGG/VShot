@@ -24,7 +24,9 @@ Capture targets
   window pick         the window you click, on a live desktop with the others dimmed
   long                a scrolling region: vshot scrolls it, grabs frames while it moves and
                       stitches them into one tall image
-  record monitor|all  record the screen to an MP4 on the GPU (see below)
+  record monitor|all|window
+                      record to an MP4 on the GPU: a screen, the desktop, or one window's
+                      own pixels (see below)
 
 Destination (every capture above goes to exactly one)
   -o, --output PATH   a PNG at PATH, with strftime expanded (shots/%Y%m%d-%H%M%S.png); the
@@ -388,6 +390,28 @@ pub enum RecordTargetCommand {
     },
     /// Record the complete desktop: every output composed at its logical position.
     All,
+    /// Record one window's own pixels — not the screen area it covers.
+    #[command(
+        after_help = "The compositor copies the window itself, so a window that is covered by \
+another one records whole, and one that is dragged half off the screen still records whole. \
+What is behind the window never appears: this is the window, not the area it sits in.\n\n\
+The window is named by app id or title (the whole name first, else a case-insensitive \
+substring of either), picked with `--pick`, or — with no argument — the focused one. The \
+protocol this needs is `ext_image_copy_capture_v1` with the window as its source; a \
+compositor without it is told to record a screen instead.\n\n\
+A window that is resized or closed while recording ends the recording there: the file is \
+finished properly and says why, because one MP4 holds one frame size. A window whose output \
+is off, disabled or disconnected never produces a frame at all, which is reported after a \
+few seconds rather than waited on."
+    )]
+    Window {
+        /// App id or title of the window; the focused window when omitted.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Pick the window to record by clicking it.
+        #[arg(long)]
+        pick: bool,
+    },
     /// Stop the recording that is running.
     Stop,
 }
@@ -613,6 +637,30 @@ impl Cli {
                     crate::record::RecordTarget::Monitor(name.clone())
                 }
                 RecordTargetCommand::All => crate::record::RecordTarget::All,
+                RecordTargetCommand::Window { name, pick } => {
+                    // One way to say which window, not three that fight.
+                    if *pick && name.is_some() {
+                        return Err(VshotError::InvalidDestination(
+                            "`record window` takes a window name or `--pick`, not both".into(),
+                        ));
+                    }
+                    let target = if *pick {
+                        crate::record::WindowTarget::Pick
+                    } else {
+                        match name.as_deref() {
+                            Some(filter) if !filter.trim().is_empty() => {
+                                crate::record::WindowTarget::Filter(filter.to_owned())
+                            }
+                            Some(_) => {
+                                return Err(VshotError::InvalidDestination(
+                                    "the window name cannot be empty".into(),
+                                ))
+                            }
+                            None => crate::record::WindowTarget::Active,
+                        }
+                    };
+                    crate::record::RecordTarget::Window(target)
+                }
                 RecordTargetCommand::Stop => unreachable!("handled above"),
             };
             let encoder = match encoder.as_deref() {
@@ -895,6 +943,55 @@ mod tests {
     fn defaults_monitor_to_current() {
         let request = Cli::try_parse_from(["vshot", "monitor", "--output", "-"]).unwrap();
         assert_eq!(request.target, CaptureTarget::Monitor("current".into()));
+    }
+
+    /// `record monitor` without a name means `current`, and `record window`
+    /// resolves its three shapes — focused, picked, named.
+    #[test]
+    fn record_targets_default_the_way_the_help_says() {
+        let action =
+            Cli::try_parse_action_from(["vshot", "record", "monitor", "--duration", "1"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record monitor` is a start");
+        };
+        assert_eq!(
+            request.target,
+            crate::record::RecordTarget::Monitor("current".into())
+        );
+        assert_eq!(request.duration, Some(1));
+
+        let action = Cli::try_parse_action_from(["vshot", "record", "window"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record window` is a start");
+        };
+        assert_eq!(
+            request.target,
+            crate::record::RecordTarget::Window(crate::record::WindowTarget::Active)
+        );
+
+        let action = Cli::try_parse_action_from(["vshot", "record", "window", "--pick"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record window --pick` is a start");
+        };
+        assert_eq!(
+            request.target,
+            crate::record::RecordTarget::Window(crate::record::WindowTarget::Pick)
+        );
+
+        let action = Cli::try_parse_action_from(["vshot", "record", "window", "firefox"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record window NAME` is a start");
+        };
+        assert_eq!(
+            request.target,
+            crate::record::RecordTarget::Window(crate::record::WindowTarget::Filter(
+                "firefox".into()
+            ))
+        );
+
+        // One way to name the window, not two that fight.
+        assert!(Cli::try_parse_action_from(["vshot", "record", "window", "x", "--pick"]).is_err());
+        assert!(Cli::try_parse_action_from(["vshot", "record", "window", ""]).is_err());
     }
 
     #[test]

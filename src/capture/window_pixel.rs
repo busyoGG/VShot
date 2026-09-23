@@ -216,6 +216,10 @@ pub fn detect_active_window(scene: &SceneSnapshot, cursor: Option<Point>) -> Res
     Ok(ActiveWindow {
         geometry,
         source: WindowSource::Pixel,
+        // Pixel detection sees a rectangle, not a name; a window recording
+        // that needs a name takes the picker instead.
+        app_id: String::new(),
+        title: String::new(),
     })
 }
 

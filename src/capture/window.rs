@@ -12,6 +12,13 @@ use super::active_output::Session;
 pub struct ActiveWindow {
     pub geometry: Rect,
     pub source: WindowSource,
+    /// The app id (Wayland) or class (X11) the compositor reports for this
+    /// window, and its title.  Empty where the compositor's query reports
+    /// neither (KWin's probe, the pixel fallback).  Recording a window needs
+    /// them: the foreign-toplevel list names a window the same way, and that
+    /// is how the focused window is found in it.
+    pub app_id: String,
+    pub title: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +39,26 @@ pub struct WindowCandidate {
     /// `class — title` for Wayland-native windows, the closest available
     /// equivalent elsewhere, and empty when the compositor reports neither.
     pub label: String,
+    /// The app id (Wayland) or class (X11), as the compositor reports it.
+    /// Recording a window matches this against the foreign-toplevel list's own
+    /// `app_id`, so the two descriptions of a window have to keep the raw
+    /// parts and not only the joined label.
+    pub app_id: String,
+    /// The window's title, as the compositor reports it.  May be empty.
+    pub title: String,
+}
+
+impl WindowCandidate {
+    /// A candidate whose compositor reported no separate labels: the label
+    /// stands alone (the pixel fallback, KWin's titleless list).
+    pub fn unlabelled(geometry: Rect, label: String) -> Self {
+        Self {
+            geometry,
+            label,
+            app_id: String::new(),
+            title: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -324,6 +351,18 @@ impl ProcessWindowProvider {
         let windows = self.windows().ok()?;
         topmost_containing(windows.iter().map(|window| window.geometry), point)
     }
+
+    /// The window under `point` *with its labels*, for a caller that has to
+    /// name the window it just resolved — a window recording matches the
+    /// compositor's app id and title against the foreign-toplevel list, and a
+    /// bare rectangle cannot do that.
+    pub fn candidate_at(&self, point: Point) -> Option<WindowCandidate> {
+        let windows = self.windows().ok()?;
+        windows
+            .into_iter()
+            .rev()
+            .find(|window| window.geometry.contains(point))
+    }
 }
 
 /// The last rect that contains `point`.  The window list is ordered bottom to
@@ -523,6 +562,16 @@ pub fn parse_hyprland_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
     Ok(ActiveWindow {
         geometry: Rect::new(at.0, at.1, size.0, size.1),
         source: WindowSource::Hyprland,
+        app_id: value
+            .get("class")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
     })
 }
 
@@ -548,6 +597,22 @@ pub fn parse_sway_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
     Ok(ActiveWindow {
         geometry: Rect::new(x, y, width, height),
         source: WindowSource::Sway,
+        app_id: node
+            .get("app_id")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                node.get("window_properties")
+                    .and_then(|properties| properties.get("class"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("")
+            .to_owned(),
+        title: node
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
     })
 }
 
@@ -589,6 +654,10 @@ pub fn parse_kwin_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
     Ok(ActiveWindow {
         geometry: Rect::new(x, y, width, height),
         source: WindowSource::KWin,
+        // The probe reports geometry only; a window recording then falls back
+        // to the picker, which knows the labels.
+        app_id: String::new(),
+        title: String::new(),
     })
 }
 
@@ -668,6 +737,16 @@ pub fn parse_hyprland_windows(clients: &[u8], monitors: &[u8]) -> Result<Vec<Win
                     client.get("class").and_then(Value::as_str).unwrap_or(""),
                     client.get("title").and_then(Value::as_str).unwrap_or(""),
                 ),
+                app_id: client
+                    .get("class")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                title: client
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
             },
         ));
     }
@@ -831,6 +910,12 @@ fn collect_sway_windows(
                 class,
                 node.get("name").and_then(Value::as_str).unwrap_or(""),
             ),
+            app_id: class.to_owned(),
+            title: node
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
         };
         if is_floating {
             floating.push(candidate);
@@ -861,10 +946,7 @@ pub fn parse_kwin_windows(bytes: &[u8]) -> Result<Vec<WindowCandidate>> {
         let Ok(window) = parse_kwin_active_window(line.as_bytes()) else {
             continue;
         };
-        windows.push(WindowCandidate {
-            geometry: window.geometry,
-            label: String::new(),
-        });
+        windows.push(WindowCandidate::unlabelled(window.geometry, String::new()));
     }
     Ok(windows)
 }

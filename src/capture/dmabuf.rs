@@ -27,6 +27,17 @@ extern "C" {
         stride_out: *mut u32,
         offset_out: *mut u32,
     ) -> *mut c_void;
+    fn vshot_gbm_buffer_create_with_modifiers(
+        width: c_int,
+        height: c_int,
+        fourcc: u32,
+        modifiers: *const u64,
+        count: c_int,
+        modifier_out: *mut u64,
+        fd_out: *mut c_int,
+        stride_out: *mut u32,
+        offset_out: *mut u32,
+    ) -> *mut c_void;
     fn vshot_gbm_buffer_destroy(handle: *mut c_void);
     fn vshot_gbm_available() -> c_int;
     fn vshot_gbm_load_error() -> *const c_char;
@@ -76,29 +87,82 @@ impl std::fmt::Debug for GbmBuffer {
     }
 }
 
+/// The descriptor facts the shim reads back out of a fresh allocation.
+#[derive(Default)]
+struct Allocation {
+    modifier: u64,
+    fd: RawFd,
+    stride: u32,
+    offset: u32,
+}
+
+/// The refusal both allocators share: a buffer with no pixels cannot be
+/// allocated, and the size comes from the compositor, so it is worth checking.
+fn zero_pixel(width: u32, height: u32) -> Option<VshotError> {
+    (width == 0 || height == 0).then(|| {
+        VshotError::WaylandProtocol("refusing to allocate a 0-pixel capture buffer".into())
+    })
+}
+
 impl GbmBuffer {
     /// Allocates a linear-preferred dma-buf of the given fourcc and size.
     pub fn create(width: u32, height: u32, fourcc: u32) -> Result<Self> {
-        if width == 0 || height == 0 {
-            return Err(VshotError::WaylandProtocol(
-                "refusing to allocate a 0-pixel capture buffer".into(),
-            ));
+        if let Some(error) = zero_pixel(width, height) {
+            return Err(error);
         }
-        let mut modifier = 0u64;
-        let mut fd = -1;
-        let mut stride = 0u32;
-        let mut offset = 0u32;
+        let mut allocation = Allocation::default();
         let handle = unsafe {
             vshot_gbm_buffer_create(
                 width as c_int,
                 height as c_int,
                 fourcc,
-                &mut modifier,
-                &mut fd,
-                &mut stride,
-                &mut offset,
+                &mut allocation.modifier,
+                &mut allocation.fd,
+                &mut allocation.stride,
+                &mut allocation.offset,
             )
         };
+        Self::wrap(handle, width, height, fourcc, allocation)
+    }
+
+    /// Allocates a dma-buf of the given fourcc and size from the modifiers the
+    /// compositor advertised, which is what an `ext_image_copy_capture` client
+    /// has to do: there the client is the side that allocates the buffer a
+    /// window gets copied into, and the modifier has to be one the compositor
+    /// can import.  GBM picks the first modifier of the list it can allocate.
+    pub fn create_with_modifiers(
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifiers: &[u64],
+    ) -> Result<Self> {
+        if let Some(error) = zero_pixel(width, height) {
+            return Err(error);
+        }
+        let mut allocation = Allocation::default();
+        let handle = unsafe {
+            vshot_gbm_buffer_create_with_modifiers(
+                width as c_int,
+                height as c_int,
+                fourcc,
+                modifiers.as_ptr(),
+                i32::try_from(modifiers.len()).unwrap_or(i32::MAX),
+                &mut allocation.modifier,
+                &mut allocation.fd,
+                &mut allocation.stride,
+                &mut allocation.offset,
+            )
+        };
+        Self::wrap(handle, width, height, fourcc, allocation)
+    }
+
+    fn wrap(
+        handle: *mut c_void,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        allocation: Allocation,
+    ) -> Result<Self> {
         if handle.is_null() {
             let detail = load_error();
             return Err(VshotError::WaylandProtocol(format!(
@@ -107,11 +171,11 @@ impl GbmBuffer {
         }
         Ok(Self {
             handle,
-            fd,
+            fd: allocation.fd,
             fourcc,
-            modifier,
-            stride,
-            offset,
+            modifier: allocation.modifier,
+            stride: allocation.stride,
+            offset: allocation.offset,
             width,
             height,
         })
@@ -178,3 +242,43 @@ pub struct DmabufFrame {
 pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// The DRM fourcc of XRGB8888 (little-endian `XR24`).
 pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What modifier does GBM actually hand back?  The window-capture path
+    /// needs a specific answer here: it passes the modifiers the compositor
+    /// advertised, and the buffer it gets has to be one the compositor can
+    /// import.  Prints rather than asserts, because the answer is a property
+    /// of the machine.
+    #[test]
+    #[ignore = "needs a DRM render node"]
+    fn reports_what_gbm_allocates() {
+        let dcc = [
+            0u64,
+            0x200000028a6bf04,
+            0x200000028a67f04,
+            0x200000028a01f04,
+        ];
+        for (what, list) in [
+            ("linear alone", vec![0u64]),
+            ("linear then dcc", dcc.to_vec()),
+            ("dcc then linear", vec![dcc[1], 0]),
+        ] {
+            match GbmBuffer::create_with_modifiers(256, 256, DRM_FORMAT_XRGB8888, &list) {
+                Ok(buffer) => eprintln!(
+                    "vshot: {what} -> modifier 0x{:x} (stride {})",
+                    buffer.modifier(),
+                    buffer.stride()
+                ),
+                Err(error) => eprintln!("vshot: {what} -> {error}"),
+            }
+        }
+        // The plain allocator, which is what the screencopy pool uses.
+        match GbmBuffer::create(256, 256, DRM_FORMAT_XRGB8888) {
+            Ok(buffer) => eprintln!("vshot: create() -> modifier 0x{:x}", buffer.modifier()),
+            Err(error) => eprintln!("vshot: create() -> {error}"),
+        }
+    }
+}
