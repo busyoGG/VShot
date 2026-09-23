@@ -120,13 +120,20 @@ vshot settings
 vshot ocr                                   # frame a region, text to stdout
 vshot ocr --clipboard                       # the same, onto the clipboard
 vshot ocr --input shot.png                  # read an existing image file
+
+# Recording: the screen to an MP4 (H.264, encoded on the GPU)
+vshot record monitor eDP-1 --output clip.mp4    # one output
+vshot record monitor --fps 30                   # the output you are on (NAME defaults to current)
+vshot record all                                # every output, default video dir
+vshot record stop                               # stop the recording that runs
+vshot record monitor current --duration 30      # stop itself after 30 seconds
 ```
 
 The global options apply to every capture:
 
 | Option | Meaning |
 | --- | --- |
-| `-o, --output PATH` | Write the PNG to PATH, expanding strftime formats like `%Y%m%d`; afterwards the file's `file://` URI is copied to the clipboard. `-` writes to stdout without copying |
+| `-o, --output PATH` | Write the PNG to PATH, expanding strftime formats like `%Y%m%d`; afterwards the file's `file://` URI is copied to the clipboard. `-` writes to stdout without copying. `record` reads the same flag as the video path (strftime expanded, `.mp4` added when missing, `-` refused, no URI copied) |
 | `--clipboard` | Copy the PNG data to the clipboard |
 | `--pin` | Pin the image to the screen instead of writing it (the daemon deletes the temporary file once it is in memory) |
 | `-c, --cursor` | Ask the compositor to draw the cursor into every output frame. **Not supported by `long`** (see ["Known rough edges"](#known-rough-edges)); for the most common reason a capture has no cursor, see ["The cursor (`--cursor`)"](#the-cursor---cursor) |
@@ -300,6 +307,73 @@ Alignment uses only the rows that **belong to the page**: runs of rows at the to
 
 `auto` picks in order of "least intrusive". `VSHOT_LONG_DEBUG_DIR=<dir>` saves every grabbed frame as `grab-NNNN.png` and appends every stitch decision to `steps.log`.
 
+## Screen recording
+
+`vshot record` writes the screen to an MP4: frames come from the same capture
+backends the screenshots use (`zwlr-screencopy` on wlroots sessions, KWin's
+ScreenShot2 on Plasma) and encoding happens on the GPU's media engine.
+
+```sh
+vshot record monitor eDP-1 --output clip.mp4    # one output; NAME as in `vshot monitor`
+vshot record monitor                            # NAME defaults to `current`: where you are
+vshot record all                                # every output, composed at its position
+vshot record monitor current --encoder hevc     # codec: h264 (default) / hevc / av1
+vshot record monitor current --fps 120          # aim for 120 fps (1-240, default 60)
+vshot record monitor current --duration 60      # stop by itself after 60 seconds
+vshot record stop                               # stop the running recording
+```
+
+- **Which output `current` is.** A recording has nothing of its own on screen,
+  and a Wayland client sees no pointer at all until it owns a surface under it,
+  so `current` cannot ask the seat the way a screenshot does. It asks the
+  compositor instead — `hyprctl`, `swaymsg`, `niri msg` or KWin's D-Bus, the
+  same query a pin uses to land on the right monitor: the output under the
+  pointer where the compositor reports that (Hyprland), the focused output
+  otherwise. When nothing answers, vshot says so and points at `monitor NAME`
+  and `all`.
+
+- **Stopping.** `vshot record stop` (no display needed, so it binds to a
+  compositor keybinding) or Ctrl+C in the terminal that started it. Both
+  finish the file properly first — libavformat writes the trailer, the sample
+  table and the index — so the result is always a seekable MP4. `--duration`
+  ends a recording on its own.
+- **Where it goes.** The global `-o/--output`, with strftime expanded; with
+  no path the file lands in the videos directory as
+  `vshot-%Y%m%d-%H%M%S.mp4` — `$XDG_VIDEOS_DIR`, else the one
+  `~/.config/user-dirs.dirs` names (xdg-user-dirs keeps the localised name
+  there, `~/视频` on a Chinese desktop), else `~/Videos` — and that directory
+  is created when missing, because it is vshot's own choice of location. A
+  path you name with `-o` is not created; a missing directory there is
+  reported. A missing `.mp4` suffix is added; `-` (stdout) is refused,
+  because a video is not something a terminal carries.
+- **Frame rate.** `--fps` is what the loop *aims* for; each frame carries the
+  wall time it was on screen into the MP4 (variable frame rate), so a
+  recording that drops frames plays back short rather than slow. A single 4K
+  output measures at a steady 120 fps here (the ceiling on this 7900 XT is
+  around 149 fps), well past 60.
+- **The codec.** `--encoder` picks h264 (the default), hevc or av1, all on the
+  GPU's media engine. Encoding *and* muxing run on ffmpeg's libraries —
+  libavcodec for the bitstream, libavformat for the MP4 boxes — the same
+  route wf-recorder takes, loaded at run time with `dlopen`. A machine without
+  the ffmpeg libraries still takes screenshots; only `record` reports what is
+  missing. Needs `ffmpeg` and `libva` (for AMD/Intel VAAPI). Every frame is an
+  IDR (all-intra), so any player reads it and any position is seekable.
+- **Width limit 4096.** That is the hardware H.264 encoder's limit (measured
+  on this machine's 7900 XT VCN), so `record all` across two 4K screens
+  (5760 wide) is refused with that explanation — record one output instead, or
+  switch to `--encoder hevc`, which encodes the 7680-wide desktop here. A
+  single 4K screen (3840) is fine.
+
+> Why not libva directly? We tried; the first implementation was exactly
+> that. On this machine (mesa-git 26.3.0-devel, radeonsi) the encoder
+> dereferences a null pointer inside `vaEndPicture` (`mov 0xb0(%rdi),%rax`
+> with rdi = NULL) in about half of all runs, independently of the call
+> shape — reused or per-frame coded buffers, `vaSyncSurface` or
+> `vaSyncBuffer`, one thread or many all segfaulted alike. libavcodec's
+> `h264_vaapi` runs the same hardware for hundreds of frames without a
+> fault on the same machine, so the encoder boundary belongs to libavcodec.
+> That is an engineering decision, not an aesthetic one.
+
 ## Pin overlay
 
 `vshot pin` pins images to the screen as overlays, held by a **resident daemon**:
@@ -367,7 +441,7 @@ With a pin focused, press **Space** and the daemon exports that image and brings
 A layer-shell overlay surface belongs to the process that created it, so a resident process is needed:
 
 - The Qt binary is reused: `vshot-qt-ui --pin-server <socket>` is the daemon, and the first `vshot pin` that cannot reach the socket starts it detached (not holding the terminal);
-- The CLI is a thin client sending one-line JSON requests over a Unix socket; the socket defaults to `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock` and can be overridden with `VSHOT_PIN_SOCKET`;
+- The CLI is a thin client sending one-line JSON requests over a Unix socket; the socket defaults to `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock` and can be overridden with `VSHOT_PIN_SOCKET`
 - About 0.5 s after the last pin closes (or after `--close-all`) the daemon exits on its own, and the next pin command starts it again. `vshot pin --quit` exits it manually at any time;
 - **Never end the daemon with `pkill` / `kill -9`**: it holds layer-shell surfaces, and when killed hard some compositors (Hyprland 0.56 measured) leave the surface and its screencopy session behind, which makes **screencopy block forever on every output** (`vshot` and `grim` all time out, and `hyprctl reload` does not recover it — only restarting the session does). Always use `vshot pin --quit`, which unmaps every overlay before exiting; the daemon also handles `SIGTERM` / `SIGINT` through the same graceful path.
 
@@ -617,6 +691,8 @@ The shadow is built once and cached — blurred at a third of the size and scale
 | `VSHOT_PIN_DEBUG=1` | The daemon prints every pin's density decision |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | The daemon prints every focus change of every pin render surface |
 | `VSHOT_PIN_SOURCE_FILE` | Overrides the screenshot tool's record path (default `/tmp/screenshot-path`) |
+| `VSHOT_RECORD_PIDFILE` | The pid file `vshot record stop` reads (default `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`) |
+| `VSHOT_RECORD_DEBUG=1` | The recording loop traces each frame's stage (grab/encode/mux) and the libavcodec version in use |
 
 > As soon as any `VSHOT_PIN_*_DEBUG` is set for the daemon, it stops sending its stderr to `/dev/null`, so the traces are readable. The variables must be in place when the daemon starts; for one already resident, run `vshot pin --quit` first.
 

@@ -13,6 +13,7 @@ mod ocr;
 mod output;
 mod pin;
 mod qt_overlay;
+mod record;
 mod selection;
 mod stitch;
 mod wayland;
@@ -79,6 +80,14 @@ fn run() -> Result<()> {
             source,
             destination,
         } => return run_ocr(source, destination),
+        Action::Record(action) => {
+            // Recording owns its own loop and writer; nothing below is shared
+            // with the screenshot routes beyond the `Capturer`.
+            return match action {
+                cli::RecordAction::Start(request) => record::run(&request).map(|_| ()),
+                cli::RecordAction::Stop => record::stop(),
+            };
+        }
         Action::Capture(request) => request,
     };
     let mut wayland = WaylandSession::connect()?;

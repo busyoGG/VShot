@@ -80,6 +80,37 @@ pub fn ocr_failed(reason: &str) {
     );
 }
 
+/// Says that a recording was written, with its size in frames and seconds.
+///
+/// A recording runs from a keybinding and ends on a signal, so nothing on
+/// screen marks the moment it stopped or where the file went; the
+/// notification is the receipt.  It is not part of the result — a session
+/// with no notification daemon still gets its file — so a failure to send
+/// only reaches stderr.
+pub fn recording_finished(path: &std::path::Path, frames: usize, seconds: f64) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    let summary = if chinese {
+        "录制完成"
+    } else {
+        "Recording saved"
+    };
+    let body = format!("{} — {} frames, {:.1}s", path.display(), frames, seconds);
+    send(summary, &preview(&body));
+}
+
+/// Says that a recording could not start or stopped short, with the reason.
+pub fn recording_failed(reason: &str) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    send(
+        if chinese {
+            "录制失败"
+        } else {
+            "Recording failed"
+        },
+        &preview(reason),
+    );
+}
+
 /// Sends a notification, unless the user turned them off (`cli.ocr.notify`).
 fn send(summary: &str, body: &str) {
     if !notifications_enabled() {

@@ -33,6 +33,13 @@ png = "0.18"
 rustix = { version = "1.1.4", features = ["event", "pipe", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The recording loop stops cleanly on SIGINT/SIGTERM: the flag registration
+# is what makes a signal set an `AtomicBool` without an unsafe handler.
+signal-hook = "0.4.4"
+# `dlopen` for libva, and the open/close of the DRM render node.  libc is
+# already in the tree through other dependencies; naming it makes it a direct
+# dependency of the one module that drops to the C ABI.
+libc = "0.2.189"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 wayland-client = "0.31.13"
@@ -44,7 +51,14 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # not involved.
 zbus = "5.19.0"
 
+[build-dependencies]
+# Compiles src/record/shim.c, the libavcodec encoder boundary.
+cc = "1.2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+# Debug info for the recording investigation; stripped from the packaged
+# binary by `strip = true` anyway for the parts that do not matter.
+debug = 1

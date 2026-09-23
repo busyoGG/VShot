@@ -24,6 +24,7 @@ Capture targets
   window pick         the window you click, on a live desktop with the others dimmed
   long                a scrolling region: vshot scrolls it, grabs frames while it moves and
                       stitches them into one tall image
+  record monitor|all  record the screen to an MP4 on the GPU (see below)
 
 Destination (every capture above goes to exactly one)
   -o, --output PATH   a PNG at PATH, with strftime expanded (shots/%Y%m%d-%H%M%S.png); the
@@ -78,9 +79,11 @@ pub struct Cli {
     /// Include the compositor cursor in each native screencopy capture.
     #[arg(short = 'c', long = "cursor", global = true)]
     pub cursor: bool,
-    /// Write PNG bytes to PATH, expanding strftime formats such as `%Y%m%d`;
-    /// after writing, copy the file URI to the Wayland clipboard. Use `-`
-    /// for stdout instead.
+    /// Write the result to PATH, expanding strftime formats such as
+    /// `%Y%m%d`. For a capture this is PNG bytes, and the file URI is copied
+    /// to the Wayland clipboard afterwards; `-` writes the PNG to stdout.
+    /// For `record` it is the video file: `-` is refused there, no URI is
+    /// copied, and an `.mp4` suffix is added when PATH has none.
     #[arg(
         short = 'o',
         long = "output",
@@ -289,6 +292,60 @@ so this also works under a compositor vshot cannot otherwise capture."
     )]
     Settings,
 
+    /// Record the screen to an MP4, on the GPU.
+    #[command(
+        after_help = "Frames are taken through the same capture backends the screenshots use \
+(wlr-screencopy on wlroots sessions, KWin's ScreenShot2 on Plasma) and encoded on the GPU's \
+media engine. The encoder runs on libavcodec (ffmpeg's libraries, the same route wf-recorder \
+takes), loaded at run time: a machine without ffmpeg still takes screenshots, and `record` alone \
+reports what is missing. `monitor [NAME]` records one output, `current` — what a bare \
+`record monitor` means — asking the compositor which output you are on: the one under the \
+pointer where it reports that, the focused output \
+otherwise; a recording has nothing of its own on screen for the pointer to enter, so the seat \
+itself cannot answer), `all` records every output composed at its logical position.\n\n\
+--encoder picks the video codec: h264 (default), hevc or av1. All three run on the GPU's media \
+engine through the same libavcodec route; whether the hardware offers one is checked when the \
+recording opens, and the message names the encoder when it does not. HEVC is also the answer \
+for a composed desktop wider than 4096 pixels, which this class of GPU cannot encode as H.264.\n\n\
+A recording runs until it is stopped: `vshot record stop` sends the signal, or Ctrl+C in the \
+terminal that started it. Either way the file is finished properly (a seekable MP4 with its \
+sample table written) before the process exits. --duration SECONDS ends it by itself. \
+--fps N sets the frame rate the loop aims for (1-240, default 60); each frame carries the wall \
+time it was on screen, so playback follows the real pace rather than a nominal rate. \
+`vshot record stop` needs no display and works from a keybinding:\n    \
+bind = SUPER, R, exec, vshot record monitor current\n    \
+bind = SUPER SHIFT, R, exec, vshot record stop\n\n\
+The output path comes from the global -o/--output: VIDEO_PATH is strftime-expanded, and the \
+default is vshot-%Y%m%d-%H%M%S.mp4 in the videos directory — $XDG_VIDEOS_DIR, else the one \
+xdg-user-dirs names, else ~/Videos — which is created when it is missing; an `.mp4` suffix is \
+added when the name has none. `-` (stdout) is refused — a video is not something a terminal \
+carries.\n\n\
+On a wlroots session whose compositor speaks linux-dmabuf, the frames go to the encoder \
+without a copy through the CPU; elsewhere (and for `record all`) the software path is used. \
+Either way the file looks the same.\n\n\
+A recording that never started leaves nothing behind, and a process killed outright leaves a \
+file without its sample table (players report it as such rather than showing a wrong video).\n\n\
+VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1 traces each \
+frame's stage and the libavcodec version in use."
+    )]
+    Record {
+        #[command(subcommand)]
+        target: RecordTargetCommand,
+        /// Frame rate the loop aims for, 1-240 (default 60).
+        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=240))]
+        fps: Option<u32>,
+        /// Stop on its own after this many seconds.
+        #[arg(long, global = true)]
+        duration: Option<u64>,
+        /// Video codec: h264 (default), hevc or av1.
+        #[arg(
+            long,
+            global = true,
+            value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
+        )]
+        encoder: Option<String>,
+    },
+
     /// Read the text out of a region of the screen.
     #[command(
         after_help = "Without --geometry the frozen scene is handed to the Qt overlay to frame \
@@ -318,6 +375,21 @@ entry."
         #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "interactive"])]
         input: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordTargetCommand {
+    /// Record one output by name, or the one you are on with `current`.
+    Monitor {
+        /// Output name, or `current` for the output the compositor says you
+        /// are on. A bare `record monitor` means `current`.
+        #[arg(default_value = "current")]
+        name: String,
+    },
+    /// Record the complete desktop: every output composed at its logical position.
+    All,
+    /// Stop the recording that is running.
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]
@@ -458,6 +530,15 @@ pub enum Action {
         source: OcrSource,
         destination: OcrDestination,
     },
+    /// Record the screen to a file; `Stop` ends a running recording.
+    Record(RecordAction),
+}
+
+/// What `vshot record` was asked to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecordAction {
+    Start(crate::record::RecordRequest),
+    Stop,
 }
 
 /// Where `vshot ocr` gets its image.
@@ -495,6 +576,64 @@ impl Cli {
     /// drive the pin daemon, render a pin-edit session, or show the settings
     /// window.
     pub fn parse_action(self) -> Result<Action> {
+        if let Command::Record {
+            target,
+            fps,
+            duration,
+            encoder,
+        } = &self.command
+        {
+            // A recording is a file, not an image: the screenshot
+            // destinations have no meaning here, and `--pin` least of all.
+            if self.pin || self.clipboard {
+                return Err(VshotError::InvalidDestination(
+                    "--clipboard and --pin do not apply to the record subcommand; a recording \
+                     is written to a file"
+                        .into(),
+                ));
+            }
+            if let RecordTargetCommand::Stop = target {
+                if self.output.is_some() || fps.is_some() || duration.is_some() || encoder.is_some()
+                {
+                    return Err(VshotError::InvalidDestination(
+                        "`record stop` takes no options: it signals the recording that is \
+                         already running"
+                            .into(),
+                    ));
+                }
+                return Ok(Action::Record(RecordAction::Stop));
+            }
+            let target = match target {
+                RecordTargetCommand::Monitor { name } => {
+                    if name.trim().is_empty() {
+                        return Err(VshotError::InvalidDestination(
+                            "monitor name cannot be empty".into(),
+                        ));
+                    }
+                    crate::record::RecordTarget::Monitor(name.clone())
+                }
+                RecordTargetCommand::All => crate::record::RecordTarget::All,
+                RecordTargetCommand::Stop => unreachable!("handled above"),
+            };
+            let encoder = match encoder.as_deref() {
+                None => crate::record::avcodec::VideoCodec::H264,
+                Some(word) => crate::record::avcodec::VideoCodec::parse(word).ok_or_else(|| {
+                    VshotError::InvalidDestination(format!(
+                        "unknown encoder `{word}`: pick h264, hevc or av1"
+                    ))
+                })?,
+            };
+            return Ok(Action::Record(RecordAction::Start(
+                crate::record::RecordRequest {
+                    target,
+                    output: self.output.clone(),
+                    fps: fps.unwrap_or(crate::record::DEFAULT_FPS),
+                    cursor: self.cursor,
+                    duration: *duration,
+                    encoder,
+                },
+            )));
+        }
         if let Command::Settings = &self.command {
             // Nothing else applies: this subcommand captures nothing and has
             // no destination to argue about.
@@ -670,6 +809,11 @@ impl Cli {
             Command::Ocr { .. } => {
                 return Err(VshotError::InvalidDestination(
                     "the ocr subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Record { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the record subcommand is not a screenshot capture target".into(),
                 ))
             }
         };

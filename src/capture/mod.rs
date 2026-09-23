@@ -1,4 +1,5 @@
 pub mod active_output;
+pub mod dmabuf;
 pub mod kwin;
 pub mod niri;
 pub mod window;
@@ -54,6 +55,58 @@ impl Capturer {
         match self {
             Self::Wlr(capture) => capture.capture_output(name, cursor),
             Self::Kwin(capture) => capture.capture_output(name, cursor),
+        }
+    }
+
+    /// Captures one output straight into a dma-buf, for the recording
+    /// loop's zero-copy path.  `Ok(None)` means this backend or session
+    /// cannot do it (KWin, a wlroots compositor without linux-dmabuf) and
+    /// the caller should take the software path; an `Err` is a capture
+    /// that should have worked and did not.
+    ///
+    /// KWin is deliberately `None` rather than an error: its screenshots
+    /// arrive over D-Bus as PNG data, with no buffer to hand over.
+    pub fn capture_output_dmabuf(
+        &mut self,
+        name: &str,
+        cursor: bool,
+    ) -> Result<Option<crate::capture::dmabuf::DmabufFrame>> {
+        match self {
+            Self::Wlr(capture) => match capture.capture_output_dmabuf(name, cursor) {
+                Ok(frame) => Ok(Some(frame)),
+                // "This session cannot" is a fallback, not a failure: the
+                // caller records through the software path instead.
+                Err(VshotError::MissingCapability(_)) | Err(VshotError::UnsupportedOutput(_)) => {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+            Self::Kwin(_) => Ok(None),
+        }
+    }
+
+    /// Asks the compositor what dma-buf it would offer for an output, by
+    /// running one plain shm capture and reading the offer off it.  The
+    /// recorder uses the answer to build its buffer pool before the loop
+    /// starts.
+    pub fn probe_dmabuf_offer(&mut self, name: &str) -> Result<Option<(u32, u32, u32, bool)>> {
+        match self {
+            Self::Wlr(capture) => match capture.probe_dmabuf_offer(name) {
+                Ok(offer) => Ok(Some(offer)),
+                Err(VshotError::MissingCapability(_)) | Err(VshotError::UnsupportedOutput(_)) => {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+            Self::Kwin(_) => Ok(None),
+        }
+    }
+
+    /// Builds the zero-copy buffer pool for one output shape.
+    pub fn build_dmabuf_pool(&mut self, width: u32, height: u32, fourcc: u32) -> Result<()> {
+        match self {
+            Self::Wlr(capture) => capture.build_dmabuf_pool(width, height, fourcc),
+            Self::Kwin(_) => Ok(()),
         }
     }
 

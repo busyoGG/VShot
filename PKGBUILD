@@ -1,7 +1,7 @@
 # Maintainer: VShot contributors
 pkgname=vshot
 pkgver=0.1.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pin server'
 url='https://github.com/busyoGG/VShot'
 arch=('x86_64')
@@ -20,8 +20,12 @@ license=('MIT')
 # dynamically.  The provider it offers is not selected by anything here, so a
 # GPU build runs the OCR on the CPU exactly like the CPU one does.
 depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt' 'onnxruntime')
-makedepends=('rust' 'cargo' 'cmake' 'gcc' 'pkgconf')
-optdepends=('wl-clipboard: clipboard input and output support')
+# `ffmpeg` provides the libavcodec/libavformat headers the recording shim is
+# compiled against; at run time both libraries are dlopen'ed, so ffmpeg stays
+# an optdepend and a machine without it simply has no `vshot record`.
+makedepends=('rust' 'cargo' 'cmake' 'gcc' 'pkgconf' 'ffmpeg')
+optdepends=('wl-clipboard: clipboard input and output support'
+            'ffmpeg: screen recording (vshot record)')
 # PaddleOCR's PP-OCRv6 models, converted to ONNX by RapidOCR, plus the
 # character dictionary oar-ocr reads them with.  They are downloaded rather
 # than committed: 30 MB of weights do not belong in the source tree, and the

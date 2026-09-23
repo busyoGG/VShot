@@ -205,6 +205,49 @@ niri 画的一个十字（无高亮）来指认窗口；点中的窗口由 niri 
 所以在一个 vshot 本来截不了图的合成器上也能用。"#,
     ),
     (
+        "record",
+        "把屏幕录成 MP4，用 GPU 编码",
+        r#"帧来自与截图相同的捕获后端（wlroots 会话走 wlr-screencopy，Plasma 走 KWin 的
+ScreenShot2），编码在 GPU 的媒体引擎上完成。编码与封装都跑在 ffmpeg 的库上，与 wf-recorder
+同一条路线：libavcodec 出码流，libavformat 写 MP4 盒子，两者都在运行时用 dlopen 加载，所以
+没有 ffmpeg 的机器截图照常可用，只有 `record` 会说明缺什么。`--encoder` 选编码器（h264 默认，
+或 hevc、av1）。`monitor [NAME]` 录一块输出，NAME 缺省即 `current`（问你当前所在的那块：
+合成器能报指针位置时是指针那块，否则是焦点那块），`all` 把每块输出按各自的逻辑位置拼合录制。VIDEO_PATH 与截图路径
+一样展开 strftime；默认是视频目录下的
+vshot-%Y%m%d-%H%M%S.mp4（先取 $XDG_VIDEOS_DIR，再取 xdg-user-dirs 里那个目录，最后是 ~/Videos），
+目录不存在时会建出来；名字没有 `.mp4` 后缀时会补上。
+
+录制一直进行到被停止：`vshot record stop` 发信号，或者在启动它的终端里按 Ctrl+C。两种方式都会
+在进程退出前把文件正常收尾（可寻址的 MP4，采样表写完整）。--duration 秒数让它自己结束。
+--fps N 设定循环瞄准的帧率（1-240，默认 60）；每帧带着它在屏上停留的真实时长，所以回放跟随
+真实节奏而非名义帧率。`vshot record stop` 不需要显示器，可以直接绑快捷键：
+    bind = SUPER, R, exec, vshot record monitor current
+    bind = SUPER SHIFT, R, exec, vshot record stop
+
+录制没能开始时不会留下任何文件；进程被强行杀掉时留下的文件缺少采样表（播放器会如实报
+"无法播放"，而不是放一段错的视频）。VSHOT_RECORD_PIDFILE 覆盖 `stop` 读取的 pid 文件，
+VSHOT_RECORD_DEBUG=1 把每帧的阶段与所用 libavcodec 版本打到 stderr。"#,
+    ),
+    (
+        "record monitor",
+        "录一块输出；NAME 缺省即 `current`（你当前所在的那块）",
+        r#"NAME 省略就是 `current`，即你当前所在的那块输出；给了就是输出名（同 `vshot monitor`）。录制期间
+不冻结桌面：帧是实时抓的，屏幕上东西照常动——所以 `current` 问的是合成器，而不是 seat：
+录制时 vshot 在屏幕上没有自己的面，指针不会进到我们这边来。合成器能报指针位置时（Hyprland）
+取指针所在的那块，否则取焦点所在的那块。"#,
+    ),
+    (
+        "record all",
+        "录整个桌面：每块输出按各自的逻辑位置拼合",
+        "与 `vshot all` 相同的拼合方式，但逐帧进行：多显示器桌面按实际布局合成为一段视频。",
+    ),
+    (
+        "record stop",
+        "停止正在进行的录制",
+        r#"读取 pid 文件（VSHOT_RECORD_PIDFILE 可覆盖）向录制进程发送 SIGTERM，并等它把文件
+收尾完毕后返回。没有录制在跑时如实报错。"#,
+    ),
+    (
         "ocr",
         "把屏幕上某块区域的文字读出来",
         r#"不给 --geometry 时，冻结场景交给 Qt overlay 框住文字——和 `vshot region` 一样，只是没有
@@ -243,7 +286,7 @@ const ARGS: &[(&str, &str)] = &[
         "input",
         "改为读这个文件里的图片，而不是截屏。标注编辑器的取字按钮用的就是这条路。",
     ),
-    ("name", "输出名；`current` 表示指针所在的那块输出。"),
+    ("name", "输出名；`current` 表示你当前所在的那块输出。"),
     ("notches", "捕获滚动时一次发送的滚轮格数。"),
     ("max_height", "拼接结果的高度上限，单位像素。"),
     ("max_frames", "单次捕获的帧数上限。"),
@@ -274,6 +317,18 @@ const ARGS: &[(&str, &str)] = &[
     (
         "pixel",
         "跳过合成器元数据/窗口列表，直接从捕获的像素识别（先是描边带，再退回背景分割）。用于测试识别器、没有元数据或窗口列表查询的合成器；无缝无边框平铺没有像素信号，会如实报错。",
+    ),
+    (
+        "fps",
+        "录制循环瞄准的帧率，1-240（默认 60）。每帧带着它在屏上的真实时长，所以低了也不会变速。",
+    ),
+    (
+        "duration",
+        "录制到这个秒数后自动停止。",
+    ),
+    (
+        "encoder",
+        "视频编码器：h264（默认）、hevc 或 av1，三者都跑 GPU 的媒体引擎。某台机器的 ffmpeg 或显卡不支持所选编码器时，录制一开始就会说明是哪一个（例如 h264 的 4096 宽度上限）。",
     ),
     (
         "no_blend",

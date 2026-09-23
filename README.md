@@ -120,7 +120,15 @@ vshot settings
 vshot ocr                                   # 框选，文字到 stdout
 vshot ocr --clipboard                       # 同上，进剪贴板
 vshot ocr --input shot.png                  # 读一个已有的图片文件
+
+# 录屏：把屏幕录成 MP4（H.264，GPU 编码）
+vshot record monitor eDP-1 --output clip.mp4    # 录一块屏
+vshot record monitor --fps 30                   # 你当前所在的那块（NAME 省略即 current），30fps
+vshot record all                                # 整个桌面，默认存视频目录
+vshot record stop                               # 停止正在进行的录制
+vshot record monitor current --duration 30      # 录 30 秒自动停
 ```
+
 
 全局参数对所有捕获生效：
 
@@ -300,6 +308,55 @@ for text in (result.txts or []):
 
 `auto` 按"打扰最少"的顺序挑。`VSHOT_LONG_DEBUG_DIR=<dir>` 把每次抓帧存成 `grab-NNNN.png`、每次拼接判定追加到 `steps.log`。
 
+## 录屏
+
+`vshot record` 把屏幕录成 MP4：帧来自截图用的同一套捕获后端（wlroots 会话走
+`zwlr-screencopy`，Plasma 走 KWin 的 ScreenShot2），编码在 GPU 的媒体引擎上完成。
+
+```sh
+vshot record monitor eDP-1 --output clip.mp4    # 一块屏；NAME 同 `vshot monitor`
+vshot record monitor                            # NAME 省略即 `current`：你当前所在的那块
+vshot record all                                # 多屏按逻辑位置拼合
+vshot record monitor current --encoder hevc     # 编码器：h264（默认）/ hevc / av1
+vshot record monitor current --fps 120          # 瞄准 120fps（1-240，默认 60）
+vshot record monitor current --duration 60      # 60 秒后自动停
+vshot record stop                               # 停止（读取 pid 文件发信号）
+```
+
+- **`current` 是哪块屏**：录制时 vshot 在屏幕上没有自己的面，而 Wayland 客户端只有在自己
+  有面被指针覆盖时才会收到指针事件，所以 `current` 不能像截图那样问 seat——它问合成器
+  （`hyprctl` / `swaymsg` / `niri msg` / KWin 的 D-Bus，与 pin 判断落点用的是同一个查询）：
+  合成器能报指针位置时（Hyprland）就是指针所在的那块，否则是焦点所在的那块。都不报告时
+  会明确报错，让你用 `monitor NAME` 或 `all`。
+
+- **录制怎么停**：`vshot record stop`（不需要显示器，可直接绑快捷键），或启动它的终端里
+  按 Ctrl+C。两种方式都会先把文件正常收尾（libavformat 写完 trailer、采样表与索引）再退出，
+  所以文件总是可寻址的 MP4。`--duration` 让它自己到点停。
+- **输出路径**：全局 `-o/--output`，`%Y%m%d` 这类 strftime 会展开；不给时写入视频目录下的
+  `vshot-%Y%m%d-%H%M%S.mp4`——视频目录先取 `$XDG_VIDEOS_DIR`，再取
+  `~/.config/user-dirs.dirs` 里 xdg-user-dirs 记的那个（中文桌面通常是 `~/视频`），最后才
+  是 `~/Videos`；这个目录不存在时会建出来，因为那是 vshot 自己挑的位置。你自己用 `-o`
+  指的路径不会被建，目录不存在时会明确报出来。名字没有 `.mp4` 后缀会自动补上；`-`
+  （stdout）不接受——一段视频不是终端能承载的东西。
+- **帧率**：`--fps` 是循环"瞄准"的速率，每帧带着它在屏上的真实时长写入 MP4
+  （可变帧率），所以编码跟不上时回放是"少几帧"而不是"变慢"。单块 4K 实测能稳定跑满
+  120fps（本机 7900 XT 的上限约 149fps），远超 60fps。
+- **编码器**：`--encoder` 在 h264（默认）、hevc、av1 之间选，三者都跑 GPU 的媒体引擎。
+  编码与封装都走 ffmpeg 的库——`libavcodec` 出码流、`libavformat` 写 MP4 盒子，与
+  wf-recorder 同一条路线——运行时用 `dlopen` 加载，所以没有 ffmpeg 库的机器上截图照常
+  工作，只是 `record` 会说明缺什么。需要 `ffmpeg` 与 `libva`（AMD/Intel 的 VAAPI）。
+  码流每帧都是 IDR（全帧内），任意播放器可读，且任何位置都能跳。
+- **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），
+  所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，
+  或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
+
+> 为什么不用 libva 直接编码？我们试过，而且最初的实现就是它。这台机器上
+> mesa-git 26.3.0-devel 的 radeonsi 编码器会在 `vaEndPicture` 内部解引用空指针
+> （驱动里 `mov 0xb0(%rdi),%rax`、rdi=NULL）——复现率约 50%，且与调用形态无关
+> （复用/每帧新建 coded buffer、`vaSyncSurface`/`vaSyncBuffer`、单线程转换全都一样崩）。
+> 同一台机器上 libavcodec 的 `h264_vaapi` 跑几百帧零故障，所以编码边界交给
+> libavcodec；这是工程决定，不是审美。
+
 ## pin 浮层
 
 `vshot pin` 把图片作为浮层钉在屏幕上，由**常驻 daemon** 持有：
@@ -367,7 +424,7 @@ pin 的尺寸按**图片的来源密度**决定，默认不需要任何参数。
 layer-shell 浮层 surface 由创建它的进程拥有，因此需要一个常驻进程：
 
 - 复用 Qt 二进制：`vshot-qt-ui --pin-server <socket>` 即 daemon，首次 `vshot pin` 连不上 socket 时自动分离式拉起（不占终端）；
-- CLI 是瘦客户端，通过 Unix socket 发送单行 JSON 请求；socket 默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`，可用 `VSHOT_PIN_SOCKET` 覆盖；
+- CLI 是瘦客户端，通过 Unix socket 发送单行 JSON 请求；socket 默认 `$XDG_RUNTIME_DIR/vshot-pin-<uid>.sock`，可用 `VSHOT_PIN_SOCKET` 覆盖
 - 关闭最后一张 pin（或 `--close-all`）约 0.5 s 后 daemon 自动退出；下次 pin 命令自动重新拉起。`vshot pin --quit` 可随时手动退出；
 - **不要用 `pkill` / `kill -9` 结束 daemon**：它持有 layer-shell surface，被强杀时部分合成器（实测 Hyprland 0.56）会残留该 surface 与其截屏会话，导致**所有输出的 screencopy 永久阻塞**（`vshot` / `grim` 全部超时，`hyprctl reload` 也无法恢复，只能重启会话）。请始终用 `vshot pin --quit`，它会在退出前 unmap 全部浮层；daemon 也已处理 `SIGTERM` / `SIGINT` 走同样的优雅路径。
 
@@ -617,6 +674,8 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_PIN_DEBUG=1` | daemon 打印每张 pin 的密度判定 |
 | `VSHOT_PIN_FOCUS_DEBUG=1` | daemon 打印 pin 渲染面每一次焦点变化 |
 | `VSHOT_PIN_SOURCE_FILE` | 覆盖截图工具记录的路径（默认 `/tmp/screenshot-path`） |
+| `VSHOT_RECORD_PIDFILE` | `vshot record stop` 读取的 pid 文件路径（默认 `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`） |
+| `VSHOT_RECORD_DEBUG=1` | 录制循环打印每帧的阶段（抓取/编码/入封装）与所用 libavcodec 版本 |
 
 > 只要给 daemon 开了任一 `VSHOT_PIN_*_DEBUG`，它就不再把自己的 stderr 丢给 `/dev/null`，踪迹因此可读。变量必须在 daemon 启动时就位；已经在常驻的那个要先 `vshot pin --quit`。
 

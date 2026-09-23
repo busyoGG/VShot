@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
 use memmap2::{MmapMut, MmapOptions};
@@ -7,6 +7,9 @@ use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
@@ -14,6 +17,8 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use crate::error::{Result, VshotError};
 use crate::geometry::{Rect, Size};
 use crate::model::Frame;
+
+use super::dmabuf::{DmabufFrame, GbmBuffer};
 
 #[derive(Debug)]
 struct CaptureBuffer {
@@ -198,10 +203,67 @@ impl Drop for CaptureBuffer {
 struct PendingCapture {
     _frame: zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     buffer: Option<CaptureBuffer>,
+    /// The shm offer from the `buffer` event, remembered so the shm buffer
+    /// is allocated lazily — only when the dma-buf path does not take the
+    /// frame.  (Version 3 defers the copy to `buffer_done`, so nothing
+    /// needs the buffer before then.)
+    shm_offer: Option<ShmOffer>,
+    /// Set for a capture that wants a linux-dmabuf buffer.
+    want_dmabuf: bool,
+    /// The pool slot the compositor's `linux_dmabuf` event picked.
+    dmabuf_slot: Option<usize>,
     y_invert: bool,
     copy_sent: bool,
     complete: bool,
     error: Option<String>,
+}
+
+/// The wl_shm buffer parameters of one capture, from its `buffer` event.
+#[derive(Clone, Copy, Debug)]
+struct ShmOffer {
+    format: wl_shm::Format,
+    width: u32,
+    height: u32,
+    stride: u32,
+}
+
+/// Size of the zero-copy buffer pool.  Each slot holds a full-size dma-buf
+/// (33 MB at 4K); four slots let the compositor render into one while the
+/// encoder still reads the previous ones, without the cost of a deeper pool.
+const DMABUF_POOL_SLOTS: usize = 4;
+
+/// One pooled dma-buf with the `wl_buffer` the compositor renders into.
+struct DmabufSlot {
+    gbm: GbmBuffer,
+    wl_buffer: wl_buffer::WlBuffer,
+}
+
+impl std::fmt::Debug for DmabufSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DmabufSlot")
+            .field("fd", &self.gbm.fd())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DmabufSlot {
+    fn drop(&mut self) {
+        self.wl_buffer.destroy();
+    }
+}
+
+/// A rotating set of dma-bufs a screencopy capture can render into,
+/// together with the shape they were built for.  A capture whose offer does
+/// not match the pool's shape falls back to the shm path rather than
+/// rebuilding mid-recording.
+#[derive(Debug)]
+struct DmabufPool {
+    slots: Vec<DmabufSlot>,
+    next: usize,
+    width: u32,
+    height: u32,
+    fourcc: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,9 +276,21 @@ struct CaptureState {
     shm: Option<wl_shm::WlShm>,
     manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
     manager_version: u32,
+    dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    dmabuf_version: u32,
     outputs: HashMap<u32, wl_output::WlOutput>,
     output_names: HashMap<u32, String>,
     pending: Option<PendingCapture>,
+    /// Zero-copy pool, built on first use and reused for the session.
+    pool: Option<DmabufPool>,
+    /// The last linux-dmabuf offer the compositor made, whatever capture it
+    /// went by: `(fourcc, width, height)`.  A probe reads it after a plain
+    /// shm capture, because every frame event carries the offer whether or
+    /// not one wants the buffer.
+    probe_offer: Option<(u32, u32, u32)>,
+    /// The y-inversion flag of the last capture.  A probe reads it to know
+    /// whether the zero-copy path (which cannot flip) is usable.
+    probe_y_invert: bool,
 }
 
 impl CaptureState {
@@ -316,6 +390,9 @@ impl WlrCapture {
         self.state.pending = Some(PendingCapture {
             _frame: frame,
             buffer: None,
+            shm_offer: None,
+            want_dmabuf: false,
+            dmabuf_slot: None,
             y_invert: false,
             copy_sent: false,
             complete: false,
@@ -323,7 +400,9 @@ impl WlrCapture {
         });
         let _ = global_id;
 
+        let wait_started = Instant::now();
         self.dispatch_until(Instant::now() + Duration::from_secs(10))?;
+        let wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
         let pending = self.state.pending.take().ok_or_else(|| {
             VshotError::WaylandProtocol("capture disappeared before completion".into())
         })?;
@@ -333,7 +412,207 @@ impl WlrCapture {
         let buffer = pending.buffer.ok_or_else(|| {
             VshotError::WaylandProtocol("screencopy completed without a buffer".into())
         })?;
-        buffer.into_frame(pending.y_invert)
+        let convert_started = Instant::now();
+        let frame = buffer.into_frame(pending.y_invert);
+        if std::env::var_os("VSHOT_RECORD_DEBUG").is_some() {
+            eprintln!(
+                "vshot:   capture: compositor+shm-copy {wait_ms:.1}ms pixel-convert {:.1}ms",
+                convert_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        frame
+    }
+
+    /// Captures one output straight into a dma-buf: the compositor renders
+    /// into a buffer the encoder can import, and no pixel passes through
+    /// the CPU.  This is the fast path the recorder runs `record monitor`
+    /// through; the shm `capture_output` stays as the compatibility path.
+    ///
+    /// The buffer pool is built on the first call, from the compositor's
+    /// own linux-dmabuf offer — that is where the fourcc and the size come
+    /// from.  Later calls rotate through the pool.
+    ///
+    /// Fails — and the caller falls back to `capture_output` — when the
+    /// session lacks linux-dmabuf, the compositor offers no dma-buf, the
+    /// buffer's shape does not match the pool, or the frame needs a
+    /// y-flip the zero-copy chain cannot apply.
+    pub fn capture_output_dmabuf(&mut self, name: &str, cursor: bool) -> Result<DmabufFrame> {
+        if self.state.pending.is_some() {
+            return Err(VshotError::WaylandProtocol(
+                "a capture is already in progress".into(),
+            ));
+        }
+        if !super::dmabuf::available() {
+            return Err(VshotError::MissingCapability(format!(
+                "zero-copy capture needs libgbm: {}",
+                super::dmabuf::load_error()
+            )));
+        }
+        if self.state.manager_version < 3 {
+            return Err(VshotError::MissingCapability(
+                "screencopy version 3 (linux-dmabuf buffers)".into(),
+            ));
+        }
+        let (global_id, output) = self
+            .state
+            .output_names
+            .iter()
+            .find(|(_, output_name)| output_name.as_str() == name)
+            .and_then(|(global_id, _)| {
+                self.state
+                    .outputs
+                    .get(global_id)
+                    .cloned()
+                    .map(|output| (*global_id, output))
+            })
+            .ok_or_else(|| VshotError::IncompleteTopology(format!("unknown output `{name}`")))?;
+        let manager =
+            self.state.manager.as_ref().cloned().ok_or_else(|| {
+                VshotError::MissingCapability("zwlr_screencopy_manager_v1".into())
+            })?;
+        let qh = self.event_queue.handle();
+        let overlay_cursor = if cursor { 1 } else { 0 };
+        let frame = manager.capture_output(overlay_cursor, &output, &qh, ());
+        self.state.pending = Some(PendingCapture {
+            _frame: frame,
+            buffer: None,
+            shm_offer: None,
+            want_dmabuf: true,
+            dmabuf_slot: None,
+            y_invert: false,
+            copy_sent: false,
+            complete: false,
+            error: None,
+        });
+        let _ = global_id;
+
+        let wait_started = Instant::now();
+        self.dispatch_until(Instant::now() + Duration::from_secs(10))?;
+        let wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+        let pending = self.state.pending.take().ok_or_else(|| {
+            VshotError::WaylandProtocol("capture disappeared before completion".into())
+        })?;
+        if let Some(error) = pending.error {
+            return Err(VshotError::WaylandProtocol(error));
+        }
+        if pending.y_invert {
+            // The GPU path cannot flip; the shm path can.  Say so rather
+            // than reading the frame upside down.
+            return Err(VshotError::UnsupportedOutput(
+                "the compositor renders this output y-inverted, which the zero-copy path cannot \
+                 capture; the software path handles it"
+                    .into(),
+            ));
+        }
+        let slot = pending.dmabuf_slot.ok_or_else(|| {
+            VshotError::UnsupportedOutput(
+                "the compositor offered no linux-dmabuf buffer for this capture".into(),
+            )
+        })?;
+        let pool = self.state.pool.as_ref().ok_or_else(|| {
+            VshotError::WaylandProtocol("the dma-buf pool disappeared mid-capture".into())
+        })?;
+        let slot_ref = pool.slots.get(slot).ok_or_else(|| {
+            VshotError::WaylandProtocol("the dma-buf pool slot vanished mid-capture".into())
+        })?;
+        let gbm = &slot_ref.gbm;
+        if std::env::var_os("VSHOT_RECORD_DEBUG").is_some() {
+            eprintln!(
+                "vshot:   capture: compositor+dmabuf-copy {wait_ms:.1}ms (zero copy, no \
+                 conversion)"
+            );
+        }
+        Ok(DmabufFrame {
+            fd: gbm.fd(),
+            fourcc: gbm.fourcc(),
+            modifier: gbm.modifier(),
+            offset: gbm.offset(),
+            stride: gbm.stride(),
+            width: gbm.width(),
+            height: gbm.height(),
+        })
+    }
+
+    /// Builds the zero-copy buffer pool for one output shape.  Called
+    /// between captures (never mid-capture); the recorder does it once the
+    /// first probe of the output has established the fourcc and size from
+    /// the compositor's own offer.
+    pub fn build_dmabuf_pool(&mut self, width: u32, height: u32, fourcc: u32) -> Result<()> {
+        if self.state.pool.is_some() {
+            return Ok(());
+        }
+        let dmabuf = self
+            .state
+            .dmabuf
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()))?;
+        let qh = self.event_queue.handle();
+        let mut slots = Vec::with_capacity(DMABUF_POOL_SLOTS);
+        for _ in 0..DMABUF_POOL_SLOTS {
+            let gbm = GbmBuffer::create(width, height, fourcc)?;
+            let modifier = gbm.modifier();
+            let params = dmabuf.create_params(&qh, ());
+            let borrowed = unsafe { BorrowedFd::borrow_raw(gbm.fd()) };
+            params.add(
+                borrowed,
+                0,
+                gbm.offset(),
+                gbm.stride(),
+                (modifier >> 32) as u32,
+                (modifier & 0xffff_ffff) as u32,
+            );
+            let wl_buffer = params.create_immed(
+                i32::try_from(width).map_err(|_| {
+                    VshotError::WaylandProtocol("capture width is too large".into())
+                })?,
+                i32::try_from(height).map_err(|_| {
+                    VshotError::WaylandProtocol("capture height is too large".into())
+                })?,
+                fourcc,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                &qh,
+                (),
+            );
+            params.destroy();
+            slots.push(DmabufSlot { gbm, wl_buffer });
+        }
+        self.state.pool = Some(DmabufPool {
+            slots,
+            next: 0,
+            width,
+            height,
+            fourcc,
+        });
+        Ok(())
+    }
+
+    /// The dma-buf format/size the compositor offered for an output, read
+    /// from a plain shm capture: every screencopy frame event carries the
+    /// linux-dmabuf offer whether or not a client wants the buffer, so the
+    /// offer can be sampled without disturbing the compatibility capture.
+    /// The fourcc comes back as the DRM fourcc the pool must use.
+    pub fn probe_dmabuf_offer(&mut self, name: &str) -> Result<(u32, u32, u32, bool)> {
+        if self.state.manager_version < 3 {
+            return Err(VshotError::MissingCapability(
+                "screencopy version 3 (linux-dmabuf buffers)".into(),
+            ));
+        }
+        if self.state.dmabuf.is_none() {
+            return Err(VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()));
+        }
+        self.state.probe_offer = None;
+        let _frame = self.capture_output(name, false)?;
+        let y_invert = self.state.probe_y_invert;
+        self.state
+            .probe_offer
+            .take()
+            .map(|(fourcc, width, height)| (fourcc, width, height, y_invert))
+            .ok_or_else(|| {
+                VshotError::UnsupportedOutput(
+                    "the compositor offered no linux-dmabuf buffer for this output".into(),
+                )
+            })
     }
 
     fn dispatch_until(&mut self, deadline: Instant) -> Result<()> {
@@ -419,6 +698,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
                     state.manager_version = bind_version;
                     state.manager = Some(registry.bind(name, bind_version, qh, ()));
                 }
+                "zwp_linux_dmabuf_v1" if state.dmabuf.is_none() => {
+                    // Version 3 is what screencopy's dmabuf event needs;
+                    // binding lower is still fine for the shm path.
+                    let bind_version = version.min(3);
+                    state.dmabuf_version = bind_version;
+                    state.dmabuf = Some(registry.bind(name, bind_version, qh, ()));
+                }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
                         name,
@@ -485,6 +771,30 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for CaptureState {
     }
 }
 
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CaptureState {
+    fn event(
+        _: &mut Self,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        _: zwp_linux_dmabuf_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for CaptureState {
+    fn event(
+        _: &mut Self,
+        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        _: zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, ()> for CaptureState {
     fn event(
         _: &mut Self,
@@ -520,25 +830,114 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                         return;
                     }
                 };
-                let Some(shm) = state.shm.as_ref().cloned() else {
-                    state.fail_pending("wl_shm disappeared during capture");
-                    return;
-                };
                 let copy_immediately = state.manager_version < 3;
                 let Some(pending) = state.pending.as_mut() else {
                     return;
                 };
-                if pending.buffer.is_some() {
+                if pending.shm_offer.is_some() {
                     pending.error = Some("screencopy sent more than one SHM buffer".into());
                     pending.complete = true;
                     return;
                 }
-                match CaptureBuffer::new(&shm, width, height, stride, format, qh) {
-                    Ok(buffer) => {
-                        if copy_immediately {
+                pending.shm_offer = Some(ShmOffer {
+                    format,
+                    width,
+                    height,
+                    stride,
+                });
+                // A pre-v3 compositor has no buffer_done: the copy has to
+                // go out with the offer, so the shm buffer is built now.
+                if copy_immediately && !pending.want_dmabuf {
+                    let Some(shm) = state.shm.as_ref().cloned() else {
+                        state.fail_pending("wl_shm disappeared during capture");
+                        return;
+                    };
+                    match CaptureBuffer::new(&shm, width, height, stride, format, qh) {
+                        Ok(buffer) => {
                             frame.copy(&buffer.buffer);
                             pending.copy_sent = true;
+                            pending.buffer = Some(buffer);
                         }
+                        Err(error) => {
+                            pending.error = Some(error.to_string());
+                            pending.complete = true;
+                        }
+                    }
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                // Every frame event carries the offer, wanted or not; keep
+                // the newest for `probe_dmabuf_offer`.
+                state.probe_offer = Some((format, width, height));
+                let Some(pending) = state.pending.as_mut() else {
+                    return;
+                };
+                if !pending.want_dmabuf {
+                    return;
+                }
+                // The offer must match exactly what the pool was built
+                // for: the same fourcc and size.  A mismatch (a scale
+                // change, a rotated buffer) makes this capture fall back
+                // to the shm path.
+                if let Some(pool) = state.pool.as_ref() {
+                    if pool.fourcc == format && pool.width == width && pool.height == height {
+                        pending.dmabuf_slot = Some(pool.next);
+                    }
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
+                // The zero-copy branch first: bind the pool's wl_buffer and
+                // copy.  Nothing shm was allocated for this capture.
+                if state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.dmabuf_slot.is_some())
+                {
+                    let Some(pending) = state.pending.as_mut() else {
+                        return;
+                    };
+                    if let Some(pool) = state.pool.as_mut() {
+                        let slot = pending.dmabuf_slot.expect("checked above");
+                        let slot_ref = &pool.slots[slot];
+                        frame.copy(&slot_ref.wl_buffer);
+                        pending.copy_sent = true;
+                        pool.next = (slot + 1) % pool.slots.len();
+                        return;
+                    }
+                }
+                // The shm branch: allocate the buffer now (lazily) and copy.
+                let Some(pending) = state.pending.as_mut() else {
+                    return;
+                };
+                if pending.copy_sent {
+                    return;
+                }
+                let Some(offer) = pending.shm_offer else {
+                    pending.error =
+                        Some("screencopy sent buffer_done without a usable buffer".into());
+                    pending.complete = true;
+                    return;
+                };
+                let Some(shm) = state.shm.as_ref().cloned() else {
+                    pending.error = Some("wl_shm disappeared during capture".into());
+                    pending.complete = true;
+                    return;
+                };
+                match CaptureBuffer::new(
+                    &shm,
+                    offer.width,
+                    offer.height,
+                    offer.stride,
+                    offer.format,
+                    qh,
+                ) {
+                    Ok(buffer) => {
+                        frame.copy(&buffer.buffer);
+                        pending.copy_sent = true;
                         pending.buffer = Some(buffer);
                     }
                     Err(error) => {
@@ -547,26 +946,12 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                     }
                 }
             }
-            zwlr_screencopy_frame_v1::Event::BufferDone => {
-                let Some(pending) = state.pending.as_mut() else {
-                    return;
-                };
-                let Some(buffer) = pending.buffer.as_ref() else {
-                    pending.error =
-                        Some("screencopy sent buffer_done without an SHM buffer".into());
-                    pending.complete = true;
-                    return;
-                };
-                if !pending.copy_sent {
-                    frame.copy(&buffer.buffer);
-                    pending.copy_sent = true;
-                }
-            }
             zwlr_screencopy_frame_v1::Event::Flags {
                 flags: WEnum::Value(flags),
             } => {
+                state.probe_y_invert = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
                 if let Some(pending) = state.pending.as_mut() {
-                    pending.y_invert = flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
+                    pending.y_invert = state.probe_y_invert;
                 }
             }
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
