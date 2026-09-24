@@ -1,7 +1,7 @@
 # Maintainer: VShot contributors
 pkgname=vshot
 pkgver=0.1.2
-pkgrel=2
+pkgrel=3
 pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pin server'
 url='https://github.com/busyoGG/VShot'
 arch=('x86_64')
@@ -23,9 +23,15 @@ depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt' 'onnxruntime')
 # `ffmpeg` provides the libavcodec/libavformat headers the recording shim is
 # compiled against; at run time both libraries are dlopen'ed, so ffmpeg stays
 # an optdepend and a machine without it simply has no `vshot record`.
-makedepends=('rust' 'cargo' 'cmake' 'gcc' 'pkgconf' 'ffmpeg')
+#
+# `libpipewire` is the same shape for `record --portal`: the portal's screen
+# cast arrives on a PipeWire stream, and the client for it is compiled from
+# libpipewire's headers while the library itself is dlopen'ed, so the build
+# needs the package and the run time does not.
+makedepends=('rust' 'cargo' 'cmake' 'gcc' 'pkgconf' 'ffmpeg' 'libpipewire')
 optdepends=('wl-clipboard: clipboard input and output support'
-            'ffmpeg: screen recording (vshot record)')
+            'ffmpeg: screen recording (vshot record)'
+            'libpipewire: screen recording through the desktop portal (vshot record --portal)')
 # PaddleOCR's PP-OCRv6 models, converted to ONNX by RapidOCR, plus the
 # character dictionary oar-ocr reads them with.  They are downloaded rather
 # than committed: 30 MB of weights do not belong in the source tree, and the

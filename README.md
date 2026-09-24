@@ -324,6 +324,8 @@ vshot record window --pick                      # 点选一扇窗来录
 vshot record monitor --encoder hevc             # 编码器：h264（默认）/ hevc / av1
 vshot record monitor --fps 120                  # 瞄准 120fps（1-240，默认 60）
 vshot record monitor --duration 60              # 60 秒后自动停
+vshot record monitor --portal                   # 走桌面 portal：由合成器弹出选择器
+vshot record window --portal                    # 同上，但选择器列的是窗口
 vshot record stop                               # 停止（读取 pid 文件发信号）
 ```
 
@@ -365,6 +367,18 @@ vshot record stop                               # 停止（读取 pid 文件发�
 - **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），
   所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，
   或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
+
+- **`--portal`：走桌面 portal 录制**（`org.freedesktop.portal.ScreenCast`）。合成器自己的捕获
+  协议（wlr-screencopy、KWin 的 ScreenShot2、`ext_image_copy_capture_v1`）各自只在部分桌面
+  存在，而 portal 是每个桌面都有的那一套——代价是**由合成器决定录什么**：它会弹出自己的
+  选择器，在那里选中的屏幕/窗口就是录下来的内容。`record monitor --portal` 让它列屏幕，
+  `record window --portal` 让它列窗口，但名字与 `--pick` 决定不了具体是哪一个；每开一个会话
+  都会弹一次选择器。一次只录一路流，所以 `record all --portal` 会被拒绝。
+  屏幕投射是**按需出帧**的：画面变了才出一帧，不变时一帧都不出，所以静止画面在文件里是一帧
+  长帧；`--fps` 是向合成器要的采样上限，而不是文件帧率。帧以 dma-buf 送来时零拷贝进编码器，
+  否则在 CPU 上转成 RGBA；`VSHOT_PORTAL_SHM=1` 强制走内存拷贝那条（合成器的缓冲编码器导入
+  不了时的备用）。需要 `xdg-desktop-portal` 与 `libpipewire`：编译时要有它的头文件，库在
+  运行时用 `dlopen` 加载，所以缺了只是没有 `--portal`，其他功能照常。
 
 > 为什么不用 libva 直接编码？我们试过，而且最初的实现就是它。这台机器上
 > mesa-git 26.3.0-devel 的 radeonsi 编码器会在 `vaEndPicture` 内部解引用空指针
@@ -692,6 +706,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_PIN_SOURCE_FILE` | 覆盖截图工具记录的路径（默认 `/tmp/screenshot-path`） |
 | `VSHOT_RECORD_PIDFILE` | `vshot record stop` 读取的 pid 文件路径（默认 `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`） |
 | `VSHOT_RECORD_DEBUG=1` | 录制循环打印每帧的阶段（抓取/编码/入封装）与所用 libavcodec 版本 |
+| `VSHOT_PORTAL_SHM=1` | `record --portal` 改为要内存帧而不是 dma-buf（合成器的缓冲导入不了时的备用路线） |
 
 > 只要给 daemon 开了任一 `VSHOT_PIN_*_DEBUG`，它就不再把自己的 stderr 丢给 `/dev/null`，踪迹因此可读。变量必须在 daemon 启动时就位；已经在常驻的那个要先 `vshot pin --quit`。
 

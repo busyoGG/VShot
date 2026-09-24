@@ -222,6 +222,15 @@ ScreenShot2），编码在 GPU 的媒体引擎上完成。编码与封装都跑�
 vshot-%Y%m%d-%H%M%S.mp4（先取 $XDG_VIDEOS_DIR，再取 xdg-user-dirs 里那个目录，最后是 ~/Videos），
 目录不存在时会建出来；名字没有 `.mp4` 后缀时会补上。
 
+--portal 改走桌面 portal（org.freedesktop.portal.ScreenCast）录制，而不是合成器自己的捕获协议，
+这是 vshot 说不了那个合成器语言时的路线。portal 不是静默回退：合成器会弹出它自己的选择器，
+在那里选中的就是录下来的内容 —— `record monitor --portal` 让它列出屏幕，`record window
+--portal` 让它列出窗口，但名字与 --pick 决定不了具体那一块。屏幕投射在画面变化时才出一帧，
+不变时一帧都不出，所以 --fps 是向合成器要的采样上限、而不是文件的帧率，静止画面会变成一帧长
+帧。`record all --portal` 会被拒绝：portal 一次只给一路流，而且哪块屏幕由 portal 说了算。这条
+路需要 libpipewire（以及 xdg-desktop-portal）；VSHOT_PORTAL_SHM=1 改为要内存帧而不是 dma-buf，
+这是编码器导入不了合成器缓冲时的备用路线。
+
 录制一直进行到被停止：`vshot record stop` 发信号，或者在启动它的终端里按 Ctrl+C。两种方式都会
 在进程退出前把文件正常收尾（可寻址的 MP4，采样表写完整）。--duration 秒数让它自己结束。
 --fps N 设定循环瞄准的帧率（1-240，默认 60）；每帧带着它在屏上停留的真实时长，所以回放跟随
@@ -259,7 +268,8 @@ VSHOT_RECORD_DEBUG=1 把每帧的阶段与所用 libavcodec 版本打到 stderr�
 
 录制期间窗口被缩放或被关掉，录制就在那里结束：文件正常收尾（trailer 写完整），并说明原因，
 因为一个 MP4 只有一种帧尺寸。窗口所在的那块输出如果是关着、禁用或已断开，永远不会有帧送过来，
-这种情况几秒后会报出来，而不是一直等下去。"#,
+这种情况几秒后会报出来，而不是一直等下去。加 --portal 时由合成器自己的选择器挑窗口，这里写的
+名字就决定不了具体哪一扇了；--portal 决定的是选择器列出窗口而不是屏幕。"#,
     ),
     (
         "record stop",
@@ -352,6 +362,10 @@ const ARGS: &[(&str, &str)] = &[
     (
         "encoder",
         "视频编码器：h264（默认）、hevc 或 av1，三者都跑 GPU 的媒体引擎。某台机器的 ffmpeg 或显卡不支持所选编码器时，录制一开始就会说明是哪一个（例如 h264 的 4096 宽度上限）。",
+    ),
+    (
+        "portal",
+        "改走桌面 portal（org.freedesktop.portal.ScreenCast）录制，而不是合成器自己的捕获协议。合成器会弹出它自己的选择器，在那里选中的屏幕/窗口就是录下来的内容；一次只录一路流，所以 `record all --portal` 不支持。需要 xdg-desktop-portal 与 libpipewire；VSHOT_PORTAL_SHM=1 强制走内存拷贝（dma-buf 导入不了时的备用路线）。",
     ),
     (
         "no_blend",

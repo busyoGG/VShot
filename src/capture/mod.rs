@@ -182,7 +182,8 @@ fn is_missing_screencopy(error: &VshotError) -> bool {
 fn no_capture_backend(kwin_error: &VshotError) -> VshotError {
     VshotError::NoCaptureBackend(format!(
         "the compositor provides no wlr-screencopy (`zwlr_screencopy_manager_v1`) \
-         and the KWin ScreenShot2 fallback failed: {kwin_error}"
+         and the KWin ScreenShot2 fallback failed: {kwin_error}; on a session like this one, \
+         `vshot record --portal` is the recording route that may still work"
     ))
 }
 

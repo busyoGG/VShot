@@ -253,7 +253,8 @@ impl WindowCapture {
             if missing.0 {
                 return Err(VshotError::Recording(format!(
                     "this compositor does not offer window capture (`{}`); record a screen instead \
-                     (`vshot record monitor`, or `vshot record all`)",
+                     (`vshot record monitor`, or `vshot record all`), or ask the compositor's own \
+                     picker through the portal (`vshot record window --portal`)",
                     missing.1
                 )));
             }

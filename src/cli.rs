@@ -325,6 +325,17 @@ carries.\n\n\
 On a wlroots session whose compositor speaks linux-dmabuf, the frames go to the encoder \
 without a copy through the CPU; elsewhere (and for `record all`) the software path is used. \
 Either way the file looks the same.\n\n\
+--portal records through the desktop portal (org.freedesktop.portal.ScreenCast) instead of the \
+compositor's own capture protocols, which is the route that works on a desktop whose protocols \
+vshot does not speak. The portal is not a silent fallback: the compositor shows its own picker, \
+and whatever is chosen there is what gets recorded — `record monitor --portal` asks it to offer \
+screens, `record window --portal` to offer windows, but a name or --pick does not decide the \
+source itself. A screen cast produces a frame when the screen changes and none while it does \
+not, so --fps is the rate asked of the compositor rather than the rate the file has, and a \
+still screen becomes one long frame. `record all --portal` is refused: the portal hands over one \
+stream, and it is the portal that chooses which screen that is. This needs libpipewire (and \
+xdg-desktop-portal); VSHOT_PORTAL_SHM=1 asks for memory frames instead of dma-bufs, the fallback \
+for a compositor whose buffers the encoder cannot import.\n\n\
 A recording that never started leaves nothing behind, and a process killed outright leaves a \
 file without its sample table (players report it as such rather than showing a wrong video).\n\n\
 VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1 traces each \
@@ -346,6 +357,10 @@ frame's stage and the libavcodec version in use."
             value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
         )]
         encoder: Option<String>,
+        /// Record through the XDG desktop portal instead of the compositor's
+        /// own protocols. The portal shows the compositor's own picker.
+        #[arg(long, global = true)]
+        portal: bool,
     },
 
     /// Read the text out of a region of the screen.
@@ -402,7 +417,9 @@ compositor without it is told to record a screen instead.\n\n\
 A window that is resized or closed while recording ends the recording there: the file is \
 finished properly and says why, because one MP4 holds one frame size. A window whose output \
 is off, disabled or disconnected never produces a frame at all, which is reported after a \
-few seconds rather than waited on."
+few seconds rather than waited on. With --portal the compositor's own picker chooses the \
+window, so nothing here names it; what --portal decides is that the picker offers windows \
+rather than screens."
     )]
     Window {
         /// App id or title of the window; the focused window when omitted.
@@ -605,6 +622,7 @@ impl Cli {
             fps,
             duration,
             encoder,
+            portal,
         } = &self.command
         {
             // A recording is a file, not an image: the screenshot
@@ -617,7 +635,11 @@ impl Cli {
                 ));
             }
             if let RecordTargetCommand::Stop = target {
-                if self.output.is_some() || fps.is_some() || duration.is_some() || encoder.is_some()
+                if self.output.is_some()
+                    || fps.is_some()
+                    || duration.is_some()
+                    || encoder.is_some()
+                    || *portal
                 {
                     return Err(VshotError::InvalidDestination(
                         "`record stop` takes no options: it signals the recording that is \
@@ -626,6 +648,17 @@ impl Cli {
                     ));
                 }
                 return Ok(Action::Record(RecordAction::Stop));
+            }
+            // The portal hands over one stream per session and the compositor
+            // decides which screen that is, so "the whole desktop" has no
+            // portal shape: recording every output is the compositor's own
+            // protocols' job.
+            if *portal && matches!(target, RecordTargetCommand::All) {
+                return Err(VshotError::InvalidDestination(
+                    "`--portal` records one stream, and the compositor chooses which screen it \
+                     is; record a single screen instead (`vshot record monitor --portal`)"
+                        .into(),
+                ));
             }
             let target = match target {
                 RecordTargetCommand::Monitor { name } => {
@@ -679,6 +712,7 @@ impl Cli {
                     cursor: self.cursor,
                     duration: *duration,
                     encoder,
+                    portal: *portal,
                 },
             )));
         }

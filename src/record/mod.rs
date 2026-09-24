@@ -65,6 +65,8 @@ use crate::wayland::WaylandSession;
 use self::avcodec::{Recorder, VideoCodec};
 
 pub mod avcodec;
+mod pipewire;
+mod portal;
 mod window;
 
 /// How many times per second frames are taken at most.  The loop always
@@ -123,6 +125,9 @@ pub struct RecordRequest {
     /// The video codec to encode with; h264 unless `--encoder` says
     /// otherwise.
     pub encoder: VideoCodec,
+    /// Take the frames from the XDG desktop portal instead of the
+    /// compositor's own protocols (`--portal`).
+    pub portal: bool,
 }
 
 impl RecordRequest {
@@ -287,6 +292,13 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
         return Err(VshotError::Recording(format!(
             "a recording is already running (pid {pid}); stop it with `vshot record stop` first"
         )));
+    }
+    // The portal route takes its frames from the compositor's screen-cast
+    // service instead of its capture protocols, and the compositor's own
+    // picker decides what is recorded — so a window recording goes through
+    // here too, and the loop is its own.
+    if request.portal {
+        return portal::run(request);
     }
     // A window recording has a different frame source — the compositor's own
     // copy of one window — so it runs its own loop; everything around it (the
@@ -903,6 +915,7 @@ mod tests {
             cursor: false,
             duration: None,
             encoder: VideoCodec::H264,
+            portal: false,
         };
         assert_eq!(request.frame_interval(), Duration::from_nanos(16_666_666));
         request.fps = 30;

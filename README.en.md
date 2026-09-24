@@ -324,6 +324,8 @@ vshot record window --pick                      # click the window to record
 vshot record monitor --encoder hevc             # codec: h264 (default) / hevc / av1
 vshot record monitor --fps 120                  # aim for 120 fps (1-240, default 60)
 vshot record monitor --duration 60              # stop by itself after 60 seconds
+vshot record monitor --portal                   # through the desktop portal: its picker chooses
+vshot record window --portal                    # the same, with windows in the picker
 vshot record stop                               # stop the running recording
 ```
 
@@ -387,6 +389,26 @@ vshot record stop                               # stop the running recording
   (5760 wide) is refused with that explanation — record one output instead, or
   switch to `--encoder hevc`, which encodes the 7680-wide desktop here. A
   single 4K screen (3840) is fine.
+
+- **`--portal` records through the desktop portal**
+  (`org.freedesktop.portal.ScreenCast`). A compositor's own capture protocols
+  — wlr-screencopy, KWin's ScreenShot2, `ext_image_copy_capture_v1` — each
+  exist on some desktops and not others; the portal is the one every desktop
+  has, and the price is that **the compositor decides what is recorded**: it
+  shows its own picker, and whatever is chosen there is what gets recorded.
+  `record monitor --portal` asks it to offer screens, `record window --portal`
+  to offer windows, but a name or `--pick` cannot decide which one — every
+  session shows the picker again. One stream per session, so
+  `record all --portal` is refused. A screen cast produces a frame when the
+  screen changes and none while it does not, so a still screen becomes one
+  long frame and `--fps` is the rate asked of the compositor rather than the
+  rate the file has. Frames that arrive as dma-bufs go to the encoder without
+  a copy; otherwise they are converted to RGBA on the CPU.
+  `VSHOT_PORTAL_SHM=1` forces the memory path, which is the fallback for a
+  compositor whose buffers the encoder cannot import. Needs
+  `xdg-desktop-portal` and `libpipewire`: its headers to build against, its
+  library `dlopen`ed at run time, so a machine without it simply has no
+  `--portal`.
 
 > Why not libva directly? We tried; the first implementation was exactly
 > that. On this machine (mesa-git 26.3.0-devel, radeonsi) the encoder
@@ -717,6 +739,7 @@ The shadow is built once and cached — blurred at a third of the size and scale
 | `VSHOT_PIN_SOURCE_FILE` | Overrides the screenshot tool's record path (default `/tmp/screenshot-path`) |
 | `VSHOT_RECORD_PIDFILE` | The pid file `vshot record stop` reads (default `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`) |
 | `VSHOT_RECORD_DEBUG=1` | The recording loop traces each frame's stage (grab/encode/mux) and the libavcodec version in use |
+| `VSHOT_PORTAL_SHM=1` | `record --portal` asks for memory frames instead of dma-bufs (the fallback when a compositor's buffers cannot be imported) |
 
 > As soon as any `VSHOT_PIN_*_DEBUG` is set for the daemon, it stops sending its stderr to `/dev/null`, so the traces are readable. The variables must be in place when the daemon starts; for one already resident, run `vshot pin --quit` first.
 
