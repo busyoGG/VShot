@@ -468,7 +468,7 @@ impl fmt::Debug for Memory<'_> {
 /// A `Duration` in the milliseconds the C client counts in, clamped to what
 /// an `int` holds: a timeout longer than 24 days is "wait forever" in
 /// practice, and the alternative is an overflow.
-fn milliseconds(timeout: Duration) -> c_int {
+pub(crate) fn milliseconds(timeout: Duration) -> c_int {
     c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX)
 }
 

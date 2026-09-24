@@ -85,6 +85,7 @@ fn run() -> Result<()> {
             // with the screenshot routes beyond the `Capturer`.
             return match action {
                 cli::RecordAction::Start(request) => record::run(&request).map(|_| ()),
+                cli::RecordAction::Mics => record::print_mics(),
                 cli::RecordAction::Stop => record::stop(),
             };
         }

@@ -53,6 +53,23 @@ struct CliPreferences {
     std::uint32_t longIgnoreTop = 0;
     QString longInject;     ///< `auto` | `wlr` | `portal` | `uinput`
     std::uint32_t pinDensity = 0;
+    /// Which codec `record --encoder` falls back to: `h264` (the built-in
+    /// default), `hevc` or `av1`.  Empty means the file says nothing.
+    QString recordEncoder;
+    /// The frame rate `record --fps` falls back to, 1-240; zero means the file
+    /// says nothing.  A rate outside that range is read as "nothing" rather
+    /// than clamped, because that is what vshot itself does with one.
+    std::uint32_t recordFps = 0;
+    /// Whether a recording goes through the desktop portal without `--portal`.
+    /// Off when the file says nothing, which is also what an absent key means.
+    bool recordPortal = false;
+    /// Whether a recording takes a microphone at all (`cli.record.mic`), and
+    /// which one.  Silence is the absent key, so the pair is not one field:
+    /// `false` writes no key at all, while `true` with an empty name writes the
+    /// empty string, which is what "the session's default input" means to
+    /// `vshot record --mic`.
+    bool recordMicEnabled = false;
+    QString recordMic;
     /// Whether a finished text recognition raises a desktop notification
     /// (`cli.ocr.notify`).  Notifications are on when the file says nothing, so
     /// the switch shows the state the engine will actually run in, and the
@@ -217,5 +234,6 @@ const QStringList &arrowStyleNames();
 const QStringList &mosaicShapeNames();
 const QStringList &compressionNames();
 const QStringList &injectNames();
+const QStringList &encoderNames();
 
 } // namespace vshot

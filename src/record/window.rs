@@ -108,14 +108,28 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
     }
 
     // --- the output, encoder and muxer ------------------------------------
+    // The microphone, when one was asked for: opened before the encoder,
+    // because the AAC encoder's rate and channel count come from the
+    // negotiation and the MP4's audio stream is declared in its header.
+    let mic = super::open_microphone(request)?;
     let path = prepare_output_path(request)?;
-    let mut recorder = Recorder::start_dmabuf(
-        &path,
-        shape.width,
-        shape.height,
-        request.encoder,
-        shape.fourcc,
-    )?;
+    let mut recorder = match &mic {
+        Some(mic) => Recorder::start_dmabuf_mic(
+            &path,
+            shape.width,
+            shape.height,
+            request.encoder,
+            shape.fourcc,
+            mic.format(),
+        )?,
+        None => Recorder::start_dmabuf(
+            &path,
+            shape.width,
+            shape.height,
+            request.encoder,
+            shape.fourcc,
+        )?,
+    };
     if debug_enabled() {
         eprintln!(
             "vshot: recording {width}x{height} with {} through libavcodec {version} and \
@@ -125,11 +139,30 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
             height = shape.height,
             version = super::avcodec::libavcodec_version()
         );
+        if recorder.audio_channels() > 0 {
+            eprintln!(
+                "vshot: microphone soundtrack: {} Hz, {} channel(s), AAC",
+                recorder.audio_rate(),
+                recorder.audio_channels()
+            );
+        }
     }
 
     let interrupted = super::install_stop_handler()?;
     super::write_pid_file()?;
-    let outcome = loop_over(&mut capture, &mut recorder, request, &interrupted);
+    // The microphone has been running through the setup; arming keeps the
+    // samples from here on, so the soundtrack starts where the recording
+    // does.
+    if let Some(mic) = &mic {
+        mic.arm();
+    }
+    let outcome = loop_over(
+        &mut capture,
+        &mut recorder,
+        request,
+        mic.as_ref(),
+        &interrupted,
+    );
     let _ = std::fs::remove_file(super::pid_file());
 
     // The trailer has to go in even when the loop failed: a file that exists
@@ -159,10 +192,13 @@ fn loop_over(
     capture: &mut WindowCapture,
     recorder: &mut Recorder,
     request: &RecordRequest,
+    mic: Option<&super::pipewire_audio::Mic>,
     interrupted: &AtomicBool,
 ) -> Result<()> {
     let started = Instant::now();
     let interval = request.frame_interval();
+    // The microphone's buffer, reused across frames.
+    let mut mic_samples: Vec<f32> = Vec::new();
     let mut timeline_ms = 0u64;
     let mut covered_us = 0u64;
     let mut last_frame_at = started;
@@ -262,6 +298,10 @@ fn loop_over(
             frame.stride as i32,
             duration_ms,
         )?;
+        // The soundtrack for the interval this frame covered.
+        if let Some(mic) = mic {
+            super::pump_microphone(mic, recorder, &mut mic_samples)?;
+        }
         if debug_enabled() {
             eprintln!(
                 "vshot: frame {}: {}x{} muxed in {:.1}ms (on screen {duration_ms}ms)",
@@ -278,6 +318,12 @@ fn loop_over(
     // stop signal — has not been written yet, because a frame's duration is
     // only known once the *next* frame arrives.  Re-sending the last frame
     // with that interval as its duration is what puts that time in the file.
+    // The soundtrack of the tail interval, queued before the last frame is
+    // sent again: `finish` flushes the audio encoder after the video's, so
+    // the samples have to be in by then.
+    if let Some(mic) = mic {
+        super::pump_microphone(mic, recorder, &mut mic_samples)?;
+    }
     if let Some(frame) = capture.last_frame() {
         let now = Instant::now();
         covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;

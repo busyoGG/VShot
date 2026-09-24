@@ -35,6 +35,7 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -47,6 +48,7 @@
 #include <QPainterPath>
 #include <QPalette>
 #include <QPixmap>
+#include <QProcess>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -55,6 +57,8 @@
 #include <QStyle>
 #include <QVBoxLayout>
 #include <QWidget>
+
+#include <unistd.h>
 
 #include <algorithm>
 #include <functional>
@@ -355,6 +359,82 @@ ModernSpinBox *optionalSpin(QWidget *parent, int maximum, const QString &suffix)
 std::uint32_t spinValue(const QSpinBox *spin)
 {
     return static_cast<std::uint32_t>(std::max(0, spin->value()));
+}
+
+/// The two answers the microphone row always offers, and the data the combo
+/// carries for them.  A real entry carries the PipeWire node name, which is
+/// what the file stores -- so the markers have to be names no node can have.
+/// The empty string cannot be one: `"mic": ""` is already how the file spells
+/// "the session's default input".
+const QString kNoMicrophone = QStringLiteral("\x01 none");
+const QString kDefaultMicrophone = QStringLiteral("\x01 default");
+
+/// How long to wait for the input listing.  `vshot` gives up on PipeWire
+/// itself after five seconds, so this is that plus room to start and exit.
+constexpr int kMicrophoneListTimeoutMs = 8000;
+
+/// The audio inputs `vshot record mics` lists, as `(node name, label)` pairs:
+/// the name is what `--mic` accepts and what the file keeps, the label is the
+/// description a person reads.
+///
+/// The list has to come from the running session -- it is the only thing that
+/// knows which inputs exist -- so this runs `vshot`, which is the binary beside
+/// this helper: the same discovery the capture overlay makes for the OCR engine,
+/// and for the same reason (this process *is* the helper, so its own path names
+/// the program to run).
+///
+/// Nothing here can fail the settings window.  A machine without PipeWire, a
+/// session with no inputs, or a vshot that cannot be found all yield an empty
+/// list, and the row then offers the two answers that always exist; the button
+/// beside it re-asks, which is what one does after fixing the machine.
+QList<QPair<QString, QString>> detectedMicrophones()
+{
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        return {};
+    }
+    buffer[length] = '\0';
+    const QString helper = QString::fromLocal8Bit(buffer);
+    QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
+    if (!QFileInfo::exists(program)) {
+        const QString beside =
+            QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
+        if (QFileInfo::exists(beside)) {
+            program = QDir::cleanPath(beside);
+        } else {
+            program = QStringLiteral("vshot");
+        }
+    }
+
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments({QStringLiteral("record"), QStringLiteral("mics")});
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.start();
+    if (!process.waitForStarted(kMicrophoneListTimeoutMs)) {
+        return {};
+    }
+    if (!process.waitForFinished(kMicrophoneListTimeoutMs)) {
+        process.kill();
+        process.waitForFinished();
+        return {};
+    }
+
+    QList<QPair<QString, QString>> inputs;
+    const QString listing = QString::fromUtf8(process.readAllStandardOutput());
+    for (const QString &line : listing.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        // `serial<TAB>name<TAB>description`.  The serial is not offered: a name
+        // is stable across sessions and a serial is not, and the file has to
+        // outlive the session.
+        const QStringList fields = line.split(QLatin1Char('\t'));
+        if (fields.size() < 2 || fields.at(1).isEmpty()) {
+            continue;
+        }
+        const QString description = fields.size() > 2 ? fields.at(2) : QString();
+        inputs.append({fields.at(1), description.isEmpty() ? fields.at(1) : description});
+    }
+    return inputs;
 }
 
 /// A small square of a colour, drawn with the same rounding as the swatch
@@ -908,6 +988,45 @@ private:
         return scroll;
     }
 
+    /// What the config remembers as the microphone, in the box's own terms.
+    QString rememberedMicrophone() const
+    {
+        if (!config_.cli.recordMicEnabled) {
+            return kNoMicrophone;
+        }
+        return config_.cli.recordMic.isEmpty() ? kDefaultMicrophone : config_.cli.recordMic;
+    }
+
+    /// Fills the microphone row: silence and the session's own default input
+    /// first, then the inputs this session actually has, then -- when nothing
+    /// is offering it right now -- the name the file remembers.  A microphone
+    /// that is merely unplugged today must not be dropped from the file by
+    /// opening and saving this window.
+    void fillMicrophoneBox()
+    {
+        // What to keep selected: what the box holds now, and on the first call
+        // -- when the box is still empty -- what the file holds.  Rebuilding
+        // from the box rather than from the config is what makes re-detecting
+        // midway through an edit keep the user's choice.
+        const QString shown = recordMicBox_->currentData().toString();
+        const QString wanted = shown.isEmpty() ? rememberedMicrophone() : shown;
+
+        recordMicBox_->clear();
+        recordMicBox_->addItem(uiTr("Do not record audio"), kNoMicrophone);
+        recordMicBox_->addItem(uiTr("The session's default input"), kDefaultMicrophone);
+        const QList<QPair<QString, QString>> inputs = detectedMicrophones();
+        for (const QPair<QString, QString> &input : inputs) {
+            recordMicBox_->addItem(input.second, input.first);
+            recordMicBox_->setItemData(recordMicBox_->count() - 1, input.first, Qt::ToolTipRole);
+        }
+        if (wanted != kNoMicrophone && wanted != kDefaultMicrophone &&
+            recordMicBox_->findData(wanted) < 0) {
+            recordMicBox_->addItem(wanted, wanted);
+            recordMicBox_->setItemData(recordMicBox_->count() - 1, wanted, Qt::ToolTipRole);
+        }
+        selectChoice(recordMicBox_, wanted);
+    }
+
     QWidget *buildCliPage()
     {
         QScrollArea *scroll = newScrollPage(pages_);
@@ -997,6 +1116,60 @@ private:
                uiTr("A desktop notification with the text, or with why it failed; it "
                     "needs a notification daemon"),
                ocrNotifySwitch_, true);
+
+        // Recording is the one card whose control asks the running session a
+        // question -- which audio inputs it has -- so the answer is what the
+        // row offers: a name has to be a PipeWire node's own, and nobody can
+        // type one of those from memory.
+        QWidget *recording = addCard(page, uiTr("Recording"));
+        recordEncoderBox_ = choiceBox(recording, encoderNames(), uiTr("built-in default (h264)"));
+        recordEncoderBox_->setObjectName(QStringLiteral("recordEncoder"));
+        recordEncoderBox_->setMinimumWidth(200);
+        selectChoice(recordEncoderBox_, config_.cli.recordEncoder);
+        addRow(recording, uiTr("Encoder"),
+               uiTr("All three encode on the GPU's media engine"),
+               recordEncoderBox_, true);
+
+        recordFpsSpin_ = optionalSpin(recording, 240, uiTr(" fps"));
+        recordFpsSpin_->setObjectName(QStringLiteral("recordFps"));
+        recordFpsSpin_->setMinimumWidth(120);
+        recordFpsSpin_->setValue(static_cast<int>(config_.cli.recordFps));
+        addRow(recording, uiTr("Frame rate"), uiTr("1-240; the built-in default is 60"),
+               recordFpsSpin_, false);
+
+        recordPortalSwitch_ = new ModernSwitch(recording);
+        recordPortalSwitch_->setObjectName(QStringLiteral("recordPortal"));
+        recordPortalSwitch_->setChecked(config_.cli.recordPortal);
+        recordPortalSwitch_->setToolTip(
+            uiTr("The compositor's own picker decides what is recorded"));
+        addRow(recording, uiTr("Through the desktop portal"),
+               uiTr("Needs xdg-desktop-portal and libpipewire; `record all` cannot use it"),
+               recordPortalSwitch_, false);
+
+        recordMicBox_ = new ModernComboBox(recording);
+        recordMicBox_->setObjectName(QStringLiteral("recordMic"));
+        recordMicBox_->setMinimumWidth(240);
+        recordMicDetectButton_ = new QPushButton(uiTr("Detect"), recording);
+        recordMicDetectButton_->setObjectName(QStringLiteral("recordMicDetect"));
+        recordMicDetectButton_->setFixedHeight(kControlHeight);
+        recordMicDetectButton_->setToolTip(
+            uiTr("Ask the running session which inputs it has"));
+        connect(recordMicDetectButton_, &QPushButton::clicked, this,
+                [this] { fillMicrophoneBox(); });
+        fillMicrophoneBox();
+
+        auto *microphoneRow = new QWidget(recording);
+        auto *microphoneLayout = new QHBoxLayout(microphoneRow);
+        microphoneLayout->setContentsMargins(0, 0, 0, 0);
+        microphoneLayout->setSpacing(8);
+        recordMicBox_->setParent(microphoneRow);
+        recordMicDetectButton_->setParent(microphoneRow);
+        microphoneLayout->addWidget(recordMicBox_);
+        microphoneLayout->addWidget(recordMicDetectButton_);
+        addRow(recording, uiTr("Microphone"),
+               uiTr("Recorded into the same MP4 as an AAC track; the name is what the "
+                    "file keeps"),
+               microphoneRow, false);
 
         return scroll;
     }
@@ -1235,6 +1408,17 @@ private:
         cli.longInject = injectBox_->currentData().toString();
         cli.ocrNotify = ocrNotifySwitch_->isChecked();
 
+        cli.recordEncoder = recordEncoderBox_->currentData().toString();
+        cli.recordFps = spinValue(recordFpsSpin_);
+        cli.recordPortal = recordPortalSwitch_->isChecked();
+        // Three answers, two stored states: no `mic` key at all is silence,
+        // while the empty string is the session's default input.
+        const QString microphone = recordMicBox_->currentData().toString();
+        cli.recordMicEnabled = microphone != kNoMicrophone;
+        cli.recordMic =
+            (microphone == kNoMicrophone || microphone == kDefaultMicrophone) ? QString()
+                                                                             : microphone;
+
         DialogPreferences &dialog = config.dialog;
         dialog.radius =
             static_cast<std::uint32_t>(std::max(0, dialogRadiusSpin_->value()));
@@ -1292,6 +1476,11 @@ private:
     QSpinBox *ignoreTopSpin_ = nullptr;
     QComboBox *injectBox_ = nullptr;
     ModernSwitch *ocrNotifySwitch_ = nullptr;
+    QComboBox *recordEncoderBox_ = nullptr;
+    ModernSpinBox *recordFpsSpin_ = nullptr;
+    ModernSwitch *recordPortalSwitch_ = nullptr;
+    ModernComboBox *recordMicBox_ = nullptr;
+    QPushButton *recordMicDetectButton_ = nullptr;
     ModernSpinBox *dialogRadiusSpin_ = nullptr;
     ModernSpinBox *dialogBorderWidthSpin_ = nullptr;
     ShadowControls dialogShadow_;

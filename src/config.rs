@@ -36,6 +36,27 @@ pub struct CliDefaults {
     pub long: LongDefaults,
     pub pin: PinDefaults,
     pub ocr: OcrDefaults,
+    pub record: RecordDefaults,
+}
+
+/// Defaults for `vshot record`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RecordDefaults {
+    /// The microphone to record when `--mic` is given without a name, or
+    /// when the command line says neither `--mic` nor `--no-mic`: an empty
+    /// string is the session's default source, a name is a PipeWire node.
+    /// `null` (the default) means a recording is silent.
+    pub mic: Option<String>,
+    /// The codec `--encoder` falls back to: `h264` (the built-in default),
+    /// `hevc` or `av1`.
+    pub encoder: Option<String>,
+    /// The frame rate `--fps` falls back to, 1-240.
+    pub fps: Option<u32>,
+    /// Whether a recording goes through the desktop portal without
+    /// `--portal`.  `null` (the default) keeps the compositor's own
+    /// protocols; `--no-portal` overrides a remembered `true`.
+    pub portal: Option<bool>,
 }
 
 /// Text recognition, used by `vshot ocr` and the editor's text tool.
@@ -195,6 +216,36 @@ mod tests {
         // own default is what stands.
         assert!(file.cli.long.timeout.is_none());
         assert!(file.cli.monitor.is_none());
+        // The microphone is off unless the file says otherwise: `null` and
+        // an absent key are the same silence, an empty string is the
+        // session's default source, and a name is that input.
+        assert!(file.cli.record.mic.is_none());
+        let file: ConfigFile =
+            serde_json::from_str(r#"{"cli":{"record":{"mic":""}}}"#).expect("an empty name parses");
+        assert_eq!(file.cli.record.mic.as_deref(), Some(""));
+        let file: ConfigFile =
+            serde_json::from_str(r#"{"cli":{"record":{"mic":"55"}}}"#).expect("a serial parses");
+        assert_eq!(file.cli.record.mic.as_deref(), Some("55"));
+    }
+
+    #[test]
+    fn the_record_section_carries_the_encoder_fps_and_portal() {
+        let file: ConfigFile = serde_json::from_str(
+            r#"{"cli":{"record":{"encoder":"hevc","fps":120,"portal":true,"mic":"alsa_input.x"}}}"#,
+        )
+        .expect("a record section parses");
+        assert_eq!(file.cli.record.encoder.as_deref(), Some("hevc"));
+        assert_eq!(file.cli.record.fps, Some(120));
+        assert_eq!(file.cli.record.portal, Some(true));
+        assert_eq!(file.cli.record.mic.as_deref(), Some("alsa_input.x"));
+
+        // Absent is absent: the caller's own default is what stands.
+        let bare: ConfigFile = serde_json::from_str(r#"{"cli":{"record":{}}}"#)
+            .expect("an empty record section parses");
+        assert!(bare.cli.record.encoder.is_none());
+        assert!(bare.cli.record.fps.is_none());
+        assert!(bare.cli.record.portal.is_none());
+        assert!(bare.cli.record.mic.is_none());
     }
 }
 

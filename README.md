@@ -326,6 +326,10 @@ vshot record monitor --fps 120                  # 瞄准 120fps（1-240，默认
 vshot record monitor --duration 60              # 60 秒后自动停
 vshot record monitor --portal                   # 走桌面 portal：由合成器弹出选择器
 vshot record window --portal                    # 同上，但选择器列的是窗口
+vshot record monitor --mic                      # 同时录麦克风（会话的默认输入设备）
+vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
+vshot record monitor --no-mic                   # 配置里记着麦克风时强制不录
+vshot record mics                               # 列出这台机器上能录的音频输入
 vshot record stop                               # 停止（读取 pid 文件发信号）
 ```
 
@@ -364,9 +368,25 @@ vshot record stop                               # 停止（读取 pid 文件发�
   wf-recorder 同一条路线——运行时用 `dlopen` 加载，所以没有 ffmpeg 库的机器上截图照常
   工作，只是 `record` 会说明缺什么。需要 `ffmpeg` 与 `libva`（AMD/Intel 的 VAAPI）。
   码流每帧都是 IDR（全帧内），任意播放器可读，且任何位置都能跳。
+- **麦克风（`--mic`）**：把麦克风录进同一个 MP4，编码是 AAC（ffmpeg 自己的编码器，和
+  视频同一条 libavcodec 路线）。不带名字用会话的默认输入设备，给名字或节点序号录别的输入
+  （`wpctl status` 列得出来；序号比如 `--mic 55` 就是那个 monitor）。麦克风在视频编码器之前
+  打开——它的采样率与声道数要写进 MP4 文件头——样本在每个视频帧后抽干一次，两条轨共用一个
+  时钟；文件里因此是一个 h264/hevc/av1 视频流加一个 AAC 音频流。`--no-mic` 在配置文件记着
+  `cli.record.mic` 时也强制不录；两个都不给就是"按配置"（默认不录）。麦克风走 PipeWire，
+  所以和 `--portal` 一样需要 libpipewire。实测（48 kHz 立体声）：录屏同时录本机 sink 的
+  monitor，回放音量与参考 `pw-cat` 抓到的完全一致（-24.1 dB 对 -24.3 dB）。
+  没有默认输入设备的会话会明确报错并提示看 `wpctl status`，而不是丢一句 PipeWire 的
+  "no target node available"。
 - **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），
   所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，
   或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
+- **记住的默认值**：`--encoder`、`--fps`、`--portal`、`--mic` 不写时，去配置文件的 `cli.record`
+  段取值（见 [`cli`——命令行默认值](#cli命令行默认值)）；设置窗口的「录制」一栏改的就是这四个键。
+  `--no-portal` 与 `--no-mic` 是对**那一次**录制把记着的值关掉——有了它们，配置里记着
+  `portal: true` 或某个麦克风时也不必每次先改配置。`vshot record mics` 列出这次会话里能录的
+  音频输入，每行是 `节点序号	节点名	说明`（节点名就是 `--mic` 收的值），设置窗口的麦克风
+  下拉读的正是它；没有输入设备的会话会说明一句，而不是报错。
 
 - **`--portal`：走桌面 portal 录制**（`org.freedesktop.portal.ScreenCast`）。合成器自己的捕获
   协议（wlr-screencopy、KWin 的 ScreenShot2、`ext_image_copy_capture_v1`）各自只在部分桌面
@@ -636,6 +656,10 @@ vshot settings
 | `long.ignore-top` | `long --ignore-top` | `0` |
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | 自动推断 |
+| `record.encoder` | `record --encoder` | `h264` |
+| `record.fps` | `record --fps` | `60` |
+| `record.portal` | `record --portal` | `false` |
+| `record.mic` | `record --mic` | 不录 |
 | `ocr.engine` | `vshot ocr` 用哪个引擎 | `builtin` |
 | `ocr.external.command` | `engine: "external"` 时跑的程序（数组） | 无 |
 | `ocr.external.stdin` | 把 PNG 走 stdin 而不是给路径 | `false` |
@@ -644,7 +668,7 @@ vshot settings
 
 `pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效——一个键写错只损失那一个键，其余照常生效。
 
-`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项和 `ocr.notify` 这个开关；`ocr.engine` 与 `ocr.external` 要手改文件——**这个开关只写「关」**，因为键不存在就是「开」，写一个 `true` 进去等于什么都没说。
+`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 那四项（编码器、帧率、portal、麦克风）；`ocr.engine` 与 `ocr.external` 要手改文件——**`ocr.notify` 这个开关只写「关」**，因为键不存在就是「开」，写一个 `true` 进去等于什么都没说。麦克风那一项是**从当前会话检测出来的**，旁边那个按钮重新检测：检测不到也不报错，只是行里只剩「不录音」和「会话默认输入」两个选项。
 
 `color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）。注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 

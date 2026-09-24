@@ -31,7 +31,7 @@ depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt' 'onnxruntime')
 makedepends=('rust' 'cargo' 'cmake' 'gcc' 'pkgconf' 'ffmpeg' 'libpipewire')
 optdepends=('wl-clipboard: clipboard input and output support'
             'ffmpeg: screen recording (vshot record)'
-            'libpipewire: screen recording through the desktop portal (vshot record --portal)')
+            'libpipewire: screen recording through the desktop portal, and microphone audio (vshot record --portal / --mic)')
 # PaddleOCR's PP-OCRv6 models, converted to ONNX by RapidOCR, plus the
 # character dictionary oar-ocr reads them with.  They are downloaded rather
 # than committed: 30 MB of weights do not belong in the source tree, and the

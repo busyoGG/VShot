@@ -79,6 +79,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
   long                一块会滚动的区域：vshot 替你滚动，边动边抓帧，再拼成一张长图
   record monitor|all|window
                       录成 MP4，GPU 编码：一块屏、整个桌面，或一扇窗自己的像素（见下）
+  record mics|stop    能录的音频输入列表，以及结束录制的那道信号
 
 输出目标：每次捕获恰好去 --output / --clipboard / --pin 中的一个，--cursor 与
 --png-compression 对所有捕获生效；具体取值见上方 Options。
@@ -210,10 +211,12 @@ niri 画的一个十字（无高亮）来指认窗口；点中的窗口由 niri 
         "record",
         "把屏幕录成 MP4，用 GPU 编码",
         r#"帧来自与截图相同的捕获后端（wlroots 会话走 wlr-screencopy，Plasma 走 KWin 的
-ScreenShot2），编码在 GPU 的媒体引擎上完成。编码与封装都跑在 ffmpeg 的库上，与 wf-recorder
+ScreenShot2），编码在 GPU 的媒体引擎上完成。--mic 可把麦克风一起录进 MP4（AAC，`--no-mic`
+强制不录；默认跟随配置里的 `cli.record.mic`）。编码与封装都跑在 ffmpeg 的库上，与 wf-recorder
 同一条路线：libavcodec 出码流，libavformat 写 MP4 盒子，两者都在运行时用 dlopen 加载，所以
 没有 ffmpeg 的机器截图照常可用，只有 `record` 会说明缺什么。`--encoder` 选编码器（h264 默认，
-或 hevc、av1）。`monitor [NAME]` 录一块输出，NAME 缺省即 `current`（问你当前所在的那块：
+或 hevc、av1；不写时跟随配置里的 `cli.record.encoder`）。`monitor [NAME]` 录一块输出，NAME 缺省
+即 `current`（问你当前所在的那块：
 合成器能报指针位置时是指针那块，否则是焦点那块），`all` 把每块输出按各自的逻辑位置拼合录制，
 `window [NAME]` 录一扇窗自己的像素（不是它所在的屏幕区域）：被别的窗口盖住也录得完整，拖到屏幕
 外一半也录得完整，窗口背后有什么都不会出现。窗口按 app id 或标题指定（先整名，再大小写不敏感的
@@ -229,12 +232,27 @@ vshot-%Y%m%d-%H%M%S.mp4（先取 $XDG_VIDEOS_DIR，再取 xdg-user-dirs 里那�
 不变时一帧都不出，所以 --fps 是向合成器要的采样上限、而不是文件的帧率，静止画面会变成一帧长
 帧。`record all --portal` 会被拒绝：portal 一次只给一路流，而且哪块屏幕由 portal 说了算。这条
 路需要 libpipewire（以及 xdg-desktop-portal）；VSHOT_PORTAL_SHM=1 改为要内存帧而不是 dma-buf，
-这是编码器导入不了合成器缓冲时的备用路线。
+这是编码器导入不了合成器缓冲时的备用路线。配置里记着 `cli.record.portal` 就不必每次写 --portal，
+`--no-portal` 是对那一次录制把它关掉。
+
+--mic 把麦克风录进同一个 MP4：不带名字就是会话的默认输入设备，给名字（或节点序号）录另一个
+输入；音轨是 AAC，由 ffmpeg 自己的编码器编出。麦克风在视频编码器之前打开，因为它的采样率与
+声道数要写进 MP4 的文件头；样本在每个视频帧后抽干一次，所以两条轨共用一个时钟。--no-mic 在
+配置里记着 `cli.record.mic` 时也强制不录；两个都不给就是"按配置"。没有默认输入设备的会话会
+得到一句提示，让你看 `wpctl status`，而不是一条看不出所以然的 PipeWire 错误。
+
+`vshot record mics` 列出这次会话里能录的输入，每行三列：节点序号、节点名、说明。节点名就是
+`--mic` 收的名字，设置窗口的麦克风一项也是照这份列表给的。没有输入设备的会话会得到一句说明，
+而不是一条错误。
+
+--encoder、--fps、--portal、--mic 都不给时，各自去配置的 `cli.record` 段取值，设置窗口里改的
+也是这四个键。
 
 录制一直进行到被停止：`vshot record stop` 发信号，或者在启动它的终端里按 Ctrl+C。两种方式都会
 在进程退出前把文件正常收尾（可寻址的 MP4，采样表写完整）。--duration 秒数让它自己结束。
---fps N 设定循环瞄准的帧率（1-240，默认 60）；每帧带着它在屏上停留的真实时长，所以回放跟随
-真实节奏而非名义帧率。`vshot record stop` 不需要显示器，可以直接绑快捷键：
+--fps N 设定循环瞄准的帧率（1-240，默认 60；不写时跟随配置里的 `cli.record.fps`）；每帧带着它在
+屏上停留的真实时长，所以回放跟随真实节奏而非名义帧率。`vshot record stop` 不需要显示器，可以
+直接绑快捷键：
     bind = SUPER, R, exec, vshot record monitor current
     bind = SUPER SHIFT, R, exec, vshot record stop
 
@@ -270,6 +288,13 @@ VSHOT_RECORD_DEBUG=1 把每帧的阶段与所用 libavcodec 版本打到 stderr�
 因为一个 MP4 只有一种帧尺寸。窗口所在的那块输出如果是关着、禁用或已断开，永远不会有帧送过来，
 这种情况几秒后会报出来，而不是一直等下去。加 --portal 时由合成器自己的选择器挑窗口，这里写的
 名字就决定不了具体哪一扇了；--portal 决定的是选择器列出窗口而不是屏幕。"#,
+    ),
+    (
+        "record mics",
+        "列出这次会话里能录的音频输入：`--mic` 收的就是这些",
+        r#"每行三列，制表符分隔：节点序号、节点名、说明。节点名是 `--mic` 收的名字（比序号稳），说明是
+给人看的。没有输入设备不是错误，只会说一句这个会话没有可录的输入——设置窗口的麦克风一项读的
+就是这份输出。"#,
     ),
     (
         "record stop",
@@ -353,7 +378,7 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "fps",
-        "录制循环瞄准的帧率，1-240（默认 60）。每帧带着它在屏上的真实时长，所以低了也不会变速。",
+        "录制循环瞄准的帧率，1-240（默认 60）。不写 --fps 时跟随配置里的 `cli.record.fps`。每帧带着它在屏上的真实时长，所以低了也不会变速。",
     ),
     (
         "duration",
@@ -361,11 +386,23 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "encoder",
-        "视频编码器：h264（默认）、hevc 或 av1，三者都跑 GPU 的媒体引擎。某台机器的 ffmpeg 或显卡不支持所选编码器时，录制一开始就会说明是哪一个（例如 h264 的 4096 宽度上限）。",
+        "视频编码器：h264（默认）、hevc 或 av1，三者都跑 GPU 的媒体引擎。不写 --encoder 时跟随配置里的 `cli.record.encoder`。某台机器的 ffmpeg 或显卡不支持所选编码器时，录制一开始就会说明是哪一个（例如 h264 的 4096 宽度上限）。",
     ),
     (
         "portal",
-        "改走桌面 portal（org.freedesktop.portal.ScreenCast）录制，而不是合成器自己的捕获协议。合成器会弹出它自己的选择器，在那里选中的屏幕/窗口就是录下来的内容；一次只录一路流，所以 `record all --portal` 不支持。需要 xdg-desktop-portal 与 libpipewire；VSHOT_PORTAL_SHM=1 强制走内存拷贝（dma-buf 导入不了时的备用路线）。",
+        "改走桌面 portal（org.freedesktop.portal.ScreenCast）录制，而不是合成器自己的捕获协议。合成器会弹出它自己的选择器，在那里选中的屏幕/窗口就是录下来的内容；一次只录一路流，所以 `record all --portal` 不支持。不写 --portal 时跟随配置里的 `cli.record.portal`，`--no-portal` 对那一次录制把它关掉。需要 xdg-desktop-portal 与 libpipewire；VSHOT_PORTAL_SHM=1 强制走内存拷贝（dma-buf 导入不了时的备用路线）。",
+    ),
+    (
+        "mic",
+        "把麦克风录进同一个 MP4。不带值就是会话的默认输入设备，给名字（或节点序号）则录另一个输入；音轨是 AAC，由 ffmpeg 自己的编码器编出。`vshot record mics` 列出这台机器上可以录的输入。",
+    ),
+    (
+        "no_mic",
+        "强制不录麦克风，即使配置里记着 `cli.record.mic`。",
+    ),
+    (
+        "no_portal",
+        "强制不走 portal，即使配置里记着 `cli.record.portal`。`record all` 只能用这条：portal 一次只给一路流，整个桌面是合成器自己协议的活。",
     ),
     (
         "no_blend",

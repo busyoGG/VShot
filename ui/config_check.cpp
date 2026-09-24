@@ -135,6 +135,11 @@ void checkDefaultsWhenTheFileIsMissing()
     expect(config.cli.pngCompression.isEmpty(), "no compression default is remembered");
     expect(config.cli.longTimeout == 0, "no scroll timeout is remembered");
     expect(config.cli.pinDensity == 0, "no pin density is remembered");
+    expect(config.cli.recordEncoder.isEmpty(), "no encoder default is remembered");
+    expect(config.cli.recordFps == 0, "no frame rate default is remembered");
+    expect(!config.cli.recordPortal, "the portal is off unless the file says otherwise");
+    expect(!config.cli.recordMicEnabled,
+           "a recording is silent unless the file asks for a microphone");
 }
 
 void checkUnknownKeysAreIgnored()
@@ -242,7 +247,8 @@ void checkClearingAValueRemovesIt()
     writeConfig(QStringLiteral(R"({
         "cli": {"png-compression": "high", "monitor": "DP-2",
                 "long": {"notches": 2, "max-height": 9000, "timeout": 30},
-                "pin": {"density": 2}}
+                "pin": {"density": 2},
+                "record": {"encoder": "hevc", "fps": 30, "portal": true, "mic": ""}}
     })"));
     // What the settings window produces when the user picks the built-in
     // default everywhere: every owned value absent.
@@ -254,7 +260,9 @@ void checkClearingAValueRemovesIt()
            "clearing everything leaves no empty cli section behind");
     const vshot::Config reread = vshot::loadConfig();
     expect(reread.cli.pngCompression.isEmpty() && reread.cli.longNotches == 0 &&
-               reread.cli.pinDensity == 0,
+               reread.cli.pinDensity == 0 && reread.cli.recordEncoder.isEmpty() &&
+               reread.cli.recordFps == 0 && !reread.cli.recordPortal &&
+               !reread.cli.recordMicEnabled,
            "the cleared defaults read back as unset");
 }
 
@@ -284,6 +292,11 @@ void checkRoundTripOfEveryField()
     written.cli.longIgnoreTop = 42;
     written.cli.longInject = QStringLiteral("uinput");
     written.cli.pinDensity = 3;
+    written.cli.recordEncoder = QStringLiteral("hevc");
+    written.cli.recordFps = 120;
+    written.cli.recordPortal = true;
+    written.cli.recordMicEnabled = true;
+    written.cli.recordMic = QStringLiteral("alsa_input.pci-0000_2f_00.4.analog-stereo");
     written.pin.radius = 12;
     written.pin.shadow.enabled = false;
     written.pin.shadow.size = 21;
@@ -321,6 +334,13 @@ void checkRoundTripOfEveryField()
     expect(read.cli.longIgnoreTop == written.cli.longIgnoreTop, "cli.long.ignore-top round-trips");
     expect(read.cli.longInject == written.cli.longInject, "cli.long.inject round-trips");
     expect(read.cli.pinDensity == written.cli.pinDensity, "cli.pin.density round-trips");
+    expect(read.cli.recordEncoder == written.cli.recordEncoder,
+           "cli.record.encoder round-trips", read.cli.recordEncoder);
+    expect(read.cli.recordFps == written.cli.recordFps, "cli.record.fps round-trips",
+           QString::number(read.cli.recordFps));
+    expect(read.cli.recordPortal, "cli.record.portal round-trips");
+    expect(read.cli.recordMicEnabled && read.cli.recordMic == written.cli.recordMic,
+           "cli.record.mic round-trips", read.cli.recordMic);
     expect(read.pin.radius == written.pin.radius, "pin.radius round-trips",
            QString::number(read.pin.radius));
     expect(read.pin.shadow.enabled == written.pin.shadow.enabled,
@@ -369,9 +389,41 @@ void checkRoundTripOfEveryField()
                    .arg(zeroed.pin.borderWidth));
     }
 
+    // The microphone key has two spellings that are not the same thing: no key
+    // at all is silence, and the empty string is the session's default input. A
+    // save has to keep them apart.  A frame rate outside the range `vshot
+    // record --fps` takes reads as "the file said nothing" rather than as a
+    // clamped rate, because that is what the CLI does with one.
+    {
+        vshot::Config probe = written;
+        probe.cli.recordMicEnabled = true;
+        probe.cli.recordMic.clear();
+        probe.cli.recordFps = 400;
+        vshot::saveConfig(probe);
+        const vshot::Config defaulted = vshot::loadConfig();
+        expect(defaulted.cli.recordMicEnabled && defaulted.cli.recordMic.isEmpty(),
+               "the session's default input is a written empty string",
+               defaulted.cli.recordMic.isEmpty() ? QStringLiteral("empty")
+                                                 : defaulted.cli.recordMic);
+        expect(defaulted.cli.recordFps == 0, "a frame rate out of range reads as unset",
+               QString::number(defaulted.cli.recordFps));
+
+        probe.cli.recordMicEnabled = false;
+        vshot::saveConfig(probe);
+        expect(!vshot::loadConfig().cli.recordMicEnabled,
+               "silence is the absent key, not an empty one");
+    }
+
     // The names the settings window offers have to be the names the loader
     // accepts, or a value picked in the UI would be silently dropped on the
     // next read.
+    for (const QString &value : vshot::encoderNames()) {
+        vshot::Config probe = written;
+        probe.cli.recordEncoder = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.recordEncoder == value,
+               "the settings window's encoder names all load back", value);
+    }
     for (const QString &value : vshot::compressionNames()) {
         vshot::Config probe = written;
         probe.cli.pngCompression = value;

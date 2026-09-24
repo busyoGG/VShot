@@ -7,6 +7,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/record/shim.c");
     println!("cargo:rerun-if-changed=src/record/pipewire_client.c");
+    println!("cargo:rerun-if-changed=src/record/pipewire_audio.c");
     // `cfg` names a build script chooses have to be declared, or rustc reports
     // every use of them as a typo.
     println!("cargo:rustc-check-cfg=cfg(vshot_pipewire)");
@@ -22,21 +23,22 @@ fn main() {
     for flag in pkg_config_cflags(&["libavcodec", "libavutil", "libavfilter"]) {
         build.flag(flag);
     }
-    // The portal's PipeWire client is the one C file that is optional: it is
-    // compiled only where libpipewire's headers are installed, and its absence
-    // costs nothing else — the compositor's own protocols still record, and
-    // `record --portal` reports the missing package instead of the build
-    // failing for everybody.
+    // The portal's PipeWire client and the microphone's are the C files that
+    // are optional: they are compiled only where libpipewire's headers are
+    // installed, and their absence costs nothing else — the compositor's own
+    // protocols still record, and `record --portal` / `record --mic` report
+    // the missing package instead of the build failing for everybody.
     if pkg_config_present("libpipewire-0.3") {
         println!("cargo:rustc-cfg=vshot_pipewire");
         build.file("src/record/pipewire_client.c");
+        build.file("src/record/pipewire_audio.c");
         for flag in pkg_config_cflags(&["libpipewire-0.3"]) {
             build.flag(flag);
         }
     } else {
         println!(
             "cargo:warning=libpipewire-0.3 has no pkg-config entry; this build leaves out \
-             `record --portal`"
+             `record --portal` and `record --mic`"
         );
     }
     build.warnings(true);

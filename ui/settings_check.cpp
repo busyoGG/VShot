@@ -148,6 +148,22 @@ void checkEveryFieldReachesTheFile()
     // it is turned *off* here: on is what a mis-wired switch would leave it at.
     find<QAbstractButton>(dialog.get(), "ocrNotify")->setChecked(false);
 
+    expect(choose(find<QComboBox>(dialog.get(), "recordEncoder"), QStringLiteral("hevc")),
+           "the encoder list offers hevc");
+    find<QSpinBox>(dialog.get(), "recordFps")->setValue(144);
+    find<QAbstractButton>(dialog.get(), "recordPortal")->setChecked(true);
+    // The microphone row is filled from the running session, so which devices
+    // it offers is not this check's business -- but the first two entries are
+    // the answers that always exist, and index 1 is the session's default
+    // input, which is the one that exercises the empty string the file spells
+    // it with.
+    QComboBox *microphone = find<QComboBox>(dialog.get(), "recordMic");
+    if (microphone != nullptr) {
+        expect(microphone->count() >= 2, "the microphone row offers both built-in answers",
+               QString::number(microphone->count()));
+        microphone->setCurrentIndex(1);
+    }
+
     // The pins' look.  The radius and the border width are set to values that
     // are neither the default nor each other, so a pair wired to the same
     // member cannot pass.
@@ -190,6 +206,14 @@ void checkEveryFieldReachesTheFile()
     expect(saved.cli.longIgnoreTop == 42, "the scroll ignore-top reached the file");
     expect(saved.cli.longInject == QStringLiteral("uinput"), "the scroll backend reached the file");
     expect(!saved.cli.ocrNotify, "the notification switch reached the file");
+    expect(saved.cli.recordEncoder == QStringLiteral("hevc"),
+           "the encoder default reached the file", saved.cli.recordEncoder);
+    expect(saved.cli.recordFps == 144, "the frame rate default reached the file",
+           QString::number(saved.cli.recordFps));
+    expect(saved.cli.recordPortal, "the portal switch reached the file");
+    expect(saved.cli.recordMicEnabled && saved.cli.recordMic.isEmpty(),
+           "the session's default input reached the file as an empty name",
+           saved.cli.recordMic);
     expect(saved.pin.radius == 17, "the pin radius reached the file",
            QString::number(saved.pin.radius));
     expect(!saved.pin.shadow.enabled, "the pin shadow switch reached the file");
@@ -228,7 +252,9 @@ void checkTheWindowOpensOnTheStoredValues()
                    "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textPixels": 28},
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
-                "pin": {"density": 2}, "ocr": {"notify": false}},
+                "pin": {"density": 2}, "ocr": {"notify": false},
+                "record": {"encoder": "av1", "fps": 30, "portal": true,
+                           "mic": "alsa_input.pci-0000_2f_00.4.analog-stereo"}},
         "pin": {"radius": 9, "shadow": false, "shadowSize": 21, "shadowOffset": -7,
                 "shadowOpacity": 200, "borderWidth": 6,
                 "borderColor": "#112233", "activeBorderColor": "#445566"},
@@ -261,6 +287,20 @@ void checkTheWindowOpensOnTheStoredValues()
     expect(find<QSpinBox>(dialog.get(), "pinDensity")->value() == 2, "the pin density box is right");
     expect(!find<QAbstractButton>(dialog.get(), "ocrNotify")->isChecked(),
            "the notification switch shows the stored off state");
+    expect(find<QComboBox>(dialog.get(), "recordEncoder")->currentData().toString() ==
+               QStringLiteral("av1"),
+           "the encoder box shows the stored codec");
+    expect(find<QSpinBox>(dialog.get(), "recordFps")->value() == 30,
+           "the frame rate box shows the stored rate");
+    expect(find<QAbstractButton>(dialog.get(), "recordPortal")->isChecked(),
+           "the portal switch shows the stored on state");
+    // A device the session is not offering right now -- this one is not running
+    // on the machine the check runs on either -- has to stay selectable, or
+    // opening and saving the window would quietly drop it from the file.
+    expect(find<QComboBox>(dialog.get(), "recordMic")->currentData().toString() ==
+               QStringLiteral("alsa_input.pci-0000_2f_00.4.analog-stereo"),
+           "the microphone box shows the stored device",
+           find<QComboBox>(dialog.get(), "recordMic")->currentData().toString());
     expect(find<QSpinBox>(dialog.get(), "pinRadius")->value() == 9, "the pin radius box is right");
     expect(!find<QAbstractButton>(dialog.get(), "pinShadow")->isChecked(),
            "the shadow switch shows the stored off state");

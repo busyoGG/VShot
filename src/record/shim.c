@@ -43,6 +43,11 @@
 //   vshot_rec_start_dmabuf(path, width, height, codec, qp, fourcc)
 //   vshot_rec_frame(handle, rgba, duration_ms)
 //   vshot_rec_frame_dmabuf(handle, fd, fourcc, modifier, offset, stride, duration_ms)
+//   vshot_rec_start_mic(path, width, height, codec, qp, rate, channels)
+//   vshot_rec_start_dmabuf_mic(path, width, height, codec, qp, fourcc, rate, channels)
+//   vshot_rec_audio_feed(handle, float samples, frames)
+//   vshot_rec_audio_pump(handle) / vshot_rec_audio_rate(handle)
+//   vshot_rec_audio_channels(handle) / vshot_rec_audio_error(handle)
 //   vshot_rec_finish(handle)                          -> trailer written
 //   vshot_rec_frames(handle) / vshot_rec_seconds(handle)
 //   vshot_rec_free(handle)
@@ -409,6 +414,12 @@ typedef struct VshotAvApi {
     int64_t (*rescale_q)(int64_t a, AVRational bq, AVRational cq);
     void (*log_set_level)(int level);
     void (*buffer_default_free)(void *opaque, uint8_t *data);
+    // The audio side (`record --mic`): one more frame allocator and the
+    // channel-layout constructor.  The latter is optional — a build of
+    // ffmpeg old enough to lack `av_channel_layout_default` still records
+    // audio, with the layout left to the encoder's default for the count.
+    int (*frame_get_buffer)(AVFrame *frame, int align);
+    void (*channel_layout_default)(AVChannelLayout *layout, int channels);
     // libavformat (optional; the recorder's MP4 muxer is the only user)
     int format_loaded;
     int (*format_alloc_output)(AVFormatContext **ctx, const AVOutputFormat *oformat,
@@ -559,6 +570,10 @@ static VshotAvApi *load_api(void) {
     NEED(table.strerror, util, "av_strerror");
     NEED(table.rescale_q, util, "av_rescale_q");
     NEED(table.log_set_level, util, "av_log_set_level");
+    NEED(table.frame_get_buffer, util, "av_frame_get_buffer");
+    // Optional: a pre-5.0 ffmpeg has no channel-layout API at all, and its
+    // AAC encoder reads the channel count from the context instead.
+    OPT(table.channel_layout_default, util, "av_channel_layout_default");
 #undef NEED
     // libavformat is optional: only the recorder's MP4 muxer uses it, and
     // its absence disables `record` while leaving screenshots alone.
@@ -1561,16 +1576,309 @@ unsigned vshot_av_enc_version(void) {
 // over slices coded against `38 30`), and AV1 needed its OBU stream put
 // back together.  libavformat takes the packet as it is.
 
+/* ---------------------------------------------------------------------------
+ * The microphone encoder
+ * ---------------------------------------------------------------------------
+ *
+ * `record --mic` records a soundtrack beside the video: the microphone's
+ * samples are encoded with AAC (ffmpeg's own encoder, in the same libavcodec
+ * this file already loads) and muxed as a second stream in the same MP4.  The
+ * video side is untouched — same encoder, same muxer — and the audio stream
+ * is created before the header is written, because a container's streams are
+ * declared in its header.
+ *
+ * The audio encoder is opened with the rate and channel count the
+ * microphone's PipeWire negotiation settled on, which is why the microphone
+ * client is opened before the recorder.  A sample rate the AAC encoder does
+ * not take is resampled to 48 kHz inside the encoder.
+ */
+
+// The sample rates the AAC encoder takes, best first.
+static const int vshot_audio_rates[] = {48000, 44100, 32000, 24000,
+                                        22050, 16000, 12000, 11025, 8000};
+
+typedef struct VshotAudioEnc {
+    AVCodecContext *ctx;
+    AVFrame *frame;      // the planar-float staging frame
+    float *pending;      // interleaved float samples not yet in a whole frame
+    int pending_samples; // in frames (samples per channel)
+    int pending_cap;     // frames the staging buffer can hold
+    int64_t next_pts;    // in samples, the encoder's own timeline
+    int rate;
+    int channels;
+    char err[256];
+} VshotAudioEnc;
+
+// The rate the AAC encoder takes: the microphone's own when it is one of
+// them, else 48 kHz (the encoder's resampler handles the rest).
+static int vshot_audio_pick_rate(int device_rate) {
+    for (size_t i = 0; i < sizeof(vshot_audio_rates) / sizeof(vshot_audio_rates[0]); i++) {
+        if (vshot_audio_rates[i] == device_rate) {
+            return device_rate;
+        }
+    }
+    return 48000;
+}
+
+// Creates and opens the AAC encoder.  Returns NULL with `err` set.
+static VshotAudioEnc *vshot_audio_enc_create(int device_rate, int channels, char *err,
+                                             size_t err_len) {
+    api = load_api();
+    if (!api) {
+        snprintf(err, err_len, "%s", api_error);
+        return NULL;
+    }
+    if (channels < 1 || channels > 2) {
+        snprintf(err, err_len,
+                 "the microphone reports %d channels; one or two are supported", channels);
+        return NULL;
+    }
+    const AVCodec *codec = api->find_encoder_by_name("aac");
+    if (!codec) {
+        snprintf(err, err_len, "this ffmpeg build has no aac encoder");
+        return NULL;
+    }
+    VshotAudioEnc *audio = calloc(1, sizeof(*audio));
+    if (!audio) {
+        snprintf(err, err_len, "out of memory for the audio encoder");
+        return NULL;
+    }
+    audio->rate = vshot_audio_pick_rate(device_rate);
+    audio->channels = channels;
+    audio->ctx = api->alloc_context3(codec);
+    if (!audio->ctx) {
+        snprintf(err, err_len, "could not allocate the audio encoder context");
+        free(audio);
+        return NULL;
+    }
+    audio->ctx->sample_rate = audio->rate;
+    audio->ctx->time_base = (AVRational){1, audio->rate};
+    if (api->channel_layout_default) {
+        api->channel_layout_default(&audio->ctx->ch_layout, channels);
+    }
+    audio->ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    audio->ctx->bit_rate = channels == 1 ? 96000 : 160000;
+    audio->ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    int ret = api->open2(audio->ctx, codec, NULL);
+    if (ret < 0) {
+        char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+        api->strerror(ret, detail, sizeof(detail));
+        snprintf(err, err_len, "opening the aac encoder failed: %s (%d)", detail, ret);
+        api->free_context(&audio->ctx);
+        free(audio);
+        return NULL;
+    }
+    audio->frame = api->frame_alloc();
+    if (!audio->frame) {
+        snprintf(err, err_len, "could not allocate the audio frame");
+        api->free_context(&audio->ctx);
+        free(audio);
+        return NULL;
+    }
+    return audio;
+}
+
+static void vshot_audio_enc_destroy(VshotAudioEnc *audio) {
+    if (!audio) {
+        return;
+    }
+    free(audio->pending);
+    if (audio->frame && api) {
+        api->frame_free(&audio->frame);
+    }
+    if (audio->ctx && api) {
+        api->free_context(&audio->ctx);
+    }
+    free(audio);
+}
+
+// Queues interleaved float samples for encoding.  The staging buffer grows
+// on demand; a frame's worth of audio is a few kilobytes, so it is allocated
+// once and reused.
+static int vshot_audio_enc_feed(VshotAudioEnc *audio, const float *samples, int frames) {
+    if (frames <= 0) {
+        return 0;
+    }
+    int needed = audio->pending_samples + frames;
+    if (needed > audio->pending_cap) {
+        int cap = audio->pending_cap ? audio->pending_cap : 4096;
+        while (cap < needed) {
+            cap *= 2;
+        }
+        float *grown = realloc(audio->pending, (size_t)cap * audio->channels * sizeof(float));
+        if (!grown) {
+            snprintf(audio->err, sizeof(audio->err),
+                     "out of memory for the audio staging buffer");
+            return -1;
+        }
+        audio->pending = grown;
+        audio->pending_cap = cap;
+    }
+    memcpy(audio->pending + (size_t)audio->pending_samples * audio->channels, samples,
+           (size_t)frames * audio->channels * sizeof(float));
+    audio->pending_samples += frames;
+    return 0;
+}
+
 typedef struct VshotRec {
     VshotAvEnc *enc;
     AVFormatContext *fmt;
     AVStream *stream;
+    // The microphone's soundtrack, when `record --mic` asked for one.  The
+    // audio stream is created before the header is written (a container's
+    // streams are declared in its header), and the encoder feeding it lives
+    // here because the two are the same recording's.
+    VshotAudioEnc *audio;
+    AVStream *audio_stream;
+    AVRational audio_time_base; // the muxer's, read back after the header
     int finished;
     char err[256];
 } VshotRec;
 
 void vshot_rec_free(VshotRec *rec);
 
+// Hands one encoded audio packet to the recorder's audio stream.  The
+// encoder's own sample timeline is rescaled into the muxer's time base, the
+// same conversion the video packets go through.
+static int vshot_audio_write_packet(VshotAudioEnc *audio, VshotRec *rec, AVPacket *pkt) {
+    if (!rec || !rec->audio_stream || !rec->fmt) {
+        return 0;
+    }
+    AVRational sample = {1, audio->rate};
+    pkt->stream_index = rec->audio_stream->index;
+    pkt->pts = pkt->dts = api->rescale_q(pkt->pts, sample, rec->audio_time_base);
+    pkt->duration = api->rescale_q(pkt->duration, sample, rec->audio_time_base);
+    int written = api->format_write_frame(rec->fmt, pkt);
+    if (written < 0) {
+        char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+        api->strerror(written, detail, sizeof(detail));
+        snprintf(audio->err, sizeof(audio->err),
+                 "writing an audio packet to the MP4 muxer failed: %s (%d)", detail, written);
+        return -1;
+    }
+    return 0;
+}
+
+// Drains every packet the encoder has ready.
+static int vshot_audio_drain(VshotAudioEnc *audio, VshotRec *rec) {
+    for (;;) {
+        AVPacket *pkt = api->packet_alloc();
+        if (!pkt) {
+            snprintf(audio->err, sizeof(audio->err), "could not allocate an audio packet");
+            return -1;
+        }
+        int ret = api->receive_packet(audio->ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            api->packet_free(&pkt);
+            break;
+        }
+        if (ret < 0) {
+            char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+            api->strerror(ret, detail, sizeof(detail));
+            api->packet_free(&pkt);
+            snprintf(audio->err, sizeof(audio->err),
+                     "receiving an encoded audio packet failed: %s (%d)", detail, ret);
+            return -1;
+        }
+        int status = vshot_audio_write_packet(audio, rec, pkt);
+        api->packet_free(&pkt);
+        if (status != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// Encodes every whole frame the staging buffer holds.  `flush` also sends the
+// tail, padded with silence to a whole frame: the encoder needs whole frames,
+// and the last partial frame of a recording is silence by definition.
+static int vshot_audio_enc_pump(VshotAudioEnc *audio, VshotRec *rec, int flush) {
+    int frame_size = audio->ctx->frame_size > 0 ? audio->ctx->frame_size : 1024;
+
+    for (;;) {
+        int have = audio->pending_samples;
+        int take = have < frame_size ? have : frame_size;
+        if (take < frame_size && !flush) {
+            break;
+        }
+        // `av_frame_get_buffer` allocates from the frame's own description:
+        // the format, the sample count and the channel layout must be set
+        // *before* the call, or it cannot size the planes (which it answers
+        // with a bare refusal otherwise).
+        audio->frame->format = AV_SAMPLE_FMT_FLTP;
+        audio->frame->sample_rate = audio->rate;
+        audio->frame->nb_samples = frame_size;
+        if (api->channel_layout_default) {
+            api->channel_layout_default(&audio->frame->ch_layout, audio->channels);
+        }
+        int ret = api->frame_get_buffer(audio->frame, 0);
+        if (ret < 0) {
+            char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+            api->strerror(ret, detail, sizeof(detail));
+            snprintf(audio->err, sizeof(audio->err),
+                     "could not get an audio frame buffer: %s (%d)", detail, ret);
+            return -1;
+        }
+        audio->frame->pts = audio->next_pts;
+        // Planar float: channel c's samples live in data[c].
+        for (int c = 0; c < audio->channels; c++) {
+            float *plane = (float *)audio->frame->data[c];
+            for (int i = 0; i < frame_size; i++) {
+                plane[i] = i < take ? audio->pending[(size_t)i * audio->channels + c] : 0.0f;
+            }
+        }
+        if (take > 0) {
+            memmove(audio->pending, audio->pending + (size_t)take * audio->channels,
+                    (size_t)(have - take) * audio->channels * sizeof(float));
+            audio->pending_samples = have - take;
+        }
+        audio->next_pts += frame_size;
+        ret = api->send_frame(audio->ctx, audio->frame);
+        if (ret < 0) {
+            char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+            api->strerror(ret, detail, sizeof(detail));
+            snprintf(audio->err, sizeof(audio->err),
+                     "the aac encoder rejected a frame: %s (%d)", detail, ret);
+            return -1;
+        }
+        if (vshot_audio_drain(audio, rec) != 0) {
+            return -1;
+        }
+        if (take < frame_size && flush) {
+            // The padded tail was the last frame.
+            break;
+        }
+        if (!flush && audio->pending_samples == 0) {
+            break;
+        }
+    }
+    return 0;
+}
+
+// Flushes the encoder: the samples still inside it come out as packets.  The
+// muxer writes them before its trailer, so the audio track ends where the
+// samples did.
+static int vshot_audio_enc_flush(VshotAudioEnc *audio, VshotRec *rec) {
+    if (!audio || !audio->ctx) {
+        return 0;
+    }
+    if (vshot_audio_enc_pump(audio, rec, 1) != 0) {
+        return -1;
+    }
+    int ret = api->send_frame(audio->ctx, NULL);
+    if (ret < 0 && ret != AVERROR_EOF) {
+        char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+        api->strerror(ret, detail, sizeof(detail));
+        snprintf(audio->err, sizeof(audio->err), "flushing the aac encoder failed: %s (%d)",
+                 detail, ret);
+        return -1;
+    }
+    return vshot_audio_drain(audio, rec);
+}
+
+// ---------------------------------------------------------------------------
+// The recorder: one encoder, plus the MP4 muxer libavformat provides
+// ---------------------------------------------------------------------------
 // AV_CODEC_ID_* for the short names `--encoder` accepts.
 static enum AVCodecID codec_id_for_word(const char *codec) {
     if (strcmp(codec, "h264") == 0) {
@@ -1635,6 +1943,26 @@ static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height
     rec->stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     rec->stream->codecpar->width = width;
     rec->stream->codecpar->height = height;
+    // The soundtrack, when there is one.  Its stream has to exist before the
+    // header is written: a container's streams are declared in its header,
+    // and movenc writes the track list there.
+    if (rec->audio) {
+        rec->audio_stream = api->format_new_stream(rec->fmt, NULL);
+        if (!rec->audio_stream) {
+            snprintf(rec->err, sizeof(rec->err),
+                     "could not add an audio stream to the MP4 muxer");
+            return -1;
+        }
+        rec->audio_stream->time_base = (AVRational){1, rec->audio->rate};
+        ret = api->parameters_from_context(rec->audio_stream->codecpar, rec->audio->ctx);
+        if (ret < 0) {
+            snprintf(rec->err, sizeof(rec->err),
+                     "the MP4 muxer refused the audio codec parameters (%d)", ret);
+            return -1;
+        }
+        rec->audio_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        rec->audio_stream->codecpar->sample_rate = rec->audio->rate;
+    }
     if (!(rec->fmt->oformat->flags & AVFMT_NOFILE)) {
         ret = api->io_open(&rec->fmt->pb, path, AVIO_FLAG_WRITE);
         if (ret < 0) {
@@ -1654,9 +1982,17 @@ static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height
     // the millisecond base).  Packet timestamps are read in this unit, so it
     // is kept and every packet is rescaled into it.
     rec->enc->mux_time_base = rec->stream->time_base;
+    if (rec->audio_stream) {
+        rec->audio_time_base = rec->audio_stream->time_base;
+    }
     if (trace_enabled()) {
         fprintf(stderr, "vshot: MP4 stream time base %d/%d\n",
                 rec->stream->time_base.num, rec->stream->time_base.den);
+        if (rec->audio_stream) {
+            fprintf(stderr, "vshot: MP4 audio time base %d/%d (%d Hz, %d channels)\n",
+                    rec->audio_stream->time_base.num, rec->audio_stream->time_base.den,
+                    rec->audio->rate, rec->audio->channels);
+        }
     }
     rec->enc->mux = rec->fmt;
     rec->enc->mux_stream = rec->stream;
@@ -1666,7 +2002,7 @@ static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height
 }
 
 static VshotRec *rec_start(const char *path, int width, int height, const char *codec, int qp,
-                           int dmabuf, unsigned fourcc) {
+                           int dmabuf, unsigned fourcc, int mic_rate, int mic_channels) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -1680,6 +2016,18 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
         snprintf(create_error, sizeof(create_error), "out of memory for the recorder");
         return NULL;
     }
+    // The microphone's encoder is opened first: its rate and channel count
+    // are the ones the muxer's audio stream declares, and that stream has to
+    // exist before the header is written.
+    if (mic_rate > 0 && mic_channels > 0) {
+        char detail[256] = {0};
+        rec->audio = vshot_audio_enc_create(mic_rate, mic_channels, detail, sizeof(detail));
+        if (!rec->audio) {
+            snprintf(create_error, sizeof(create_error), "%s", detail);
+            free(rec);
+            return NULL;
+        }
+    }
     rec->enc = dmabuf ? vshot_av_enc_create_dmabuf(width, height, codec, qp, 0, fourcc)
                       : vshot_av_enc_create(width, height, codec, qp, 0);
     if (!rec->enc) {
@@ -1688,7 +2036,7 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
         char detail[sizeof(create_error)];
         snprintf(detail, sizeof(detail), "%s", vshot_av_enc_load_error());
         snprintf(create_error, sizeof(create_error), "%s", detail);
-        free(rec);
+        vshot_rec_free(rec);
         return NULL;
     }
     if (rec_open_muxer(rec, path, width, height, codec) != 0) {
@@ -1702,13 +2050,26 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
 // Starts a recording: an encoder for `codec` plus the MP4 file at `path`.
 // Returns NULL with the reason in `vshot_rec_load_error`.
 VshotRec *vshot_rec_start(const char *path, int width, int height, const char *codec, int qp) {
-    return rec_start(path, width, height, codec, qp, 0, 0);
+    return rec_start(path, width, height, codec, qp, 0, 0, 0, 0);
+}
+
+// The same, with a microphone: a soundtrack is recorded beside the video
+// when both the rate and the channel count are positive.
+VshotRec *vshot_rec_start_mic(const char *path, int width, int height, const char *codec, int qp,
+                              int mic_rate, int mic_channels) {
+    return rec_start(path, width, height, codec, qp, 0, 0, mic_rate, mic_channels);
 }
 
 // The zero-copy variant: the frames are dma-bufs with this fourcc.
 VshotRec *vshot_rec_start_dmabuf(const char *path, int width, int height, const char *codec,
                                  int qp, unsigned fourcc) {
-    return rec_start(path, width, height, codec, qp, 1, fourcc);
+    return rec_start(path, width, height, codec, qp, 1, fourcc, 0, 0);
+}
+
+// The zero-copy variant with a microphone.
+VshotRec *vshot_rec_start_dmabuf_mic(const char *path, int width, int height, const char *codec,
+                                     int qp, unsigned fourcc, int mic_rate, int mic_channels) {
+    return rec_start(path, width, height, codec, qp, 1, fourcc, mic_rate, mic_channels);
 }
 
 // Feeds one RGBA frame and hands its packets to the muxer.  `duration_ms` is
@@ -1767,6 +2128,15 @@ int vshot_rec_finish(VshotRec *rec) {
         rec_take_enc_error(rec, "flushing the encoder failed");
         return -1;
     }
+    // The microphone's tail goes in before the trailer: the samples still
+    // inside the AAC encoder become packets, and the trailer then indexes
+    // both tracks.
+    if (rec->audio) {
+        if (vshot_audio_enc_flush(rec->audio, rec) != 0) {
+            snprintf(rec->err, sizeof(rec->err), "%s", rec->audio->err);
+            return -1;
+        }
+    }
     if (rec->fmt) {
         int ret = api->format_write_trailer(rec->fmt);
         if (ret < 0) {
@@ -1809,6 +2179,10 @@ void vshot_rec_free(VshotRec *rec) {
         api->format_free_context(rec->fmt);
         rec->fmt = NULL;
     }
+    if (rec->audio) {
+        vshot_audio_enc_destroy(rec->audio);
+        rec->audio = NULL;
+    }
     if (rec->enc) {
         vshot_av_enc_destroy(rec->enc);
         rec->enc = NULL;
@@ -1830,6 +2204,42 @@ const char *vshot_rec_load_error(void) {
         return api_error;
     }
     return "";
+}
+
+// The recorder-level audio entry points.  The encoder lives inside the
+// VshotRec, because its stream has to exist in the muxer before the header is
+// written and its packets go to the same AVFormatContext as the video's.
+//
+// Queues interleaved float samples from the microphone.
+int vshot_rec_audio_feed(VshotRec *rec, const float *samples, int frames) {
+    if (!rec || !rec->audio) {
+        return -1;
+    }
+    return vshot_audio_enc_feed(rec->audio, samples, frames);
+}
+
+// Encodes and muxes everything queued so far.
+int vshot_rec_audio_pump(VshotRec *rec) {
+    if (!rec || !rec->audio) {
+        return -1;
+    }
+    return vshot_audio_enc_pump(rec->audio, rec, 0);
+}
+
+// Whether a soundtrack is being recorded, and in what shape.
+int vshot_rec_audio_rate(VshotRec *rec) {
+    return rec && rec->audio ? rec->audio->rate : 0;
+}
+
+int vshot_rec_audio_channels(VshotRec *rec) {
+    return rec && rec->audio ? rec->audio->channels : 0;
+}
+
+const char *vshot_rec_audio_error(VshotRec *rec) {
+    if (!rec || !rec->audio) {
+        return "";
+    }
+    return rec->audio->err;
 }
 
 unsigned vshot_rec_version(void) {

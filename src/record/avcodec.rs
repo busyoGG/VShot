@@ -47,6 +47,25 @@ extern "C" {
         qp: c_int,
         fourcc: u32,
     ) -> *mut VshotRec;
+    fn vshot_rec_start_mic(
+        path: *const c_char,
+        width: c_int,
+        height: c_int,
+        codec: *const c_char,
+        qp: c_int,
+        mic_rate: c_int,
+        mic_channels: c_int,
+    ) -> *mut VshotRec;
+    fn vshot_rec_start_dmabuf_mic(
+        path: *const c_char,
+        width: c_int,
+        height: c_int,
+        codec: *const c_char,
+        qp: c_int,
+        fourcc: u32,
+        mic_rate: c_int,
+        mic_channels: c_int,
+    ) -> *mut VshotRec;
     fn vshot_rec_frame(rec: *mut VshotRec, rgba: *const u8, duration_ms: c_int) -> c_int;
     fn vshot_rec_frame_dmabuf(
         rec: *mut VshotRec,
@@ -66,6 +85,13 @@ extern "C" {
     fn vshot_rec_load_error() -> *const c_char;
     fn vshot_rec_version() -> u32;
     fn vshot_av_enc_filter_available() -> c_int;
+    // The audio side: the microphone's samples, encoded to AAC and muxed as
+    // a second stream in the same MP4.
+    fn vshot_rec_audio_feed(rec: *mut VshotRec, samples: *const f32, frames: c_int) -> c_int;
+    fn vshot_rec_audio_pump(rec: *mut VshotRec) -> c_int;
+    fn vshot_rec_audio_rate(rec: *mut VshotRec) -> c_int;
+    fn vshot_rec_audio_channels(rec: *mut VshotRec) -> c_int;
+    fn vshot_rec_audio_error(rec: *mut VshotRec) -> *const c_char;
 }
 
 /// Whether the whole recorder can run: libavcodec, libavutil and the
@@ -164,7 +190,7 @@ impl Recorder {
     /// Starts recording `width` x `height` with `codec` into `path`, taking
     /// tightly packed RGBA frames.
     pub fn start(path: &Path, width: u32, height: u32, codec: VideoCodec) -> Result<Self> {
-        Self::open(path, width, height, codec, None)
+        Self::open(path, width, height, codec, None, None)
     }
 
     /// The zero-copy variant: frames arrive as dma-bufs with this DRM fourcc
@@ -176,7 +202,31 @@ impl Recorder {
         codec: VideoCodec,
         fourcc: u32,
     ) -> Result<Self> {
-        Self::open(path, width, height, codec, Some(fourcc))
+        Self::open(path, width, height, codec, Some(fourcc), None)
+    }
+
+    /// The same two, with a soundtrack: `mic` is the microphone's negotiated
+    /// rate and channel count, and the recorder opens an AAC encoder for it
+    /// and declares a second stream in the MP4 before writing the header.
+    pub fn start_mic(
+        path: &Path,
+        width: u32,
+        height: u32,
+        codec: VideoCodec,
+        mic: crate::record::pipewire_audio::Format,
+    ) -> Result<Self> {
+        Self::open(path, width, height, codec, None, Some(mic))
+    }
+
+    pub fn start_dmabuf_mic(
+        path: &Path,
+        width: u32,
+        height: u32,
+        codec: VideoCodec,
+        fourcc: u32,
+        mic: crate::record::pipewire_audio::Format,
+    ) -> Result<Self> {
+        Self::open(path, width, height, codec, Some(fourcc), Some(mic))
     }
 
     fn open(
@@ -185,6 +235,7 @@ impl Recorder {
         height: u32,
         codec: VideoCodec,
         fourcc: Option<u32>,
+        mic: Option<crate::record::pipewire_audio::Format>,
     ) -> Result<Self> {
         if !recorder_available() {
             return Err(VshotError::Recording(format!(
@@ -215,8 +266,27 @@ impl Recorder {
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| VshotError::Recording("the output path contains a NUL byte".into()))?;
         let word = std::ffi::CString::new(codec.word()).expect("codec words have no NUL");
-        let handle = match fourcc {
-            Some(fourcc) => unsafe {
+        let (mic_rate, mic_channels) = match mic {
+            Some(format) => (
+                c_int::try_from(format.rate).unwrap_or(0),
+                c_int::try_from(format.channels).unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
+        let handle = match (fourcc, mic) {
+            (Some(fourcc), Some(_)) => unsafe {
+                vshot_rec_start_dmabuf_mic(
+                    c_path.as_ptr(),
+                    width as c_int,
+                    height as c_int,
+                    word.as_ptr(),
+                    FRAME_QP,
+                    fourcc,
+                    mic_rate,
+                    mic_channels,
+                )
+            },
+            (Some(fourcc), None) => unsafe {
                 vshot_rec_start_dmabuf(
                     c_path.as_ptr(),
                     width as c_int,
@@ -226,7 +296,18 @@ impl Recorder {
                     fourcc,
                 )
             },
-            None => unsafe {
+            (None, Some(_)) => unsafe {
+                vshot_rec_start_mic(
+                    c_path.as_ptr(),
+                    width as c_int,
+                    height as c_int,
+                    word.as_ptr(),
+                    FRAME_QP,
+                    mic_rate,
+                    mic_channels,
+                )
+            },
+            (None, None) => unsafe {
                 vshot_rec_start(
                     c_path.as_ptr(),
                     width as c_int,
@@ -326,6 +407,63 @@ impl Recorder {
             ));
         }
         Ok(())
+    }
+
+    /// Queues interleaved float samples from the microphone: `samples` holds
+    /// `frames * channels` floats, and `frames` is what the C side counts
+    /// (samples per channel) — passing the float count instead doubles the
+    /// soundtrack for a stereo input.
+    pub fn audio_feed(&mut self, samples: &[f32], frames: usize) -> Result<()> {
+        if self.handle.is_null() || frames == 0 {
+            return Ok(());
+        }
+        let frames = c_int::try_from(frames).unwrap_or(c_int::MAX);
+        let status = unsafe { vshot_rec_audio_feed(self.handle, samples.as_ptr(), frames) };
+        if status != 0 {
+            return Err(VshotError::Recording(
+                self.audio_error("queueing microphone samples failed"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encodes and muxes everything the audio staging buffer holds.  Called
+    /// once per video frame; nothing to do when no soundtrack is recorded.
+    pub fn audio_pump(&mut self) -> Result<()> {
+        if self.handle.is_null() {
+            return Ok(());
+        }
+        if unsafe { vshot_rec_audio_pump(self.handle) } != 0 {
+            return Err(VshotError::Recording(
+                self.audio_error("encoding the microphone audio failed"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The AAC encoder's rate, or 0 when no soundtrack is recorded.
+    pub fn audio_rate(&self) -> u32 {
+        if self.handle.is_null() {
+            return 0;
+        }
+        unsafe { vshot_rec_audio_rate(self.handle).max(0) as u32 }
+    }
+
+    /// The AAC encoder's channel count, or 0 when no soundtrack is recorded.
+    pub fn audio_channels(&self) -> u32 {
+        if self.handle.is_null() {
+            return 0;
+        }
+        unsafe { vshot_rec_audio_channels(self.handle).max(0) as u32 }
+    }
+
+    fn audio_error(&self, what: &str) -> String {
+        let detail = c_take(unsafe { vshot_rec_audio_error(self.handle) });
+        if detail.is_empty() {
+            what.to_string()
+        } else {
+            format!("{what}: {detail}")
+        }
     }
 
     /// How many packets reached the muxer.

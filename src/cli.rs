@@ -27,6 +27,7 @@ Capture targets
   record monitor|all|window
                       record to an MP4 on the GPU: a screen, the desktop, or one window's
                       own pixels (see below)
+  record mics|stop    the audio inputs a recording could take, and the signal that ends one
 
 Destination (every capture above goes to exactly one)
   -o, --output PATH   a PNG at PATH, with strftime expanded (shots/%Y%m%d-%H%M%S.png); the
@@ -336,6 +337,20 @@ still screen becomes one long frame. `record all --portal` is refused: the porta
 stream, and it is the portal that chooses which screen that is. This needs libpipewire (and \
 xdg-desktop-portal); VSHOT_PORTAL_SHM=1 asks for memory frames instead of dma-bufs, the fallback \
 for a compositor whose buffers the encoder cannot import.\n\n\
+--mic records the microphone into the same MP4: a bare `--mic` takes the session's default \
+source, a name (or a node serial) records another input, and the soundtrack is AAC, encoded by \
+ffmpeg's own encoder. The microphone is opened before the video encoder so its rate and channel \
+count can be declared in the MP4's header, and the samples are drained once per video frame, so \
+the two tracks share one clock. `--no-mic` refuses the microphone even when the config's \
+`cli.record.mic` remembers one; neither flag means \"whatever the config says\", and a session \
+with no default input answers with a sentence naming `wpctl status` instead of an opaque \
+PipeWire error. `record mics` lists the inputs a session actually has, which is also what the \
+settings window offers in its microphone row.\n\n\
+The config file's `cli.record` section supplies the defaults the flags fall back to: `encoder`, \
+`fps`, `portal` and `mic`. A flag always wins over the file — `--no-portal` is how a remembered \
+`portal: true` is turned off for one recording — and a value the file gets wrong (an unknown \
+encoder name, a rate outside 1-240) falls back to the built-in default rather than failing the \
+recording.\n\n\
 A recording that never started leaves nothing behind, and a process killed outright leaves a \
 file without its sample table (players report it as such rather than showing a wrong video).\n\n\
 VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1 traces each \
@@ -344,13 +359,25 @@ frame's stage and the libavcodec version in use."
     Record {
         #[command(subcommand)]
         target: RecordTargetCommand,
-        /// Frame rate the loop aims for, 1-240 (default 60).
+        /// Frame rate the loop aims for, 1-240; the config's `cli.record.fps`
+        /// when the flag is not given, else 60.
         #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=240))]
         fps: Option<u32>,
         /// Stop on its own after this many seconds.
         #[arg(long, global = true)]
         duration: Option<u64>,
-        /// Video codec: h264 (default), hevc or av1.
+        /// Record the microphone into the MP4 beside the video. Without a
+        /// name the session's default source is used; give a node name to
+        /// record another input, and `record mics` lists the ones this
+        /// session has. The config's `cli.record.mic` is what a recording
+        /// with neither `--mic` nor `--no-mic` falls back to.
+        #[arg(long, global = true, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
+        mic: Option<String>,
+        /// Do not record the microphone, even when the config remembers it.
+        #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
+        no_mic: bool,
+        /// Video codec: h264 (default), hevc or av1; the config's
+        /// `cli.record.encoder` when the flag is not given.
         #[arg(
             long,
             global = true,
@@ -358,9 +385,14 @@ frame's stage and the libavcodec version in use."
         )]
         encoder: Option<String>,
         /// Record through the XDG desktop portal instead of the compositor's
-        /// own protocols. The portal shows the compositor's own picker.
+        /// own protocols, which is also what the config's `cli.record.portal`
+        /// asks for when the flag is not given. The portal shows the
+        /// compositor's own picker.
         #[arg(long, global = true)]
         portal: bool,
+        /// Refuse the portal, even when the config remembers it.
+        #[arg(long = "no-portal", global = true, conflicts_with = "portal")]
+        no_portal: bool,
     },
 
     /// Read the text out of a region of the screen.
@@ -429,6 +461,8 @@ rather than screens."
         #[arg(long)]
         pick: bool,
     },
+    /// List the audio inputs a recording could take: what `--mic` accepts.
+    Mics,
     /// Stop the recording that is running.
     Stop,
 }
@@ -579,6 +613,8 @@ pub enum Action {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecordAction {
     Start(crate::record::RecordRequest),
+    /// `record mics`: list the session's audio inputs, one per line.
+    Mics,
     Stop,
 }
 
@@ -623,6 +659,9 @@ impl Cli {
             duration,
             encoder,
             portal,
+            no_portal,
+            mic,
+            no_mic,
         } = &self.command
         {
             // A recording is a file, not an image: the screenshot
@@ -634,26 +673,56 @@ impl Cli {
                         .into(),
                 ));
             }
-            if let RecordTargetCommand::Stop = target {
-                if self.output.is_some()
-                    || fps.is_some()
-                    || duration.is_some()
-                    || encoder.is_some()
-                    || *portal
-                {
-                    return Err(VshotError::InvalidDestination(
-                        "`record stop` takes no options: it signals the recording that is \
-                         already running"
-                            .into(),
-                    ));
+            // The two read-only shapes take no recording options. The flags
+            // are all global, so clap would accept them here; refusing them
+            // explicitly is what keeps `record stop --fps 30` from looking
+            // like it means something.
+            let option_given = self.output.is_some()
+                || fps.is_some()
+                || duration.is_some()
+                || encoder.is_some()
+                || *portal
+                || *no_portal
+                || mic.is_some()
+                || *no_mic;
+            match target {
+                RecordTargetCommand::Stop => {
+                    if option_given {
+                        return Err(VshotError::InvalidDestination(
+                            "`record stop` takes no options: it signals the recording that is \
+                             already running"
+                                .into(),
+                        ));
+                    }
+                    return Ok(Action::Record(RecordAction::Stop));
                 }
-                return Ok(Action::Record(RecordAction::Stop));
+                RecordTargetCommand::Mics => {
+                    if option_given {
+                        return Err(VshotError::InvalidDestination(
+                            "`record mics` takes no options: it lists the audio inputs a \
+                             recording could take"
+                                .into(),
+                        ));
+                    }
+                    return Ok(Action::Record(RecordAction::Mics));
+                }
+                _ => {}
             }
+            // The portal: `--portal` is on, `--no-portal` is off, and
+            // neither means the config's remembered default (off unless it
+            // was written).
+            let portal = if *no_portal {
+                false
+            } else if *portal {
+                true
+            } else {
+                crate::record::default_portal()
+            };
             // The portal hands over one stream per session and the compositor
             // decides which screen that is, so "the whole desktop" has no
             // portal shape: recording every output is the compositor's own
             // protocols' job.
-            if *portal && matches!(target, RecordTargetCommand::All) {
+            if portal && matches!(target, RecordTargetCommand::All) {
                 return Err(VshotError::InvalidDestination(
                     "`--portal` records one stream, and the compositor chooses which screen it \
                      is; record a single screen instead (`vshot record monitor --portal`)"
@@ -694,25 +763,46 @@ impl Cli {
                     };
                     crate::record::RecordTarget::Window(target)
                 }
-                RecordTargetCommand::Stop => unreachable!("handled above"),
+                // Both handled above, with the options they refuse.
+                RecordTargetCommand::Stop | RecordTargetCommand::Mics => {
+                    unreachable!("handled above")
+                }
             };
             let encoder = match encoder.as_deref() {
-                None => crate::record::avcodec::VideoCodec::H264,
+                None => crate::record::default_encoder(),
                 Some(word) => crate::record::avcodec::VideoCodec::parse(word).ok_or_else(|| {
                     VshotError::InvalidDestination(format!(
                         "unknown encoder `{word}`: pick h264, hevc or av1"
                     ))
                 })?,
             };
+            // The microphone: `--mic` is on, `--no-mic` is off, and
+            // neither means the config's remembered default (off unless it
+            // was written).  An empty name is the default source.
+            let mic = if *no_mic {
+                None
+            } else {
+                match mic {
+                    // `--mic` with no value fills an empty name (clap's
+                    // `default_missing_value`), which means the default
+                    // source, exactly like no flag at all... except that
+                    // giving the flag is itself the decision, so the config
+                    // does not get a vote.
+                    Some(name) if name.trim().is_empty() => Some(crate::record::MicChoice::Default),
+                    Some(name) => Some(crate::record::MicChoice::Device(name.clone())),
+                    None => crate::record::default_mic(),
+                }
+            };
             return Ok(Action::Record(RecordAction::Start(
                 crate::record::RecordRequest {
                     target,
                     output: self.output.clone(),
-                    fps: fps.unwrap_or(crate::record::DEFAULT_FPS),
+                    fps: fps.unwrap_or_else(crate::record::default_fps),
                     cursor: self.cursor,
                     duration: *duration,
                     encoder,
-                    portal: *portal,
+                    portal,
+                    mic,
                 },
             )));
         }
@@ -1026,6 +1116,172 @@ mod tests {
         // One way to name the window, not two that fight.
         assert!(Cli::try_parse_action_from(["vshot", "record", "window", "x", "--pick"]).is_err());
         assert!(Cli::try_parse_action_from(["vshot", "record", "window", ""]).is_err());
+
+        // The microphone: a bare `--mic` is the default source, a name is
+        // that input, and `--no-mic` is a silence the config cannot override.
+        let action = Cli::try_parse_action_from(["vshot", "record", "monitor", "--mic"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record monitor --mic` is a start");
+        };
+        assert_eq!(
+            request.mic,
+            Some(crate::record::MicChoice::Default),
+            "a bare --mic asks for the default source"
+        );
+
+        let action = Cli::try_parse_action_from([
+            "vshot",
+            "record",
+            "monitor",
+            "--mic",
+            "alsa_input.pci-0000_2f_00.4.analog-stereo",
+        ])
+        .unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record monitor --mic NAME` is a start");
+        };
+        assert_eq!(
+            request.mic,
+            Some(crate::record::MicChoice::Device(
+                "alsa_input.pci-0000_2f_00.4.analog-stereo".into()
+            ))
+        );
+
+        let action =
+            Cli::try_parse_action_from(["vshot", "record", "monitor", "--no-mic"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record monitor --no-mic` is a start");
+        };
+        assert_eq!(request.mic, None, "--no-mic is a silence");
+
+        // The two contradict each other; clap refuses the pair.
+        assert!(
+            Cli::try_parse_action_from(["vshot", "record", "monitor", "--mic", "--no-mic"])
+                .is_err()
+        );
+
+        // `record stop` takes no options, and the microphone flags are
+        // options like any other.
+        assert!(Cli::try_parse_action_from(["vshot", "record", "stop", "--mic"]).is_err());
+        assert!(Cli::try_parse_action_from(["vshot", "record", "stop", "--no-mic"]).is_err());
+    }
+
+    /// `record mics` and `record stop` are the two shapes that record
+    /// nothing: they list or they signal, and every recording option is
+    /// refused by name rather than quietly ignored.
+    #[test]
+    fn the_read_only_record_shapes_take_no_options() {
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "record", "mics"]).unwrap(),
+            Action::Record(RecordAction::Mics)
+        );
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "record", "stop"]).unwrap(),
+            Action::Record(RecordAction::Stop)
+        );
+
+        // The flags are global, so clap lets them through; the parser is
+        // what says they mean nothing next to a listing.
+        assert!(Cli::try_parse_action_from(["vshot", "record", "mics", "--fps", "30"]).is_err());
+        assert!(Cli::try_parse_action_from(["vshot", "record", "mics", "--mic"]).is_err());
+        assert!(
+            Cli::try_parse_action_from(["vshot", "record", "mics", "--output", "x.mp4"]).is_err()
+        );
+        assert!(Cli::try_parse_action_from(["vshot", "record", "stop", "--no-portal"]).is_err());
+        assert!(
+            Cli::try_parse_action_from(["vshot", "record", "stop", "--encoder", "hevc"]).is_err()
+        );
+
+        // The two portal flags contradict each other, and clap is what sees
+        // it — the parser only resolves their absence.
+        assert!(Cli::try_parse_action_from([
+            "vshot",
+            "record",
+            "monitor",
+            "--portal",
+            "--no-portal"
+        ])
+        .is_err());
+    }
+
+    /// The `cli.record` section is what a flag falls back to, and a flag
+    /// always wins — `--no-portal` included, which is how a remembered
+    /// `true` is turned off for one recording.
+    #[test]
+    fn the_record_section_is_what_a_flag_falls_back_to() {
+        let dir = std::env::temp_dir().join("vshot-cli-record-defaults");
+        let path = dir.join("vshot").join("config.json");
+        std::fs::create_dir_all(path.parent().expect("a parent directory")).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"cli":{"record":{"encoder":"hevc","fps":30,"portal":true,"mic":"alsa_input.x"}}}"#,
+        )
+        .unwrap();
+        // SAFETY: the variable is put back below.  A test in another thread
+        // that parses a record command while this one runs reads whatever
+        // config the variable points at, and none of them asserts a
+        // remembered default, so the worst a stray read can do is parse a
+        // different encoder than the file this test wrote.
+        let saved = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let start = |argv: &[&str]| match Cli::try_parse_action_from(argv) {
+            Ok(Action::Record(RecordAction::Start(request))) => request,
+            other => panic!("{argv:?} is a start: {other:?}"),
+        };
+
+        // Nothing on the command line: the file decides, field by field.
+        let request = start(&["vshot", "record", "monitor"]);
+        assert_eq!(request.encoder, crate::record::avcodec::VideoCodec::Hevc);
+        assert_eq!(request.fps, 30);
+        assert!(request.portal, "the file remembers the portal");
+        assert_eq!(
+            request.mic,
+            Some(crate::record::MicChoice::Device("alsa_input.x".into()))
+        );
+
+        // A remembered portal reaches the refusal too: one stream is what
+        // the portal hands over, so "the whole desktop" has no portal shape.
+        assert!(Cli::try_parse_action_from(["vshot", "record", "all"]).is_err());
+        assert!(
+            Cli::try_parse_action_from(["vshot", "record", "all", "--no-portal"]).is_ok(),
+            "--no-portal is how the whole desktop is recorded anyway"
+        );
+
+        // Flags win over the file, one at a time and together.
+        let request = start(&[
+            "vshot",
+            "record",
+            "monitor",
+            "--no-portal",
+            "--fps",
+            "24",
+            "--encoder",
+            "av1",
+        ]);
+        assert!(!request.portal);
+        assert_eq!(request.fps, 24);
+        assert_eq!(request.encoder, crate::record::avcodec::VideoCodec::Av1);
+        assert_eq!(
+            request.mic,
+            Some(crate::record::MicChoice::Device("alsa_input.x".into())),
+            "a flag nobody gave keeps the file's value"
+        );
+
+        // A bare `--mic` is the session's default source, not the name the
+        // file remembers, and `--no-mic` is a silence the file cannot fill
+        // back in.
+        assert_eq!(
+            start(&["vshot", "record", "monitor", "--mic"]).mic,
+            Some(crate::record::MicChoice::Default)
+        );
+        assert_eq!(start(&["vshot", "record", "monitor", "--no-mic"]).mic, None);
+
+        match saved {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

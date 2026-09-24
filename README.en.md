@@ -326,6 +326,10 @@ vshot record monitor --fps 120                  # aim for 120 fps (1-240, defaul
 vshot record monitor --duration 60              # stop by itself after 60 seconds
 vshot record monitor --portal                   # through the desktop portal: its picker chooses
 vshot record window --portal                    # the same, with windows in the picker
+vshot record monitor --mic                      # record the microphone into the same MP4
+vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
+vshot record monitor --no-mic                   # refuse the microphone the config remembers
+vshot record mics                               # list this session's audio inputs
 vshot record stop                               # stop the running recording
 ```
 
@@ -384,11 +388,35 @@ vshot record stop                               # stop the running recording
   the ffmpeg libraries still takes screenshots; only `record` reports what is
   missing. Needs `ffmpeg` and `libva` (for AMD/Intel VAAPI). Every frame is an
   IDR (all-intra), so any player reads it and any position is seekable.
+- **The microphone (`--mic`).** Records an input into the same MP4, encoded as AAC
+  (ffmpeg's own encoder, the same libavcodec route the video takes). A bare
+  `--mic` takes the session's default source; a name or node serial records
+  another input (`wpctl status` lists them — a serial like `--mic 55` is that
+  monitor). The microphone is opened before the video encoder, because its rate
+  and channel count are declared in the MP4's header, and its samples are
+  drained once per video frame, so the two tracks share one clock; the file
+  ends up with one video stream and one AAC stream. `--no-mic` refuses the
+  microphone even when the config's `cli.record.mic` remembers one; neither
+  flag means the config's answer (silent by default). It goes through
+  PipeWire, so like `--portal` it needs libpipewire. Measured (48 kHz stereo):
+  recording this machine's sink monitor through it gave the same level as a
+  reference `pw-cat` capture (-24.1 dB against -24.3 dB). A session with no
+  default input says so and names `wpctl status` instead of quoting PipeWire's
+  bare "no target node available".
 - **Width limit 4096.** That is the hardware H.264 encoder's limit (measured
   on this machine's 7900 XT VCN), so `record all` across two 4K screens
   (5760 wide) is refused with that explanation — record one output instead, or
   switch to `--encoder hevc`, which encodes the 7680-wide desktop here. A
   single 4K screen (3840) is fine.
+- **Remembered defaults.** When `--encoder`, `--fps`, `--portal` or `--mic` is not
+  given, the value comes from the config file's `cli.record` section (see
+  [`cli` — command-line defaults](#cli--command-line-defaults)); the settings
+  window's Recording card writes exactly those four keys, and `--no-portal` and
+  `--no-mic` turn a remembered value off for one recording. `vshot record mics`
+  lists the audio inputs this session has, one per line as a serial, a node name
+  and a description, tab-separated; the node name is what `--mic` takes, and
+  that listing is what the settings window's microphone row offers. A session
+  with no inputs says so rather than failing.
 
 - **`--portal` records through the desktop portal**
   (`org.freedesktop.portal.ScreenCast`). A compositor's own capture protocols
@@ -669,6 +697,10 @@ command line > environment > config file > built-in default
 | `long.ignore-top` | `long --ignore-top` | `0` |
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | inferred |
+| `record.encoder` | `record --encoder` | `h264` |
+| `record.fps` | `record --fps` | `60` |
+| `record.portal` | `record --portal` | `false` |
+| `record.mic` | `record --mic` | none |
 | `ocr.engine` | which engine `vshot ocr` uses | `builtin` |
 | `ocr.external.command` | the program to run when `engine` is `"external"` (an array) | none |
 | `ocr.external.stdin` | send the PNG on stdin instead of passing a path | `false` |
@@ -677,7 +709,7 @@ command line > environment > config file > built-in default
 
 `pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid — a misspelled key costs you that one setting, and the rest still apply.
 
-`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries and the `ocr.notify` switch; `ocr.engine` and `ocr.external` are edited by hand. That switch **only ever writes "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say.
+`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch and the four `record` keys (encoder, frame rate, portal, microphone); `ocr.engine` and `ocr.external` are edited by hand. That switch **only ever writes "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say. The microphone row is filled from the running session, with a button beside it to ask again: a session with no inputs is not an error there, the row simply offers the two answers that always exist.
 
 `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 

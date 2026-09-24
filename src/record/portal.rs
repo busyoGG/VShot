@@ -245,16 +245,35 @@ fn record(
         );
     }
 
+    // The microphone, when one was asked for: opened before the encoder,
+    // because the AAC encoder's rate and channel count come from the
+    // negotiation and the MP4's audio stream is declared in its header.
+    let mic = super::open_microphone(request)?;
     let path = prepare_output_path(request)?;
-    let mut recorder = match shape {
-        Shape::Dmabuf => Recorder::start_dmabuf(
+    let mut recorder = match (shape, &mic) {
+        (Shape::Dmabuf, Some(mic)) => Recorder::start_dmabuf_mic(
+            &path,
+            geometry.width,
+            geometry.height,
+            request.encoder,
+            fourcc,
+            mic.format(),
+        )?,
+        (Shape::Dmabuf, None) => Recorder::start_dmabuf(
             &path,
             geometry.width,
             geometry.height,
             request.encoder,
             fourcc,
         )?,
-        Shape::Software => {
+        (Shape::Software, Some(mic)) => Recorder::start_mic(
+            &path,
+            geometry.width,
+            geometry.height,
+            request.encoder,
+            mic.format(),
+        )?,
+        (Shape::Software, None) => {
             Recorder::start(&path, geometry.width, geometry.height, request.encoder)?
         }
     };
@@ -268,10 +287,23 @@ fn record(
             request.encoder.word(),
             super::avcodec::libavcodec_version()
         );
+        if recorder.audio_channels() > 0 {
+            eprintln!(
+                "vshot: microphone soundtrack: {} Hz, {} channel(s), AAC",
+                recorder.audio_rate(),
+                recorder.audio_channels()
+            );
+        }
     }
 
     let interrupted = super::install_stop_handler()?;
     super::write_pid_file()?;
+    // The microphone has been running through the negotiation and the
+    // picker; arming keeps the samples from here on, so the soundtrack
+    // starts where the recording does.
+    if let Some(mic) = &mic {
+        mic.arm();
+    }
     let outcome = loop_over(
         &mut stream,
         &mut recorder,
@@ -279,6 +311,7 @@ fn record(
         shape,
         fourcc,
         geometry,
+        mic.as_ref(),
         &interrupted,
     );
     let _ = std::fs::remove_file(super::pid_file());
@@ -308,8 +341,11 @@ fn loop_over(
     shape: Shape,
     fourcc: u32,
     geometry: pipewire::Geometry,
+    mic: Option<&super::pipewire_audio::Mic>,
     interrupted: &AtomicBool,
 ) -> Result<()> {
+    // The microphone's buffer, reused across frames.
+    let mut mic_samples: Vec<f32> = Vec::new();
     // The clock the recording's own length is measured against: the first
     // frame's arrival.  Everything before it is the negotiation, which the
     // user may have spent answering a picker.
@@ -424,6 +460,10 @@ fn loop_over(
                 tail_software = Some(rgba);
             }
         }
+        // The soundtrack for the interval this frame covered.
+        if let Some(mic) = mic {
+            super::pump_microphone(mic, recorder, &mut mic_samples)?;
+        }
         if debug_enabled() {
             eprintln!(
                 "vshot: frame {}: muxed in {:.1}ms (on screen {duration_ms}ms, PipeWire \
@@ -441,6 +481,12 @@ fn loop_over(
     // in the file: without it a still screen's recording would be as long as
     // the moment of its last change, not as long as it was recorded.  The
     // client still holds the buffer, so its pixels are still there.
+    // The soundtrack of the tail interval, queued before the last frame is
+    // sent again: `finish` flushes the audio encoder after the video's, so
+    // the samples have to be in by then.
+    if let Some(mic) = mic {
+        super::pump_microphone(mic, recorder, &mut mic_samples)?;
+    }
     let now = Instant::now();
     covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;
     let step = (covered_us / 1000).saturating_sub(timeline_ms);

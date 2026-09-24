@@ -66,6 +66,7 @@ use self::avcodec::{Recorder, VideoCodec};
 
 pub mod avcodec;
 mod pipewire;
+mod pipewire_audio;
 mod portal;
 mod window;
 
@@ -110,6 +111,85 @@ pub enum WindowTarget {
     Filter(String),
 }
 
+/// Which microphone `record --mic` records, if any.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MicChoice {
+    /// The session's default source (what a bare `--mic` means).
+    Default,
+    /// A named PipeWire node.
+    Device(String),
+}
+
+/// The remembered microphone setting: `--mic` overrides it, `--no-mic`
+/// overrides it the other way, and the config's `record-mic` decides what
+/// "neither" means.  Off unless it says otherwise.
+pub(crate) fn default_mic() -> Option<MicChoice> {
+    let remembered = crate::config::load().record.mic?;
+    if remembered.is_empty() {
+        Some(MicChoice::Default)
+    } else {
+        Some(MicChoice::Device(remembered))
+    }
+}
+
+/// The remembered codec: `--encoder` overrides it, and the config's
+/// `record.encoder` decides what "no flag" means.  H.264 unless it says
+/// otherwise — so the config can only ever move the default off the codec
+/// that is known to work everywhere.
+pub(crate) fn default_encoder() -> VideoCodec {
+    let Some(remembered) = crate::config::load().record.encoder else {
+        return VideoCodec::H264;
+    };
+    // A name the CLI would refuse is a hand edit gone wrong; the built-in
+    // default stands rather than failing every future recording on it.
+    VideoCodec::parse(remembered.trim()).unwrap_or(VideoCodec::H264)
+}
+
+/// The remembered frame rate: `--fps` overrides it, and the config's
+/// `record.fps` decides what "no flag" means.  The CLI's own default
+/// (60) unless the file says otherwise; a rate outside 1-240 is the
+/// built-in default rather than an error, for the same reason as the
+/// encoder above.
+pub(crate) fn default_fps() -> u32 {
+    match crate::config::load().record.fps {
+        Some(fps) if (1..=240).contains(&fps) => fps,
+        _ => DEFAULT_FPS,
+    }
+}
+
+/// The remembered portal switch: `--portal` turns it on, `--no-portal`
+/// turns it off, and the config's `record.portal` decides what "neither"
+/// means.  Off unless it says otherwise.
+pub(crate) fn default_portal() -> bool {
+    crate::config::load().record.portal.unwrap_or(false)
+}
+
+/// Lists the session's audio capture sources, for `vshot record mics` and
+/// the settings window.  This is the "automatic detection" side of the
+/// microphone option: the entries are what the session actually has.
+pub fn list_mics() -> Result<Vec<pipewire_audio::Source>> {
+    pipewire_audio::sources()
+}
+
+/// `vshot record mics`: prints what [`list_mics`] found, one source per
+/// line, tab-separated as `serial`, `name`, `description`.  The tab shape is
+/// the same one the C side hands over — deliberately plain, so both a person
+/// and the settings window can read it, and a caller that wants one field
+/// can cut on the first two tabs.
+pub fn print_mics() -> Result<()> {
+    let sources = list_mics()?;
+    for source in &sources {
+        println!("{}\t{}\t{}", source.serial, source.name, source.description);
+    }
+    if sources.is_empty() {
+        // Not an error: a session with no inputs is a valid session, and a
+        // caller piping this into something should get an empty list rather
+        // than a failure.  Saying so on stderr is for the person who ran it.
+        eprintln!("vshot: this session has no audio inputs to record");
+    }
+    Ok(())
+}
+
 /// A parsed recording request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordRequest {
@@ -128,6 +208,9 @@ pub struct RecordRequest {
     /// Take the frames from the XDG desktop portal instead of the
     /// compositor's own protocols (`--portal`).
     pub portal: bool,
+    /// Record the microphone into the same MP4 (`--mic`), and which input.
+    /// `None` is a silent recording — the sound is an opt-in.
+    pub mic: Option<MicChoice>,
 }
 
 impl RecordRequest {
@@ -312,6 +395,11 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     let topology = wayland.output_infos()?;
     let mut capture = Capturer::connect()?;
 
+    // The microphone, when one was asked for: opened before the encoder,
+    // because the audio encoder's rate and channel count come from the
+    // negotiation and the MP4's audio stream is declared in its header.
+    let mic = open_microphone(request)?;
+
     let (source, geometry) = match &request.target {
         RecordTarget::Monitor(name) if name == "current" => {
             let info = current_output(&topology)?;
@@ -438,15 +526,30 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             }
         }
     }
-    let recorder = match dmabuf_fourcc {
-        Some(fourcc) => Recorder::start_dmabuf(
+    let recorder = match (dmabuf_fourcc, &mic) {
+        (Some(fourcc), Some(mic)) => Recorder::start_dmabuf_mic(
+            &path,
+            encoded_width,
+            encoded_height,
+            request.encoder,
+            fourcc,
+            mic.format(),
+        )?,
+        (Some(fourcc), None) => Recorder::start_dmabuf(
             &path,
             encoded_width,
             encoded_height,
             request.encoder,
             fourcc,
         )?,
-        None => Recorder::start(&path, encoded_width, encoded_height, request.encoder)?,
+        (None, Some(mic)) => Recorder::start_mic(
+            &path,
+            encoded_width,
+            encoded_height,
+            request.encoder,
+            mic.format(),
+        )?,
+        (None, None) => Recorder::start(&path, encoded_width, encoded_height, request.encoder)?,
     };
     if debug_enabled() {
         eprintln!(
@@ -456,12 +559,25 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             request.encoder.word(),
             avcodec::libavcodec_version()
         );
+        if recorder.audio_channels() > 0 {
+            eprintln!(
+                "vshot: microphone soundtrack: {} Hz, {} channel(s), AAC",
+                recorder.audio_rate(),
+                recorder.audio_channels()
+            );
+        }
     }
 
     // --- stopping ---------------------------------------------------------
     let interrupted = install_stop_handler()?;
 
     write_pid_file()?;
+    // Everything before this line is setup, and the microphone has been
+    // running through it: arming keeps the samples from here on, so the
+    // soundtrack starts where the recording does.
+    if let Some(mic) = &mic {
+        mic.arm();
+    }
     // The loop writes the file and reports what went into it; the pid file
     // goes away whatever happened, because a stale pid would make the next
     // `stop` signal an unrelated process.
@@ -471,6 +587,7 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
         request,
         dmabuf_fourcc.is_some(),
         recorder,
+        mic.as_ref(),
         &interrupted,
     );
     let _ = std::fs::remove_file(pid_file());
@@ -507,6 +624,61 @@ fn prepare_output_path(request: &RecordRequest) -> Result<std::path::PathBuf> {
         _ => {}
     }
     Ok(path)
+}
+
+/// Opens the microphone when the request asked for one, at the same time the
+/// caller opens its frame source.  Returns `None` for a silent recording.
+///
+/// This is shared by the three recording loops: they all end up feeding the
+/// same [`Recorder`], whose audio side is armed by the loop once the video
+/// side is ready.
+pub(crate) fn open_microphone(request: &RecordRequest) -> Result<Option<pipewire_audio::Mic>> {
+    let Some(choice) = &request.mic else {
+        return Ok(None);
+    };
+    let target = match choice {
+        MicChoice::Default => None,
+        MicChoice::Device(name) => Some(name.as_str()),
+    };
+    let mic = pipewire_audio::Mic::open(target)?;
+    if debug_enabled() {
+        let format = mic.format();
+        eprintln!(
+            "vshot: microphone {} Hz, {} channel(s)",
+            format.rate, format.channels
+        );
+    }
+    Ok(Some(mic))
+}
+
+/// Drains the microphone into the recorder: every sample that arrived since
+/// the last call is queued and encoded, so the soundtrack follows the video's
+/// own frames rather than a timer of its own.
+///
+/// `samples` is reused across calls (the loop owns it) so a recording does not
+/// allocate per frame.
+pub(crate) fn pump_microphone(
+    mic: &pipewire_audio::Mic,
+    recorder: &mut Recorder,
+    samples: &mut Vec<f32>,
+) -> Result<()> {
+    let channels = mic.format().channels.max(1) as usize;
+    // One second of audio in one read: far more than any frame interval
+    // produces, so the ring is drained in one or two calls and the buffer
+    // never has to grow again.
+    let room = mic.format().rate.max(8000) as usize * channels;
+    if samples.len() < room {
+        samples.resize(room, 0.0);
+    }
+    loop {
+        let read = mic.read(samples)?;
+        if read == 0 {
+            break;
+        }
+        // `read` is frames (samples per channel); the slice is interleaved.
+        recorder.audio_feed(&samples[..read * channels], read)?;
+    }
+    recorder.audio_pump()
 }
 
 /// Installs the SIGINT/SIGTERM flag every recording shape stops on.
@@ -611,10 +783,15 @@ fn record_loop(
     request: &RecordRequest,
     zero_copy: bool,
     mut recorder: Recorder,
+    mic: Option<&pipewire_audio::Mic>,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<(usize, f64)> {
     let started = Instant::now();
     let interval = request.frame_interval();
+    // The microphone's own buffer, reused across frames: the soundtrack is
+    // drained into the encoder once per video frame, so the audio timeline
+    // and the video timeline are fed by the same clock.
+    let mut mic_samples: Vec<f32> = Vec::new();
     let mut scratch = SceneScratch {
         outputs: Vec::new(),
     };
@@ -705,6 +882,12 @@ fn record_loop(
             )?,
         }
         let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        // The soundtrack for the interval this frame covered: everything the
+        // microphone has produced since the last frame is queued and encoded
+        // now, so the audio track grows with the video's own frame clock.
+        if let Some(mic) = mic {
+            pump_microphone(mic, &mut recorder, &mut mic_samples)?;
+        }
         if debug_enabled() {
             let (shape, kind) = match &frame {
                 Grabbed::Software(frame) => (
@@ -916,6 +1099,7 @@ mod tests {
             duration: None,
             encoder: VideoCodec::H264,
             portal: false,
+            mic: None,
         };
         assert_eq!(request.frame_interval(), Duration::from_nanos(16_666_666));
         request.fps = 30;

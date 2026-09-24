@@ -265,6 +265,33 @@ const QHash<QString, QString> &chineseTable()
                            "需要通知服务")},
         {QStringLiteral("Shown with the result once recognition ends"),
          QString::fromUtf8("识别结束时随结果一起显示")},
+        {QStringLiteral("Recording"), QString::fromUtf8("录制")},
+        {QStringLiteral("Encoder"), QString::fromUtf8("编码器")},
+        {QStringLiteral("All three encode on the GPU's media engine"),
+         QString::fromUtf8("三者都跑 GPU 的媒体引擎")},
+        {QStringLiteral("built-in default (h264)"),
+         QString::fromUtf8("内置默认（h264）")},
+        {QStringLiteral("Frame rate"), QString::fromUtf8("帧率")},
+        {QStringLiteral("1-240; the built-in default is 60"),
+         QString::fromUtf8("1-240；内置默认 60")},
+        {QStringLiteral("Through the desktop portal"),
+         QString::fromUtf8("走桌面 portal")},
+        {QStringLiteral("Needs xdg-desktop-portal and libpipewire; `record all` cannot use it"),
+         QString::fromUtf8("需要 xdg-desktop-portal 与 libpipewire；"
+                           "`record all` 用不了这条")},
+        {QStringLiteral("The compositor's own picker decides what is recorded"),
+         QString::fromUtf8("由合成器自己的选择器决定录什么")},
+        {QStringLiteral("Microphone"), QString::fromUtf8("麦克风")},
+        {QStringLiteral("Recorded into the same MP4 as an AAC track; the name is what the "
+                        "file keeps"),
+         QString::fromUtf8("与视频一起录进同一个 MP4（AAC 音轨）；"
+                           "写进文件的是节点名")},
+        {QStringLiteral("Do not record audio"), QString::fromUtf8("不录音")},
+        {QStringLiteral("The session's default input"),
+         QString::fromUtf8("会话的默认输入设备")},
+        {QStringLiteral("Detect"), QString::fromUtf8("检测")},
+        {QStringLiteral("Ask the running session which inputs it has"),
+         QString::fromUtf8("问当前会话它有哪些输入设备")},
         {QStringLiteral("File dialogs"), QString::fromUtf8("文件对话框")},
         {QStringLiteral("How the save and open windows are drawn. They are layer "
                         "surfaces, so the compositor draws them no decoration of its "

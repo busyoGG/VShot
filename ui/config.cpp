@@ -37,6 +37,8 @@ const QStringList kCompressionNames = {QStringLiteral("none"), QStringLiteral("f
                                        QStringLiteral("high")};
 const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
+const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
+                                   QStringLiteral("av1")};
 
 constexpr int kMaxWidth = 64;
 // The text size is a pixel height, and its range comes from `ui/text_size.hpp`
@@ -45,6 +47,10 @@ constexpr int kMaxWidth = 64;
 constexpr int kMaxArrowSize = 8;
 constexpr int kMaxMosaicStrength = 3;
 constexpr int kMaxDensity = 4;
+/// The frame rate `record --fps` accepts, `vshot record`'s own range.  A file
+/// that names a rate above it is read as saying nothing, the way the CLI reads
+/// it, rather than being clamped to a rate the user never asked for.
+constexpr int kMaxRecordFps = 240;
 // The dialog's rim.  A radius past half the window's shorter side would stop
 // being a corner and start being a lozenge, so the ceiling is well inside that;
 // the stroke stops before it eats the dialog's own margins.  Both live in
@@ -157,6 +163,30 @@ std::uint64_t readOptionalWide(const QJsonObject &object, const QString &key, st
         return 0;
     }
     return static_cast<std::uint64_t>(std::min<long long>(rounded, static_cast<long long>(max)));
+}
+
+/// Like [`readOptional`], but a value above `max` is "the file says nothing"
+/// rather than clamped up to it.
+///
+/// The frame rate is the reason: `vshot record` reads a rate outside 1-240 as a
+/// file that said nothing, so clamping 400 to 240 here would have the window
+/// show a frame rate no recording will ever use.
+std::uint32_t readOptionalInRange(const QJsonObject &object, const QString &key,
+                                  std::uint32_t max)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return 0;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return 0;
+    }
+    const auto rounded = static_cast<long long>(raw);
+    if (rounded < 1 || rounded > static_cast<long long>(max)) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(rounded);
 }
 
 /// Reads one of `allowed`; anything else keeps `fallback`.  The values come
@@ -273,6 +303,8 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
     {"pin", "density"},      {"ocr", "notify"},
+    {"record", "encoder"},   {"record", "fps"},
+    {"record", "portal"},    {"record", "mic"},
 };
 
 /// Removes `key` from `object`, leaving `object` possibly empty for the caller
@@ -391,6 +423,21 @@ CliPreferences readCli(const QJsonObject &cli)
     const QJsonObject ocrSection = cli.value(QStringLiteral("ocr")).toObject();
     preferences.ocrNotify =
         readFlag(ocrSection, QStringLiteral("notify"), preferences.ocrNotify);
+
+    const QJsonObject recordSection = cli.value(QStringLiteral("record")).toObject();
+    preferences.recordEncoder =
+        readChoice(recordSection, QStringLiteral("encoder"), QString(), kEncoderNames);
+    preferences.recordFps =
+        readOptionalInRange(recordSection, QStringLiteral("fps"), kMaxRecordFps);
+    preferences.recordPortal = readFlag(recordSection, QStringLiteral("portal"), false);
+    // Silence is the absent key, so only a string asks for a microphone -- and
+    // the empty string is a value here rather than a missing one: it is how the
+    // file spells "the session's default input".
+    const QJsonValue microphone = recordSection.value(QStringLiteral("mic"));
+    if (microphone.isString()) {
+        preferences.recordMicEnabled = true;
+        preferences.recordMic = microphone.toString();
+    }
     return preferences;
 }
 
@@ -470,6 +517,27 @@ QJsonObject cliJson(const CliPreferences &preferences)
         QJsonObject ocrSection;
         ocrSection.insert(QStringLiteral("notify"), false);
         cli.insert(QStringLiteral("ocr"), ocrSection);
+    }
+    QJsonObject recordSection;
+    if (!preferences.recordEncoder.isEmpty()) {
+        recordSection.insert(QStringLiteral("encoder"), preferences.recordEncoder);
+    }
+    if (preferences.recordFps > 0) {
+        recordSection.insert(QStringLiteral("fps"), static_cast<double>(preferences.recordFps));
+    }
+    // Only the exception is written, for the reason the notification switch
+    // above is: an absent key already means off, so a remembered `false` would
+    // be a key that says nothing.
+    if (preferences.recordPortal) {
+        recordSection.insert(QStringLiteral("portal"), true);
+    }
+    // The microphone's two states are one key with two spellings: no key at all
+    // is silence, while the empty string is the session's default input.
+    if (preferences.recordMicEnabled) {
+        recordSection.insert(QStringLiteral("mic"), preferences.recordMic);
+    }
+    if (!recordSection.isEmpty()) {
+        cli.insert(QStringLiteral("record"), recordSection);
     }
     return cli;
 }
@@ -793,6 +861,11 @@ const QStringList &compressionNames()
 const QStringList &injectNames()
 {
     return kInjectNames;
+}
+
+const QStringList &encoderNames()
+{
+    return kEncoderNames;
 }
 
 } // namespace vshot
