@@ -129,6 +129,22 @@ pub enum Capture {
     /// until the window's content changes.  The request stays in flight, so the
     /// next call picks up the same frame.
     Idle,
+    /// The window changed size: the compositor re-sent its buffer constraints
+    /// and the old pool no longer matches.  The pool has been rebuilt at the
+    /// new size, and the caller — which owns the encoder the recording was
+    /// opened for — is told the new size (and format) so it can fit the
+    /// frames into its canvas.  The session stays alive; the next grab
+    /// captures at the new size.
+    Resized {
+        width: u32,
+        height: u32,
+        fourcc: u32,
+    },
+    /// The compositor refused a frame because the buffer no longer matched
+    /// its constraints, and the new constraints have not arrived yet.  There
+    /// is nothing to re-allocate *from* for a moment; the caller retries and
+    /// the resize branch above takes over when they land.
+    Retry,
     /// The session is over; the message says why, for the recording to report.
     Ended(String),
     /// The caller asked to stop.
@@ -200,6 +216,12 @@ struct Live {
     /// (which then becomes the last one), so the recording's tail can re-send
     /// it: see [`WindowCapture::last_frame`].
     last_slot: Option<usize>,
+    /// Whether any frame has *ever* come back.  A recording's tail re-sends
+    /// the last frame, and after a resize the old slot is gone — the window
+    /// was still on screen the whole time, so the missing tail must not be
+    /// mistaken for "no frame ever arrived" by the caller's first-frame
+    /// timeout.
+    ever_had_frames: bool,
     /// When the session started waiting for its first frame.  A window whose
     /// output never commits — a disabled or disconnected monitor — never gets
     /// one, and that has to be reported rather than waited on forever.
@@ -344,6 +366,7 @@ impl WindowCapture {
             next: 0,
             shape: None,
             last_slot: None,
+            ever_had_frames: false,
             first_wait_started: Instant::now(),
             pending: None,
         });
@@ -491,6 +514,118 @@ impl WindowCapture {
         Ok(shape)
     }
 
+    /// Rebuilds the dma-buf pool at a new frame size, which the compositor
+    /// re-sent its constraints for: the old buffers are dropped, fresh ones
+    /// are allocated from the current formats, and the shape the session
+    /// reports becomes the new one.
+    ///
+    /// The frame that was in flight is *destroyed* before its slot goes: the
+    /// protocol allows one frame per session at a time ("create_frame sent
+    /// before destroying previous frame" is an error), so a pending frame
+    /// left alive would make the next capture a protocol violation rather
+    /// than a retry.  Its pixels belong to the old pool and are dropped with
+    /// it — the recording's tail re-send falls back to nothing for one
+    /// interval, which the loop's own timing already tolerates.
+    fn rebuild_pool(&mut self, width: u32, height: u32) -> Result<()> {
+        let Some(live) = self.state.live.as_mut() else {
+            return Err(VshotError::WaylandProtocol(
+                "no window capture session is running".into(),
+            ));
+        };
+        if let Some(pending) = live.pending.take() {
+            pending.frame.destroy();
+        }
+        let (fourcc, modifiers) = pick_format(&live.formats).ok_or_else(|| {
+            VshotError::Recording(format!(
+                "the compositor offers no dma-buf format this encoder can take after the window \
+                 was resized (it offered {}); the GPU path needs ARGB8888 or XRGB8888",
+                describe_formats(&live.formats)
+            ))
+        })?;
+        live.slots.clear();
+        live.next = 0;
+        live.last_slot = None;
+        let qh = self.event_queue.handle();
+        let dmabuf = self
+            .state
+            .dmabuf
+            .clone()
+            .ok_or_else(|| VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()))?;
+        let mut create_failed = false;
+        for _ in 0..POOL_SLOTS {
+            let gbm = GbmBuffer::create_with_modifiers(width, height, fourcc, &modifiers)?;
+            let params = dmabuf.create_params(&qh, ());
+            let borrowed = unsafe { BorrowedFd::borrow_raw(gbm.fd()) };
+            params.add(
+                borrowed,
+                0,
+                gbm.offset(),
+                gbm.stride(),
+                (gbm.modifier() >> 32) as u32,
+                (gbm.modifier() & 0xffff_ffff) as u32,
+            );
+            let wl_buffer = params.create_immed(
+                i32::try_from(width).map_err(|_| {
+                    VshotError::Recording("the window is too wide to capture".into())
+                })?,
+                i32::try_from(height).map_err(|_| {
+                    VshotError::Recording("the window is too tall to capture".into())
+                })?,
+                fourcc,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                &qh,
+                (),
+            );
+            params.destroy();
+            if self
+                .event_queue
+                .roundtrip(&mut self.state)
+                .map_err(|error| VshotError::WaylandProtocol(error.to_string()))
+                .is_err()
+            {
+                create_failed = true;
+                break;
+            }
+            let Some(live) = self.state.live.as_mut() else {
+                return Err(VshotError::WaylandProtocol(
+                    "the window capture session disappeared while its pool was being rebuilt"
+                        .into(),
+                ));
+            };
+            if live.params_failed {
+                create_failed = true;
+                break;
+            }
+            live.slots.push(Slot { gbm, wl_buffer });
+        }
+        let Some(live) = self.state.live.as_mut() else {
+            return Err(VshotError::WaylandProtocol(
+                "the window capture session disappeared while its pool was being rebuilt".into(),
+            ));
+        };
+        if create_failed {
+            return Err(VshotError::Recording(format!(
+                "the compositor could not import a {width}x{height} dma-buf after the window was \
+                 resized (fourcc 0x{fourcc:08x}, modifier 0x{:x}), which means the modifier it \
+                 advertised is not one it can actually take",
+                modifiers.first().copied().unwrap_or(0)
+            )));
+        }
+        live.shape = Some(Shape {
+            width,
+            height,
+            fourcc,
+        });
+        if debug_enabled() {
+            eprintln!(
+                "vshot: window capture pool rebuilt for {width}x{height} (fourcc 0x{fourcc:08x}, \
+                 {} buffer(s))",
+                live.slots.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Asks for one frame and waits up to `wait` for it.  A frame that does not
     /// arrive in time is not lost: it stays in flight and the next call picks
     /// it up (see [`Capture::Idle`]).
@@ -515,16 +650,39 @@ impl WindowCapture {
             ));
         };
         // A window that changed size changes the size of the frames the
-        // compositor sends, and a recording is one fixed frame size from the
-        // first packet to the trailer: the file ends here rather than growing
-        // frames the encoder would refuse.
+        // compositor sends: it re-sends its buffer constraints, and the pool
+        // no longer matches.  The protocol has the answer — re-allocate the
+        // buffers and retry — so the pool is rebuilt at the new size here and
+        // the caller is told, because it owns the encoder that has to fit
+        // the new frames into its canvas.  A recording that ends at a window
+        // resize would be recording the wrong thing: a window can be
+        // resized at any moment, and the file is the window's whole history.
+        //
+        // A resize *animation* reports the size it is passing through, and
+        // some of those are not dimensions a buffer can exist at all: a
+        // negative width arrives as a huge unsigned number (Hyprland sends
+        // -5 as 4294967291 while a window is being dragged).  Only a settled,
+        // capture-able size is acted on; anything else is a Retry, and the
+        // next constraints — the settled ones — are a moment away.
         if live.buffer_size != Some((shape.width, shape.height)) {
             let (width, height) = live.buffer_size.unwrap_or((shape.width, shape.height));
-            return Ok(Capture::Ended(format!(
-                "the window changed size, from {}x{} to {width}x{height}, which one recording \
-                 cannot follow",
-                shape.width, shape.height
-            )));
+            const MAX_DIMENSION: u32 = 16384;
+            if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+                return Ok(Capture::Retry);
+            }
+            self.rebuild_pool(width, height)?;
+            let fourcc = self
+                .state
+                .live
+                .as_ref()
+                .and_then(|live| live.shape)
+                .map(|shape| shape.fourcc)
+                .unwrap_or(shape.fourcc);
+            return Ok(Capture::Resized {
+                width,
+                height,
+                fourcc,
+            });
         }
         if live.pending.is_none() {
             let qh = self.event_queue.handle();
@@ -583,11 +741,15 @@ impl WindowCapture {
                     "the compositor stopped the window capture (the window may have been closed)"
                         .to_owned(),
                 )),
-                FAILED_BUFFER_CONSTRAINTS => Ok(Capture::Ended(
-                    "the compositor refused the capture buffer: the window's buffers no longer \
-                     match the shape they were allocated for"
-                        .to_owned(),
-                )),
+                // The protocol's own run-time condition: the buffer no longer
+                // matches the constraints the compositor last sent.  The
+                // reason is almost always a resize whose new constraints
+                // have not been dispatched yet; rebuilding the pool at the
+                // size it does describe and trying again is the protocol's
+                // prescription ("The client should re-allocate its buffers
+                // and retry").  The call after this one picks the new
+                // constraints up.
+                FAILED_BUFFER_CONSTRAINTS => Ok(Capture::Retry),
                 // An unnamed runtime error, which the protocol says may be
                 // retried: a dropped frame rather than the end of the
                 // recording.
@@ -607,6 +769,7 @@ impl WindowCapture {
             ));
         };
         live.last_slot = Some(pending.slot);
+        live.ever_had_frames = true;
         live.next = (pending.slot + 1) % live.slots.len().max(1);
         let gbm = &pooled.gbm;
         Ok(Capture::Frame(DmabufFrame {
@@ -645,12 +808,14 @@ impl WindowCapture {
 
     /// Whether the compositor has delivered any frame at all yet.  A window
     /// whose output never commits (a disabled or disconnected monitor) never
-    /// gets one, which [`Self::first_frame_overdue`] turns into an error.
+    /// gets one, which the recording's first-frame timeout turns into an
+    /// error.  This stays true across a rebuild — the window was on screen
+    /// the whole time — so a resize mid-recording does not restart that wait.
     pub fn has_frames(&self) -> bool {
         self.state
             .live
             .as_ref()
-            .is_some_and(|live| live.last_slot.is_some())
+            .is_some_and(|live| live.last_slot.is_some() || live.ever_had_frames)
     }
 
     /// How long this session has been waiting for its first frame.
@@ -698,11 +863,21 @@ impl WindowCapture {
             )];
             let timeout = rustix::event::Timespec::try_from(remaining.min(POLL_GRANULARITY))
                 .map_err(|_| VshotError::WaylandProtocol("poll timeout is out of range".into()))?;
-            let ready = rustix::event::poll(&mut poll_fds, Some(&timeout)).map_err(|error| {
-                VshotError::WaylandProtocol(format!(
-                    "failed to poll the Wayland connection: {error}"
-                ))
-            })?;
+            let ready = match rustix::event::poll(&mut poll_fds, Some(&timeout)) {
+                Ok(ready) => ready,
+                // A signal — the stop handler's, most of all — interrupts the
+                // poll; that is not a protocol failure.  The loop's next turn
+                // sees the flag and reports a clean stop.
+                Err(rustix::io::Errno::INTR) => {
+                    drop(read_guard);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(VshotError::WaylandProtocol(format!(
+                        "failed to poll the Wayland connection: {error}"
+                    )));
+                }
+            };
             if ready == 0 {
                 drop(read_guard);
                 continue;
@@ -1333,6 +1508,16 @@ mod tests {
                     );
                 }
                 Capture::Idle => eprintln!("vshot: nothing ready yet"),
+                // A live window can be resized under the probe too; the
+                // pool is rebuilt and the loop simply asks again.
+                Capture::Resized {
+                    width,
+                    height,
+                    fourcc,
+                } => eprintln!(
+                    "vshot: the window was resized to {width}x{height} (fourcc 0x{fourcc:08x})"
+                ),
+                Capture::Retry => eprintln!("vshot: the compositor refused a stale buffer"),
                 Capture::Ended(reason) => {
                     eprintln!("vshot: the session ended: {reason}");
                     break;

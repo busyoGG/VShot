@@ -354,7 +354,9 @@ recording.\n\n\
 A recording that never started leaves nothing behind, and a process killed outright leaves a \
 file without its sample table (players report it as such rather than showing a wrong video).\n\n\
 VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1 traces each \
-frame's stage and the libavcodec version in use."
+frame's stage and the libavcodec version in use, and VSHOT_RECORD_NO_OVERLAY=1 forces the \
+letterbox's fallback composition instead of the GPU overlay (a test hook for drivers that \
+cannot blend)."
     )]
     Record {
         #[command(subcommand)]
@@ -446,12 +448,14 @@ The window is named by app id or title (the whole name first, else a case-insens
 substring of either), picked with `--pick`, or — with no argument — the focused one. The \
 protocol this needs is `ext_image_copy_capture_v1` with the window as its source; a \
 compositor without it is told to record a screen instead.\n\n\
-A window that is resized or closed while recording ends the recording there: the file is \
-finished properly and says why, because one MP4 holds one frame size. A window whose output \
-is off, disabled or disconnected never produces a frame at all, which is reported after a \
-few seconds rather than waited on. With --portal the compositor's own picker chooses the \
-window, so nothing here names it; what --portal decides is that the picker offers windows \
-rather than screens."
+A window that is resized while recording keeps recording: the new size is fitted into the \
+recording's own canvas (scaled down to fit, centred, letterboxed), because one MP4 holds one \
+frame size — the window was on screen the whole time, so the file is its whole history. A \
+window that is closed ends the recording there: the file is finished properly and says why. A \
+window whose output is off, disabled or disconnected never produces a frame at all, which is \
+reported after a few seconds rather than waited on. With --portal the compositor's own picker \
+chooses the window, so nothing here names it; what --portal decides is that the picker offers \
+windows rather than screens."
     )]
     Window {
         /// App id or title of the window; the focused window when omitted.

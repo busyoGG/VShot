@@ -43,6 +43,7 @@
 //   vshot_rec_start_dmabuf(path, width, height, codec, qp, fourcc)
 //   vshot_rec_frame(handle, rgba, duration_ms)
 //   vshot_rec_frame_dmabuf(handle, fd, fourcc, modifier, offset, stride, duration_ms)
+//   vshot_rec_resize_fit(handle, width, height)       -> follow a source resize
 //   vshot_rec_start_mic(path, width, height, codec, qp, rate, channels)
 //   vshot_rec_start_dmabuf_mic(path, width, height, codec, qp, fourcc, rate, channels)
 //   vshot_rec_audio_feed(handle, float samples, frames)
@@ -468,6 +469,7 @@ void vshot_av_enc_destroy(VshotAvEnc *enc);
 int vshot_av_enc_send(VshotAvEnc *enc, const uint8_t *rgba);
 int vshot_av_enc_send_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t modifier,
                              int offset, int stride);
+int vshot_av_enc_resize_fit(VshotAvEnc *enc, int in_w, int in_h, unsigned fourcc);
 int vshot_av_enc_flush(VshotAvEnc *enc);
 const uint8_t *vshot_av_enc_take(VshotAvEnc *enc, int *len);
 const uint8_t *vshot_av_enc_extradata(VshotAvEnc *enc, int *len);
@@ -657,9 +659,22 @@ struct VshotAvEnc {
     // --- zero-copy path ---
     int dmabuf;             // 1 when this session encodes dma-bufs
     unsigned fourcc;        // the dma-buf format this session was opened for
+    // The size of the dma-buf frames arriving from the capture side.  It is
+    // the encoder's own size until the source is resized mid-recording
+    // (`vshot_rec_resize_fit`), after which the filtergraph fits these
+    // frames into the encoder's canvas.
+    int in_w;
+    int in_h;
     AVFilterGraph *graph;
     AVFilterContext *graph_src;
     AVFilterContext *graph_sink;
+    // The fit chain's second input: the canvas-sized black plate the letterbox
+    // is composed over (see `open_filtergraph_dmabuf_fit`).  Only a fit graph
+    // has one; a graph built for the encoder's own size runs the two-filter
+    // chain and leaves these NULL.
+    AVFilterContext *graph_plate; // the plate's buffer source
+    AVBufferRef *plate_frames;    // BGRA pool of canvas-sized plates
+    AVFrame *plate;               // the one black plate fed with every frame
     VshotDmabufMap maps[VSHOT_MAX_MAPS];
     int map_count;
     // --- output ---
@@ -944,7 +959,123 @@ static int fourcc_to_sw_format(unsigned fourcc) {
 // dma-buf surfaces) -> scale_vaapi=format=nv12 -> VAAPI out (what the
 // encoder takes).  The GPU does the colour conversion; no pixels are
 // touched on the CPU.
-static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
+//
+// `in_w`/`in_h` are the input frames' size, which is not always the
+// encoder's: `record window` rebuilds this graph when the window is resized
+// mid-recording.  When `fit_w`/`fit_h` are positive the graph fits the
+// input into that box — scaled down until it fits, never up, then
+// letterboxed — so the encoder's own canvas stays the size it was opened
+// for.  The open-time call passes the encoder's size and no fit box.
+//
+// The letterbox is composed with `overlay_vaapi` over a black plate, and the
+// plate is an input the caller feeds with every frame (see
+// `vshot_av_enc_send_dmabuf`).  `pad_vaapi` would be the two-filter way to
+// write those bars, but it only writes where it draws: on radeonsi the
+// padded region keeps whatever the output surface held before, and the
+// surfaces a rebuilt fit chain draws into are exactly the ones the previous
+// chain used — so the bars replay the old size's pixels (measured: a window
+// resized smaller left its old content in the letterbox).  overlay_vaapi
+// rewrites the whole canvas — main first, blended content second — so the
+// bars are the plate's colour by construction, every frame, whatever the
+// surface used to hold.
+//
+// The plate itself: a canvas-sized VAAPI pool in the packed format and one
+// black frame in it, uploaded once.  Every capture frame re-sends a
+// reference to it, so the composed canvas has a defined background at every
+// pixel the content does not reach.  The alpha byte is 255 — the plate is
+// the background it is composed over.
+static int build_plate(VshotAvEnc *enc, int width, int height) {
+    enc->plate_frames = api->hwframe_ctx_alloc(enc->device);
+    if (!enc->plate_frames) {
+        snprintf(enc->err, sizeof(enc->err), "could not allocate the plate's frame pool");
+        return -1;
+    }
+    AVHWFramesContext *plate_pool = (AVHWFramesContext *)enc->plate_frames->data;
+    plate_pool->format = AV_PIX_FMT_VAAPI;
+    plate_pool->sw_format = AV_PIX_FMT_BGRA;
+    plate_pool->width = width;
+    plate_pool->height = height;
+    int ret = api->hwframe_ctx_init(enc->plate_frames);
+    if (ret < 0) {
+        set_err(enc, "could not initialise the plate's frame pool", ret);
+        return -1;
+    }
+    enc->plate = api->frame_alloc();
+    AVFrame *sw = api->frame_alloc();
+    if (!enc->plate || !sw) {
+        snprintf(enc->err, sizeof(enc->err), "could not allocate the plate frame");
+        api->frame_free(&enc->plate);
+        api->frame_free(&sw);
+        return -1;
+    }
+    ret = api->hwframe_get_buffer(enc->plate_frames, enc->plate, 0);
+    if (ret < 0) {
+        set_err(enc, "could not allocate the plate's surface", ret);
+        api->frame_free(&enc->plate);
+        api->frame_free(&sw);
+        return -1;
+    }
+    sw->format = AV_PIX_FMT_BGRA;
+    sw->width = width;
+    sw->height = height;
+    ret = api->frame_get_buffer(sw, 0);
+    if (ret < 0) {
+        set_err(enc, "could not allocate the plate's pixels", ret);
+        api->frame_free(&enc->plate);
+        api->frame_free(&sw);
+        return -1;
+    }
+    for (int y = 0; y < height; y++) {
+        uint8_t *row = sw->data[0] + (size_t)y * sw->linesize[0];
+        for (int x = 0; x < width; x++) {
+            row[x * 4 + 0] = 0;
+            row[x * 4 + 1] = 0;
+            row[x * 4 + 2] = 0;
+            row[x * 4 + 3] = 255;
+        }
+    }
+    ret = api->hwframe_transfer_data(enc->plate, sw, 0);
+    api->frame_free(&sw);
+    if (ret < 0) {
+        set_err(enc, "could not upload the plate", ret);
+        api->frame_free(&enc->plate);
+        return -1;
+    }
+    return 0;
+}
+
+static int open_filtergraph_dmabuf_fit(VshotAvEnc *enc, int sw_format, int in_w, int in_h,
+                                       int fit_w, int fit_h);
+
+// Tears down whatever chain this session currently has: the filtergraph, the
+// fit chain's plate (frame and pool) and the dma-buf input pool.  A rebuild
+// replaces all of it together.
+static void teardown_graph(VshotAvEnc *enc) {
+    if (enc->graph) {
+        api->filter_graph_free(&enc->graph);
+    }
+    enc->graph = NULL;
+    enc->graph_src = NULL;
+    enc->graph_sink = NULL;
+    enc->graph_plate = NULL;
+    if (enc->plate) {
+        api->frame_free(&enc->plate);
+    }
+    if (enc->plate_frames) {
+        api->buffer_unref(&enc->plate_frames);
+    }
+    if (enc->frames) {
+        api->buffer_unref(&enc->frames);
+    }
+}
+
+// Builds one chain.  `use_overlay` is only meaningful when fitting: 1 builds
+// the plate + overlay chain, 0 the pad chain (the fallback for drivers whose
+// overlay_vaapi refuses to configure).  On failure the caller tears down
+// whatever was built.
+static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, int fit_w,
+                           int fit_h, int use_overlay) {
+    int overlay = use_overlay && fit_w > 0 && fit_h > 0;
     if (!api->filter_loaded) {
         snprintf(enc->err, sizeof(enc->err),
                  "libavfilter is not available, so zero-copy recording cannot run "
@@ -965,8 +1096,8 @@ static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
     AVHWFramesContext *frames = (AVHWFramesContext *)enc->frames->data;
     frames->format = AV_PIX_FMT_VAAPI;
     frames->sw_format = sw_format;
-    frames->width = enc->width;
-    frames->height = enc->height;
+    frames->width = in_w;
+    frames->height = in_h;
     int ret = api->hwframe_ctx_init(enc->frames);
     if (ret < 0) {
         set_err(enc, "could not initialise the input frame pool", ret);
@@ -1005,12 +1136,49 @@ static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
     }
     char config[128];
     snprintf(config, sizeof(config),
-             "video_size=%dx%d:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1", enc->width,
-             enc->height, (int)AV_PIX_FMT_VAAPI);
+             "video_size=%dx%d:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1", in_w, in_h,
+             (int)AV_PIX_FMT_VAAPI);
     ret = api->filter_init_str(enc->graph_src, config);
     if (ret < 0) {
         set_err(enc, "could not initialise the source filter", ret);
         return -1;
+    }
+    // The fit chain needs a second input, the black plate the letterbox is
+    // composed over.  It is a canvas-sized VAAPI pool of its own; the plate
+    // frame in it is uploaded once (build_plate) and re-sent with every
+    // capture frame.
+    if (overlay) {
+        if (build_plate(enc, fit_w, fit_h) != 0) {
+            return -1;
+        }
+        enc->graph_plate = api->filter_graph_alloc_filter(enc->graph, source, "Plate");
+        if (!enc->graph_plate) {
+            snprintf(enc->err, sizeof(enc->err), "could not allocate the plate's source filter");
+            return -1;
+        }
+        AVBufferSrcParameters *plate_params = api->buffersrc_parameters_alloc();
+        if (!plate_params) {
+            snprintf(enc->err, sizeof(enc->err),
+                     "could not allocate the plate source's parameters");
+            return -1;
+        }
+        memset(plate_params, 0, sizeof(*plate_params));
+        plate_params->format = AV_PIX_FMT_NONE;
+        plate_params->hw_frames_ctx = enc->plate_frames;
+        ret = api->buffersrc_parameters_set(enc->graph_plate, plate_params);
+        free(plate_params);
+        if (ret < 0) {
+            set_err(enc, "could not set the plate source's frames context", ret);
+            return -1;
+        }
+        snprintf(config, sizeof(config),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1", fit_w, fit_h,
+                 (int)AV_PIX_FMT_VAAPI);
+        ret = api->filter_init_str(enc->graph_plate, config);
+        if (ret < 0) {
+            set_err(enc, "could not initialise the plate source filter", ret);
+            return -1;
+        }
     }
     enc->graph_sink = api->filter_graph_alloc_filter(enc->graph, sink, "Sink");
     if (!enc->graph_sink) {
@@ -1039,12 +1207,81 @@ static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
     outputs->filter_ctx = enc->graph_src;
     outputs->pad_idx = 0;
     outputs->next = NULL;
+    if (overlay) {
+        // The plate is the chain's second source: its own buffer filter,
+        // fed the black plate frame with every capture frame.
+        AVFilterInOut *plate_link = api->filter_inout_alloc();
+        if (!plate_link) {
+            snprintf(enc->err, sizeof(enc->err), "could not allocate the plate's in/out link");
+            api->filter_inout_free(&inputs);
+            api->filter_inout_free(&outputs);
+            return -1;
+        }
+        plate_link->name = api->strdup("plate");
+        plate_link->filter_ctx = enc->graph_plate;
+        plate_link->pad_idx = 0;
+        plate_link->next = NULL;
+        outputs->next = plate_link;
+    }
     inputs->name = api->strdup("out");
     inputs->filter_ctx = enc->graph_sink;
     inputs->pad_idx = 0;
     inputs->next = NULL;
-    ret = api->filter_graph_parse_ptr(enc->graph, "scale_vaapi=format=nv12:out_range=full",
-                                      &inputs, &outputs, NULL);
+    char chain[512];
+    if (fit_w > 0 && fit_h > 0) {
+        // Fit the new-size frame into the canvas: scaled down when it is
+        // larger than the box, kept at its own size and centred when it is
+        // smaller (never upscaled — a recording does not invent pixels).
+        int scaled_w = in_w;
+        int scaled_h = in_h;
+        if (in_w > fit_w || in_h > fit_h) {
+            double scale = (double)fit_w / (double)in_w;
+            double by_height = (double)fit_h / (double)in_h;
+            if (by_height < scale) {
+                scale = by_height;
+            }
+            scaled_w = ((int)((double)in_w * scale)) & ~1;
+            scaled_h = ((int)((double)in_h * scale)) & ~1;
+            if (scaled_w < 2) {
+                scaled_w = 2;
+            }
+            if (scaled_h < 2) {
+                scaled_h = 2;
+            }
+        }
+        if (overlay) {
+            // The scaled frame carries no alpha (`bgr0`): overlay_vaapi
+            // treats an overlay input with an alpha channel as
+            // premultiplied, and a capture buffer's alpha byte is whatever
+            // the compositor left there — zero for a fully occluding window
+            // — which would erase the content from the composed frame.
+            // Dropping the byte keeps the pixels; the plate underneath
+            // supplies the background.
+            snprintf(chain, sizeof(chain),
+                     "[in]scale_vaapi=w=%d:h=%d:format=bgr0[content];"
+                     "[plate]null[bg];"
+                     "[bg][content]overlay_vaapi=x=(main_w-overlay_w)/2:y=(main_h-"
+                     "overlay_h)/2[comp];"
+                     "[comp]scale_vaapi=format=nv12:out_range=full[out]",
+                     scaled_w, scaled_h);
+        } else {
+            // The fallback composition, for drivers whose overlay_vaapi will
+            // not configure: scale to fit, then pad the rest of the canvas.
+            // The fill lands in the packed surface before the NV12
+            // conversion (padding after it would fill the planes with YUV
+            // zeros, which a full-range player decodes as dark green), but
+            // pad only writes where it draws — see the note above.
+            const char *packed = sw_format == AV_PIX_FMT_BGRA ? "bgra" : "bgr0";
+            snprintf(chain, sizeof(chain),
+                     "[in]scale_vaapi=w=%d:h=%d:format=%s[content];"
+                     "[content]pad_vaapi=w=%d:h=%d:x=(ow-iw)/2:y=(oh-ih)/2,"
+                     "scale_vaapi=format=nv12:out_range=full[out]",
+                     scaled_w, scaled_h, packed, fit_w, fit_h);
+        }
+    } else {
+        snprintf(chain, sizeof(chain), "[in]scale_vaapi=format=nv12:out_range=full[out]");
+    }
+    ret = api->filter_graph_parse_ptr(enc->graph, chain, &inputs, &outputs, NULL);
     api->filter_inout_free(&inputs);
     api->filter_inout_free(&outputs);
     if (ret < 0) {
@@ -1064,6 +1301,42 @@ static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
     return 0;
 }
 
+// The chain the encoder runs: the overlay composition for a fit, the
+// two-filter conversion otherwise.
+//
+// The overlay chain is preferred where it works because it *writes* the
+// letterbox (see above); a driver whose VAAPI video processor cannot blend
+// refuses to configure it — `overlay_vaapi` needs VA_BLEND_GLOBAL_ALPHA —
+// and the pad chain is the one that has always been here, so it is the
+// fallback rather than the only route.
+static int open_filtergraph_dmabuf_fit(VshotAvEnc *enc, int sw_format, int in_w, int in_h,
+                                       int fit_w, int fit_h) {
+    if (fit_w <= 0 || fit_h <= 0) {
+        return build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 0);
+    }
+    // A test hook for the fallback: the machines this was developed on all
+    // blend, so the pad chain would otherwise never run in a test.
+    if (getenv("VSHOT_RECORD_NO_OVERLAY")) {
+        return build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 0);
+    }
+    if (build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 1) == 0) {
+        return 0;
+    }
+    if (trace_enabled()) {
+        fprintf(stderr,
+                "vshot:   the overlay fit chain did not configure (%s); falling back to the "
+                "pad chain\n",
+                enc->err);
+    }
+    teardown_graph(enc);
+    return build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 0);
+}
+
+// The open-time graph: the input pool is the output pool.
+static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
+    return open_filtergraph_dmabuf_fit(enc, sw_format, enc->width, enc->height, 0, 0);
+}
+
 // Opens a session whose factory is done by the caller: the software path
 // calls this with `dmabuf == 0` after sizing `enc->sw`, the zero-copy path
 // with `dmabuf == 1` and the buffer's fourcc.
@@ -1071,6 +1344,8 @@ static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec
                        int dmabuf, unsigned fourcc) {
     enc->width = width;
     enc->height = height;
+    enc->in_w = width;
+    enc->in_h = height;
     enc->dmabuf = dmabuf;
     enc->fourcc = fourcc;
     if (open_encoder(enc, width, height, codec, qp) != 0) {
@@ -1225,6 +1500,12 @@ void vshot_av_enc_destroy(VshotAvEnc *enc) {
             api->frame_free(&enc->sw);
         }
     }
+    if (enc->plate && api) {
+        api->frame_free(&enc->plate);
+    }
+    if (enc->plate_frames && api) {
+        api->buffer_unref(&enc->plate_frames);
+    }
     if (enc->graph && api) {
         api->filter_graph_free(&enc->graph);
     }
@@ -1330,14 +1611,14 @@ static AVFrame *map_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t mo
     desc->nb_objects = 1;
     desc->objects[0].fd = fd;
     desc->objects[0].format_modifier = modifier;
-    desc->objects[0].size = (size_t)stride * (size_t)enc->height;
+    desc->objects[0].size = (size_t)stride * (size_t)enc->in_h;
     desc->layers[0].format = fourcc;
     desc->layers[0].nb_planes = 1;
     desc->layers[0].planes[0].object_index = 0;
     desc->layers[0].planes[0].offset = offset;
     desc->layers[0].planes[0].pitch = stride;
-    drm->width = enc->width;
-    drm->height = enc->height;
+    drm->width = enc->in_w;
+    drm->height = enc->in_h;
     drm->format = AV_PIX_FMT_DRM_PRIME;
     drm->data[0] = (uint8_t *)desc;
     // The descriptor is plain C memory and the buffer owns it: `free` is
@@ -1421,6 +1702,27 @@ int vshot_av_enc_send_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t 
         return -1;
     }
     api->frame_free(&feed);
+    // A fit graph has a second input: the black plate its letterbox is
+    // composed over.  It needs one reference per output frame — the
+    // framesync behind overlay_vaapi pairs the two by frame — and the same
+    // uploaded plate serves all of them.
+    if (enc->graph_plate && enc->plate) {
+        AVFrame *plate = api->frame_alloc();
+        if (!plate) {
+            snprintf(enc->err, sizeof(enc->err), "could not allocate a plate reference");
+            return -1;
+        }
+        ret = api->frame_ref(plate, enc->plate);
+        if (ret >= 0) {
+            plate->pts = enc->frames_sent;
+            ret = api->buffersrc_add_frame_flags(enc->graph_plate, plate, 0);
+        }
+        api->frame_free(&plate);
+        if (ret < 0) {
+            set_err(enc, "feeding the plate to the filtergraph failed", ret);
+            return -1;
+        }
+    }
     double t_filter_in = trace_enabled() ? now_ms() : 0.0;
     // The conversion may lag the input by nothing at all (no buffering in
     // scale_vaapi), but the contract is to drain whatever the graph emits.
@@ -1460,19 +1762,120 @@ int vshot_av_enc_send_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t 
     return status;
 }
 
+// Rebuilds the zero-copy chain for a new input size, fitting the frames into
+// the encoder's canvas.
+//
+// `record window` records one window's own pixels, and a window can be
+// resized while the recording runs.  The compositor re-sends its buffer
+// constraints at the new size (and refuses frames of the old one), and the
+// capture pool is rebuilt — but the encoder was opened once for the
+// recording's canvas, and one MP4 holds one frame size.  So the input side
+// is what moves: the old filtergraph (and the old input pool it mapped
+// through) is torn down, a new one is built for the new size, and it scales
+// the frames down until they fit the canvas and letterboxes them into it.
+// A frame's geometry on screen is preserved, and the file keeps the same
+// dimensions from its first packet to its trailer.
+//
+// Freeing the old graph while the encoder still has a couple of pictures in
+// flight is safe: the encoder took its own references to the filtered frames
+// it was handed (measured — see the `fit-midstream-probe`).
+int vshot_av_enc_resize_fit(VshotAvEnc *enc, int in_w, int in_h, unsigned fourcc) {
+    if (!api || !enc || !enc->ctx) {
+        return -1;
+    }
+    if (!enc->dmabuf) {
+        snprintf(enc->err, sizeof(enc->err),
+                 "resizing the fit chain needs a dma-buf session");
+        return -1;
+    }
+    if (in_w <= 0 || in_h <= 0) {
+        snprintf(enc->err, sizeof(enc->err), "refusing a %dx%d resize", in_w, in_h);
+        return -1;
+    }
+    // A rebuild is also how a compositor that changes its offered format
+    // across a resize is followed: the new fourcc becomes the session's.
+    if (fourcc == 0) {
+        fourcc = enc->fourcc;
+    }
+    if (in_w == enc->in_w && in_h == enc->in_h && fourcc == enc->fourcc) {
+        return 0;
+    }
+    // The old chain goes first: the graph holds the input pool referenced by
+    // the mappings, and both are replaced together.  The plate and its pool
+    // belong to the chain too — the rebuilt graph builds its own.
+    for (int i = 0; i < enc->map_count; i++) {
+        if (enc->maps[i].frame) {
+            api->frame_unref(enc->maps[i].frame);
+            api->frame_free(&enc->maps[i].frame);
+        }
+    }
+    enc->map_count = 0;
+    teardown_graph(enc);
+    int sw_format = fourcc_to_sw_format(fourcc);
+    if (sw_format < 0) {
+        snprintf(enc->err, sizeof(enc->err),
+                 "the dma-buf format 0x%08x is not a packed RGB format the encoder accepts",
+                 fourcc);
+        return -1;
+    }
+    // How the new graph is built depends on which side is bigger: an input
+    // larger than the canvas is scaled down to fit; a smaller one is left at
+    // its own size and centred — the fit chain expresses exactly that.
+    if (open_filtergraph_dmabuf_fit(enc, sw_format, in_w, in_h, enc->width, enc->height) != 0) {
+        return -1;
+    }
+    // The sink pool must still match what the encoder was opened with: same
+    // size, same format.  A mismatch would be a bug in the fit chain rather
+    // than a caller's mistake, so it is checked rather than assumed.
+    AVFilterLink *link = enc->graph_sink->inputs[0];
+    if (link->w != enc->width || link->h != enc->height) {
+        snprintf(enc->err, sizeof(enc->err),
+                 "the rebuilt fit chain is %dx%d, but the recording is %dx%d", link->w, link->h,
+                 enc->width, enc->height);
+        return -1;
+    }
+    enc->in_w = in_w;
+    enc->in_h = in_h;
+    enc->fourcc = fourcc;
+    if (trace_enabled()) {
+        fprintf(stderr, "vshot:   shim fit chain rebuilt for %dx%d (fourcc 0x%08x) into %dx%d\n",
+                in_w, in_h, fourcc, enc->width, enc->height);
+    }
+    return 0;
+}
+
 // Flushes the encoder: the frames still in flight come out of `take`.
 int vshot_av_enc_flush(VshotAvEnc *enc) {
     enc->out_len = 0;
     if (!api || !enc || !enc->ctx) {
         return -1;
     }
+    // A recording whose source never produced a frame arrives here with an
+    // encoder that has seen nothing: the VAAPI encoders' drain path assumes
+    // at least one picture was issued and a flush of an empty stream
+    // crashes inside libavcodec (measured: a static window recording killed
+    // with SIGTERM segfaulted in avcodec_send_frame before this guard).
+    // There is nothing to flush, and the muxer still writes its header and
+    // trailer — a playable zero-frame file rather than a dead process.
+    if (enc->frames_sent == 0) {
+        return 0;
+    }
     if (enc->dmabuf && enc->graph) {
         // The filtergraph has to be flushed first: pushing NULL through it
-        // is what sends its own tail to the sink.
+        // is what sends its own tail to the sink.  A fit graph has two
+        // inputs — content and plate — and both are ended, or the framesync
+        // behind overlay_vaapi would wait on the one still open.
         int ret = api->buffersrc_add_frame_flags(enc->graph_src, NULL, 0);
         if (ret < 0 && ret != AVERROR_EOF) {
             set_err(enc, "flushing the filtergraph failed", ret);
             return -1;
+        }
+        if (enc->graph_plate) {
+            ret = api->buffersrc_add_frame_flags(enc->graph_plate, NULL, 0);
+            if (ret < 0 && ret != AVERROR_EOF) {
+                set_err(enc, "flushing the plate's stream failed", ret);
+                return -1;
+            }
         }
         for (;;) {
             AVFrame *filtered = api->frame_alloc();
@@ -2109,6 +2512,25 @@ int vshot_rec_frame_dmabuf(VshotRec *rec, int fd, unsigned fourcc, uint64_t modi
         rec_take_enc_error(rec, "encoding a dma-buf frame failed");
     }
     return status;
+}
+
+// The source was resized mid-recording: the zero-copy chain is rebuilt so
+// the new-size frames are fitted into the canvas the file was opened with.
+// No duration is queued — this produces no packet, it only changes what the
+// next `vshot_rec_frame_dmabuf` feeds the encoder.
+int vshot_rec_resize_fit(VshotRec *rec, int width, int height, unsigned fourcc) {
+    if (!rec || !rec->enc) {
+        return -1;
+    }
+    if (rec->finished) {
+        snprintf(rec->err, sizeof(rec->err), "the recorder was already finished");
+        return -1;
+    }
+    if (vshot_av_enc_resize_fit(rec->enc, width, height, fourcc) != 0) {
+        rec_take_enc_error(rec, "resizing the capture chain failed");
+        return -1;
+    }
+    return 0;
 }
 
 // Flushes the encoder's remaining frames into the muxer and writes the

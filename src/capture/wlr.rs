@@ -647,9 +647,22 @@ impl WlrCapture {
             let timeout = rustix::event::Timespec::try_from(remaining).map_err(|_| {
                 VshotError::WaylandProtocol("capture timeout is out of range".into())
             })?;
-            let ready = rustix::event::poll(&mut poll_fds, Some(&timeout)).map_err(|error| {
-                VshotError::WaylandProtocol(format!("failed to poll Wayland connection: {error}"))
-            })?;
+            let ready = match rustix::event::poll(&mut poll_fds, Some(&timeout)) {
+                Ok(ready) => ready,
+                // A signal — the stop handler's, most of all — interrupts the
+                // poll; that is not a protocol failure, and returning from
+                // here with a timeout error would turn a clean stop into a
+                // dropped frame.
+                Err(rustix::io::Errno::INTR) => {
+                    drop(read_guard);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(VshotError::WaylandProtocol(format!(
+                        "failed to poll Wayland connection: {error}"
+                    )));
+                }
+            };
             if ready == 0 {
                 drop(read_guard);
                 self.state.pending.take();

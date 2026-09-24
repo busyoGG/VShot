@@ -354,13 +354,16 @@ vshot record stop                               # stop the running recording
   title (whole name first, then a case-insensitive substring), `--pick` it with
   a click, or leave it out for the focused one. A compositor without these
   protocols is told to record a screen instead.
-- **Two ways a window recording ends by itself.** If the window is *resized*
-  or *closed* while recording, the recording ends there: the file is finished
-  properly (trailer written) and stderr says why. One MP4 holds one frame size,
-  and the encoder would refuse the frames a resize brings, so stopping there
-  beats writing a broken file. If the window's output is off, disabled or
-  disconnected, no frame ever arrives; that is reported after a few seconds
-  rather than waited on forever.
+- **Resizing a window mid-recording.** A window *resized* while recording does
+  not end the recording: the compositor re-sends its buffer constraints at the
+  new size, vshot rebuilds the capture pool for them, and the new frames are
+  fitted into the recording's own canvas on the GPU — scaled down when larger,
+  centred at their own size when smaller, letterboxed. One MP4 keeps one frame
+  size from its first packet to its trailer, and the file is the window's whole
+  history. A window that is *closed* ends the recording there: the file is
+  finished properly (trailer written) and stderr says why. If the window's
+  output is off, disabled or disconnected, no frame ever arrives; that is
+  reported after a few seconds rather than waited on forever.
 
 - **Stopping.** `vshot record stop` (no display needed, so it binds to a
   compositor keybinding) or Ctrl+C in the terminal that started it. Both

@@ -30,8 +30,10 @@
 //! * **A window can change size, a recording cannot.**  The encoder is opened
 //!   for one frame size, and the compositor resends its constraints when the
 //!   window is resized.  Frames of a new size would be refused mid-file, so the
-//!   recording ends cleanly at the resize with a message saying so, and the
-//!   file up to that point is complete.
+//!   encoder is told to fit the new frames into the canvas the file was opened
+//!   with (scaled down, centred, over a black letterbox) and the recording goes
+//!   on: the window was on screen the whole time, so the file is its whole
+//!   history.
 //!
 //! * **The window can go away.**  Closing it stops the session, which ends the
 //!   recording the same way — the file is finished properly rather than left
@@ -188,6 +190,14 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
 /// window's content changes, so the loop asks and waits rather than samples.
 /// A still window therefore yields long-duration frames, and the file plays
 /// back at the pace the window actually changed.
+///
+/// The window can also change *size* while the recording runs.  One MP4
+/// holds one frame size, so the recording does not follow the new size; the
+/// encoder is told to fit the new frames into the canvas the file was
+/// opened with (scaled down, centred), and the recording goes on.  That is
+/// what [`Capture::Resized`] carries, and it is the difference between a
+/// recording of the window's session and a recording cut short the first
+/// time its user drags a corner.
 fn loop_over(
     capture: &mut WindowCapture,
     recorder: &mut Recorder,
@@ -209,6 +219,10 @@ fn loop_over(
     // Consecutive frames the compositor refused.  One is a dropped frame; a
     // run of them is a session that has stopped working.
     let mut consecutive_errors = 0u32;
+    // Refusals of a stale buffer while a resize is being settled.  These are
+    // expected during a resize animation and are bounded separately (and
+    // more generously) than frame errors: each one costs one grab wait.
+    let mut consecutive_retries = 0u32;
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
@@ -255,11 +269,70 @@ fn loop_over(
                 continue;
             }
             Ok(Capture::Interrupted) => break,
+            // The window was resized: the capture side has already rebuilt
+            // its pool at the new size, and the encoder has to fit the new
+            // frames into the canvas the file was opened with — one MP4
+            // holds one frame size, and the window was on screen the whole
+            // time, so the recording goes on.
+            Ok(Capture::Resized {
+                width,
+                height,
+                fourcc,
+            }) => {
+                // A successful rebuild is progress: the resize that caused
+                // whatever refusals preceded it is handled, so the retry
+                // budget starts over.
+                consecutive_retries = 0;
+                consecutive_errors = 0;
+                recorder.resize_fit(width, height, fourcc)?;
+                eprintln!(
+                    "vshot: the window was resized to {width}x{height}; fitting it into the \
+                     recording's {canvas_width}x{canvas_height} canvas",
+                    canvas_width = recorder.width(),
+                    canvas_height = recorder.height(),
+                );
+                continue;
+            }
+            // The compositor refused a frame whose buffer no longer matched
+            // its constraints, but the new constraints have not been
+            // dispatched yet.  The protocol's answer is to retry — and the
+            // retry is bounded, because a compositor that keeps refusing
+            // without ever sending new constraints is a session that is not
+            // working, not one that is about to.  The bound is generous: a
+            // resize animation refuses a good number in a row while the new
+            // size is still settling.
+            Ok(Capture::Retry) => {
+                consecutive_retries += 1;
+                if consecutive_retries >= 60 {
+                    return Err(VshotError::Recording(
+                        "the compositor kept refusing the capture buffer without sending new \
+                         constraints; the window capture session appears to be broken"
+                            .into(),
+                    ));
+                }
+                if debug_enabled() {
+                    eprintln!(
+                        "vshot: the compositor refused a stale buffer; retrying \
+                         ({consecutive_retries}/60)"
+                    );
+                }
+                // The retry comes back before any frame wait could have run
+                // (the refusal is immediate), so the pace has to come from
+                // here or this would spin on a compositor that is between
+                // constraint updates.
+                sleep_interruptible(
+                    next_frame_at
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(20)),
+                    interrupted,
+                );
+                continue;
+            }
             Ok(Capture::Ended(reason)) => {
-                // A window that closed or resized ends the recording rather
-                // than failing it: what was recorded is real and the file is
-                // finished properly.  Say why on stderr, because a recording
-                // that stops on its own has to explain itself.
+                // The window closed, or the compositor stopped the session:
+                // what was recorded is real and the file is finished
+                // properly.  Say why on stderr, because a recording that
+                // stops on its own has to explain itself.
                 eprintln!("vshot: the recording ended: {reason}");
                 break;
             }

@@ -258,7 +258,8 @@ vshot-%Y%m%d-%H%M%S.mp4（先取 $XDG_VIDEOS_DIR，再取 xdg-user-dirs 里那�
 
 录制没能开始时不会留下任何文件；进程被强行杀掉时留下的文件缺少采样表（播放器会如实报
 "无法播放"，而不是放一段错的视频）。VSHOT_RECORD_PIDFILE 覆盖 `stop` 读取的 pid 文件，
-VSHOT_RECORD_DEBUG=1 把每帧的阶段与所用 libavcodec 版本打到 stderr。"#,
+VSHOT_RECORD_DEBUG=1 把每帧的阶段与所用 libavcodec 版本打到 stderr，
+VSHOT_RECORD_NO_OVERLAY=1 强制黑边走备用合成路径而不是 GPU overlay（给不能混合的驱动用的测试开关）。"#,
     ),
     (
         "record monitor",
@@ -284,8 +285,9 @@ VSHOT_RECORD_DEBUG=1 把每帧的阶段与所用 libavcodec 版本打到 stderr�
 什么都不给就是当前焦点那扇。它需要合成器的 `ext_image_copy_capture_v1` 与窗口列表
 （`ext_foreign_toplevel_list_v1`）；没有这些的合成器会明确说明，让你改录屏幕。
 
-录制期间窗口被缩放或被关掉，录制就在那里结束：文件正常收尾（trailer 写完整），并说明原因，
-因为一个 MP4 只有一种帧尺寸。窗口所在的那块输出如果是关着、禁用或已断开，永远不会有帧送过来，
+录制期间窗口被缩放不会中断录制：新尺寸会被等比缩放适配进录制自己的画布（大则缩小、居中、
+加黑边），因为一个 MP4 只有一种帧尺寸——窗口一直在屏幕上，文件就该是它完整的历史。窗口被关掉
+则在那里结束：文件正常收尾（trailer 写完整），并说明原因。窗口所在的那块输出如果是关着、禁用或已断开，永远不会有帧送过来，
 这种情况几秒后会报出来，而不是一直等下去。加 --portal 时由合成器自己的选择器挑窗口，这里写的
 名字就决定不了具体哪一扇了；--portal 决定的是选择器列出窗口而不是屏幕。"#,
     ),

@@ -67,6 +67,7 @@ extern "C" {
         mic_channels: c_int,
     ) -> *mut VshotRec;
     fn vshot_rec_frame(rec: *mut VshotRec, rgba: *const u8, duration_ms: c_int) -> c_int;
+    fn vshot_rec_resize_fit(rec: *mut VshotRec, width: c_int, height: c_int, fourcc: u32) -> c_int;
     fn vshot_rec_frame_dmabuf(
         rec: *mut VshotRec,
         fd: c_int,
@@ -181,6 +182,11 @@ impl fmt::Display for VideoCodec {
 /// — the file is complete and seekable when `finish` returns.
 pub struct Recorder {
     handle: *mut VshotRec,
+    /// The canvas the file was opened with.  One MP4 holds one frame size
+    /// from its first packet to its trailer, so a source that is resized
+    /// mid-recording is fitted into this one instead of changing it.
+    width: u32,
+    height: u32,
 }
 
 // The recorder is created and used on the recording thread only; the raw
@@ -335,7 +341,11 @@ impl Recorder {
                 codec.word()
             )));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            width,
+            height,
+        })
     }
 
     /// Encodes one captured frame and muxes it.  `duration_ms` is how long
@@ -393,6 +403,42 @@ impl Recorder {
             ));
         }
         Ok(())
+    }
+
+    /// Follows a source that was resized mid-recording: the dma-buf chain is
+    /// rebuilt so the new-size frames are fitted into the canvas the file was
+    /// opened with (scaled down if larger, centred if smaller).  No frame is
+    /// encoded — the next [`Self::frame_dmabuf`] feeds the new chain.
+    /// `fourcc` is the format the capture side now delivers; 0 keeps the one
+    /// the recording was opened with.
+    pub fn resize_fit(&mut self, width: u32, height: u32, fourcc: u32) -> Result<()> {
+        if self.handle.is_null() {
+            return Err(VshotError::Recording("the recorder is closed".into()));
+        }
+        let status = unsafe {
+            vshot_rec_resize_fit(
+                self.handle,
+                c_int::try_from(width).unwrap_or(0),
+                c_int::try_from(height).unwrap_or(0),
+                fourcc,
+            )
+        };
+        if status != 0 {
+            return Err(VshotError::Recording(
+                self.last_error("following the window resize failed"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The frame size the recording was opened with, which is the size its
+    /// file reports — and what a resize is fitted into.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
     }
 
     /// Flushes the encoder and writes the container's trailer, leaving a
