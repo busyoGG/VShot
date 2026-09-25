@@ -42,6 +42,18 @@ const EXPIRE_MS: i32 = 4000;
 /// this is the glance that says it looks like what was asked for.
 const BODY_LIMIT: usize = 160;
 
+/// The kind of result a notification reports.  Each one has its own switch in
+/// the config file (`ocr.notify`, `record.notify`, `replay.notify`), because a
+/// user may want a recording's receipt but not a stream of text-recognition
+/// notes, or the other way round -- reading one key for all of them would make
+/// one preference silence the other's report.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Ocr,
+    Recording,
+    Replay,
+}
+
 /// Says that the text is ready, having just been sent to `destination`.
 pub fn ocr_finished(text: &str, to_clipboard: bool) {
     let chinese = crate::cli_i18n::prefers_chinese();
@@ -49,6 +61,7 @@ pub fn ocr_finished(text: &str, to_clipboard: bool) {
         // An empty result is a result: saying "finished" over an unchanged
         // clipboard would leave the user pasting whatever was there before.
         send(
+            Kind::Ocr,
             if chinese {
                 "没识别到文字"
             } else {
@@ -67,13 +80,14 @@ pub fn ocr_finished(text: &str, to_clipboard: bool) {
         (false, true) => "Copied to the clipboard",
         (false, false) => "Text recognized",
     };
-    send(summary, &preview(text));
+    send(Kind::Ocr, summary, &preview(text));
 }
 
 /// Says that the recognition itself failed, with the reason it gives.
 pub fn ocr_failed(reason: &str) {
     let chinese = crate::cli_i18n::prefers_chinese();
     send(
+        Kind::Ocr,
         if chinese {
             "取字失败"
         } else {
@@ -98,13 +112,14 @@ pub fn recording_finished(path: &std::path::Path, frames: usize, seconds: f64) {
         "Recording saved"
     };
     let body = format!("{} — {} frames, {:.1}s", path.display(), frames, seconds);
-    send(summary, &preview(&body));
+    send(Kind::Recording, summary, &preview(&body));
 }
 
 /// Says that a recording could not start or stopped short, with the reason.
 pub fn recording_failed(reason: &str) {
     let chinese = crate::cli_i18n::prefers_chinese();
     send(
+        Kind::Recording,
         if chinese {
             "录制失败"
         } else {
@@ -125,12 +140,12 @@ pub fn replay_saved(path: &std::path::Path, seconds: f64) {
         "Replay saved"
     };
     let body = format!("{} — {:.1}s", path.display(), seconds);
-    send(summary, &preview(&body));
+    send(Kind::Replay, summary, &preview(&body));
 }
 
-/// Sends a notification, unless the user turned them off (`cli.ocr.notify`).
-fn send(summary: &str, body: &str) {
-    if !notifications_enabled() {
+/// Sends a notification, unless the user turned this kind off.
+fn send(kind: Kind, summary: &str, body: &str) {
+    if !enabled(kind) {
         return;
     }
     if let Err(error) = post(summary, body) {
@@ -138,11 +153,16 @@ fn send(summary: &str, body: &str) {
     }
 }
 
-/// Whether the config file asks for notifications.  Absent means yes: the
-/// notification is the point of the feature, and it is one switch away from
-/// off in the settings window.
-fn notifications_enabled() -> bool {
-    config::load().ocr.notify.unwrap_or(true)
+/// Whether the config file asks for this kind of notification.  Absent means
+/// yes for each: a notification is the point of the feature, and it is one
+/// switch away from off in the settings window.
+fn enabled(kind: Kind) -> bool {
+    let cli = config::load();
+    match kind {
+        Kind::Ocr => cli.ocr.notify.unwrap_or(true),
+        Kind::Recording => cli.record.notify.unwrap_or(true),
+        Kind::Replay => cli.replay.notify.unwrap_or(true),
+    }
 }
 
 fn post(summary: &str, body: &str) -> zbus::Result<()> {

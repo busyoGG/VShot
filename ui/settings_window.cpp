@@ -372,6 +372,40 @@ std::uint32_t spinValue(const QSpinBox *spin)
 const QString kNoMicrophone = QStringLiteral("\x01 none");
 const QString kDefaultMicrophone = QStringLiteral("\x01 default");
 
+/// The combo entry a stored microphone maps to: the "none" marker when the
+/// config has no microphone, the "default input" marker for the empty name, and
+/// the node name itself otherwise.
+QString microphoneMarker(bool enabled, const QString &name)
+{
+    if (!enabled) {
+        return kNoMicrophone;
+    }
+    return name.isEmpty() ? kDefaultMicrophone : name;
+}
+
+/// The `follow` line's text: the window names joined with commas.  One line
+/// carries several names, which is what the file stores as an array, and a hand
+/// edit reads the same as the `--follow` list on the command line.
+QString followText(const QStringList &names)
+{
+    return names.join(QStringLiteral(", "));
+}
+
+/// Splits the follow line back into names, dropping blanks: a trailing comma or
+/// an empty field is a typo, not a window named the empty string, and the CLI
+/// drops the same blanks out of a remembered list.
+QStringList parseFollowText(const QString &text)
+{
+    QStringList names;
+    for (const QString &piece : text.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const QString name = piece.trimmed();
+        if (!name.isEmpty()) {
+            names.append(name);
+        }
+    }
+    return names;
+}
+
 /// How long to wait for the input listing.  `vshot` gives up on PipeWire
 /// itself after five seconds, so this is that plus room to start and exit.
 constexpr int kMicrophoneListTimeoutMs = 8000;
@@ -606,6 +640,32 @@ void addRow(QWidget *card, const QString &label, const QString &hint, QWidget *c
     control->setFixedHeight(kControlHeight);
     rowLayout->addWidget(control, 0, Qt::AlignRight | Qt::AlignVCenter);
     cardLayout->addWidget(row);
+}
+
+/// Fills a microphone combo: silence and the session's own default input first,
+/// then the inputs this session actually has, then -- when nothing is offering
+/// it right now -- the name the file remembers.  A microphone that is merely
+/// unplugged today must not be dropped from the file by opening and saving this
+/// window.  Both the recording and the replay card carry one of these, so the
+/// filling lives here once.
+///
+/// `wanted` is the marker to keep selected: the box's current entry on a
+/// re-detect, and the file's own value on the first fill.
+void fillMicrophoneCombo(QComboBox *box, const QString &wanted)
+{
+    box->clear();
+    box->addItem(uiTr("Do not record audio"), kNoMicrophone);
+    box->addItem(uiTr("The session's default input"), kDefaultMicrophone);
+    const QList<QPair<QString, QString>> inputs = detectedMicrophones();
+    for (const QPair<QString, QString> &input : inputs) {
+        box->addItem(input.second, input.first);
+        box->setItemData(box->count() - 1, input.first, Qt::ToolTipRole);
+    }
+    if (wanted != kNoMicrophone && wanted != kDefaultMicrophone && box->findData(wanted) < 0) {
+        box->addItem(wanted, wanted);
+        box->setItemData(box->count() - 1, wanted, Qt::ToolTipRole);
+    }
+    selectChoice(box, wanted);
 }
 
 /// A page heading and its explanation, above the first card.
@@ -994,40 +1054,30 @@ private:
     /// What the config remembers as the microphone, in the box's own terms.
     QString rememberedMicrophone() const
     {
-        if (!config_.cli.recordMicEnabled) {
-            return kNoMicrophone;
-        }
-        return config_.cli.recordMic.isEmpty() ? kDefaultMicrophone : config_.cli.recordMic;
+        return microphoneMarker(config_.cli.recordMicEnabled, config_.cli.recordMic);
     }
 
-    /// Fills the microphone row: silence and the session's own default input
-    /// first, then the inputs this session actually has, then -- when nothing
-    /// is offering it right now -- the name the file remembers.  A microphone
-    /// that is merely unplugged today must not be dropped from the file by
-    /// opening and saving this window.
+    /// Fills the recording card's microphone row.  The config is read through
+    /// [`rememberedMicrophone`]; rebuilding from the box rather than the config
+    /// is what makes re-detecting midway through an edit keep the user's choice.
     void fillMicrophoneBox()
     {
-        // What to keep selected: what the box holds now, and on the first call
-        // -- when the box is still empty -- what the file holds.  Rebuilding
-        // from the box rather than from the config is what makes re-detecting
-        // midway through an edit keep the user's choice.
         const QString shown = recordMicBox_->currentData().toString();
-        const QString wanted = shown.isEmpty() ? rememberedMicrophone() : shown;
+        fillMicrophoneCombo(recordMicBox_, shown.isEmpty() ? rememberedMicrophone() : shown);
+    }
 
-        recordMicBox_->clear();
-        recordMicBox_->addItem(uiTr("Do not record audio"), kNoMicrophone);
-        recordMicBox_->addItem(uiTr("The session's default input"), kDefaultMicrophone);
-        const QList<QPair<QString, QString>> inputs = detectedMicrophones();
-        for (const QPair<QString, QString> &input : inputs) {
-            recordMicBox_->addItem(input.second, input.first);
-            recordMicBox_->setItemData(recordMicBox_->count() - 1, input.first, Qt::ToolTipRole);
-        }
-        if (wanted != kNoMicrophone && wanted != kDefaultMicrophone &&
-            recordMicBox_->findData(wanted) < 0) {
-            recordMicBox_->addItem(wanted, wanted);
-            recordMicBox_->setItemData(recordMicBox_->count() - 1, wanted, Qt::ToolTipRole);
-        }
-        selectChoice(recordMicBox_, wanted);
+    QString rememberedReplayMicrophone() const
+    {
+        return microphoneMarker(config_.cli.replayMicEnabled, config_.cli.replayMic);
+    }
+
+    /// Fills the replay card's microphone row, on the same terms as the
+    /// recording's.
+    void fillReplayMicrophoneBox()
+    {
+        const QString shown = replayMicBox_->currentData().toString();
+        fillMicrophoneCombo(replayMicBox_,
+                            shown.isEmpty() ? rememberedReplayMicrophone() : shown);
     }
 
     QWidget *buildCliPage()
@@ -1133,12 +1183,31 @@ private:
                uiTr("All three encode on the GPU's media engine"),
                recordEncoderBox_, true);
 
+        recordEncoderBackendBox_ =
+            choiceBox(recording, encoderBackendNames(), uiTr("built-in default (auto)"));
+        recordEncoderBackendBox_->setObjectName(QStringLiteral("recordEncoderBackend"));
+        recordEncoderBackendBox_->setMinimumWidth(200);
+        selectChoice(recordEncoderBackendBox_, config_.cli.recordEncoderBackend);
+        addRow(recording, uiTr("Hardware encoder"),
+               uiTr("auto tries VAAPI then NVENC; NVENC records the software path"),
+               recordEncoderBackendBox_, false);
+
         recordFpsSpin_ = optionalSpin(recording, 240, uiTr(" fps"));
         recordFpsSpin_->setObjectName(QStringLiteral("recordFps"));
         recordFpsSpin_->setMinimumWidth(120);
         recordFpsSpin_->setValue(static_cast<int>(config_.cli.recordFps));
         addRow(recording, uiTr("Frame rate"), uiTr("1-240; the built-in default is 60"),
                recordFpsSpin_, false);
+
+        recordFollowEdit_ = new QLineEdit(recording);
+        recordFollowEdit_->setObjectName(QStringLiteral("recordFollow"));
+        recordFollowEdit_->setMinimumWidth(240);
+        recordFollowEdit_->setPlaceholderText(uiTr("no windows to follow"));
+        recordFollowEdit_->setText(followText(config_.cli.recordFollow));
+        addRow(recording, uiTr("Follow the focus"),
+               uiTr("Window names, comma-separated (`record window` with no NAME); the "
+                    "recording moves to whichever the focus lands on"),
+               recordFollowEdit_, false);
 
         recordPortalSwitch_ = new ModernSwitch(recording);
         recordPortalSwitch_->setObjectName(QStringLiteral("recordPortal"));
@@ -1174,7 +1243,132 @@ private:
                     "file keeps"),
                microphoneRow, false);
 
+        recordNotifySwitch_ = new ModernSwitch(recording);
+        recordNotifySwitch_->setObjectName(QStringLiteral("recordNotify"));
+        recordNotifySwitch_->setChecked(config_.cli.recordNotify);
+        recordNotifySwitch_->setToolTip(uiTr("A receipt for a recording started from a keybinding"));
+        addRow(recording, uiTr("Notify when the recording is written"),
+               uiTr("A desktop notification naming the file; it needs a notification daemon"),
+               recordNotifySwitch_, false);
+
+        buildReplayCard(page);
+
         return scroll;
+    }
+
+    /// The replay card: the same shape as the recording one, over the
+    /// `cli.replay` section.  It is its own card rather than rows shared with
+    /// the recording because the two sessions have their own sensible defaults
+    /// and their own keys -- a replay lives for hours at 30 fps, a recording for
+    /// minutes at 60 -- and one card showing both would have to say which of two
+    /// values each row meant.
+    void buildReplayCard(QWidget *page)
+    {
+        QWidget *replay = addCard(page, uiTr("Replay"));
+
+        replayWindowSpin_ = optionalSpin(replay, 3600, uiTr(" s"));
+        replayWindowSpin_->setObjectName(QStringLiteral("replayWindow"));
+        replayWindowSpin_->setMinimumWidth(120);
+        replayWindowSpin_->setValue(static_cast<int>(config_.cli.replayWindow));
+        addRow(replay, uiTr("History kept"),
+               uiTr("Seconds of history the ring holds, 1-3600; the built-in default is 30"),
+               replayWindowSpin_, true);
+
+        replayGopSpin_ = optionalSpin(replay, 10, uiTr(" s"));
+        replayGopSpin_->setObjectName(QStringLiteral("replayGop"));
+        replayGopSpin_->setMinimumWidth(120);
+        replayGopSpin_->setValue(static_cast<int>(config_.cli.replayGop));
+        addRow(replay, uiTr("Key-frame distance"),
+               uiTr("1-10 seconds; smaller makes a save start closer to the moment you asked "
+                    "for, at the cost of a bigger ring"),
+               replayGopSpin_, false);
+
+        replayEncoderBox_ = choiceBox(replay, encoderNames(), uiTr("built-in default (h264)"));
+        replayEncoderBox_->setObjectName(QStringLiteral("replayEncoder"));
+        replayEncoderBox_->setMinimumWidth(200);
+        selectChoice(replayEncoderBox_, config_.cli.replayEncoder);
+        addRow(replay, uiTr("Encoder"),
+               uiTr("All three encode on the GPU's media engine"),
+               replayEncoderBox_, false);
+
+        replayEncoderBackendBox_ =
+            choiceBox(replay, encoderBackendNames(), uiTr("built-in default (auto)"));
+        replayEncoderBackendBox_->setObjectName(QStringLiteral("replayEncoderBackend"));
+        replayEncoderBackendBox_->setMinimumWidth(200);
+        selectChoice(replayEncoderBackendBox_, config_.cli.replayEncoderBackend);
+        addRow(replay, uiTr("Hardware encoder"),
+               uiTr("auto tries VAAPI then NVENC; NVENC records the software path"),
+               replayEncoderBackendBox_, false);
+
+        replayFpsSpin_ = optionalSpin(replay, 240, uiTr(" fps"));
+        replayFpsSpin_->setObjectName(QStringLiteral("replayFps"));
+        replayFpsSpin_->setMinimumWidth(120);
+        replayFpsSpin_->setValue(static_cast<int>(config_.cli.replayFps));
+        addRow(replay, uiTr("Frame rate"),
+               uiTr("1-240; the built-in default is 30, which halves the encoder's work over "
+                    "a long session"),
+               replayFpsSpin_, false);
+
+        replayFollowEdit_ = new QLineEdit(replay);
+        replayFollowEdit_->setObjectName(QStringLiteral("replayFollow"));
+        replayFollowEdit_->setMinimumWidth(240);
+        replayFollowEdit_->setPlaceholderText(uiTr("no windows to follow"));
+        replayFollowEdit_->setText(followText(config_.cli.replayFollow));
+        addRow(replay, uiTr("Follow the focus"),
+               uiTr("Window names, comma-separated (`replay start window` with no NAME); the "
+                    "ring moves to whichever the focus lands on"),
+               replayFollowEdit_, false);
+
+        replayPortalSwitch_ = new ModernSwitch(replay);
+        replayPortalSwitch_->setObjectName(QStringLiteral("replayPortal"));
+        replayPortalSwitch_->setChecked(config_.cli.replayPortal);
+        replayPortalSwitch_->setToolTip(
+            uiTr("The compositor's own picker decides what is recorded"));
+        addRow(replay, uiTr("Through the desktop portal"),
+               uiTr("An experimental route for a compositor vshot cannot capture directly"),
+               replayPortalSwitch_, false);
+
+        replayMicBox_ = new ModernComboBox(replay);
+        replayMicBox_->setObjectName(QStringLiteral("replayMic"));
+        replayMicBox_->setMinimumWidth(240);
+        replayMicDetectButton_ = new QPushButton(uiTr("Detect"), replay);
+        replayMicDetectButton_->setObjectName(QStringLiteral("replayMicDetect"));
+        replayMicDetectButton_->setFixedHeight(kControlHeight);
+        replayMicDetectButton_->setToolTip(
+            uiTr("Ask the running session which inputs it has"));
+        connect(replayMicDetectButton_, &QPushButton::clicked, this,
+                [this] { fillReplayMicrophoneBox(); });
+        fillReplayMicrophoneBox();
+
+        auto *replayMicrophoneRow = new QWidget(replay);
+        auto *replayMicrophoneLayout = new QHBoxLayout(replayMicrophoneRow);
+        replayMicrophoneLayout->setContentsMargins(0, 0, 0, 0);
+        replayMicrophoneLayout->setSpacing(8);
+        replayMicBox_->setParent(replayMicrophoneRow);
+        replayMicDetectButton_->setParent(replayMicrophoneRow);
+        replayMicrophoneLayout->addWidget(replayMicBox_);
+        replayMicrophoneLayout->addWidget(replayMicDetectButton_);
+        addRow(replay, uiTr("Microphone"),
+               uiTr("Kept in the ring beside the video, as an AAC track"),
+               replayMicrophoneRow, false);
+
+        replaySaveDirEdit_ = new QLineEdit(replay);
+        replaySaveDirEdit_->setObjectName(QStringLiteral("replaySaveDir"));
+        replaySaveDirEdit_->setMinimumWidth(240);
+        replaySaveDirEdit_->setPlaceholderText(uiTr("the videos directory"));
+        replaySaveDirEdit_->setText(config_.cli.replaySaveDir);
+        addRow(replay, uiTr("Save directory"),
+               uiTr("Where `replay save` lands when it names no path; strftime is expanded"),
+               replaySaveDirEdit_, false);
+
+        replayNotifySwitch_ = new ModernSwitch(replay);
+        replayNotifySwitch_->setObjectName(QStringLiteral("replayNotify"));
+        replayNotifySwitch_->setChecked(config_.cli.replayNotify);
+        replayNotifySwitch_->setToolTip(
+            uiTr("A receipt for a save triggered from a keybinding"));
+        addRow(replay, uiTr("Notify when a save is written"),
+               uiTr("A desktop notification naming the file; it needs a notification daemon"),
+               replayNotifySwitch_, false);
     }
 
     QWidget *buildDialogPage()
@@ -1412,8 +1606,11 @@ private:
         cli.ocrNotify = ocrNotifySwitch_->isChecked();
 
         cli.recordEncoder = recordEncoderBox_->currentData().toString();
+        cli.recordEncoderBackend = recordEncoderBackendBox_->currentData().toString();
         cli.recordFps = spinValue(recordFpsSpin_);
         cli.recordPortal = recordPortalSwitch_->isChecked();
+        cli.recordFollow = parseFollowText(recordFollowEdit_->text());
+        cli.recordNotify = recordNotifySwitch_->isChecked();
         // Three answers, two stored states: no `mic` key at all is silence,
         // while the empty string is the session's default input.
         const QString microphone = recordMicBox_->currentData().toString();
@@ -1421,6 +1618,22 @@ private:
         cli.recordMic =
             (microphone == kNoMicrophone || microphone == kDefaultMicrophone) ? QString()
                                                                              : microphone;
+
+        cli.replayWindow = spinValue(replayWindowSpin_);
+        cli.replayGop = spinValue(replayGopSpin_);
+        cli.replayEncoder = replayEncoderBox_->currentData().toString();
+        cli.replayEncoderBackend = replayEncoderBackendBox_->currentData().toString();
+        cli.replayFps = spinValue(replayFpsSpin_);
+        cli.replayFollow = parseFollowText(replayFollowEdit_->text());
+        cli.replayPortal = replayPortalSwitch_->isChecked();
+        const QString replayMicrophone = replayMicBox_->currentData().toString();
+        cli.replayMicEnabled = replayMicrophone != kNoMicrophone;
+        cli.replayMic = (replayMicrophone == kNoMicrophone ||
+                         replayMicrophone == kDefaultMicrophone)
+                            ? QString()
+                            : replayMicrophone;
+        cli.replaySaveDir = replaySaveDirEdit_->text().trimmed();
+        cli.replayNotify = replayNotifySwitch_->isChecked();
 
         DialogPreferences &dialog = config.dialog;
         dialog.radius =
@@ -1480,10 +1693,24 @@ private:
     QComboBox *injectBox_ = nullptr;
     ModernSwitch *ocrNotifySwitch_ = nullptr;
     QComboBox *recordEncoderBox_ = nullptr;
+    QComboBox *recordEncoderBackendBox_ = nullptr;
     ModernSpinBox *recordFpsSpin_ = nullptr;
+    QLineEdit *recordFollowEdit_ = nullptr;
     ModernSwitch *recordPortalSwitch_ = nullptr;
     ModernComboBox *recordMicBox_ = nullptr;
     QPushButton *recordMicDetectButton_ = nullptr;
+    ModernSwitch *recordNotifySwitch_ = nullptr;
+    ModernSpinBox *replayWindowSpin_ = nullptr;
+    ModernSpinBox *replayGopSpin_ = nullptr;
+    QComboBox *replayEncoderBox_ = nullptr;
+    QComboBox *replayEncoderBackendBox_ = nullptr;
+    ModernSpinBox *replayFpsSpin_ = nullptr;
+    QLineEdit *replayFollowEdit_ = nullptr;
+    ModernSwitch *replayPortalSwitch_ = nullptr;
+    ModernComboBox *replayMicBox_ = nullptr;
+    QPushButton *replayMicDetectButton_ = nullptr;
+    QLineEdit *replaySaveDirEdit_ = nullptr;
+    ModernSwitch *replayNotifySwitch_ = nullptr;
     ModernSpinBox *dialogRadiusSpin_ = nullptr;
     ModernSpinBox *dialogBorderWidthSpin_ = nullptr;
     ShadowControls dialogShadow_;

@@ -65,6 +65,21 @@ pub struct RecordDefaults {
     /// `--portal`.  `null` (the default) keeps the compositor's own
     /// protocols; `--no-portal` overrides a remembered `true`.
     pub portal: Option<bool>,
+    /// The windows a `record window` moves between without `--follow`: the
+    /// names are the same ones the flag takes, and the fallback is read only
+    /// when the target is a plain `window` (no NAME, no `--pick`) — a
+    /// remembered follow must not turn a `record monitor` into an error, so
+    /// every other target ignores it.  `null` (the default) means whatever the
+    /// focus is on stays recorded; `--no-follow` turns a remembered list off
+    /// for one recording.
+    pub follow: Option<Vec<String>>,
+    /// Whether a finished recording raises a desktop notification.  A
+    /// recording started from a keybinding ends with nothing on screen to
+    /// mark the moment, so the notification is its receipt; that is why the
+    /// absent key means yes rather than no.  Like `ocr.notify` this is a
+    /// settings-window and hand-edit key with no flag of its own, and only
+    /// `false` is ever written.
+    pub notify: Option<bool>,
 }
 
 /// Defaults for `vshot replay`: the memory-replay settings the flags fall back
@@ -93,6 +108,11 @@ pub struct ReplayDefaults {
     /// Whether a replay uses the desktop portal instead of the compositor's
     /// own protocols, as `record --portal` does.
     pub portal: Option<bool>,
+    /// The windows a `replay start window` moves between without `--follow`,
+    /// read on the same terms as `record.follow`: only a plain `window` target
+    /// falls back to them, and `--no-follow` turns a remembered list off for
+    /// one session.
+    pub follow: Option<Vec<String>>,
     /// Where a triggered save lands; strftime is expanded.  The videos
     /// directory with a timestamped name when unset.
     pub save_dir: Option<String>,
@@ -287,6 +307,43 @@ mod tests {
         assert!(bare.cli.record.fps.is_none());
         assert!(bare.cli.record.portal.is_none());
         assert!(bare.cli.record.mic.is_none());
+        assert!(bare.cli.record.follow.is_none());
+    }
+
+    #[test]
+    fn the_record_section_remembers_the_windows_to_follow() {
+        // The follow list is the one value here that is not a scalar: the
+        // settings window writes several windows at once, and a session that
+        // read only the first would follow the wrong one of them.
+        let file: ConfigFile =
+            serde_json::from_str(r#"{"cli":{"record":{"follow":["game","chat"]}}}"#)
+                .expect("a follow list parses");
+        assert_eq!(
+            file.cli.record.follow.as_deref(),
+            Some(["game".to_owned(), "chat".to_owned()].as_slice())
+        );
+        // An empty list is a value the file can carry, and it means the same
+        // thing as the absent key: nothing to follow.
+        let empty: ConfigFile = serde_json::from_str(r#"{"cli":{"record":{"follow":[]}}}"#)
+            .expect("an empty list parses");
+        assert_eq!(empty.cli.record.follow.as_deref(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn the_replay_section_carries_its_own_follow_and_save_places() {
+        let file: ConfigFile = serde_json::from_str(
+            r#"{"cli":{"replay":{"follow":["game"],"save-dir":"/tmp/clips","notify":false}}}"#,
+        )
+        .expect("a replay section parses");
+        assert_eq!(
+            file.cli.replay.follow.as_deref(),
+            Some(["game".to_owned()].as_slice())
+        );
+        assert_eq!(file.cli.replay.save_dir.as_deref(), Some("/tmp/clips"));
+        assert_eq!(file.cli.replay.notify, Some(false));
+        // The recording side's follow is its own field: a replay list must not
+        // appear as one.
+        assert!(file.cli.record.follow.is_none());
     }
 }
 

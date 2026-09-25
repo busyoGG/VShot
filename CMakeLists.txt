@@ -97,7 +97,7 @@ if(VSHOT_BUILD_CHECKS)
     # The settings window check: it builds the real dialog and drives its
     # widgets, then reads the config file back. A field wired to the wrong
     # member is invisible until a user notices their stroke width changing
-    # their text size, so it is worth driving all eighteen of them.
+    # their text size, so it is worth driving every one of them.
     add_executable(vshot-settings-check
         ui/settings_check.cpp
         ui/settings_window.cpp

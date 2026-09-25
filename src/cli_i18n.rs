@@ -253,8 +253,9 @@ vshot-%Y%m%d-%H%M%S.mp4（先取 $XDG_VIDEOS_DIR，再取 xdg-user-dirs 里那�
 `--mic` 收的名字，设置窗口的麦克风一项也是照这份列表给的。没有输入设备的会话会得到一句说明，
 而不是一条错误。
 
---encoder、--fps、--portal、--mic 都不给时，各自去配置的 `cli.record` 段取值，设置窗口里改的
-也是这四个键。
+--encoder、--fps、--portal、--mic、--follow 都不给时，各自去配置的 `cli.record` 段取值；回录
+对应 `cli.replay` 段，设置窗口里改的就是这些键（加上 `encoder-backend` 与回录的 `save-dir` /
+`notify`）。
 
 录制一直进行到被停止：`vshot record stop` 发信号，或者在启动它的终端里按 Ctrl+C。两种方式都会
 在进程退出前把文件正常收尾（可寻址的 MP4，采样表写完整）。--duration 秒数让它自己结束。
@@ -356,8 +357,10 @@ libavcodec GPU 编码器，所以能录的会话就能回录，`record` 用零�
 `replay save` 写进 `--save-dir`（展开 strftime，默认视频目录下带时间戳的名字），除非给了路径：
 `vshot replay save /tmp/clip.mp4`。`--background` 让会话脱离终端，从而活得比启动它的 shell 久。
 
-配置文件的 `cli.replay` 段给出默认值：`window`、`encoder`、`fps`、`gop`、`mic`、`save-dir` 与
-`notify`。命令行永远压过文件。
+配置文件的 `cli.replay` 段给出默认值：`window`、`encoder`、`encoder-backend`、`fps`、`gop`、
+`mic`、`follow`、`portal`、`save-dir` 与 `notify`。命令行永远压过文件——`--no-follow` 对那一次
+会话把记着的 `follow` 列表关掉，正如 `--no-mic` 对记着的麦克风那样。记着的 `follow` 列表只在
+不带窗口名的 `replay start window` 上生效，与录制侧同一条规则。
 
 VSHOT_REPLAY_SOCKET 覆盖控制 socket，VSHOT_REPLAY_PIDFILE 覆盖 `replay stop` 读的 pid 文件，
 VSHOT_RECORD_DEBUG=1 追踪每一帧。"#,
@@ -514,6 +517,14 @@ const ARGS: &[(&str, &str)] = &[
     (
         "no_portal",
         "强制不走 portal，即使配置里记着 `cli.record.portal`。`record all` 只能用这条：portal 一次只给一路流，整个桌面是合成器自己协议的活。",
+    ),
+    (
+        "follow",
+        "焦点在这些窗口之间移动时换源：给若干窗口名（`--follow NAME`，可重复），焦点落在其中哪扇就录（回录）哪扇，落在别处就保持上一扇。只有 `record window` 与 `replay start window` 有窗口可换，且不能与窗口 NAME 同用。`record window` / `replay start window` 不带任何 `--follow` 时，跟随配置里 `cli.record.follow` / `cli.replay.follow` 记着的窗口。",
+    ),
+    (
+        "no_follow",
+        "强制不跟随焦点，即使配置里记着 `cli.record.follow` / `cli.replay.follow`：这一扇——焦点窗口——从头录到尾。",
     ),
     (
         "window",

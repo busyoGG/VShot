@@ -167,6 +167,47 @@ pub(crate) fn default_mic() -> Option<MicChoice> {
     }
 }
 
+/// The windows a `record window` follows without `--follow`: the config's
+/// `record.follow` when it names any.  An empty list on the command line is
+/// what `--no-follow` produces, so the caller decides whether the file gets a
+/// vote — this reads the file and nothing else, exactly like the other
+/// defaults here.
+///
+/// Names that are empty after trimming are dropped: a window name the
+/// compositor could never match (there is no such app id) is a hand edit gone
+/// wrong, and following it would pin the recording to nothing while the user
+/// believed a list was in effect.
+pub(crate) fn default_follow() -> Vec<String> {
+    clean_follow(crate::config::load().record.follow)
+}
+
+/// The replay-side twin of [`default_follow`], reading `replay.follow`.
+pub(crate) fn default_replay_follow() -> Vec<String> {
+    clean_follow(crate::config::load().replay.follow)
+}
+
+/// Drops the blank names out of a remembered follow list, so a stray empty
+/// string in the file does not become a window name nothing can match.
+fn clean_follow(remembered: Option<Vec<String>>) -> Vec<String> {
+    remembered
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !name.trim().is_empty())
+        .collect()
+}
+
+/// The remembered replay save directory: the config's `replay.save-dir` when
+/// it names one, expanded by the save path later.  `None` means the videos
+/// directory, which is what the flag's absence already means.
+pub(crate) fn default_replay_save_dir() -> Option<std::path::PathBuf> {
+    let remembered = crate::config::load().replay.save_dir?;
+    if remembered.trim().is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(remembered))
+    }
+}
+
 /// The remembered codec: `--encoder` overrides it, and the config's
 /// `record.encoder` decides what "no flag" means.  H.264 unless it says
 /// otherwise — so the config can only ever move the default off the codec

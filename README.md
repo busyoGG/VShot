@@ -344,6 +344,7 @@ vshot record monitor --no-mic                   # 配置里记着麦克风时强
 vshot record window --app-audio                 # 录这扇窗自己的声音（可与 --mic 同时给，混成一条）
 vshot record window --mic --app-audio           # 麦克风 + 窗口自己声音，混成一条音轨
 vshot record window --follow GameA --follow GameB   # 焦点在哪扇就录哪扇，只跟这两扇
+vshot record window --no-follow                 # 配置里记着跟随列表时强制不跟随
 vshot record monitor --encoder-backend nvenc    # NVIDIA 硬编（默认 auto：先 VAAPI，再 NVENC）
 vshot record mics                               # 列出这台机器上能录的音频输入
 vshot record stop                               # 停止（读取 pid 文件发信号）
@@ -428,8 +429,10 @@ vshot record stop                               # 停止（读取 pid 文件发�
   它的 pid 对应关系）。音轨同样是 AAC，与麦克风那条路共用编码与封装。
 - **跟随焦点（`--follow`）**：给若干窗口（`--follow NAME`，可重复），录制就跟着焦点在这些
   窗口之间移动——焦点落在其中哪扇就录哪扇，落在别处时**保持录上一扇**（不中断、不留空档、
-  也不会把那扇窗录进来）。`--follow` 与窗口 `NAME`、`--pick` 互斥（它自己就是选窗方式），
-  只对 `record window` 与 `replay start window` 有效。换源走的是**和窗口缩放同一条路**：
+  它不会把那扇窗录进来）。`--follow` 与窗口 `NAME`、`--pick` 互斥（它自己就是选窗方式），
+  只对 `record window` 与 `replay start window` 有效。**不带 `--follow` 的 `record window`
+  会跟随配置里 `cli.record.follow` 记着的窗口**（回录对应 `cli.replay.follow`），`--no-follow`
+  则对那一次显式关掉——正如 `--no-mic` 之于记着的麦克风。换源走的是**和窗口缩放同一条路**：
   新窗口的画面等比缩放进文件开录时的画布，所以**一条 MP4 只有一个帧尺寸**、时间线连续。
   `--app-audio` 时音轨也跟着换到新窗口自己应用的声音——而麦克风那一路**不动**，切源只换
   应用那一路（两个应用都是 48kHz 立体声，格式不变，所以 MP4 头的音频声明始终有效；
@@ -443,10 +446,13 @@ vshot record stop                               # 停止（读取 pid 文件发�
 - **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），
   所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，
   或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
-- **记住的默认值**：`--encoder`、`--encoder-backend`、`--fps`、`--portal`、`--mic` 不写时，
-  去配置文件的 `cli.record` 段取值（见 [`cli`——命令行默认值](#cli命令行默认值)）；
-  `replay` 对应 `cli.replay` 段。`--no-portal` 与 `--no-mic` 是对**那一次**录制把记着的值
-  关掉——有了它们，配置里记着 `portal: true` 或某个麦克风时也不必每次先改配置。
+- **记住的默认值**：`--encoder`、`--encoder-backend`、`--fps`、`--portal`、`--mic`、
+  `--follow` 不写时，去配置文件的 `cli.record` 段取值（见
+  [`cli`——命令行默认值](#cli命令行默认值)）；`replay` 对应 `cli.replay` 段。`--no-portal`、
+  `--no-mic` 与 `--no-follow` 是对**那一次**录制把记着的值关掉——有了它们，配置里记着
+  `portal: true`、某个麦克风或一份跟随列表时也不必每次先改配置。`cli.record.follow` 只在
+  不带窗口名的 `record window` 上生效，别的目标会忽略它（而不是报错），所以记着跟随列表也
+  不影响 `record monitor`。
   `vshot record mics` 列出这次会话里能录的音频输入，每行是 `节点序号	节点名	说明`
   （节点名就是 `--mic` 收的值），设置窗口的麦克风下拉读的正是它；没有输入设备的会话会说明
   一句，而不是报错。（`--app-audio` 只认命令行，不进配置文件——它录的是"这一扇窗的声音"，
@@ -517,8 +523,9 @@ vshot replay stop
 | `--encoder-backend` | `auto`（默认）/ `vaapi` / `nvenc`，同 `record` |
 | `--mic [DEVICE]` | 把麦克风一起留在环里，同 `record --mic`；`--no-mic` 强制不收 |
 | `--app-audio` | 额外留所录窗口自己的声音（`replay start window`），同 `record --app-audio`；可与 `--mic` 同时给，混成一条 |
-| `--follow NAME` | 焦点在这些窗口之间移动时换源（`replay start window`），同 `record --follow` |
-| `--save-dir DIR` | `replay save` 不给路径时的落盘目录（展开 strftime，默认视频目录） |
+| `--follow NAME` | 焦点在这些窗口之间移动时换源（`replay start window`），同 `record --follow`；不带 `--follow` 时跟随配置里的 `cli.replay.follow` |
+| `--no-follow` | 强制不跟随焦点，即使配置里记着 `cli.replay.follow` |
+| `--save-dir DIR` | `replay save` 不给路径时的落盘目录（展开 strftime，默认视频目录，不写时跟随配置里的 `cli.replay.save-dir`） |
 | `--background` | 只对 `replay start`：让会话脱离终端，活得比启动它的 shell 久 |
 
 ### 快捷键
@@ -536,7 +543,7 @@ bind = SUPER ALT, R, exec, vshot replay stop
 
 ### 配置
 
-配置文件的 `cli.replay` 段给出默认值（目前是手改文件；设置窗口的录制一栏还没有回录的行）：
+配置文件的 `cli.replay` 段给出默认值（也可以跑 `vshot settings`，在「命令行默认值」页的回录一栏里改）：
 
 ```jsonc
 "cli": {
@@ -547,6 +554,7 @@ bind = SUPER ALT, R, exec, vshot replay stop
     "encoder-backend": null, // auto / vaapi / nvenc；null 即 auto
     "gop": 1,                // 关键帧间隔秒数（1-10）
     "mic": null,             // "" 是默认输入设备，名字是某个 PipeWire 节点
+    "follow": null,          // 跟随的窗口名数组，如 ["game", "chat"]；null 即不跟随
     "portal": false,         // 回录暂不支持 portal
     "save-dir": null,        // 落盘目录，null 用视频目录
     "notify": true           // save 是否发通知
@@ -826,12 +834,15 @@ vshot settings
 | `record.fps` | `record --fps` | `60` |
 | `record.portal` | `record --portal` | `false` |
 | `record.mic` | `record --mic` | 不录 |
+| `record.follow` | 不带 `--follow` 的 `record window` 跟随的窗口（数组） | 不跟随 |
+| `record.notify` | 录制写盘后弹通知 | `true` |
 | `replay.window` | `replay --window` | `30` |
 | `replay.fps` | `replay --fps` | `30` |
 | `replay.encoder` | `replay --encoder` | `h264` |
 | `replay.encoder-backend` | `replay --encoder-backend` | `auto` |
 | `replay.gop` | `replay --gop` | `1` |
 | `replay.mic` | `replay --mic` | 不录 |
+| `replay.follow` | 不带 `--follow` 的 `replay start window` 跟随的窗口（数组） | 不跟随 |
 | `replay.portal` | `replay --portal` | `false` |
 | `replay.save-dir` | `replay --save-dir` | 视频目录 |
 | `replay.notify` | `replay save` 落盘后弹通知 | `true` |
@@ -843,7 +854,9 @@ vshot settings
 
 `pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效——一个键写错只损失那一个键，其余照常生效。
 
-`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 那四项（编码器、帧率、portal、麦克风）；`ocr.engine`、`ocr.external` 与 `record.encoder-backend`（以及 `replay` 那一份）要手改文件——**`ocr.notify` 这个开关只写「关」**，因为键不存在就是「开」，写一个 `true` 进去等于什么都没说。麦克风那一项是**从当前会话检测出来的**，旁边那个按钮重新检测：检测不到也不报错，只是行里只剩「不录音」和「会话默认输入」两个选项。
+`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 与 `replay` 两段（各自的编码器、硬件编码器、帧率、portal、麦克风、跟随窗口，回录还有 `window`、`gop`、`save-dir`，两条 `notify`）；`ocr.engine`、`ocr.external` 要手改文件——**两个 `notify` 开关只写「关」**，因为键不存在就是「开」，写一个 `true` 进去等于什么都没说。麦克风那两项是**从当前会话检测出来的**，旁边那个按钮重新检测：检测不到也不报错，只是行里只剩「不录音」和「会话默认输入」两个选项。`follow` 那两项在窗口里是**一行逗号分隔的窗口名**，在文件里是一个数组——手改时写成 `["game", "chat"]`。
+
+`record.follow` / `replay.follow` 只在**不带窗口名、也不给 `--pick`** 的 `record window` / `replay start window` 上生效：那是「跟随」这一概念唯一有意义的地方。其它目标（`monitor`、`all`、`region`，或命令行上点了名的窗口）会**忽略**记着的跟随列表，而不是因为它在而报错——否则配置里记着一个跟随列表，`record monitor` 就再也用不了了。`--no-follow` 是对那一次录制/回录把记着的列表关掉，正如 `--no-mic` 对记着的麦克风那样。
 
 `color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）。注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 

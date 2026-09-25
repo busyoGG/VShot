@@ -356,10 +356,12 @@ with no default input answers with a sentence naming `wpctl status` instead of a
 PipeWire error. `record mics` lists the inputs a session actually has, which is also what the \
 settings window offers in its microphone row.\n\n\
 The config file's `cli.record` section supplies the defaults the flags fall back to: `encoder`, \
-`fps`, `portal` and `mic`. A flag always wins over the file — `--no-portal` is how a remembered \
-`portal: true` is turned off for one recording — and a value the file gets wrong (an unknown \
+`encoder-backend`, `fps`, `portal`, `mic`, `follow` and `notify`. A flag always wins over the \
+file — `--no-portal` is how a remembered `portal: true` is turned off for one recording, and \
+`--no-follow` is how a remembered `follow` list is — and a value the file gets wrong (an unknown \
 encoder name, a rate outside 1-240) falls back to the built-in default rather than failing the \
-recording.\n\n\
+recording. A remembered `follow` list is read only for a bare `record window` (no NAME, no \
+`--pick`), so it cannot turn a `record monitor` into the error `--follow` would be there.\n\n\
 A recording that never started leaves nothing behind, and a process killed outright leaves a \
 file without its sample table (players report it as such rather than showing a wrong video).\n\n\
 VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1 traces each \
@@ -401,9 +403,16 @@ cannot blend)."
         /// moves to whichever of them the focus lands on, staying where it is
         /// while the focus is anywhere else. Only `record window` and
         /// `replay start window` have a window to move between, and `--follow`
-        /// cannot be combined with a window NAME.
+        /// cannot be combined with a window NAME. A bare `record window` with
+        /// no `--follow` at all follows the windows `cli.record.follow`
+        /// remembers.
         #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
         follow: Vec<String>,
+        /// Do not follow the focus, even when the config's
+        /// `cli.record.follow` remembers windows to follow: this window, the
+        /// focused one, is the one recorded from beginning to end.
+        #[arg(long = "no-follow", global = true, conflicts_with = "follow")]
+        no_follow: bool,
         /// Video codec: h264 (default), hevc or av1; the config's
         /// `cli.record.encoder` when the flag is not given.
         #[arg(
@@ -465,8 +474,11 @@ the video, the same way `record --mic` records it.\n\n\
 `replay save` writes to `--save-dir` (strftime-expanded, default the videos directory with a \
 timestamped name) unless it is given a path: `vshot replay save /tmp/clip.mp4`. `--background` \
 detaches the session from the terminal, so it outlives the shell that started it.\n\n\
-The config file's `cli.replay` section supplies the defaults: `window`, `encoder`, `fps`, `gop`, \
-`mic`, `save-dir` and `notify`. A flag always wins over the file.\n\n\
+The config file's `cli.replay` section supplies the defaults: `window`, `encoder`, \
+`encoder-backend`, `fps`, `gop`, `mic`, `follow`, `portal`, `save-dir` and `notify`. A flag \
+always wins over the file — `--no-follow` turns a remembered `follow` list off for one session, \
+as `--no-mic` does a remembered microphone. A remembered `follow` list is read only for a bare \
+`replay start window`, the same rule the recording side uses.\n\n\
 VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid file \
 `replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."
     )]
@@ -519,9 +531,15 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
         /// Follow the focus between windows while replaying one of them, as
         /// `record --follow` does: give the windows to follow (`--follow
         /// NAME`, repeated) and the ring moves to whichever of them the focus
-        /// lands on. Only `replay start window` can follow.
+        /// lands on. Only `replay start window` can follow, and a bare
+        /// `replay start window` with no `--follow` follows the windows
+        /// `cli.replay.follow` remembers.
         #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
         follow: Vec<String>,
+        /// Do not follow the focus, even when the config's `cli.replay.follow`
+        /// remembers windows to follow.
+        #[arg(long = "no-follow", global = true, conflicts_with = "follow")]
+        no_follow: bool,
         /// Directory a save lands in when `replay save` names no path;
         /// strftime-expanded. Defaults to the videos directory.
         #[arg(long, global = true, value_name = "DIR")]
@@ -912,6 +930,7 @@ impl Cli {
             no_mic,
             app_audio,
             follow,
+            no_follow,
         } = &self.command
         {
             // A recording is a file, not an image: the screenshot
@@ -937,7 +956,8 @@ impl Cli {
                 || mic.is_some()
                 || *no_mic
                 || *app_audio
-                || !follow.is_empty();
+                || !follow.is_empty()
+                || *no_follow;
             match target {
                 RecordTargetCommand::Stop => {
                     if option_given {
@@ -1086,6 +1106,24 @@ impl Cli {
                     unreachable!("handled above")
                 }
             };
+            // The windows to follow, now that the target is known: an explicit
+            // `--follow` list wins, `--no-follow` clears it, and a plain
+            // `record window` — no NAME, no `--pick` — falls back to the
+            // config's `record.follow`.  Any other target gets no list at all,
+            // so a remembered follow cannot turn a `record monitor` into the
+            // error `--follow` would be there.
+            let follow = if *no_follow {
+                Vec::new()
+            } else if !follow.is_empty() {
+                follow.clone()
+            } else if matches!(
+                target,
+                crate::record::RecordTarget::Window(crate::record::WindowTarget::Active)
+            ) {
+                crate::record::default_follow()
+            } else {
+                Vec::new()
+            };
             let encoder = match encoder.as_deref() {
                 None => crate::record::default_encoder(),
                 Some(word) => crate::record::avcodec::VideoCodec::parse(word).ok_or_else(|| {
@@ -1148,6 +1186,7 @@ impl Cli {
             no_mic,
             app_audio,
             follow,
+            no_follow,
             save_dir,
             background,
         } = &self.command
@@ -1299,6 +1338,24 @@ impl Cli {
                                 .into(),
                         ));
                     }
+                    // The windows to follow, on the same terms as the recording
+                    // side: an explicit list wins, `--no-follow` clears it, and
+                    // only a plain `replay start window` — no NAME, no `--pick`
+                    // — falls back to the config, so a remembered list cannot
+                    // turn a `replay start monitor` into the error `--follow`
+                    // would be there.
+                    let follow = if *no_follow {
+                        Vec::new()
+                    } else if !follow.is_empty() {
+                        follow.clone()
+                    } else if matches!(
+                        target,
+                        crate::record::RecordTarget::Window(crate::record::WindowTarget::Active)
+                    ) {
+                        crate::record::default_replay_follow()
+                    } else {
+                        Vec::new()
+                    };
                     if !follow.is_empty() {
                         if let crate::record::RecordTarget::Window(window_target) = &target {
                             if !matches!(window_target, crate::record::WindowTarget::Active) {
@@ -1311,6 +1368,12 @@ impl Cli {
                             }
                         }
                     }
+                    // The save directory: `--save-dir` wins, and the config's
+                    // `replay.save-dir` is what a bare `replay save` falls back
+                    // to; both are strftime-expanded where the file is named.
+                    let save_dir = save_dir
+                        .clone()
+                        .or_else(crate::record::default_replay_save_dir);
                     let request = crate::record::ReplayRequest {
                         target,
                         window: window.unwrap_or_else(crate::record::default_replay_window),
@@ -1322,7 +1385,7 @@ impl Cli {
                         app_audio: *app_audio,
                         follow: follow.clone(),
                         portal,
-                        save_dir: save_dir.clone(),
+                        save_dir,
                         gop_secs: gop.unwrap_or_else(crate::record::default_replay_gop),
                     };
                     Ok(Action::Replay(ReplayAction::Start {
@@ -1830,7 +1893,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("a parent directory")).unwrap();
         std::fs::write(
             &path,
-            r#"{"cli":{"record":{"encoder":"hevc","fps":30,"portal":true,"mic":"alsa_input.x"}}}"#,
+            r#"{"cli":{"record":{"encoder":"hevc","fps":30,"portal":true,"mic":"alsa_input.x","follow":["game","chat"]},"replay":{"follow":["game"],"save-dir":"/tmp/vshot-clips"}}}"#,
         )
         .unwrap();
         // SAFETY: the variable is put back below.  A test in another thread
@@ -1893,11 +1956,99 @@ mod tests {
         );
         assert_eq!(start(&["vshot", "record", "monitor", "--no-mic"]).mic, None);
 
+        // A remembered `record.follow` is read only for a bare `record
+        // window`: every other target ignores it, so the file cannot turn a
+        // `record monitor` into the error `--follow` would be there.
+        assert_eq!(
+            start(&["vshot", "record", "window"]).follow,
+            vec!["game".to_owned(), "chat".to_owned()]
+        );
+        assert!(start(&["vshot", "record", "monitor"]).follow.is_empty());
+        assert!(start(&["vshot", "record", "all", "--no-portal"])
+            .follow
+            .is_empty());
+        // A window named on the command line is not "a bare window": the
+        // remembered list stays out of it.
+        assert!(start(&["vshot", "record", "window", "firefox"])
+            .follow
+            .is_empty());
+        // `--no-follow` is an explicit empty list and wins over the file; an
+        // explicit `--follow` names its own windows.
+        assert!(start(&["vshot", "record", "window", "--no-follow"])
+            .follow
+            .is_empty());
+        assert_eq!(
+            start(&["vshot", "record", "window", "--follow", "chat"]).follow,
+            vec!["chat".to_owned()]
+        );
+
+        // The replay side reads its own `replay.follow`, and a remembered
+        // `replay.save-dir` is what a save falls back to.
+        let Action::Replay(ReplayAction::Start { request, .. }) =
+            Cli::try_parse_action_from(["vshot", "replay", "start", "window"]).unwrap()
+        else {
+            panic!("`replay start window` is a start");
+        };
+        assert_eq!(request.follow, vec!["game".to_owned()]);
+        assert_eq!(
+            request.save_dir,
+            Some(std::path::PathBuf::from("/tmp/vshot-clips"))
+        );
+        let Action::Replay(ReplayAction::Start { request, .. }) =
+            Cli::try_parse_action_from(["vshot", "replay", "start", "window", "--no-follow"])
+                .unwrap()
+        else {
+            panic!("`replay start window --no-follow` is a start");
+        };
+        assert!(request.follow.is_empty());
+        let Action::Replay(ReplayAction::Start { request, .. }) = Cli::try_parse_action_from([
+            "vshot",
+            "replay",
+            "start",
+            "monitor",
+            "--save-dir",
+            "/tmp/other",
+        ])
+        .unwrap() else {
+            panic!("`replay start monitor --save-dir` is a start");
+        };
+        assert_eq!(
+            request.save_dir,
+            Some(std::path::PathBuf::from("/tmp/other"))
+        );
+
         match saved {
             Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--follow` and `--no-follow` contradict each other; clap is what sees
+    /// it, on both subcommands.
+    #[test]
+    fn follow_and_no_follow_are_mutually_exclusive() {
+        assert!(Cli::try_parse_action_from([
+            "vshot",
+            "record",
+            "window",
+            "--follow",
+            "game",
+            "--no-follow"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_action_from([
+            "vshot",
+            "replay",
+            "start",
+            "window",
+            "--follow",
+            "game",
+            "--no-follow"
+        ])
+        .is_err());
+        // They are options like any other: `record stop` refuses them too.
+        assert!(Cli::try_parse_action_from(["vshot", "record", "stop", "--no-follow"]).is_err());
     }
 
     #[test]

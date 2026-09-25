@@ -59,6 +59,10 @@ struct CliPreferences {
     /// Which codec `record --encoder` falls back to: `h264` (the built-in
     /// default), `hevc` or `av1`.  Empty means the file says nothing.
     QString recordEncoder;
+    /// Which hardware encoder `record --encoder-backend` falls back to: `auto`
+    /// (the built-in default), `vaapi` or `nvenc`.  Empty means the file says
+    /// nothing.
+    QString recordEncoderBackend;
     /// The frame rate `record --fps` falls back to, 1-240; zero means the file
     /// says nothing.  A rate outside that range is read as "nothing" rather
     /// than clamped, because that is what vshot itself does with one.
@@ -73,6 +77,51 @@ struct CliPreferences {
     /// `vshot record --mic`.
     bool recordMicEnabled = false;
     QString recordMic;
+    /// The windows a `record window` follows without `--follow`: the config's
+    /// `cli.record.follow`, in the order written.  An empty list is the absent
+    /// key -- nothing to follow -- so it writes nothing back.
+    QStringList recordFollow;
+    /// Whether a finished recording raises a desktop notification
+    /// (`cli.record.notify`).  On when the file says nothing, the same rule as
+    /// `ocrNotify`, and only `false` is ever written.
+    bool recordNotify = true;
+
+    /// The replay-side twins of the block above.  A replay is configured by its
+    /// own `cli.replay` section, so every field here reads and writes a
+    /// `replay.*` key rather than sharing the recording's: the two sessions
+    /// have different sensible defaults (a replay is left running for hours at
+    /// 30 fps; a recording runs for minutes at 60), and one section holding
+    /// both would have to guess which was meant.
+    ///
+    /// How many seconds of history the ring keeps (`cli.replay.window`); zero
+    /// means the file says nothing.
+    std::uint32_t replayWindow = 0;
+    /// The key-frame distance in seconds (`cli.replay.gop`, 1-10); zero means
+    /// the file says nothing.
+    std::uint32_t replayGop = 0;
+    /// The replay codec (`cli.replay.encoder`); empty means the file says
+    /// nothing.
+    QString replayEncoder;
+    /// The replay hardware backend (`cli.replay.encoder-backend`); empty means
+    /// the file says nothing.
+    QString replayEncoderBackend;
+    /// The replay frame rate (`cli.replay.fps`); zero means the file says
+    /// nothing.
+    std::uint32_t replayFps = 0;
+    /// Whether a replay uses the portal (`cli.replay.portal`); off when the file
+    /// says nothing.
+    bool replayPortal = false;
+    /// The replay microphone, on the same two-state terms as the recording's.
+    bool replayMicEnabled = false;
+    QString replayMic;
+    /// The windows a `replay start window` follows without `--follow`.
+    QStringList replayFollow;
+    /// Where a triggered save lands when it names no path (`cli.replay.save-dir`,
+    /// strftime-expanded); empty means the videos directory.
+    QString replaySaveDir;
+    /// Whether a triggered save raises a notification (`cli.replay.notify`); on
+    /// when the file says nothing, and only `false` is written.
+    bool replayNotify = true;
     /// Whether a finished text recognition raises a desktop notification
     /// (`cli.ocr.notify`).  Notifications are on when the file says nothing, so
     /// the switch shows the state the engine will actually run in, and the
@@ -238,5 +287,8 @@ const QStringList &mosaicShapeNames();
 const QStringList &compressionNames();
 const QStringList &injectNames();
 const QStringList &encoderNames();
+/// The hardware backends `record --encoder-backend` and its replay twin accept:
+/// `auto`, `vaapi`, `nvenc`.  The settings window offers exactly these.
+const QStringList &encoderBackendNames();
 
 } // namespace vshot

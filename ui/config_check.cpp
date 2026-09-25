@@ -139,10 +139,26 @@ void checkDefaultsWhenTheFileIsMissing()
     expect(config.cli.longTimeout == 0, "no scroll timeout is remembered");
     expect(config.cli.pinDensity == 0, "no pin density is remembered");
     expect(config.cli.recordEncoder.isEmpty(), "no encoder default is remembered");
+    expect(config.cli.recordEncoderBackend.isEmpty(),
+           "no encoder-backend default is remembered");
     expect(config.cli.recordFps == 0, "no frame rate default is remembered");
     expect(!config.cli.recordPortal, "the portal is off unless the file says otherwise");
     expect(!config.cli.recordMicEnabled,
            "a recording is silent unless the file asks for a microphone");
+    expect(config.cli.recordFollow.isEmpty(), "nothing is followed unless the file says so");
+    expect(config.cli.recordNotify, "the recording notification is on unless the file says off");
+    expect(config.cli.replayWindow == 0, "no replay window is remembered");
+    expect(config.cli.replayGop == 0, "no replay gop is remembered");
+    expect(config.cli.replayEncoder.isEmpty(), "no replay encoder is remembered");
+    expect(config.cli.replayEncoderBackend.isEmpty(),
+           "no replay encoder-backend is remembered");
+    expect(config.cli.replayFps == 0, "no replay frame rate is remembered");
+    expect(!config.cli.replayPortal, "the replay portal is off unless the file says otherwise");
+    expect(!config.cli.replayMicEnabled,
+           "a replay is silent unless the file asks for a microphone");
+    expect(config.cli.replayFollow.isEmpty(), "a replay follows nothing unless the file says so");
+    expect(config.cli.replaySaveDir.isEmpty(), "no replay save directory is remembered");
+    expect(config.cli.replayNotify, "the replay notification is on unless the file says off");
 }
 
 void checkUnknownKeysAreIgnored()
@@ -244,6 +260,66 @@ void checkSettingsSaveKeepsWhatItDoesNotOwn()
            "a section written whole does not carry unknown keys forward");
 }
 
+void checkClearingOneSessionLeavesTheOther()
+{
+    std::printf("--- clearing the recording rows leaves the replay ones ------------\n");
+    // The two cards share a page but own different keys: a save that clears the
+    // recording defaults must not touch `cli.replay`, because the settings
+    // window writes one struct and a crossed owner would wipe the other
+    // session's setup.
+    writeConfig(QStringLiteral(R"({
+        "cli": {"record": {"encoder": "hevc", "fps": 30},
+                "replay": {"window": 60, "encoder": "av1", "save-dir": "/tmp/clips"}}
+    })"));
+    vshot::Config config = vshot::loadConfig();
+    // Clear only the recording fields, the way choosing "built-in default" on
+    // each recording row does.
+    config.cli.recordEncoder.clear();
+    config.cli.recordEncoderBackend.clear();
+    config.cli.recordFps = 0;
+    config.cli.recordPortal = false;
+    config.cli.recordMicEnabled = false;
+    config.cli.recordFollow.clear();
+
+    const QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!root.value(QStringLiteral("cli"))
+                .toObject()
+                .contains(QStringLiteral("record")),
+           "clearing the recording rows drops the record section");
+    expect(numberAt(root, "cli/replay/window") == 60,
+           "the replay window survives a recording-only save");
+    expect(textAt(root, "cli/replay/encoder") == QStringLiteral("av1"),
+           "the replay encoder survives", textAt(root, "cli/replay/encoder"));
+    expect(textAt(root, "cli/replay/save-dir") == QStringLiteral("/tmp/clips"),
+           "the replay save directory survives");
+
+    // And the reverse: a replay-only clear leaves the recording section whole.
+    writeConfig(QStringLiteral(R"({
+        "cli": {"record": {"encoder": "hevc", "fps": 30},
+                "replay": {"window": 60, "encoder": "av1"}}
+    })"));
+    vshot::Config second = vshot::loadConfig();
+    second.cli.replayWindow = 0;
+    second.cli.replayGop = 0;
+    second.cli.replayEncoder.clear();
+    second.cli.replayEncoderBackend.clear();
+    second.cli.replayFps = 0;
+    second.cli.replayPortal = false;
+    second.cli.replayMicEnabled = false;
+    second.cli.replayFollow.clear();
+    second.cli.replaySaveDir.clear();
+
+    const QJsonObject reread = afterSave([&] { vshot::saveConfig(second); });
+    expect(!reread.value(QStringLiteral("cli"))
+                .toObject()
+                .contains(QStringLiteral("replay")),
+           "clearing the replay rows drops the replay section");
+    expect(textAt(reread, "cli/record/encoder") == QStringLiteral("hevc"),
+           "the recording encoder survives a replay-only save");
+    expect(numberAt(reread, "cli/record/fps") == 30,
+           "the recording frame rate survives");
+}
+
 void checkClearingAValueRemovesIt()
 {
     std::printf("--- clearing a value actually clears it ----------------------------\n");
@@ -251,7 +327,11 @@ void checkClearingAValueRemovesIt()
         "cli": {"png-compression": "high", "monitor": "DP-2",
                 "long": {"notches": 2, "max-height": 9000, "timeout": 30},
                 "pin": {"density": 2},
-                "record": {"encoder": "hevc", "fps": 30, "portal": true, "mic": ""}}
+                "record": {"encoder": "hevc", "encoder-backend": "nvenc", "fps": 30,
+                           "portal": true, "mic": "", "follow": ["game"], "notify": false},
+                "replay": {"window": 30, "gop": 2, "encoder": "av1", "encoder-backend": "vaapi",
+                           "fps": 24, "portal": true, "mic": "", "follow": ["game"],
+                           "save-dir": "/tmp/clips", "notify": false}}
     })"));
     // What the settings window produces when the user picks the built-in
     // default everywhere: every owned value absent.
@@ -265,8 +345,15 @@ void checkClearingAValueRemovesIt()
     expect(reread.cli.pngCompression.isEmpty() && reread.cli.longNotches == 0 &&
                reread.cli.pinDensity == 0 && reread.cli.recordEncoder.isEmpty() &&
                reread.cli.recordFps == 0 && !reread.cli.recordPortal &&
-               !reread.cli.recordMicEnabled,
-           "the cleared defaults read back as unset");
+               !reread.cli.recordMicEnabled && reread.cli.recordFollow.isEmpty() &&
+               reread.cli.recordNotify,
+           "the cleared recording defaults read back as unset");
+    expect(reread.cli.replayWindow == 0 && reread.cli.replayGop == 0 &&
+               reread.cli.replayEncoder.isEmpty() && reread.cli.replayFps == 0 &&
+               !reread.cli.replayPortal && !reread.cli.replayMicEnabled &&
+               reread.cli.replayFollow.isEmpty() && reread.cli.replaySaveDir.isEmpty() &&
+               reread.cli.replayNotify,
+           "the cleared replay defaults read back as unset");
 }
 
 void checkRoundTripOfEveryField()
@@ -296,10 +383,24 @@ void checkRoundTripOfEveryField()
     written.cli.longInject = QStringLiteral("uinput");
     written.cli.pinDensity = 3;
     written.cli.recordEncoder = QStringLiteral("hevc");
+    written.cli.recordEncoderBackend = QStringLiteral("nvenc");
     written.cli.recordFps = 120;
     written.cli.recordPortal = true;
     written.cli.recordMicEnabled = true;
     written.cli.recordMic = QStringLiteral("alsa_input.pci-0000_2f_00.4.analog-stereo");
+    written.cli.recordFollow = {QStringLiteral("game"), QStringLiteral("chat")};
+    written.cli.recordNotify = false;
+    written.cli.replayWindow = 45;
+    written.cli.replayGop = 3;
+    written.cli.replayEncoder = QStringLiteral("av1");
+    written.cli.replayEncoderBackend = QStringLiteral("vaapi");
+    written.cli.replayFps = 24;
+    written.cli.replayPortal = true;
+    written.cli.replayMicEnabled = true;
+    written.cli.replayMic = QStringLiteral("alsa_input.usb");
+    written.cli.replayFollow = {QStringLiteral("game")};
+    written.cli.replaySaveDir = QStringLiteral("/tmp/clips");
+    written.cli.replayNotify = false;
     written.pin.radius = 12;
     written.pin.shadow.enabled = false;
     written.pin.shadow.size = 21;
@@ -339,11 +440,39 @@ void checkRoundTripOfEveryField()
     expect(read.cli.pinDensity == written.cli.pinDensity, "cli.pin.density round-trips");
     expect(read.cli.recordEncoder == written.cli.recordEncoder,
            "cli.record.encoder round-trips", read.cli.recordEncoder);
+    expect(read.cli.recordEncoderBackend == written.cli.recordEncoderBackend,
+           "cli.record.encoder-backend round-trips", read.cli.recordEncoderBackend);
     expect(read.cli.recordFps == written.cli.recordFps, "cli.record.fps round-trips",
            QString::number(read.cli.recordFps));
     expect(read.cli.recordPortal, "cli.record.portal round-trips");
     expect(read.cli.recordMicEnabled && read.cli.recordMic == written.cli.recordMic,
            "cli.record.mic round-trips", read.cli.recordMic);
+    expect(read.cli.recordFollow == written.cli.recordFollow, "cli.record.follow round-trips",
+           read.cli.recordFollow.join(QLatin1Char(',')));
+    expect(!read.cli.recordNotify, "cli.record.notify round-trips");
+    expect(read.cli.replayWindow == written.cli.replayWindow, "cli.replay.window round-trips",
+           QString::number(read.cli.replayWindow));
+    expect(read.cli.replayGop == written.cli.replayGop, "cli.replay.gop round-trips",
+           QString::number(read.cli.replayGop));
+    expect(read.cli.replayEncoder == written.cli.replayEncoder, "cli.replay.encoder round-trips",
+           read.cli.replayEncoder);
+    expect(read.cli.replayEncoderBackend == written.cli.replayEncoderBackend,
+           "cli.replay.encoder-backend round-trips", read.cli.replayEncoderBackend);
+    expect(read.cli.replayFps == written.cli.replayFps, "cli.replay.fps round-trips",
+           QString::number(read.cli.replayFps));
+    expect(read.cli.replayPortal, "cli.replay.portal round-trips");
+    expect(read.cli.replayMicEnabled && read.cli.replayMic == written.cli.replayMic,
+           "cli.replay.mic round-trips", read.cli.replayMic);
+    expect(read.cli.replayFollow == written.cli.replayFollow, "cli.replay.follow round-trips",
+           read.cli.replayFollow.join(QLatin1Char(',')));
+    expect(read.cli.replaySaveDir == written.cli.replaySaveDir,
+           "cli.replay.save-dir round-trips", read.cli.replaySaveDir);
+    expect(!read.cli.replayNotify, "cli.replay.notify round-trips");
+    // The recording and replay sections are read apart: a follow list or a
+    // codec in one must not appear in the other.
+    expect(read.cli.recordFollow != read.cli.replayFollow &&
+               read.cli.recordEncoder != read.cli.replayEncoder,
+           "the two sections' values are read apart");
     expect(read.pin.radius == written.pin.radius, "pin.radius round-trips",
            QString::number(read.pin.radius));
     expect(read.pin.shadow.enabled == written.pin.shadow.enabled,
@@ -426,6 +555,13 @@ void checkRoundTripOfEveryField()
         vshot::saveConfig(probe);
         expect(vshot::loadConfig().cli.recordEncoder == value,
                "the settings window's encoder names all load back", value);
+    }
+    for (const QString &value : vshot::encoderBackendNames()) {
+        vshot::Config probe = written;
+        probe.cli.recordEncoderBackend = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.recordEncoderBackend == value,
+               "the settings window's encoder backends all load back", value);
     }
     for (const QString &value : vshot::compressionNames()) {
         vshot::Config probe = written;
@@ -567,6 +703,7 @@ int main(int argc, char **argv)
     checkTheLegacyTextSizeIsMigrated();
     checkEditorSaveKeepsTheCliSection();
     checkSettingsSaveKeepsWhatItDoesNotOwn();
+    checkClearingOneSessionLeavesTheOther();
     checkClearingAValueRemovesIt();
     checkRoundTripOfEveryField();
 

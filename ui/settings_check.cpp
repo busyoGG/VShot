@@ -153,8 +153,14 @@ void checkEveryFieldReachesTheFile()
 
     expect(choose(find<QComboBox>(dialog.get(), "recordEncoder"), QStringLiteral("hevc")),
            "the encoder list offers hevc");
+    expect(choose(find<QComboBox>(dialog.get(), "recordEncoderBackend"), QStringLiteral("nvenc")),
+           "the encoder-backend list offers nvenc");
     find<QSpinBox>(dialog.get(), "recordFps")->setValue(144);
+    find<QLineEdit>(dialog.get(), "recordFollow")->setText(QStringLiteral("game, chat"));
     find<QAbstractButton>(dialog.get(), "recordPortal")->setChecked(true);
+    // The recording notification switch is turned off, as the OCR one is: on is
+    // what a mis-wired switch would leave it at.
+    find<QAbstractButton>(dialog.get(), "recordNotify")->setChecked(false);
     // The microphone row is filled from the running session, so which devices
     // it offers is not this check's business -- but the first two entries are
     // the answers that always exist, and index 1 is the session's default
@@ -165,6 +171,28 @@ void checkEveryFieldReachesTheFile()
         expect(microphone->count() >= 2, "the microphone row offers both built-in answers",
                QString::number(microphone->count()));
         microphone->setCurrentIndex(1);
+    }
+
+    // The replay card, every row set away from its default so a crossed wire is
+    // caught: the two cards carry same-class widgets, which is exactly the shape
+    // that gets two rows wired to one member.
+    find<QSpinBox>(dialog.get(), "replayWindow")->setValue(45);
+    find<QSpinBox>(dialog.get(), "replayGop")->setValue(3);
+    expect(choose(find<QComboBox>(dialog.get(), "replayEncoder"), QStringLiteral("av1")),
+           "the replay encoder list offers av1");
+    expect(choose(find<QComboBox>(dialog.get(), "replayEncoderBackend"), QStringLiteral("vaapi")),
+           "the replay encoder-backend list offers vaapi");
+    find<QSpinBox>(dialog.get(), "replayFps")->setValue(72);
+    find<QLineEdit>(dialog.get(), "replayFollow")->setText(QStringLiteral("game"));
+    find<QAbstractButton>(dialog.get(), "replayPortal")->setChecked(true);
+    find<QLineEdit>(dialog.get(), "replaySaveDir")->setText(QStringLiteral("  /tmp/clips  "));
+    find<QAbstractButton>(dialog.get(), "replayNotify")->setChecked(false);
+    QComboBox *replayMicrophone = find<QComboBox>(dialog.get(), "replayMic");
+    if (replayMicrophone != nullptr) {
+        expect(replayMicrophone->count() >= 2,
+               "the replay microphone row offers both built-in answers",
+               QString::number(replayMicrophone->count()));
+        replayMicrophone->setCurrentIndex(0);
     }
 
     // The pins' look.  The radius and the border width are set to values that
@@ -211,12 +239,36 @@ void checkEveryFieldReachesTheFile()
     expect(!saved.cli.ocrNotify, "the notification switch reached the file");
     expect(saved.cli.recordEncoder == QStringLiteral("hevc"),
            "the encoder default reached the file", saved.cli.recordEncoder);
+    expect(saved.cli.recordEncoderBackend == QStringLiteral("nvenc"),
+           "the encoder-backend default reached the file", saved.cli.recordEncoderBackend);
     expect(saved.cli.recordFps == 144, "the frame rate default reached the file",
            QString::number(saved.cli.recordFps));
+    expect(saved.cli.recordFollow == QStringList({QStringLiteral("game"), QStringLiteral("chat")}),
+           "the follow list reached the file", saved.cli.recordFollow.join(QLatin1Char(',')));
     expect(saved.cli.recordPortal, "the portal switch reached the file");
+    expect(!saved.cli.recordNotify, "the recording notification switch reached the file");
     expect(saved.cli.recordMicEnabled && saved.cli.recordMic.isEmpty(),
            "the session's default input reached the file as an empty name",
            saved.cli.recordMic);
+    expect(saved.cli.replayWindow == 45, "the replay history window reached the file",
+           QString::number(saved.cli.replayWindow));
+    expect(saved.cli.replayGop == 3, "the replay key-frame distance reached the file",
+           QString::number(saved.cli.replayGop));
+    expect(saved.cli.replayEncoder == QStringLiteral("av1"),
+           "the replay encoder reached the file", saved.cli.replayEncoder);
+    expect(saved.cli.replayEncoderBackend == QStringLiteral("vaapi"),
+           "the replay encoder-backend reached the file", saved.cli.replayEncoderBackend);
+    expect(saved.cli.replayFps == 72, "the replay frame rate reached the file",
+           QString::number(saved.cli.replayFps));
+    expect(saved.cli.replayFollow == QStringList({QStringLiteral("game")}),
+           "the replay follow list reached the file", saved.cli.replayFollow.join(QLatin1Char(',')));
+    expect(saved.cli.replayPortal, "the replay portal switch reached the file");
+    expect(!saved.cli.replayMicEnabled,
+           "the replay microphone row's silence reached the file", saved.cli.replayMic);
+    // Whitespace around a hand-typed path is trimmed rather than saved.
+    expect(saved.cli.replaySaveDir == QStringLiteral("/tmp/clips"),
+           "the replay save directory reached the file", saved.cli.replaySaveDir);
+    expect(!saved.cli.replayNotify, "the replay notification switch reached the file");
     expect(saved.pin.radius == 17, "the pin radius reached the file",
            QString::number(saved.pin.radius));
     expect(!saved.pin.shadow.enabled, "the pin shadow switch reached the file");
@@ -256,8 +308,12 @@ void checkTheWindowOpensOnTheStoredValues()
         "cli": {"png-compression": "fastest", "monitor": "DP-3",
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
                 "pin": {"density": 2}, "ocr": {"notify": false},
-                "record": {"encoder": "av1", "fps": 30, "portal": true,
-                           "mic": "alsa_input.pci-0000_2f_00.4.analog-stereo"}},
+                "record": {"encoder": "av1", "encoder-backend": "nvenc", "fps": 30, "portal": true,
+                           "follow": ["game", "chat"], "notify": false,
+                           "mic": "alsa_input.pci-0000_2f_00.4.analog-stereo"},
+                "replay": {"window": 12, "gop": 2, "encoder": "hevc",
+                           "encoder-backend": "vaapi", "fps": 24, "portal": true,
+                           "follow": ["game"], "save-dir": "/tmp/clips", "notify": false}},
         "pin": {"radius": 9, "shadow": false, "shadowSize": 21, "shadowOffset": -7,
                 "shadowOpacity": 200, "borderWidth": 6,
                 "borderColor": "#112233", "activeBorderColor": "#445566"},
@@ -293,10 +349,19 @@ void checkTheWindowOpensOnTheStoredValues()
     expect(find<QComboBox>(dialog.get(), "recordEncoder")->currentData().toString() ==
                QStringLiteral("av1"),
            "the encoder box shows the stored codec");
+    expect(find<QComboBox>(dialog.get(), "recordEncoderBackend")->currentData().toString() ==
+               QStringLiteral("nvenc"),
+           "the encoder-backend box shows the stored backend");
     expect(find<QSpinBox>(dialog.get(), "recordFps")->value() == 30,
            "the frame rate box shows the stored rate");
+    expect(find<QLineEdit>(dialog.get(), "recordFollow")->text() ==
+               QStringLiteral("game, chat"),
+           "the follow box shows the stored windows",
+           find<QLineEdit>(dialog.get(), "recordFollow")->text());
     expect(find<QAbstractButton>(dialog.get(), "recordPortal")->isChecked(),
            "the portal switch shows the stored on state");
+    expect(!find<QAbstractButton>(dialog.get(), "recordNotify")->isChecked(),
+           "the recording notification switch shows the stored off state");
     // A device the session is not offering right now -- this one is not running
     // on the machine the check runs on either -- has to stay selectable, or
     // opening and saving the window would quietly drop it from the file.
@@ -304,6 +369,31 @@ void checkTheWindowOpensOnTheStoredValues()
                QStringLiteral("alsa_input.pci-0000_2f_00.4.analog-stereo"),
            "the microphone box shows the stored device",
            find<QComboBox>(dialog.get(), "recordMic")->currentData().toString());
+    // The replay card reads its own `cli.replay` section, and every row has to
+    // show the value its own key carries -- the recording rows above must not
+    // have leaked into any of them.
+    expect(find<QSpinBox>(dialog.get(), "replayWindow")->value() == 12,
+           "the replay history box shows the stored window");
+    expect(find<QSpinBox>(dialog.get(), "replayGop")->value() == 2,
+           "the replay gop box shows the stored distance");
+    expect(find<QComboBox>(dialog.get(), "replayEncoder")->currentData().toString() ==
+               QStringLiteral("hevc"),
+           "the replay encoder box shows the stored codec");
+    expect(find<QComboBox>(dialog.get(), "replayEncoderBackend")->currentData().toString() ==
+               QStringLiteral("vaapi"),
+           "the replay encoder-backend box shows the stored backend");
+    expect(find<QSpinBox>(dialog.get(), "replayFps")->value() == 24,
+           "the replay frame rate box shows the stored rate");
+    expect(find<QLineEdit>(dialog.get(), "replayFollow")->text() == QStringLiteral("game"),
+           "the replay follow box shows the stored window",
+           find<QLineEdit>(dialog.get(), "replayFollow")->text());
+    expect(find<QAbstractButton>(dialog.get(), "replayPortal")->isChecked(),
+           "the replay portal switch shows the stored on state");
+    expect(find<QLineEdit>(dialog.get(), "replaySaveDir")->text() == QStringLiteral("/tmp/clips"),
+           "the replay save directory shows the stored path",
+           find<QLineEdit>(dialog.get(), "replaySaveDir")->text());
+    expect(!find<QAbstractButton>(dialog.get(), "replayNotify")->isChecked(),
+           "the replay notification switch shows the stored off state");
     expect(find<QSpinBox>(dialog.get(), "pinRadius")->value() == 9, "the pin radius box is right");
     expect(!find<QAbstractButton>(dialog.get(), "pinShadow")->isChecked(),
            "the shadow switch shows the stored off state");

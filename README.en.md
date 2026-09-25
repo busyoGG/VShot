@@ -344,6 +344,7 @@ vshot record monitor --no-mic                   # refuse the microphone the conf
 vshot record window --app-audio                 # record that window's own sound (may combine with --mic)
 vshot record window --mic --app-audio           # microphone + the window's own sound, summed into one track
 vshot record window --follow GameA --follow GameB   # record whichever of the two has the focus
+vshot record window --no-follow                 # do not follow, though the config remembers windows
 vshot record monitor --encoder-backend nvenc    # NVIDIA encode (default auto: VAAPI, then NVENC)
 vshot record mics                               # list this session's audio inputs
 vshot record stop                               # stop the running recording
@@ -480,7 +481,10 @@ vshot record stop                               # stop the running recording
   interruption, and the other window's pixels never appear. `--follow` is
   mutually exclusive with a window `NAME` and with `--pick` (it is itself a
   way of choosing windows), and only `record window` and `replay start window`
-  can follow. A switch is the **same path a resize takes**: the new window's
+  can follow. A **bare `record window` that gives no `--follow` at all**
+  follows the windows `cli.record.follow` remembers (`cli.replay.follow` for
+  the replay side), and `--no-follow` turns a remembered list off for one
+  recording — as `--no-mic` does a remembered microphone. A switch is the **same path a resize takes**: the new window's
   pixels are fitted into the canvas the file was opened with, so one MP4 keeps
   one frame size and the timeline is continuous. With `--app-audio` the
   application stream follows too, to the new window's own application — while
@@ -503,13 +507,15 @@ vshot record stop                               # stop the running recording
   (5760 wide) is refused with that explanation — record one output instead, or
   switch to `--encoder hevc`, which encodes the 7680-wide desktop here. A
   single 4K screen (3840) is fine.
-- **Remembered defaults.** When `--encoder`, `--encoder-backend`, `--fps`, `--portal`
-  or `--mic` is not given, the value comes from the config file's `cli.record`
-  section (`cli.replay` for the replay side; see
+- **Remembered defaults.** When `--encoder`, `--encoder-backend`, `--fps`, `--portal`,
+  `--mic` or `--follow` is not given, the value comes from the config file's
+  `cli.record` section (`cli.replay` for the replay side; see
   [`cli` — command-line defaults](#cli--command-line-defaults)). The settings
-  window's Recording card writes the codec, frame rate, portal and microphone
-  keys; `encoder-backend` there is edited by hand. `--no-portal` and `--no-mic`
-  turn a remembered value off for one recording. `vshot record mics` lists the
+  window's Recording and Replay cards write all of those keys. `--no-portal`,
+  `--no-mic` and `--no-follow` turn a remembered value off for one recording. A
+  remembered `follow` list applies only to a bare `record window` (no NAME, no
+  `--pick`); every other target ignores it, so a remembered list does not put
+  `record monitor` out of reach. `vshot record mics` lists the
   audio inputs this session has, one per line as a serial, a node name and a
   description, tab-separated; the node name is what `--mic` takes, and that
   listing is what the settings window's microphone row offers. A session with no
@@ -607,8 +613,9 @@ GOP.
 | `--encoder-backend` | `auto` (default), `vaapi` or `nvenc`, as for `record` |
 | `--mic [DEVICE]` | Keep the microphone in the ring too, as `record --mic` does; `--no-mic` refuses it |
 | `--app-audio` | Additionally keep the recorded window's own sound (`replay start window`), as `record --app-audio`; may combine with `--mic`, summed into one track |
-| `--follow NAME` | Switch source as the focus moves between these windows (`replay start window`), as `record --follow` |
-| `--save-dir DIR` | Where a `replay save` with no path lands (strftime-expanded; default the videos directory) |
+| `--follow NAME` | Switch source as the focus moves between these windows (`replay start window`), as `record --follow`; a bare `replay start window` follows `cli.replay.follow` |
+| `--no-follow` | Do not follow the focus, even when `cli.replay.follow` remembers windows |
+| `--save-dir DIR` | Where a `replay save` with no path lands (strftime-expanded; the videos directory, or `cli.replay.save-dir`) |
 | `--background` | `replay start` only: detach the session from the terminal so it outlives the shell |
 
 ### Keybindings
@@ -627,8 +634,8 @@ it is.
 
 ### Configuration
 
-The config file's `cli.replay` section supplies the defaults (edited by hand for
-now — the settings window's recording card does not have a replay row yet):
+The config file's `cli.replay` section supplies the defaults (the settings
+window's **Replay** card writes the same keys, or edit the file by hand):
 
 ```jsonc
 "cli": {
@@ -639,6 +646,7 @@ now — the settings window's recording card does not have a replay row yet):
     "encoder-backend": null, // auto / vaapi / nvenc; null means auto
     "gop": 1,                // key-frame distance in seconds (1-10)
     "mic": null,             // "" is the default input, a name is a PipeWire node
+    "follow": null,          // windows to follow, e.g. ["game", "chat"]; null means none
     "portal": false,         // replay does not support the portal yet
     "save-dir": null,        // null uses the videos directory
     "notify": true           // whether a save raises a notification
@@ -841,7 +849,7 @@ vshot settings
 
 The window is an ordinary window: it captures nothing and needs no compositor protocol, so it also works on a compositor vshot cannot otherwise capture. After installing the package you can also open it from the application menu as **VShot Settings** (see ["Application menu entry"](#application-menu-entry)). An empty or zero value in the `cli` section means "leave it unset, use the built-in default" rather than storing a zero; the `editor` section is always written whole. Saving **merges**: keys this build does not recognize — a newer vshot's, or your own — survive untouched instead of being wiped by a save.
 
-The window has four pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic), **Command-line defaults** (compression, default monitor, pin density, the scrolling-capture settings, and the notification a finished recognition raises), **File dialogs** (corner radius, border width and colour, and the shadow) and **Pin appearance** (corner radius, the shadow, border width, and the two border colours). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and they fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look. Saving **does not close the window**: a "Saved." note appears in the corner, so a value can be changed, saved, looked at and changed again without reopening anything. Cancel is now only "close".
+The window has four pages, switched from the sidebar: **Annotation editor** (tool, color, width, line style, arrow, text, mosaic), **Command-line defaults** (compression, default monitor, pin density, the scrolling-capture settings, the notification a finished recognition raises, and the full **Recording** and **Replay** cards — each with its codec, hardware backend, frame rate, portal, microphone, follow list and notification switch, the replay's history window, key-frame distance and save directory too), **File dialogs** (corner radius, border width and colour, and the shadow) and **Pin appearance** (corner radius, the shadow, border width, and the two border colours). Each page is a column of cards, one setting per row with the label on the left and the control on the right, and they fit without a scrollbar at the default window size. The combo and spin boxes paint their own chevrons — the native ones are beveled triangles from a different decade — so the controls match the toolbar's look. Saving **does not close the window**: a "Saved." note appears in the corner, so a value can be changed, saved, looked at and changed again without reopening anything. Cancel is now only "close".
 
 When drawing them, note that **the `QPainter` in a `paintEvent` already works in logical pixels**: Qt has folded the output's scale in, so dividing by `devicePixelRatioF()` as well would halve every coordinate on a scale-2 output and jam the chevron into the corner. That mistake is invisible at 1x, so it is worth looking at both scales.
 
@@ -924,12 +932,15 @@ command line > environment > config file > built-in default
 | `record.fps` | `record --fps` | `60` |
 | `record.portal` | `record --portal` | `false` |
 | `record.mic` | `record --mic` | none |
+| `record.follow` | the windows a bare `record window` follows (an array) | none |
+| `record.notify` | a desktop notification when a recording is written | `true` |
 | `replay.window` | `replay --window` | `30` |
 | `replay.fps` | `replay --fps` | `30` |
 | `replay.encoder` | `replay --encoder` | `h264` |
 | `replay.encoder-backend` | `replay --encoder-backend` | `auto` |
 | `replay.gop` | `replay --gop` | `1` |
 | `replay.mic` | `replay --mic` | none |
+| `replay.follow` | the windows a bare `replay start window` follows (an array) | none |
 | `replay.portal` | `replay --portal` | `false` |
 | `replay.save-dir` | `replay --save-dir` | the videos directory |
 | `replay.notify` | whether `replay save` raises a notification | `true` |
@@ -941,7 +952,9 @@ command line > environment > config file > built-in default
 
 `pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid — a misspelled key costs you that one setting, and the rest still apply.
 
-`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch and the four `record` keys (encoder, frame rate, portal, microphone); `ocr.engine`, `ocr.external` and `record.encoder-backend` (and its `replay` twin) are edited by hand. That switch **only ever writes "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say. The microphone row is filled from the running session, with a button beside it to ask again: a session with no inputs is not an error there, the row simply offers the two answers that always exist.
+`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch, and both the `record` and `replay` sections (each section's codec, hardware backend, frame rate, portal and microphone; the replay's `window`, `gop` and `save-dir` too; the `follow` list of each; and both `notify` switches); `ocr.engine` and `ocr.external` are edited by hand. The two `notify` switches **only ever write "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say. The microphone rows are filled from the running session, with a button beside each to ask again: a session with no inputs is not an error there, the row simply offers the two answers that always exist. The `follow` rows are **one comma-separated line of window names** in the window and an **array** in the file — hand-edit it as `["game", "chat"]`.
+
+`record.follow` / `replay.follow` apply only to a **bare `record window` / `replay start window`** — no window NAME and no `--pick` — because that is the one place "follow" means anything. Every other target (`monitor`, `all`, `region`, or a window named on the command line) **ignores** a remembered list rather than failing on it, since otherwise a remembered list would make `record monitor` unusable. `--no-follow` turns a remembered list off for one recording, the way `--no-mic` does a remembered microphone.
 
 `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 

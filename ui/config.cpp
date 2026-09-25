@@ -8,6 +8,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -42,6 +43,8 @@ const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
 const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
                                    QStringLiteral("av1")};
+const QStringList kEncoderBackendNames = {QStringLiteral("auto"), QStringLiteral("vaapi"),
+                                          QStringLiteral("nvenc")};
 
 constexpr int kMaxWidth = 64;
 // The text size is a pixel height, and its range comes from `ui/text_size.hpp`
@@ -54,6 +57,11 @@ constexpr int kMaxDensity = 4;
 /// that names a rate above it is read as saying nothing, the way the CLI reads
 /// it, rather than being clamped to a rate the user never asked for.
 constexpr int kMaxRecordFps = 240;
+/// The replay's own bounds, read from `replay.rs`: the ring window is 1-3600
+/// seconds and the key-frame distance 1-10.  A value outside either is "the
+/// file says nothing", the same rule the frame rate follows.
+constexpr int kMaxReplayWindow = 3600;
+constexpr int kMaxReplayGop = 10;
 // The dialog's rim.  A radius past half the window's shorter side would stop
 // being a corner and start being a lozenge, so the ceiling is well inside that;
 // the stroke stops before it eats the dialog's own margins.  Both live in
@@ -212,6 +220,30 @@ QString readString(const QJsonObject &object, const QString &key, const QString 
     return value.isString() ? value.toString() : fallback;
 }
 
+/// Reads an array of window names for a `follow` key.  A value that is not an
+/// array is "the file says nothing", and entries inside one that are not
+/// strings are skipped rather than failing the whole list: a follow list the
+/// user typed by hand may carry a stray blank or a comment-like entry, and one
+/// bad name should not cost the good ones beside it.
+QStringList readStringList(const QJsonObject &object, const QString &key, const QStringList &fallback)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isArray()) {
+        return fallback;
+    }
+    QStringList names;
+    const QJsonArray array = value.toArray();
+    for (const QJsonValue &entry : array) {
+        if (entry.isString()) {
+            const QString name = entry.toString().trimmed();
+            if (!name.isEmpty()) {
+                names.append(name);
+            }
+        }
+    }
+    return names;
+}
+
 /// The `#rrggbbaa` spelling of a color that is not opaque.
 QString colorTextWithAlpha(const QColor &color)
 {
@@ -306,8 +338,15 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
     {"pin", "density"},      {"ocr", "notify"},
-    {"record", "encoder"},   {"record", "fps"},
-    {"record", "portal"},    {"record", "mic"},
+    {"record", "encoder"},   {"record", "encoder-backend"},
+    {"record", "fps"},       {"record", "portal"},
+    {"record", "mic"},       {"record", "follow"},
+    {"record", "notify"},    {"replay", "window"},
+    {"replay", "gop"},       {"replay", "encoder"},
+    {"replay", "encoder-backend"},
+    {"replay", "fps"},       {"replay", "portal"},
+    {"replay", "mic"},       {"replay", "follow"},
+    {"replay", "save-dir"},  {"replay", "notify"},
 };
 
 /// Removes `key` from `object`, leaving `object` possibly empty for the caller
@@ -430,17 +469,47 @@ CliPreferences readCli(const QJsonObject &cli)
     const QJsonObject recordSection = cli.value(QStringLiteral("record")).toObject();
     preferences.recordEncoder =
         readChoice(recordSection, QStringLiteral("encoder"), QString(), kEncoderNames);
+    preferences.recordEncoderBackend = readChoice(recordSection, QStringLiteral("encoder-backend"),
+                                                  QString(), kEncoderBackendNames);
     preferences.recordFps =
         readOptionalInRange(recordSection, QStringLiteral("fps"), kMaxRecordFps);
     preferences.recordPortal = readFlag(recordSection, QStringLiteral("portal"), false);
-    // Silence is the absent key, so only a string asks for a microphone -- and
-    // the empty string is a value here rather than a missing one: it is how the
-    // file spells "the session's default input".
+    // Silences are the absent keys, so only a string asks for a microphone --
+    // and the empty string is a value here rather than a missing one: it is how
+    // the file spells "the session's default input".
     const QJsonValue microphone = recordSection.value(QStringLiteral("mic"));
     if (microphone.isString()) {
         preferences.recordMicEnabled = true;
         preferences.recordMic = microphone.toString();
     }
+    preferences.recordFollow =
+        readStringList(recordSection, QStringLiteral("follow"), QStringList());
+    // Notifications are on when the key is absent, so the fallback is `true` and
+    // only an explicit `false` reads as off, exactly like `ocr.notify`.
+    preferences.recordNotify = readFlag(recordSection, QStringLiteral("notify"), true);
+
+    const QJsonObject replaySection = cli.value(QStringLiteral("replay")).toObject();
+    preferences.replayWindow =
+        readOptionalInRange(replaySection, QStringLiteral("window"), kMaxReplayWindow);
+    preferences.replayGop =
+        readOptionalInRange(replaySection, QStringLiteral("gop"), kMaxReplayGop);
+    preferences.replayEncoder =
+        readChoice(replaySection, QStringLiteral("encoder"), QString(), kEncoderNames);
+    preferences.replayEncoderBackend = readChoice(replaySection, QStringLiteral("encoder-backend"),
+                                                  QString(), kEncoderBackendNames);
+    preferences.replayFps =
+        readOptionalInRange(replaySection, QStringLiteral("fps"), kMaxRecordFps);
+    preferences.replayPortal = readFlag(replaySection, QStringLiteral("portal"), false);
+    const QJsonValue replayMicrophone = replaySection.value(QStringLiteral("mic"));
+    if (replayMicrophone.isString()) {
+        preferences.replayMicEnabled = true;
+        preferences.replayMic = replayMicrophone.toString();
+    }
+    preferences.replayFollow =
+        readStringList(replaySection, QStringLiteral("follow"), QStringList());
+    preferences.replaySaveDir =
+        readString(replaySection, QStringLiteral("save-dir"), QString());
+    preferences.replayNotify = readFlag(replaySection, QStringLiteral("notify"), true);
     return preferences;
 }
 
@@ -464,6 +533,17 @@ QJsonObject editorJson(const EditorPreferences &preferences)
     editor.insert(QStringLiteral("mosaicStrength"),
                   static_cast<double>(preferences.mosaicStrength));
     return editor;
+}
+
+/// A follow list as a JSON array, so the file keeps the several windows the
+/// settings window showed rather than one string with separators in it.
+QJsonArray followArray(const QStringList &names)
+{
+    QJsonArray array;
+    for (const QString &name : names) {
+        array.append(name);
+    }
+    return array;
 }
 
 /// The `cli` section as JSON.  Only the entries that carry a value are
@@ -525,6 +605,9 @@ QJsonObject cliJson(const CliPreferences &preferences)
     if (!preferences.recordEncoder.isEmpty()) {
         recordSection.insert(QStringLiteral("encoder"), preferences.recordEncoder);
     }
+    if (!preferences.recordEncoderBackend.isEmpty()) {
+        recordSection.insert(QStringLiteral("encoder-backend"), preferences.recordEncoderBackend);
+    }
     if (preferences.recordFps > 0) {
         recordSection.insert(QStringLiteral("fps"), static_cast<double>(preferences.recordFps));
     }
@@ -539,8 +622,54 @@ QJsonObject cliJson(const CliPreferences &preferences)
     if (preferences.recordMicEnabled) {
         recordSection.insert(QStringLiteral("mic"), preferences.recordMic);
     }
+    // A follow list, like the microphone, is only written when it is not empty:
+    // an absent key already means "follow nothing", so a remembered empty list
+    // would be a key that says nothing.
+    if (!preferences.recordFollow.isEmpty()) {
+        recordSection.insert(QStringLiteral("follow"), followArray(preferences.recordFollow));
+    }
+    // Notifications are on when the key is absent, so only `false` is written --
+    // the same rule `ocr.notify` follows above.
+    if (!preferences.recordNotify) {
+        recordSection.insert(QStringLiteral("notify"), false);
+    }
     if (!recordSection.isEmpty()) {
         cli.insert(QStringLiteral("record"), recordSection);
+    }
+
+    QJsonObject replaySection;
+    if (preferences.replayWindow > 0) {
+        replaySection.insert(QStringLiteral("window"), static_cast<double>(preferences.replayWindow));
+    }
+    if (preferences.replayGop > 0) {
+        replaySection.insert(QStringLiteral("gop"), static_cast<double>(preferences.replayGop));
+    }
+    if (!preferences.replayEncoder.isEmpty()) {
+        replaySection.insert(QStringLiteral("encoder"), preferences.replayEncoder);
+    }
+    if (!preferences.replayEncoderBackend.isEmpty()) {
+        replaySection.insert(QStringLiteral("encoder-backend"), preferences.replayEncoderBackend);
+    }
+    if (preferences.replayFps > 0) {
+        replaySection.insert(QStringLiteral("fps"), static_cast<double>(preferences.replayFps));
+    }
+    if (preferences.replayPortal) {
+        replaySection.insert(QStringLiteral("portal"), true);
+    }
+    if (preferences.replayMicEnabled) {
+        replaySection.insert(QStringLiteral("mic"), preferences.replayMic);
+    }
+    if (!preferences.replayFollow.isEmpty()) {
+        replaySection.insert(QStringLiteral("follow"), followArray(preferences.replayFollow));
+    }
+    if (!preferences.replaySaveDir.isEmpty()) {
+        replaySection.insert(QStringLiteral("save-dir"), preferences.replaySaveDir);
+    }
+    if (!preferences.replayNotify) {
+        replaySection.insert(QStringLiteral("notify"), false);
+    }
+    if (!replaySection.isEmpty()) {
+        cli.insert(QStringLiteral("replay"), replaySection);
     }
     return cli;
 }
@@ -869,6 +998,11 @@ const QStringList &injectNames()
 const QStringList &encoderNames()
 {
     return kEncoderNames;
+}
+
+const QStringList &encoderBackendNames()
+{
+    return kEncoderBackendNames;
 }
 
 } // namespace vshot
