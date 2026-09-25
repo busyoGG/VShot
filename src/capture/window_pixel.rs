@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Pixel fallback for window capture. When no compositor metadata provider
 //! answers (Hyprland, Sway, or the KWin scripting probe), or when `--pixel`
 //! asks for it, the window is detected from the captured frame itself.

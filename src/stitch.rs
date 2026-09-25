@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Stitching the frames of a scrolling capture into one tall image.
 //!
 //! Every frame is the same viewport, one scroll further down than the last.

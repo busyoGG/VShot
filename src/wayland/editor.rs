@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 use super::{
     global_point, SelectionEvent, BTN_LEFT, BTN_RIGHT, KEY_CONFIRM, KEY_DOWN, KEY_ESC, KEY_LEFT,
     KEY_RIGHT, KEY_UP,

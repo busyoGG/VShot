@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 use std::os::unix::io::AsFd;
 
 use memmap2::{MmapMut, MmapOptions};

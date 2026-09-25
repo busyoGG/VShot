@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Window capture on niri, over niri's own IPC.
 //!
 //! niri is the one compositor where the rectangle-based routes cannot work: its

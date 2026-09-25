@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Scrolling capture: keep the wheel going, grab the region as it moves, and
 //! stitch the frames into one tall image.
 //!

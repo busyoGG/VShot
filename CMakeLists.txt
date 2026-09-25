@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 VShot contributors
+
 cmake_minimum_required(VERSION 3.16)
 project(vshot-qt-ui LANGUAGES CXX)
 

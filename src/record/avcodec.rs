@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! The Rust side of the recording shim (`shim.c`).
 //!
 //! The shim hides libavcodec's and libavformat's types; this module declares

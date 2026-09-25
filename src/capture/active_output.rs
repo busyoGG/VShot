@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Which output the user is looking at.
 //!
 //! A pin belongs on the monitor the user is working on, not on whatever Qt

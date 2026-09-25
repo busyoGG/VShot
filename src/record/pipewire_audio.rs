@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! The Rust side of the microphone client (`pipewire_audio.c`).
 //!
 //! `record --mic` records a soundtrack beside the video.  The microphone is a

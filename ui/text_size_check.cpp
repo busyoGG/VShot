@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the text size the panel edits: the number shown is the
 // font height in pixels, and the legacy integer glyph multiple the JSON
 // protocol carries is derived from it.

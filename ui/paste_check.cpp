@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for pasting an image into the annotation editor.
 //
 // A pasted image travels over the same file-and-JSON channel a text label's

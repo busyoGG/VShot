@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! dma-buf buffers for zero-copy capture.
 //!
 //! The recording loop's fast path has the compositor render each screencopy

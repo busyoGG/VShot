@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 [Desktop Entry]
 # The launcher entry for the settings window.  It is a separate file from
 # vshot.desktop on purpose: that one exists only to carry KWin's D-Bus

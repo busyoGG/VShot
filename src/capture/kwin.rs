@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Screen capture through KWin's private D-Bus screenshot service.
 //!
 //! KWin — including Plasma on Wayland — provides neither

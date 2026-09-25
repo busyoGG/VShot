@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! The Rust side of the portal's PipeWire client (`pipewire_client.c`).
 //!
 //! The XDG portal does not hand frames over itself: `OpenPipeWireRemote`

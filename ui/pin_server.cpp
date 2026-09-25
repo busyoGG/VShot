@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 #include "pin_density.hpp"
 #include "pin_server.hpp"
 #include "color_card.hpp"

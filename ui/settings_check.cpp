@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the settings window: that every field it shows is the
 // field it saves, and that the file it writes is the file the CLI reads.
 //

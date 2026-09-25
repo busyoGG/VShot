@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // vshot's libavcodec encoder shim.
 //
 // The recording encoder runs on ffmpeg's libavcodec, the way wf-recorder

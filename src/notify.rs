@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Desktop notifications, for the one result that arrives with nothing on
 //! screen to show for it.
 //!

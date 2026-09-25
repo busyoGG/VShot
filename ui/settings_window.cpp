@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // The settings window: an ordinary top-level dialog over the shared config
 // file, so the style a capture session starts from and the command-line
 // defaults the CLI falls back to can be looked at and changed in one place

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the pin outline: the stroke a pinned image carries, how it
 // says which pin the keyboard would act on, and the look the config file can
 // change -- the corner radius, the shadow and the stroke's width and colour.

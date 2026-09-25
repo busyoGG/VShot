@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Recording through the XDG desktop portal: `vshot record --portal`.
 //!
 //! The compositor's own protocols — wlr-screencopy, KWin's ScreenShot2,

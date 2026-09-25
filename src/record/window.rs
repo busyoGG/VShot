@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Recording one window's own pixels: `vshot record window`.
 //!
 //! This is a different thing from recording the screen area a window covers,

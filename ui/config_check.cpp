@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the shared config file: what a save does to the parts of
 // the file it did not write.
 //

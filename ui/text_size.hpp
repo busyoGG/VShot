@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // The text size the panel edits, and the unit it is stored in.
 //
 // The panel edits a **pixel size**: what the user types is what the label is,

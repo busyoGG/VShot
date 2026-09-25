@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Finds a window's own render on a captured frame.
 //!
 //! niri hands a window screenshot over rendered with its alpha channel: a

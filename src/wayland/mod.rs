@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 pub mod freeze_overlay;
 pub mod input;
 pub mod topology;

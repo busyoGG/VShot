@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the density a PNG declares about itself. That declaration
 // is read from the `pHYs` chunk, and the point of reading the chunk rather than
 // the decoded value is that 96 DPI has to be seen as the 1x it is: it is what

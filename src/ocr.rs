@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Text recognition, for `vshot ocr` and the annotation editor's text tool.
 //!
 //! Two engines can do the work, and the config file picks which:

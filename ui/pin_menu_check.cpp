@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the pinned color card's right-click menu: the formats it
 // offers, which row a click picks, and how it goes away.
 //

@@ -1,0 +1,32 @@
+vshot — third-party notices
+Copyright (C) 2026 VShot contributors
+SPDX-License-Identifier: GPL-3.0-or-later
+
+vshot itself is free software under the GNU General Public License, version 3
+or any later version; the full text is in LICENSE.
+
+The binaries in this package use the following third-party components:
+
+Qt 6 (QtCore, QtGui, QtWidgets, QtNetwork) and LayerShellQt
+    Used under the GNU General Public License, version 3.  Qt also offers
+    these libraries under LGPL-3.0, and LayerShellQt under LGPL-2.0-or-later;
+    they are dynamically linked and can be replaced with other builds of the
+    same libraries.  Only the `vshot-qt-ui` helper links them; the `vshot`
+    CLI does not.
+    Sources: https://www.qt.io/ , https://invent.kde.org/plasma/layer-shell-qt
+
+FFmpeg (libavcodec, libavformat), loaded at run time for `vshot record`
+    Used under the GNU General Public License, version 3.
+    Source: https://ffmpeg.org/
+
+Rust crates
+    MIT, Apache-2.0, BSD, Zlib, Boost, CC0 and similar permissive licenses;
+    the exact set is in Cargo.toml / Cargo.lock of the source.
+
+PaddleOCR PP-OCRv6 models (converted to ONNX by RapidOCR) and the oar-ocr
+character dictionary
+    Apache License 2.0.  Installed under /usr/share/vshot/models/.
+    Sources: https://github.com/RapidAI/RapidOCR , https://github.com/GreatV/oar-ocr
+
+The GPLv3 text is in LICENSE; the LGPLv3 text is available at
+https://www.gnu.org/licenses/lgpl-3.0.txt

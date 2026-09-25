@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the file dialog's look.
 //
 // The dialog is the one window in vshot that is drawn almost entirely by Qt,

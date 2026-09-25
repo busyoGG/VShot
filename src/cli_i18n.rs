@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Chinese translations for the CLI's own help output.
 //!
 //! The Qt helper has had this for a while (`ui/i18n.cpp`); the CLI did not, so

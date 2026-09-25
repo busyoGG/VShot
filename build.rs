@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // The recording C shims: `shim.c` (the libavcodec encoder and the MP4 muxer)
 // and, where libpipewire's headers are installed, `pipewire_client.c` (the
 // portal's screen-cast stream).  Both libraries are loaded with dlopen inside

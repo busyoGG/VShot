@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Driving the wheel of whatever page is under the pointer.
 //!
 //! A scrolling capture has to scroll the page itself, and Wayland has no

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Remembered defaults, read from the same `config.json` the Qt helper writes.
 //!
 //! The file is shared with the helper, which owns the `editor` section — the

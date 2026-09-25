@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
+  SPDX-License-Identifier: GPL-3.0-or-later
   VShot's application icon: a region selection with its resize handles, which
   is what the tool puts on screen when you drag one out.
 

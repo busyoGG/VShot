@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 #include "pin_surface.hpp"
 
 #include "i18n.hpp"

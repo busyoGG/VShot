@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 use std::collections::HashMap;
 
 use wayland_client::protocol::wl_output;

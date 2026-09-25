@@ -1,11 +1,15 @@
 # Maintainer: VShot contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
 pkgname=vshot
 pkgver=0.1.2
-pkgrel=3
+pkgrel=5
 pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pin server'
 url='https://github.com/busyoGG/VShot'
 arch=('x86_64')
-license=('MIT')
+# GPL-3.0-or-later: the recording shim loads Arch's GPL-3.0 FFmpeg build at run
+# time, and the Qt / LayerShellQt UI is used under those libraries' GPL options.
+# See NOTICE for the third-party notices; LICENSE carries the full GPLv3 text.
+license=('GPL-3.0-or-later')
 # `onnxruntime` is a virtual provide: all six Arch variants (cpu, cuda,
 # opt-cuda, rocm, opt-rocm) declare `Provides: onnxruntime` and conflict with
 # each other, so a system has exactly one.  Naming the virtual package rather
@@ -78,4 +82,9 @@ package() {
     install -Dm644 "$startdir/icons/vshot.svg" \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/vshot.svg"
     install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # The third-party notices: Qt / LayerShellQt under their GPL options,
+    # FFmpeg, and the model licenses.  GPLv3 section 6 wants the license texts
+    # to travel with the binaries, and this is the file that says which
+    # third-party works they cover.
+    install -Dm644 "$startdir/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
 }

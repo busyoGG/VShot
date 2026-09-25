@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the text card: how much empty card surrounds the text.
 //
 // A pinned text card is drawn in the palette's Base colour, which on a light

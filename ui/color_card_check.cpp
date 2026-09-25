@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 // Offline check for the clipboard color parsing and the card it renders. It
 // needs no compositor and no layer shell -- `QT_QPA_PLATFORM=offscreen` is
 // enough -- so it can run anywhere `cargo test` can. Built only with

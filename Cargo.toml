@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2021"
 rust-version = "1.88"
 description = "A strict-freeze Wayland screenshot CLI for wlroots compositors"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

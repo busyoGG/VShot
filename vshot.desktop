@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 [Desktop Entry]
 # KWin has no permission prompt for its ScreenShot2 D-Bus interface: it
 # authorizes a caller only when the desktop file whose Exec= names the caller's

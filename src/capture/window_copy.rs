@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! One window's own pixels, through `ext_image_copy_capture_v1`.
 //!
 //! The screenshots read a *window's rectangle* off the scene: compositor
