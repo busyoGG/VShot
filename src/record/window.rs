@@ -41,13 +41,23 @@
 //! * **The window can go away.**  Closing it stops the session, which ends the
 //!   recording the same way — the file is finished properly rather than left
 //!   without its trailer.
+//!
+//! * **The recording can follow the focus.**  `--follow NAME` (repeated) names
+//!   the windows the recording moves between: while the focus is on one of
+//!   them the recording is of that window, and while it is anywhere else the
+//!   recording stays on the last one — a window that is not in the list does
+//!   not pause it, cut it or appear in it.  One session still writes one file,
+//!   with the timeline continuous and every window fitted into the same
+//!   canvas, because the switch is the resize path with a different source:
+//!   the frames of the new window are fitted into the canvas the file was
+//!   opened with, exactly as the frames of a window that changed size are.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::capture::dmabuf::DmabufFrame;
 use crate::capture::window::{CompositorWindowProvider, ProcessWindowProvider};
-use crate::capture::window_copy::{self, Capture, Name, WindowCapture};
+use crate::capture::window_copy::{self, Capture, Follow, Name, WindowCapture};
 use crate::error::{Result, VshotError};
 use crate::wayland::topology::OutputInfo;
 
@@ -59,6 +69,14 @@ use super::{debug_enabled, prepare_output_path, RecordRequest, WindowTarget};
 /// overdue.  A frame that arrives inside the window is used immediately; one
 /// that does not stays in flight.
 const POLL_WINDOW: Duration = Duration::from_millis(250);
+
+/// How often the focused window is asked for while a `--follow` recording
+/// runs.  The question is a compositor IPC round trip — `hyprctl activewindow`
+/// is a process — so it is not something to pay at the frame rate, and a
+/// quarter of a second is far below the time it takes a person to switch
+/// windows; the frame that is a moment late comes out of the window the
+/// recording was already on, which is the frame the screen showed.
+const FOCUS_POLL: Duration = Duration::from_millis(250);
 
 /// How long a session may go without its *first* frame before the recording
 /// gives up on it.  A window on a monitor that is off, disabled or
@@ -78,7 +96,8 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         ));
     }
     let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
-    let index = resolve_window(target, &names)?;
+    let follow = Follow::new(request.follow.clone());
+    let index = resolve_start(target, &follow, &names)?;
     let toplevel = &toplevels[index];
     if debug_enabled() {
         eprintln!(
@@ -91,6 +110,7 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
 
     // --- the session and its shape ----------------------------------------
     let shape = capture.start(toplevel)?;
+    let source = toplevel.name.clone();
     if debug_enabled() {
         eprintln!(
             "vshot: window capture {}x{} (fourcc 0x{:08x})",
@@ -166,7 +186,9 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         &mut capture,
         &mut recorder,
         request,
-        mic.as_ref(),
+        &follow,
+        source,
+        mic,
         &interrupted,
         |_sink| Ok(false),
     );
@@ -185,6 +207,40 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         outcome.map(|_| (recorder.frames() as usize, recorder.seconds())),
         &path,
     )
+}
+
+/// Which window a window recording starts on, from its target and its
+/// `--follow` list.
+///
+/// The two are not independent: with `--follow` the focus decides which window
+/// to start on (see [`Follow::start`]), so the target is not resolved at all —
+/// the CLI refuses `--follow` together with a `NAME`, and what is left is a
+/// window recording whose *first* window is as much the focus's choice as
+/// every window after it.
+///
+/// The focus is asked for here, before any session exists, because a session
+/// on a compositor that cannot report the focus would otherwise follow nothing
+/// and say nothing: `--follow` is a request for the focus, and a session that
+/// cannot answer it is refused while the user is still looking at the command.
+pub(super) fn resolve_start(
+    target: &WindowTarget,
+    follow: &Follow,
+    names: &[&Name],
+) -> Result<usize> {
+    if follow.is_empty() {
+        return resolve_window(target, names);
+    }
+    let focused = match ProcessWindowProvider.active_window() {
+        Ok(focused) => focused,
+        Err(error) => {
+            return Err(VshotError::Recording(format!(
+                "`--follow` needs the compositor to say which window has the focus, and it \
+                 cannot ({error}); name one window to record instead \
+                 (`vshot record window NAME`)"
+            )))
+        }
+    };
+    follow.start(names, Some((&focused.app_id, &focused.title)))
 }
 
 /// Resolves which window a target names, against the compositor's toplevel
@@ -253,13 +309,16 @@ pub(super) fn open_window_capture(
 /// what [`Capture::Resized`] carries, and it is the difference between a
 /// recording of the window's session and a recording cut short the first
 /// time its user drags a corner.
+#[allow(clippy::too_many_arguments)] // the session's own shape
 pub(super) fn loop_over<
     S: crate::record::avcodec::VideoSink + crate::record::avcodec::AudioSink,
 >(
     capture: &mut WindowCapture,
     recorder: &mut S,
     request: &RecordRequest,
-    mic: Option<&super::pipewire_audio::Mic>,
+    follow: &Follow,
+    source: Name,
+    mic: Option<super::pipewire_audio::Mic>,
     interrupted: &AtomicBool,
     mut control: impl FnMut(&mut S) -> Result<bool>,
 ) -> Result<()> {
@@ -267,6 +326,17 @@ pub(super) fn loop_over<
     let interval = request.frame_interval();
     // The microphone's buffer, reused across frames.
     let mut mic_samples: Vec<f32> = Vec::new();
+    // The microphone and the window are both moved through the loop, because a
+    // `--follow` switch replaces them: the capture points at a new window, and
+    // (`--app-audio` only) the soundtrack is reopened on that window's own
+    // application.  The `Mic` is the session's, and the audio is drained
+    // through whatever it holds at the time.
+    let mut mic = mic;
+    let mut source = source;
+    // When the focus is next asked for.  `None` on a recording without
+    // `--follow`: the compositor round trip is not something a plain window
+    // recording pays for.
+    let mut next_focus_check = (!follow.is_empty()).then(|| started + FOCUS_POLL);
     let mut timeline_ms = 0u64;
     let mut covered_us = 0u64;
     let mut last_frame_at = started;
@@ -283,6 +353,9 @@ pub(super) fn loop_over<
     let mut consecutive_retries = 0u32;
     // How many frames this session has encoded, for the debug trace.
     let mut encoded = 0u64;
+    // Whether the loop has encoded a frame yet, which decides how the first
+    // one's duration is measured (see the grab site).
+    let mut delivered_any = false;
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
@@ -292,6 +365,18 @@ pub(super) fn loop_over<
         // so the session's state is consistent when it is handled.
         if control(recorder)? {
             break;
+        }
+        // Following the focus: the compositor is asked at most every
+        // `FOCUS_POLL`, and only a focus that lands on another *followed*
+        // window moves the recording.  A switch is the resize path with a new
+        // source — the new window's frames are fitted into the canvas the file
+        // was opened with — so the loop stays where it is on every other
+        // answer, including a compositor that cannot say what has the focus.
+        if let Some(deadline) = next_focus_check {
+            if Instant::now() >= deadline {
+                next_focus_check = Some(Instant::now() + FOCUS_POLL);
+                follow_focus(capture, recorder, request, follow, &mut source, &mut mic);
+            }
         }
         if let Some(seconds) = request.duration {
             if started.elapsed() >= Duration::from_secs(seconds) {
@@ -321,7 +406,17 @@ pub(super) fn loop_over<
             None => Duration::from_secs(u64::MAX / 2),
         };
         let wait = POLL_WINDOW.min(remaining.max(Duration::from_millis(1)));
-        let had_frames = capture.has_frames();
+        // Whether *the loop* has delivered a frame yet.  The first frame
+        // covers the time from the start of the recording to its arrival, so
+        // it is the one frame whose duration is measured from `started`; every
+        // frame after it is measured from its predecessor's arrival.  This is
+        // a loop-local fact and not `capture.has_frames()`, because a
+        // `--follow` switch leaves a fresh session behind — one with no frame
+        // yet — and reading that as "the recording has not started" would make
+        // the first frame of the new window claim the whole recording as its
+        // duration (measured: a 15-second recording came out as 27, with the
+        // two switch frames carrying 5 s and 10 s).
+        let first_frame = !delivered_any;
         let frame = match capture.grab(wait, interrupted) {
             Ok(Capture::Frame(frame)) => frame,
             Ok(Capture::Idle) => {
@@ -413,11 +508,12 @@ pub(super) fn loop_over<
         };
         consecutive_errors = 0;
         let now = Instant::now();
-        if !had_frames {
+        if first_frame {
             // The first frame covers the time from the start of the recording
             // to its arrival: the window was on screen for all of it.
             last_frame_at = started;
         }
+        delivered_any = true;
         let duration_ms = {
             covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;
             last_frame_at = now;
@@ -429,7 +525,7 @@ pub(super) fn loop_over<
         let encode_started = Instant::now();
         encode_window_frame(capture, recorder, &frame, duration_ms)?;
         // The soundtrack for the interval this frame covered.
-        if let Some(mic) = mic {
+        if let Some(mic) = mic.as_ref() {
             super::pump_microphone(mic, recorder, &mut mic_samples)?;
         }
         if debug_enabled() {
@@ -451,7 +547,7 @@ pub(super) fn loop_over<
     // The soundtrack of the tail interval, queued before the last frame is
     // sent again: `finish` flushes the audio encoder after the video's, so
     // the samples have to be in by then.
-    if let Some(mic) = mic {
+    if let Some(mic) = mic.as_ref() {
         super::pump_microphone(mic, recorder, &mut mic_samples)?;
     }
     if let Some(frame) = capture.last_frame() {
@@ -464,6 +560,98 @@ pub(super) fn loop_over<
         }
     }
     Ok(())
+}
+
+/// Moves the capture to the followed window the focus just landed on, if any.
+///
+/// Called between frames.  Everything it can go wrong with is reported and
+/// swallowed: a switch that fails leaves the recording on the window it was
+/// already on, which is still producing frames, so a failed switch must not end
+/// a session that is otherwise working.  The audio follows the picture, and
+/// only when `--app-audio` asked for it — a switch whose new application has no
+/// playback node keeps the soundtrack it had, rather than falling back to the
+/// microphone under a window whose own audio was requested.
+fn follow_focus<S: crate::record::avcodec::VideoSink + crate::record::avcodec::AudioSink>(
+    capture: &mut WindowCapture,
+    recorder: &mut S,
+    request: &RecordRequest,
+    follow: &Follow,
+    source: &mut Name,
+    mic: &mut Option<super::pipewire_audio::Mic>,
+) {
+    let focused = match ProcessWindowProvider.active_window() {
+        Ok(focused) => focused,
+        Err(error) => {
+            if debug_enabled() {
+                eprintln!("vshot: the focused window could not be read ({error}); staying put");
+            }
+            return;
+        }
+    };
+    let toplevels = match capture.toplevels() {
+        Ok(toplevels) => toplevels,
+        Err(error) => {
+            eprintln!("vshot: the window list could not be re-read ({error}); staying put");
+            return;
+        }
+    };
+    let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
+    let Some(index) = follow.retarget(&names, &focused.app_id, &focused.title, source) else {
+        return;
+    };
+    let toplevel = &toplevels[index];
+    let target = toplevel.name.clone();
+    let t_switch = Instant::now();
+    match capture.retarget(toplevel) {
+        Ok(shape) => {
+            if debug_enabled() {
+                eprintln!(
+                    "vshot: the capture session was retargeted in {:.0}ms",
+                    t_switch.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            if let Err(error) = recorder.resize_fit(shape.width, shape.height, shape.fourcc) {
+                eprintln!(
+                    "vshot: the switch to `{}` could not be fitted into the recording: {error}",
+                    target.label()
+                );
+                return;
+            }
+            let (canvas_width, canvas_height) = recorder.canvas();
+            eprintln!(
+                "vshot: the focus moved to `{}`; following it, fitting its {}x{} pixels into the \
+                 recording's {canvas_width}x{canvas_height} canvas",
+                target.label(),
+                shape.width,
+                shape.height
+            );
+            *source = target;
+            if request.app_audio {
+                match super::app_audio_node(source) {
+                    Ok(Some(node)) => match super::pipewire_audio::Mic::open(Some(&node)) {
+                        Ok(opened) => {
+                            opened.arm();
+                            *mic = Some(opened);
+                        }
+                        Err(error) => {
+                            eprintln!("vshot: the new window's audio could not be opened: {error}")
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("vshot: the new window's audio could not be found: {error}")
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "vshot: the switch to `{}` failed ({error}); staying on `{}`",
+                target.label(),
+                source.label()
+            );
+        }
+    }
 }
 
 /// Encodes one window frame the way the sink wants it: a dma-buf handed over

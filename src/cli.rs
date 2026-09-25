@@ -394,6 +394,14 @@ cannot blend)."
         /// report it; KWin does not), and the sound from PipeWire.
         #[arg(long = "app-audio", global = true, conflicts_with = "mic")]
         app_audio: bool,
+        /// Follow the focus between windows while recording one of them: give
+        /// the windows to follow (`--follow NAME`, repeated) and the recording
+        /// moves to whichever of them the focus lands on, staying where it is
+        /// while the focus is anywhere else. Only `record window` and
+        /// `replay start window` have a window to move between, and `--follow`
+        /// cannot be combined with a window NAME.
+        #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
+        follow: Vec<String>,
         /// Video codec: h264 (default), hevc or av1; the config's
         /// `cli.record.encoder` when the flag is not given.
         #[arg(
@@ -505,6 +513,12 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
         /// (`replay start window` only), as `record --app-audio` does.
         #[arg(long = "app-audio", global = true, conflicts_with = "mic")]
         app_audio: bool,
+        /// Follow the focus between windows while replaying one of them, as
+        /// `record --follow` does: give the windows to follow (`--follow
+        /// NAME`, repeated) and the ring moves to whichever of them the focus
+        /// lands on. Only `replay start window` can follow.
+        #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
+        follow: Vec<String>,
         /// Directory a save lands in when `replay save` names no path;
         /// strftime-expanded. Defaults to the videos directory.
         #[arg(long, global = true, value_name = "DIR")]
@@ -894,6 +908,7 @@ impl Cli {
             mic,
             no_mic,
             app_audio,
+            follow,
         } = &self.command
         {
             // A recording is a file, not an image: the screenshot
@@ -918,7 +933,8 @@ impl Cli {
                 || *no_portal
                 || mic.is_some()
                 || *no_mic
-                || *app_audio;
+                || *app_audio
+                || !follow.is_empty();
             match target {
                 RecordTargetCommand::Stop => {
                     if option_given {
@@ -984,6 +1000,16 @@ impl Cli {
                         .into(),
                 ));
             }
+            // `--follow` moves a window recording between windows, so it needs
+            // a window to move between: a screen or a region has no window to
+            // follow the focus onto.
+            if !follow.is_empty() && !matches!(target, RecordTargetCommand::Window { .. }) {
+                return Err(VshotError::InvalidDestination(
+                    "`--follow` moves a window recording between windows, so it needs a window: \
+                     `vshot record window --follow NAME`"
+                        .into(),
+                ));
+            }
             // A portal window recording never learns which window it got (the
             // compositor's picker decides, and the portal reports a stream, not
             // a window), so the application behind it cannot be named.
@@ -1021,6 +1047,18 @@ impl Cli {
                     if *pick && name.is_some() {
                         return Err(VshotError::InvalidDestination(
                             "`record window` takes a window name or `--pick`, not both".into(),
+                        ));
+                    }
+                    // `--follow` names the windows to move between, so a
+                    // separate starting window would contradict it: the focus
+                    // decides where a followed recording starts (see the
+                    // window loop), and a NAME alongside it would say two
+                    // different things about the same first frame.
+                    if !follow.is_empty() && (name.is_some() || *pick) {
+                        return Err(VshotError::InvalidDestination(
+                            "`--follow` names the windows to move between, so it takes no window \
+                             name or `--pick`: the focus decides which of them is recorded"
+                                .into(),
                         ));
                     }
                     let target = if *pick {
@@ -1092,6 +1130,7 @@ impl Cli {
                     portal,
                     mic,
                     app_audio: *app_audio,
+                    follow: follow.clone(),
                 },
             )));
         }
@@ -1105,6 +1144,7 @@ impl Cli {
             mic,
             no_mic,
             app_audio,
+            follow,
             save_dir,
             background,
         } = &self.command
@@ -1244,6 +1284,30 @@ impl Cli {
                                 .into(),
                         ));
                     }
+                    // `--follow` needs a window to move between, and it names
+                    // the windows itself, so a starting NAME would contradict
+                    // the focus the same way it does on the recording side.
+                    if !follow.is_empty()
+                        && !matches!(target, crate::record::RecordTarget::Window(_))
+                    {
+                        return Err(VshotError::InvalidDestination(
+                            "`--follow` moves a window replay between windows, so it needs a \
+                             window: `vshot replay start window --follow NAME`"
+                                .into(),
+                        ));
+                    }
+                    if !follow.is_empty() {
+                        if let crate::record::RecordTarget::Window(window_target) = &target {
+                            if !matches!(window_target, crate::record::WindowTarget::Active) {
+                                return Err(VshotError::InvalidDestination(
+                                    "`--follow` names the windows to move between, so it takes no \
+                                     window name or `--pick`: the focus decides which of them is \
+                                     replayed"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     let request = crate::record::ReplayRequest {
                         target,
                         window: window.unwrap_or_else(crate::record::default_replay_window),
@@ -1253,6 +1317,7 @@ impl Cli {
                         cursor: self.cursor,
                         mic,
                         app_audio: *app_audio,
+                        follow: follow.clone(),
                         portal,
                         save_dir: save_dir.clone(),
                         gop_secs: gop.unwrap_or_else(crate::record::default_replay_gop),

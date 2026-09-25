@@ -48,6 +48,7 @@ use crate::wayland::WaylandSession;
 
 use super::avcodec::{ReplayRecorder, VideoCodec};
 use super::{debug_enabled, resolve_source, sleep_interruptible, Source};
+use crate::capture::window_copy::Follow;
 
 /// How many times a second frames are taken at most, when `--fps` says
 /// nothing.  A replay defaults lower than a recording: it is left running for
@@ -96,6 +97,11 @@ pub struct ReplayRequest {
     pub save_dir: Option<PathBuf>,
     /// The key-frame distance, in seconds (1-10).
     pub gop_secs: u64,
+    /// The windows a `--follow` window replay moves between, as on the
+    /// recording side: the ring keeps one window at a time, switching to
+    /// whichever of them the focus lands on, and stays where it is when the
+    /// focus is anywhere else.
+    pub follow: Vec<String>,
 }
 
 impl ReplayRequest {
@@ -505,8 +511,9 @@ fn window_session(
     if let Some(mic) = &mic {
         mic.arm();
     }
-    // The recording window loop wants a `RecordRequest`; the only field it
-    // reads that matters here is the frame rate, so a minimal one carries it.
+    // The recording window loop wants a `RecordRequest`; what it reads that
+    // matters here is the frame rate and the `--app-audio` flag, which tells a
+    // `--follow` switch to carry the soundtrack across to the new window.
     let loop_request = super::RecordRequest {
         target: request.target.clone(),
         output: None,
@@ -517,16 +524,20 @@ fn window_session(
         encoder_backend: request.encoder_backend,
         portal: false,
         mic: None,
-        // The audio side is already resolved into `mic` above; the loop reads
-        // neither this nor `mic` (it takes the `Mic` directly).
-        app_audio: false,
+        // The audio side is already resolved into `mic` above; the loop takes
+        // the `Mic` itself.
+        app_audio: request.app_audio,
+        follow: request.follow.clone(),
     };
+    let follow = Follow::new(request.follow.clone());
     let _ = VideoSink::canvas(&recorder);
     super::window::loop_over(
         &mut capture,
         &mut recorder,
         &loop_request,
-        mic.as_ref(),
+        &follow,
+        name,
+        mic,
         interrupted,
         |sink| {
             // The control socket is polled at every frame boundary, so a save
@@ -779,6 +790,7 @@ mod tests {
             cursor: false,
             mic: None,
             app_audio: false,
+            follow: Vec::new(),
             portal: false,
             save_dir: None,
             gop_secs: 1,
@@ -815,6 +827,7 @@ mod tests {
             cursor: false,
             mic: None,
             app_audio: false,
+            follow: Vec::new(),
             portal: false,
             save_dir: None,
             gop_secs: 1,

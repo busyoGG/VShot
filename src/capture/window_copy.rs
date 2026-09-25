@@ -517,6 +517,32 @@ impl WindowCapture {
         Ok(shape)
     }
 
+    /// Moves a running session to another window: the switch `--follow` makes
+    /// when the focus lands on one of its windows.
+    ///
+    /// The session's objects are not shared between windows — the source, the
+    /// session and every buffer in the pool belong to the window they were
+    /// made for — so the new window means a new session, and the old one's
+    /// proxies go: dropping them destroys the compositor-side objects, which
+    /// is what keeps a session from outliving the recording that moved off it.
+    ///
+    /// The old session is kept in hand until the new one is up, though, and
+    /// put back when the new window cannot be captured: its pool, its
+    /// constraints and its delivered frames are all still valid, so the
+    /// recording goes on with the frames it was already getting instead of
+    /// ending because one switch failed.  See the frame loop's own handling —
+    /// it reports the failure and stays where it was.
+    pub fn retarget(&mut self, toplevel: &Toplevel) -> Result<Shape> {
+        let previous = self.state.live.take();
+        match self.start(toplevel) {
+            Ok(shape) => Ok(shape),
+            Err(error) => {
+                self.state.live = previous;
+                Err(error)
+            }
+        }
+    }
+
     /// Rebuilds the dma-buf pool at a new frame size, which the compositor
     /// re-sent its constraints for: the old buffers are dropped, fresh ones
     /// are allocated from the current formats, and the shape the session
@@ -1124,6 +1150,126 @@ fn describe_names(names: &[&Name]) -> String {
         .collect()
 }
 
+/// The windows a `--follow` recording stays on: the recording moves to
+/// whichever of them the focus lands on, and stays where it is when the focus
+/// is on anything else.
+///
+/// The entries are matched exactly the way a `NAME` argument is ([`select`]):
+/// the whole app id or title first, else a case-insensitive substring of
+/// either.  One name is matched at a time — the single window the focus is on
+/// — so a filter that would be ambiguous in the whole window list is not
+/// ambiguous here; what it has to name is the focused window, and there is
+/// only one of those.
+///
+/// Following is deliberately one-way: a window outside the list never pauses
+/// or redirects the recording, it only fails to move it.  That is what makes a
+/// recording of "these two" possible on a desktop where the user keeps
+/// clicking something else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Follow {
+    filters: Vec<String>,
+}
+
+impl Follow {
+    pub fn new(filters: Vec<String>) -> Self {
+        Self { filters }
+    }
+
+    /// Whether any entry was given at all.  A recording without `--follow`
+    /// asks the compositor for the focus not once, which is the whole reason
+    /// the loops check this first.
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+
+    /// Whether the app id and title the compositor reports for the focused
+    /// window are one of the followed windows.
+    pub fn matches(&self, app_id: &str, title: &str) -> bool {
+        let name = Name {
+            app_id: app_id.to_owned(),
+            title: title.to_owned(),
+            identifier: String::new(),
+        };
+        self.filters
+            .iter()
+            .any(|filter| select(&[&name], filter).is_ok())
+    }
+
+    /// The window the focus names, when it is one of the followed ones *and*
+    /// the compositor's two descriptions of it agree.  `None` is the answer in
+    /// every case where there is nothing to switch to: the focus is on the
+    /// desktop rather than on a window, on a window outside the whitelist, or
+    /// on one this compositor describes so differently that the focused
+    /// window cannot be found in the foreign-toplevel list — and switching to
+    /// a window that cannot be named is not something to guess at.
+    pub fn focused(&self, names: &[&Name], app_id: &str, title: &str) -> Option<usize> {
+        if !self.matches(app_id, title) {
+            return None;
+        }
+        match_description(names, app_id, title).ok()
+    }
+
+    /// The window a followed session starts on: the focused window when it is
+    /// one of the followed ones, else the first entry of the whitelist that the
+    /// window list resolves.
+    ///
+    /// The focus comes first because switching to a window is a thing the user
+    /// just did, and starting the recording anywhere else would put that
+    /// switch's window out of the file until the next one; an entry that is
+    /// merely open is where the recording would have to be *moved*, straight
+    /// away, with the first window's frames never in the file at all.
+    ///
+    /// `Err` when no entry names a window that is on the screen: the recording
+    /// has nothing to follow, and the message lists what the compositor does
+    /// have.
+    pub fn start(&self, names: &[&Name], focused: Option<(&str, &str)>) -> Result<usize> {
+        if let Some((app_id, title)) = focused {
+            if let Some(index) = self.focused(names, app_id, title) {
+                return Ok(index);
+            }
+        }
+        for filter in &self.filters {
+            if let Ok(index) = select(names, filter) {
+                return Ok(index);
+            }
+        }
+        Err(VshotError::Recording(format!(
+            "none of the windows to follow (`--follow {}`) is on the screen; the compositor lists{}",
+            self.filters.join(" --follow "),
+            describe_names(names)
+        )))
+    }
+
+    /// Which window a focus check should move the recording to, or `None` to
+    /// leave it exactly where it is.
+    ///
+    /// `None` covers both halves of the contract: the focus is not on a
+    /// followed window (the recording keeps recording the last one, without a
+    /// gap and without a word), and the focus is already on the window being
+    /// recorded (a move to where it already is would cost a capture session
+    /// and a pool for no new pixels).
+    pub fn retarget(
+        &self,
+        names: &[&Name],
+        app_id: &str,
+        title: &str,
+        current: &Name,
+    ) -> Option<usize> {
+        let index = self.focused(names, app_id, title)?;
+        let target = names[index];
+        // The compositor's own identifier would be the sharper answer, but the
+        // toplevel list has been re-read since the recording started and the
+        // two names describe the same window: the capture was started on a
+        // window of this app id and title, and the focus is on a window of the
+        // same two.  Two windows that agree on both are interchangeable to
+        // `--follow` anyway, because that is what its entries match on.
+        if target.app_id == current.app_id && target.title == current.title {
+            return None;
+        }
+        Some(index)
+    }
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for CopyState {
     fn event(
         state: &mut Self,
@@ -1221,15 +1367,24 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
 impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, ()> for CopyState {
     fn event(
         state: &mut Self,
-        _: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
+        session: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
         event: ext_image_copy_capture_session_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // Two sessions of this client can be alive at once: a `--follow`
+        // switch holds the old window's session until the new one has taken
+        // over (see [`WindowCapture::retarget`]).  The events below describe
+        // constraints, and a constraint of the old window must not be read as
+        // one of the new window's, so an event is only this session's if it
+        // came from the live session's own object.
         let Some(live) = state.live.as_mut() else {
             return;
         };
+        if &live.session != session {
+            return;
+        }
         match event {
             ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
                 live.buffer_size = Some((width, height));
@@ -1551,5 +1706,63 @@ mod tests {
             }
         }
         assert!(frames > 0, "at least one frame has to come back");
+    }
+
+    #[test]
+    fn a_follow_list_matches_an_entry_the_way_a_name_does() {
+        let follow = Follow::new(vec!["firefox".into(), "Game Two".into()]);
+        assert!(!follow.is_empty());
+        // The exact app id, and a title as a case-insensitive substring.
+        assert!(follow.matches("firefox", "Mozilla Firefox"));
+        assert!(follow.matches("steam_app_123", "Game Two — Main Menu"));
+        // A window that is not on the list is not a switch.
+        assert!(!follow.matches("kitty", "~/dev/vshot"));
+        // An empty list follows nothing, which is what keeps a plain window
+        // recording from asking the compositor for the focus at all.
+        assert!(Follow::default().is_empty());
+    }
+
+    #[test]
+    fn a_follow_switch_only_moves_to_a_followed_window() {
+        let game_a = window("game", "Game A");
+        let game_b = window("game", "Game B");
+        let chat = window("discord", "Discord");
+        let names = [&game_a, &game_b, &chat];
+        let follow = Follow::new(vec!["Game A".into(), "Game B".into()]);
+        // The focus on another followed window is a switch.
+        assert_eq!(follow.retarget(&names, "game", "Game B", &game_a), Some(1));
+        // The focus on a window outside the list stays put.
+        assert_eq!(follow.retarget(&names, "discord", "Discord", &game_a), None);
+        // The focus on the window already recorded is not a switch either.
+        assert_eq!(follow.retarget(&names, "game", "Game A", &game_a), None);
+    }
+
+    #[test]
+    fn a_follow_recording_starts_on_the_focus_when_the_focus_is_followed() {
+        let game_a = window("game", "Game A");
+        let game_b = window("game", "Game B");
+        let names = [&game_a, &game_b];
+        let follow = Follow::new(vec!["Game B".into(), "Game A".into()]);
+        // Focus on Game B, which is followed: start there, not on the first
+        // entry.
+        assert_eq!(follow.start(&names, Some(("game", "Game B"))).unwrap(), 1);
+        // Focus on a window outside the list: the first entry that resolves
+        // wins, which is "Game B" here — somewhere to record still comes out
+        // of it.
+        assert_eq!(
+            follow.start(&names, Some(("discord", "Discord"))).unwrap(),
+            1
+        );
+        // Focus unknown: the same fallback.
+        assert_eq!(follow.start(&names, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_follow_list_of_windows_that_are_not_open_is_refused() {
+        let kitty = window("kitty", "~/dev/vshot");
+        let names = [&kitty];
+        let follow = Follow::new(vec!["Game A".into()]);
+        let error = follow.start(&names, None).unwrap_err().to_string();
+        assert!(error.contains("none of the windows to follow"), "{error}");
     }
 }

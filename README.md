@@ -342,6 +342,7 @@ vshot record monitor --mic                      # 同时录麦克风（会话的
 vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
 vshot record monitor --no-mic                   # 配置里记着麦克风时强制不录
 vshot record window --app-audio                 # 只录这扇窗自己的声音（不是麦克风）
+vshot record window --follow GameA --follow GameB   # 焦点在哪扇就录哪扇，只跟这两扇
 vshot record monitor --encoder-backend nvenc    # NVIDIA 硬编（默认 auto：先 VAAPI，再 NVENC）
 vshot record mics                               # 列出这台机器上能录的音频输入
 vshot record stop                               # 停止（读取 pid 文件发信号）
@@ -422,6 +423,18 @@ vshot record stop                               # 停止（读取 pid 文件发�
   麦克风。窗口没在放声音时提示一句后只录视频，而不是报错。`--portal` 与 `--app-audio` 也
   互斥（portal 由合成器决定录哪个窗口，vshot 拿不到它的 pid 对应关系）。音轨同样是 AAC，
   与麦克风那条路共用编码与封装。
+- **跟随焦点（`--follow`）**：给若干窗口（`--follow NAME`，可重复），录制就跟着焦点在这些
+  窗口之间移动——焦点落在其中哪扇就录哪扇，落在别处时**保持录上一扇**（不中断、不留空档、
+  也不会把那扇窗录进来）。`--follow` 与窗口 `NAME`、`--pick` 互斥（它自己就是选窗方式），
+  只对 `record window` 与 `replay start window` 有效。换源走的是**和窗口缩放同一条路**：
+  新窗口的画面等比缩放进文件开录时的画布，所以**一条 MP4 只有一个帧尺寸**、时间线连续。
+  `--app-audio` 时音轨也跟着换到新窗口自己应用的声音（两个应用都是 48kHz 立体声，格式不变，
+  所以 MP4 头的音频声明始终有效）。焦点查询每 250ms 一次，只在给了 `--follow` 时才问合成器。
+  实测（Hyprland）：A(900×500/880Hz) → B(600×340/220Hz) → 再回 A，14 秒录制得到 14.0s 的
+  文件，宽度始终 900，音轨按时间窗 Goertzel 分析确认为 880Hz→220Hz→880Hz。
+  合成器报不出焦点时会**明确报错**而不是永不切换（`--follow` 就是为拿焦点而给的）。
+  注意跟随的是**焦点**，不是"正在玩的游戏"：切到不在白名单里的窗口时录制停在上一扇，
+  但那一瞬间你的操作不会被收录。
 - **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），
   所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，
   或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
@@ -499,6 +512,7 @@ vshot replay stop
 | `--encoder-backend` | `auto`（默认）/ `vaapi` / `nvenc`，同 `record` |
 | `--mic [DEVICE]` | 把麦克风一起留在环里，同 `record --mic`；`--no-mic` 强制不收 |
 | `--app-audio` | 只留所录窗口自己的声音（`replay start window`），同 `record --app-audio` |
+| `--follow NAME` | 焦点在这些窗口之间移动时换源（`replay start window`），同 `record --follow` |
 | `--save-dir DIR` | `replay save` 不给路径时的落盘目录（展开 strftime，默认视频目录） |
 | `--background` | 只对 `replay start`：让会话脱离终端，活得比启动它的 shell 久 |
 
@@ -680,6 +694,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 - **Hyprland**——本机会话就是 Hyprland，也是主要开发与验证环境：截图、选区标注、窗口、长截图、pin 与滚动注入都在这里跑过。
 - **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——软件路径（CPU 转 NV12 再上传）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
 - **逐应用音频**——在 Hyprland 上实测：两个 mpv 分别播 880 Hz / 220 Hz，`record window --app-audio` 录出的文件主频为 880 Hz，隔离正确；无声窗口降级为只录视频。KWin 不报告窗口 pid，因此 `--app-audio` 在 Plasma 上明确拒绝而不是静默退回麦克风；niri 的 pid 路径只有单元测试，未现场验证。
+- **跟随焦点（`--follow`）**——在 Hyprland 上用两个不同尺寸/音调的 mpv 实测：焦点 A → B → A 得到一个 14.0 s 的文件，宽度始终 900（B 的 600×340 被缩放进 A 的 900×500 画布），音轨按时间窗分析为 880 Hz → 220 Hz → 880 Hz。焦点查询、白名单匹配与"保持在原窗"三类判断都有单元测试；**报不出焦点的合成器未实测**（Hyprland 能报）。
 - **niri**——平铺与浮窗两条截图路径都已实机验证：平铺窗口拿两个并排 kitty 测（残差 0.45/0.51 每通道），浮窗走 niri 的 `tile_pos_in_workspace_view` 坐标加 `matches_at_position` 验证，实机结果正确。浮窗截图若出现错位，用 `--no-blend` 绕开定位。
 - **KWin/Plasma**——D-Bus 采集（`CaptureScreen` 的尺寸与不透明性、`native-resolution`、格式字段）、窗口列表与长截图均已实测，其中采集与窗口列表的自动化测试是在**无头 `--virtual` KWin** 上跑的，因此：
   - `--cursor` 传了 `include-cursor` 但**是否真的画出光标未验证**（无头输出上没有指针可画）；

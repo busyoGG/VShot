@@ -342,6 +342,7 @@ vshot record monitor --mic                      # record the microphone into the
 vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
 vshot record monitor --no-mic                   # refuse the microphone the config remembers
 vshot record window --app-audio                 # record only that window's own sound (not the mic)
+vshot record window --follow GameA --follow GameB   # record whichever of the two has the focus
 vshot record monitor --encoder-backend nvenc    # NVIDIA encode (default auto: VAAPI, then NVENC)
 vshot record mics                               # list this session's audio inputs
 vshot record stop                               # stop the running recording
@@ -467,6 +468,28 @@ vshot record stop                               # stop the running recording
   conflict too (the portal's compositor decides which window, and vshot has no
   pid mapping for it). The audio track is AAC, sharing the encode and mux with
   the microphone route.
+- **Following the focus (`--follow`).** Give the windows to follow (`--follow
+  NAME`, repeated) and the recording moves between them as the focus does —
+  whichever of them has the focus is the one being recorded, and while the
+  focus is anywhere else the recording **stays on the last one**: no gap, no
+  interruption, and the other window's pixels never appear. `--follow` is
+  mutually exclusive with a window `NAME` and with `--pick` (it is itself a
+  way of choosing windows), and only `record window` and `replay start window`
+  can follow. A switch is the **same path a resize takes**: the new window's
+  pixels are fitted into the canvas the file was opened with, so one MP4 keeps
+  one frame size and the timeline is continuous. With `--app-audio` the
+  soundtrack follows too, to the new window's own application (both are 48 kHz
+  stereo — the format does not change, so the audio stream declared in the
+  MP4's header stays valid). The focus is asked for at most every 250 ms, and
+  only when `--follow` was given. Measured (Hyprland): A (900x500, 880 Hz) to
+  B (600x340, 220 Hz) and back to A over a 14-second recording produced a
+  14.0 s file, 900 wide throughout, whose audio analysed by time window
+  (Goertzel) is 880 Hz, then 220 Hz, then 880 Hz again. A compositor that
+  cannot report the focus is **refused plainly** rather than never switching
+  (`--follow` is a request for the focus by definition). Note that it follows
+  *the focus*, not "the game being played": switching to a window outside the
+  list leaves the recording on the last one, but what you did in that moment
+  is not in the file.
 - **Width limit 4096.** That is the hardware H.264 encoder's limit (measured
   on this machine's 7900 XT VCN), so `record all` across two 4K screens
   (5760 wide) is refused with that explanation — record one output instead, or
@@ -576,6 +599,7 @@ GOP.
 | `--encoder-backend` | `auto` (default), `vaapi` or `nvenc`, as for `record` |
 | `--mic [DEVICE]` | Keep the microphone in the ring too, as `record --mic` does; `--no-mic` refuses it |
 | `--app-audio` | Keep only the recorded window's own sound (`replay start window`), as `record --app-audio` |
+| `--follow NAME` | Switch source as the focus moves between these windows (`replay start window`), as `record --follow` |
 | `--save-dir DIR` | Where a `replay save` with no path lands (strftime-expanded; default the videos directory) |
 | `--background` | `replay start` only: detach the session from the terminal so it outlives the shell |
 
@@ -765,6 +789,7 @@ Where nothing is adapted, vshot **degrades automatically instead of erroring**: 
 - **Hyprland** — this machine's session is Hyprland and it is the main development and verification environment: capture, selection and annotation, windows, long screenshots, pins, and scroll injection have all run here.
 - **Recording encoder backends** — this machine (7900 XT) is VAAPI: zero-copy dma-buf, h264/hevc/av1, `--fps`, mid-recording window resizes, the portal and replay have all been measured on that route. NVENC's **routing and failure path** are verified (`--encoder-backend nvenc` fails cleanly on a machine with no NVIDIA, with the specific reason, e.g. `no CUDA device for NVENC`), but **a real NVENC encode has never run on NVIDIA hardware** — the software path (CPU NV12 conversion and upload) and its window-fit code are written from code review with no live data.
 - **Per-application audio** — measured on Hyprland: two mpv players at 880 Hz and 220 Hz produced a `record window --app-audio` file whose dominant frequency is 880 Hz, so the isolation holds; a window playing nothing degrades to a video-only recording. KWin does not report a window pid, so `--app-audio` refuses plainly on Plasma instead of quietly falling back to the microphone; niri's pid path has unit tests only.
+- **Focus following (`--follow`)** — measured on Hyprland with two mpv windows at different sizes and tones: switching focus A -> B -> A produced one 14.0 s file, 900 wide throughout (B's 600x340 fitted into A's canvas), whose audio is 880 Hz, then 220 Hz, then 880 Hz by time window. The focus query, the whitelist match and the "stay put" cases have unit tests; a compositor that cannot report its focus is untested here (Hyprland can).
 - **niri** — both the tiled and floating capture paths were verified on a real session: tiled windows were measured with two side-by-side kitty windows (residual 0.45/0.51 per channel), and floating windows go through niri's `tile_pos_in_workspace_view` coordinates plus `matches_at_position` verification, with correct results on the real session. If a floating window capture comes out misaligned, `--no-blend` bypasses the locating step.
 - **KWin/Plasma** — D-Bus capture (the size and opacity of `CaptureScreen`, `native-resolution`, format fields), the window list, and long screenshots have all been tested, where the capture and window list automation ran against a **headless `--virtual` KWin**, and therefore:
   - `--cursor` passes `include-cursor` but **whether a cursor is really drawn is unverified** (there is no pointer to draw on a headless output);

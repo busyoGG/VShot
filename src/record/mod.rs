@@ -329,6 +329,12 @@ pub struct RecordRequest {
     /// by the window's process id.  Only a window recording has a window to
     /// attach it to.
     pub app_audio: bool,
+    /// The windows a `--follow` window recording moves between (`--follow
+    /// NAME`, repeated): the capture switches to whichever of them the focus
+    /// lands on, and stays where it is when the focus is on anything else.
+    /// Empty is an ordinary window recording, and the empty case is what keeps
+    /// a recording from asking the compositor for the focus at all.
+    pub follow: Vec<String>,
 }
 
 impl RecordRequest {
@@ -755,36 +761,53 @@ pub(crate) fn open_microphone_for(
 pub(crate) fn open_app_audio(
     name: &crate::capture::window_copy::Name,
 ) -> Result<Option<pipewire_audio::Mic>> {
-    let pid = match crate::capture::window_pid::pid_for(name)? {
-        Some(pid) => pid,
-        None => {
-            eprintln!(
-                "vshot: this compositor cannot report the pid of the window `{}`, so its audio \
-                 cannot be picked out; recording without application audio",
-                crate::capture::window_pid::describe(name)
-            );
-            return Ok(None);
-        }
-    };
-    let node = match pipewire_audio::app_playback_node(pid)? {
-        Some(node) => node,
-        None => {
-            eprintln!(
-                "vshot: the window's application (pid {pid}) is not playing anything right now; \
-                 recording without application audio"
-            );
-            return Ok(None);
-        }
+    let Some(node) = app_audio_node(name)? else {
+        eprintln!("vshot: recording without application audio");
+        return Ok(None);
     };
     let mic = pipewire_audio::Mic::open(Some(&node))?;
     if debug_enabled() {
         let format = mic.format();
         eprintln!(
-            "vshot: application audio (pid {pid}, node {node}) {} Hz, {} channel(s)",
+            "vshot: application audio (node {node}) {} Hz, {} channel(s)",
             format.rate, format.channels
         );
     }
     Ok(Some(mic))
+}
+
+/// The PipeWire playback node of the application the window `name` belongs to,
+/// found the way [`open_app_audio`] finds it: the window's pid from the
+/// compositor, then the playback stream that pid owns.
+///
+/// `Ok(None)` is an application that is not playing anything right now (or a
+/// compositor that cannot report the window's pid), which is a state rather
+/// than an error, and what the caller does about it differs: a recording that
+/// is starting goes silent, while a `--follow` switch keeps the soundtrack it
+/// already has — moving to the session's default input instead would put the
+/// microphone under a window whose audio was asked for, which is worse than a
+/// gap.
+pub(crate) fn app_audio_node(name: &crate::capture::window_copy::Name) -> Result<Option<String>> {
+    let pid = match crate::capture::window_pid::pid_for(name)? {
+        Some(pid) => pid,
+        None => {
+            eprintln!(
+                "vshot: this compositor cannot report the pid of the window `{}`, so its audio \
+                 cannot be picked out",
+                crate::capture::window_pid::describe(name)
+            );
+            return Ok(None);
+        }
+    };
+    match pipewire_audio::app_playback_node(pid)? {
+        Some(node) => Ok(Some(node)),
+        None => {
+            eprintln!(
+                "vshot: the window's application (pid {pid}) is not playing anything right now"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Drains the microphone into the recorder: every sample that arrived since
@@ -1480,6 +1503,7 @@ mod tests {
             portal: false,
             mic: None,
             app_audio: false,
+            follow: Vec::new(),
         };
         assert_eq!(request.frame_interval(), Duration::from_nanos(16_666_666));
         request.fps = 30;
