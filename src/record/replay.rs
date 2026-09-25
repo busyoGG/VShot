@@ -464,12 +464,22 @@ fn screen_session(
 /// encoded into the ring.  Reuses the recording window loop through the
 /// [`crate::record::avcodec::VideoSink`] the ring implements, with the control
 /// socket polled between frames.
+///
+/// Which loop depends on what the session speaks, exactly as on the recording
+/// side: the wlroots route copies the window through
+/// `ext_image_copy_capture_v1`, while a Plasma session has no such protocol
+/// and copies it through KWin's own `ScreenShot2.CaptureWindow`.
 fn window_session(
     request: &ReplayRequest,
     target: &super::WindowTarget,
     listener: &UnixListener,
     interrupted: &AtomicBool,
 ) -> Result<()> {
+    if crate::capture::active_output::Session::detect()
+        == crate::capture::active_output::Session::KWin
+    {
+        return kwin_window_session(request, target, listener, interrupted);
+    }
     use super::avcodec::VideoSink;
     let (mut capture, shape, name) = super::window::open_window_capture(target)?;
     // `--mic` and `--app-audio` are independent and may both be given: the
@@ -556,6 +566,106 @@ fn window_session(
     )
 }
 
+/// The KWin window replay session: KWin's own copy of one window, by its
+/// `QUuid`, encoded into the ring.  The twin of [`window_session`] for the
+/// desktops the wlroots route cannot serve — a Plasma session speaks neither
+/// `ext_foreign_toplevel_list_v1` nor `ext_image_copy_capture_v1`.  The frame
+/// loop, the follow logic and the per-frame control socket are exactly the
+/// ones a KWin window *recording* uses; only the sink differs — a ring instead
+/// of a file.
+fn kwin_window_session(
+    request: &ReplayRequest,
+    target: &super::WindowTarget,
+    listener: &UnixListener,
+    interrupted: &AtomicBool,
+) -> Result<()> {
+    use super::avcodec::VideoSink;
+    // The window is captured once before the ring opens, because the ring's
+    // canvas comes from the window's own pixels — which only a capture
+    // reports.  KWin's ScreenShot2 has no dma-buf, so the ring keeps RGBA
+    // frames on every backend, not only NVENC.
+    let loop_request = super::RecordRequest {
+        target: request.target.clone(),
+        output: None,
+        fps: request.fps,
+        cursor: request.cursor,
+        duration: None,
+        encoder: request.encoder,
+        encoder_backend: request.encoder_backend,
+        portal: false,
+        mic: None,
+        app_audio: request.app_audio,
+        follow: request.follow.clone(),
+    };
+    let (mut capture, mut window, follow, first) =
+        super::kwin_window::open_window_capture(&loop_request, target)?;
+    // The ring's canvas, like a file's, has to be even for NV12 — see
+    // `kwin_window::even_canvas`.  ScreenShot2 hands back the window's client
+    // geometry, which can be odd; the fit path pads the extra column and row.
+    let (width, height) = super::kwin_window::even_canvas(first.size());
+
+    // `--mic` and `--app-audio` are independent and may both be given: the
+    // microphone is the room, the window's own application audio is the
+    // window's sound, and the ring keeps both summed into its one track.
+    let app_audio = if request.app_audio {
+        super::open_app_audio(&window.as_name())?
+    } else {
+        None
+    };
+    let mic = super::open_soundtrack_with(request.mic.as_ref(), app_audio)?;
+    let mic_format = mic.format();
+    let gop_frames = request.gop_frames();
+    let retention = request
+        .window
+        .saturating_add(request.gop_secs.clamp(1, MAX_GOP));
+    let backend = request.encoder_backend.resolve();
+    let mut recorder = ReplayRecorder::start(
+        width,
+        height,
+        request.encoder,
+        // No dma-buf: ScreenShot2 writes pixels through a pipe, and the ring
+        // keeps them as RGBA.
+        None,
+        mic_format,
+        retention,
+        gop_frames,
+        request.fps,
+        backend,
+    )?;
+    if debug_enabled() {
+        eprintln!(
+            "vshot: KWin window replay {width}x{height} at {} fps with {} ({}) through libavcodec \
+             {}, keeping {}s in memory (GOP {} frames)",
+            request.fps,
+            request.encoder.word(),
+            backend.word(),
+            super::avcodec::libavcodec_version(),
+            request.window,
+            gop_frames
+        );
+    }
+    let _ = VideoSink::canvas(&recorder);
+    let mut mic = mic;
+    mic.arm();
+    super::kwin_window::loop_over(
+        &mut capture,
+        &mut recorder,
+        &loop_request,
+        &follow,
+        &mut window,
+        first,
+        &mut mic,
+        interrupted,
+        |sink| {
+            if let Some(stream) = accept_control(listener) {
+                handle_control(stream, sink, request)
+            } else {
+                Ok(false)
+            }
+        },
+    )
+}
+
 /// Binds the control socket, replacing a stale one (a socket left by a session
 /// that died without cleaning up would otherwise block the next start).
 fn bind_control_socket() -> Result<UnixListener> {
@@ -594,6 +704,9 @@ fn session_loop(
     let mut timeline_ms = 0u64;
     let mut covered_us = 0u64;
 
+    // A capture the compositor *refused* is retried rather than counted as a
+    // dropped frame — see [`super::Refusals`].
+    let mut refusals = super::Refusals::default();
     loop {
         if interrupted.load(Ordering::Relaxed) {
             break;
@@ -618,13 +731,22 @@ fn session_loop(
         let frame = match grabbed {
             Ok(frame) => frame,
             Err(error) => {
-                consecutive_errors += 1;
-                if consecutive_errors >= 10 {
-                    return Err(VshotError::Recording(format!(
-                        "giving up after {consecutive_errors} frames in a row failed: {error}"
-                    )));
+                // A refusal is the compositor declining to be asked, which on
+                // KWin comes and goes; anything else is a hiccup.  Neither is
+                // fatal on its own.
+                if let VshotError::ScreenshotDenied(explanation) = &error {
+                    if !refusals.refused(explanation) {
+                        return Err(error);
+                    }
+                } else {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 10 {
+                        return Err(VshotError::Recording(format!(
+                            "giving up after {consecutive_errors} frames in a row failed: {error}"
+                        )));
+                    }
+                    eprintln!("vshot: dropping a frame: {error}");
                 }
-                eprintln!("vshot: dropping a frame: {error}");
                 let now = Instant::now();
                 last_frame_at = now;
                 next_frame = now + interval;
@@ -632,6 +754,7 @@ fn session_loop(
             }
         };
         consecutive_errors = 0;
+        refusals.delivered();
         let duration_ms = {
             covered_us += grab_started
                 .saturating_duration_since(last_frame_at)

@@ -96,6 +96,13 @@ pub enum VshotError {
     /// surface size, a write that could not keep up, no session to talk to).
     #[error("recording failed: {0}")]
     Recording(String),
+    /// Recording a window: the window went away mid-session — it was closed,
+    /// or the compositor no longer knows the handle the capture was aimed at.
+    /// The recording ends on it the way it ends on any compositor when the
+    /// recorded window closes: the file is finished properly rather than left
+    /// without its trailer, and this says why the file ends where it does.
+    #[error("the recorded window went away: {0}")]
+    WindowClosed(String),
     /// A complete sentence that needs no prefix: a replay session's own error
     /// relayed to the client that triggered it is already worded for the user,
     /// so wrapping it again would read as "recording failed: recording

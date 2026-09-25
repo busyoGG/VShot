@@ -73,6 +73,15 @@ enum Shot<'a> {
     Output { name: &'a str, cursor: bool },
     /// The focused window, decorations included.
     ActiveWindow { cursor: bool },
+    /// One named window, decorations included.
+    ///
+    /// `handle` is the window's internal id as KWin reports it — `internalId`
+    /// in the scripting API, a `QUuid` string.  It is the one description of a
+    /// window that does not depend on the window having the focus or on where
+    /// it currently is, which is exactly what recording a window needs: the
+    /// focus moves and the geometry changes while the recording runs, and the
+    /// file has to keep showing the same window.
+    Window { handle: &'a str, cursor: bool },
 }
 
 impl Shot<'_> {
@@ -81,6 +90,7 @@ impl Shot<'_> {
         match self {
             Self::Output { name, .. } => format!("the screen `{name}`"),
             Self::ActiveWindow { .. } => "the focused window".to_string(),
+            Self::Window { handle, .. } => format!("the window `{handle}`"),
         }
     }
 }
@@ -171,6 +181,21 @@ impl KwinCapture {
         Ok((frame, scale))
     }
 
+    /// Captures one window by its internal id, whether or not it has the
+    /// focus.  `CaptureWindow` takes the window's `QUuid` string — the same
+    /// value the scripting interface calls `internalId` — and renders it the
+    /// way `CaptureActiveWindow` renders the focused one: decorations and
+    /// shadow included, alpha kept, and the screen's `scale` in the results.
+    ///
+    /// This is what makes window *recording* possible on a Plasma session.
+    /// `CaptureActiveWindow` answers "whatever has the focus", which changes
+    /// under a recording; a handle names one window for the whole session.
+    pub fn capture_window(&mut self, handle: &str, cursor: bool) -> Result<(Frame, u32)> {
+        let (frame, scale) = self.request(Shot::Window { handle, cursor })?;
+        let scale = scale.expect("a window capture always carries a scale");
+        Ok((frame, scale))
+    }
+
     /// Runs one capture and returns the frame KWin rendered, plus the density
     /// it stated for it when the capture is one that carries a density.
     ///
@@ -184,6 +209,9 @@ impl KwinCapture {
         let options = match &shot {
             Shot::Output { cursor, .. } => capture_options(*cursor),
             Shot::ActiveWindow { cursor } => window_options(*cursor),
+            // The by-handle route is the recording path only, and a recording
+            // cannot carry a shadow (see [`recording_window_options`]).
+            Shot::Window { cursor, .. } => recording_window_options(*cursor),
         };
         let (read_end, write_end) = rustix::pipe::pipe().map_err(|error| {
             VshotError::KwinScreenShot(format!(
@@ -205,6 +233,15 @@ impl KwinCapture {
                 Some(INTERFACE),
                 "CaptureActiveWindow",
                 &(options, Fd::from(&write_end)),
+            ),
+            // The window is named by its `QUuid` string and nothing else in
+            // the request: `CaptureWindow(s handle, a{sv} options, h pipe)`.
+            Shot::Window { handle, .. } => self.connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(INTERFACE),
+                "CaptureWindow",
+                &(*handle, options, Fd::from(&write_end)),
             ),
         };
         // Only the compositor's copy of the write end may stay open, otherwise
@@ -237,7 +274,9 @@ impl KwinCapture {
         // It is also the one whose pixels do not fill their frame, so it is the
         // one that keeps them see-through.
         let (scale, alpha) = match shot {
-            Shot::ActiveWindow { .. } => (Some(result_scale(&results)?), Alpha::Keep),
+            Shot::ActiveWindow { .. } | Shot::Window { .. } => {
+                (Some(result_scale(&results)?), Alpha::Keep)
+            }
             Shot::Output { .. } => (None, Alpha::Flatten),
         };
         Ok((convert_premultiplied_bgra(&bytes, geometry, alpha)?, scale))
@@ -261,8 +300,8 @@ fn capture_options(cursor: bool) -> HashMap<&'static str, Value<'static>> {
     options
 }
 
-/// The options for a window capture, which are the output ones plus the
-/// decoration.
+/// The options for a window *screenshot*: the output ones plus the decoration
+/// and KWin's default shadow.
 ///
 /// `include-decoration` is what keeps the title bar and the window's frame in
 /// the picture: the request is "this window", and a window stripped of its
@@ -281,6 +320,24 @@ fn capture_options(cursor: bool) -> HashMap<&'static str, Value<'static>> {
 fn window_options(cursor: bool) -> HashMap<&'static str, Value<'static>> {
     let mut options = capture_options(cursor);
     options.insert("include-decoration", Value::from(true));
+    options
+}
+
+/// The options for the window *recording* path, which are [`window_options`]
+/// with the shadow turned off.
+///
+/// A screenshot writes a PNG, which keeps the alpha channel, so the shadow's
+/// transparent surround is harmless — even useful.  A recording encodes NV12,
+/// which has no alpha at all: the shadow's transparent pixels become opaque
+/// black, so keeping it would ring the window in a black band.  It would also
+/// grow the canvas — a 941x768 window captured with its shadow came back as
+/// 1072x898 — which then forces the whole frame through the fit path for
+/// nothing.  Turning the shadow off makes the capture exactly the window (the
+/// title bar's decoration is kept), and the recording is of the window, not of
+/// its drop shadow.
+fn recording_window_options(cursor: bool) -> HashMap<&'static str, Value<'static>> {
+    let mut options = window_options(cursor);
+    options.insert("include-shadow", Value::from(false));
     options
 }
 
@@ -475,6 +532,13 @@ fn map_method_error(name: &str, detail: Option<&str>, target: &str) -> VshotErro
         }
         "org.kde.KWin.ScreenShot2.Error.InvalidScreen" => {
             VshotError::IncompleteTopology(format!("KWin ScreenShot2 does not know {target}"))
+        }
+        // The window a capture was aimed at is gone: it closed, or the handle
+        // belongs to a window KWin no longer knows.  A recording ends on this
+        // the way it ends on any compositor when the recorded window closes —
+        // the file is finished properly rather than left without a trailer.
+        "org.kde.KWin.ScreenShot2.Error.InvalidWindow" => {
+            VshotError::WindowClosed(format!("{target} is no longer a window KWin knows"))
         }
         _ => {
             let detail = detail.unwrap_or("no details");
@@ -941,6 +1005,137 @@ mod tests {
                 frame.pixel(center),
                 Some([channels[0], channels[1], channels[2], 255]),
                 "the colour on screen has to survive the conversion"
+            );
+        }
+    }
+
+    /// Captures one window by the `QUuid` the scripting probe reports, live.
+    ///
+    /// The route under test is the one `record window` / `replay start window`
+    /// take on Plasma: `ScreenShot2.CaptureWindow` addressed by the window's
+    /// `internalId`, with the shadow off.  Set up the compositor and a window
+    /// exactly as for [`captures_a_live_kwin_screen`], then start something
+    /// with a class:
+    ///
+    /// ```text
+    /// WAYLAND_DISPLAY=wayland-ke2e kitty --class kittytest -T "Hello VShot" &
+    /// VSHOT_KWIN_E2E_WINDOW=kittytest cargo test -- --ignored captures_a_live_kwin_window
+    /// ```
+    ///
+    /// `VSHOT_KWIN_E2E_WINDOW` is a substring of the window's class or title
+    /// (default `kitty`), and `VSHOT_KWIN_E2E_OUTPUT` names the screen to
+    /// cross-check against (default `Virtual-0`).  Three things are pinned:
+    /// the window comes back **at the size the probe reports for it** — the
+    /// recorder rounds that up to an even canvas itself, so the raw capture
+    /// must not do it first, or the even rounding would hide a wrong size; its
+    /// body is substantially opaque, which is the [`Alpha::Keep`] a window
+    /// capture carries and an output one does not; and its **colours are the
+    /// ones on screen** at the window's place, which is what says the
+    /// un-premultiply and the byte order are right.  That last check needs a
+    /// 1:1 screen at a non-negative window origin and is skipped otherwise.
+    /// Measured on this machine: 936x768, body alpha 204, rounded-corner alphas
+    /// 0..57, and a body pixel of (250, 243, 225) against (251, 244, 226) on
+    /// screen — one step of rounding, see the assertion.
+    #[test]
+    #[ignore = "needs a running KWin session with a window on it, see the comment above"]
+    fn captures_a_live_kwin_window() {
+        use crate::capture::window::{kwin_rows, ProcessWindowRunner};
+
+        let needle = std::env::var("VSHOT_KWIN_E2E_WINDOW").unwrap_or_else(|_| "kitty".into());
+        let rows = kwin_rows(&ProcessWindowRunner).expect("the KWin probe has to answer");
+        let row = rows
+            .into_iter()
+            .find(|row| row.app_id.contains(&needle) || row.title.contains(&needle))
+            .unwrap_or_else(|| panic!("no window matching `{needle}` is on screen"));
+        eprintln!(
+            "capturing {} `{}` at {}x{} (handle {})",
+            row.app_id, row.title, row.width, row.height, row.handle
+        );
+        assert!(
+            !row.handle.is_empty(),
+            "the probe has to report the window's internalId, or nothing can address it"
+        );
+
+        let mut capture = KwinCapture::connect().expect("KWin ScreenShot2 has to be reachable");
+        let (frame, scale) = capture
+            .capture_window(&row.handle, false)
+            .expect("capturing the window has to succeed");
+        eprintln!(
+            "captured {}x{} at scale {scale}, {} bytes",
+            frame.size().width,
+            frame.size().height,
+            frame.pixels().len()
+        );
+        assert_eq!(
+            frame.size(),
+            Size::new(row.width, row.height),
+            "the capture has to come back at the size the probe reported for the window"
+        );
+
+        // A window capture keeps its alpha (`Alpha::Keep`): the window sits on a
+        // transparent backdrop, so its rounded corners arrive see-through.  What
+        // a recording needs is a substantially opaque body — the recorder drops
+        // the alpha, so a wrong alpha on its own would not show up as a wrong
+        // picture, and the colours are checked separately below.
+        let centre = crate::geometry::Point::new((row.width / 2) as i32, (row.height / 2) as i32);
+        let body = frame.pixel(centre).expect("the window has a middle");
+        let corners = [
+            crate::geometry::Point::new(0, 0),
+            crate::geometry::Point::new(row.width as i32 - 1, 0),
+            crate::geometry::Point::new(0, row.height as i32 - 1),
+            crate::geometry::Point::new(row.width as i32 - 1, row.height as i32 - 1),
+        ];
+        eprintln!(
+            "body alpha {}, corner alphas {:?}",
+            body[3],
+            corners.map(|corner| frame.pixel(corner).map(|pixel| pixel[3]))
+        );
+        assert!(
+            body[3] >= 128,
+            "the window's body has to be substantially opaque, not a ghost"
+        );
+
+        // The same pixels have to be on screen, at the window's place, when the
+        // *screen* is captured instead.  That is what says the un-premultiply
+        // and the byte order are right; on a 1:1 screen the window's logical
+        // rectangle indexes the output frame directly.
+        let output = std::env::var("VSHOT_KWIN_E2E_OUTPUT").unwrap_or_else(|_| "Virtual-0".into());
+        if scale != 1 || row.x < 0 || row.y < 0 {
+            eprintln!(
+                "window at ({}, {}) on a scale-{scale} screen — skipping the colour cross-check",
+                row.x, row.y
+            );
+            return;
+        }
+        let screen = capture
+            .capture_output(&output, false)
+            .expect("the screen capture has to succeed");
+        let on_screen = crate::geometry::Point::new(
+            row.x + (row.width / 2) as i32,
+            row.y + (row.height / 2) as i32,
+        );
+        let window_pixel = frame.pixel(centre).expect("the window has a middle");
+        let screen_pixel = screen.pixel(on_screen).expect("that point is on screen");
+        let (a, b) = (window_pixel, screen_pixel);
+        eprintln!(
+            "window pixel {:?} against on-screen {:?} at ({}, {})",
+            &a[..3],
+            &b[..3],
+            on_screen.x,
+            on_screen.y
+        );
+        // One step of slack: the window capture arrives premultiplied by its own
+        // alpha and is un-premultiplied back, which rounds, while the opaque
+        // screen capture never left full strength.  Measured: (250, 243, 225)
+        // against (251, 244, 226).
+        for channel in 0..3 {
+            let difference = i32::from(a[channel]) - i32::from(b[channel]);
+            assert!(
+                difference.abs() <= 1,
+                "channel {channel} of the window capture ({}) has to match the screen ({}) \
+                 at the window's place",
+                a[channel],
+                b[channel]
             );
         }
     }

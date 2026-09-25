@@ -266,9 +266,12 @@ fn run() -> Result<()> {
             // happens above, before the scene is composed.  So this is the
             // window list, and then the frozen frame.
             CaptureTarget::ActiveWindow { .. } => {
-                if let Some(window) = metadata_window {
+                // A window the compositor named but could not place (niri's
+                // tiled windows) falls through to the pixel fallback below,
+                // which at least finds the window under the pointer.
+                if let Some(geometry) = metadata_window.and_then(|window| window.geometry) {
                     wayland.show_frozen(false)?;
-                    let geometry = selection::validate_selection(&scene, window.geometry)?;
+                    let geometry = selection::validate_selection(&scene, geometry)?;
                     // The window's own pixels at its own output's density — cropping
                     // the composed scene would hand back a nearest-upscale of a
                     // window that sits on a lower-density monitor.
@@ -281,7 +284,14 @@ fn run() -> Result<()> {
                     wayland.show_frozen(false)?;
                     let cursor = wayland.pointer_position().unwrap_or(None);
                     let geometry = match capture::detect_active_window(&scene, cursor) {
-                        Ok(window) => window.geometry,
+                        // The pixel detector always reports a rectangle; a
+                        // `None` here would mean it found nothing, which it
+                        // spells as an error instead.
+                        Ok(window) => window.geometry.ok_or_else(|| {
+                            VshotError::ActiveWindowUnavailable(
+                                "the pixel fallback reported no window rectangle".into(),
+                            )
+                        })?,
                         Err(pixel_error) => {
                             return Err(match unavailable {
                                 Some(reason) => VshotError::ActiveWindowUnavailable(format!(

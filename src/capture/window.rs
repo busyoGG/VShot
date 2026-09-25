@@ -13,21 +13,37 @@ use super::active_output::Session;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveWindow {
-    pub geometry: Rect,
+    /// Where the window is, when the compositor can say.  `None` is an honest
+    /// answer rather than a missing one: niri reports a window's size but no
+    /// absolute position for a tiled window, so the focused window it names
+    /// cannot be given a rectangle.  A caller that needs pixels of *this
+    /// window* has niri's own window screenshot for it; a caller that only
+    /// needs to name the window (`--follow`, `record window active`) uses the
+    /// labels and never reads this.
+    pub geometry: Option<Rect>,
     pub source: WindowSource,
     /// The app id (Wayland) or class (X11) the compositor reports for this
     /// window, and its title.  Empty where the compositor's query reports
-    /// neither (KWin's probe, the pixel fallback).  Recording a window needs
-    /// them: the foreign-toplevel list names a window the same way, and that
-    /// is how the focused window is found in it.
+    /// neither (the pixel fallback).  Recording a window needs them: the
+    /// foreign-toplevel list names a window the same way, and that is how the
+    /// focused window is found in it.
     pub app_id: String,
     pub title: String,
+    /// The compositor's own opaque name for this window, where it has one that
+    /// a later query can be aimed at.  KWin answers with the window's `QUuid`
+    /// (its scripting API calls it `internalId`), which is what
+    /// `org.kde.KWin.ScreenShot2.CaptureWindow` takes; the toplevel protocols
+    /// name a window by its `ext_foreign_toplevel_handle_v1`, which is not a
+    /// string and is not carried here.  `None` where the compositor's query
+    /// reports no such name.
+    pub handle: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowSource {
     Hyprland,
     Sway,
+    Niri,
     KWin,
     /// Detected from the captured frame (accent outline / segmentation).
     Pixel,
@@ -49,6 +65,12 @@ pub struct WindowCandidate {
     pub app_id: String,
     /// The window's title, as the compositor reports it.  May be empty.
     pub title: String,
+    /// The compositor's own opaque name for this window, where one exists that
+    /// a capture request can be aimed at — KWin's `QUuid`, the value
+    /// `ScreenShot2.CaptureWindow` takes.  `None` elsewhere; a window capture
+    /// on the toplevel protocols names a window by its protocol handle, which
+    /// is not a string and is not carried here.
+    pub handle: Option<String>,
 }
 
 impl WindowCandidate {
@@ -60,6 +82,7 @@ impl WindowCandidate {
             label,
             app_id: String::new(),
             title: String::new(),
+            handle: None,
         }
     }
 }
@@ -104,6 +127,18 @@ impl WindowCommand {
         }
     }
 
+    /// niri's own IPC: the focused window, as one window object.
+    fn niri() -> Self {
+        Self {
+            program: OsString::from("niri"),
+            args: vec![
+                OsString::from("msg"),
+                OsString::from("--json"),
+                OsString::from("focused-window"),
+            ],
+        }
+    }
+
     /// KDE Plasma's window metadata, in two routes. `kdotool` comes first when
     /// it is installed: it drives the same KWin scripting interface, but gets
     /// its result back over D-Bus instead of through KWin's script logging, so
@@ -138,8 +173,13 @@ fn kwin_probe(mode: &str) -> WindowCommand {
 }
 
 /// See [`WindowCommand::kwin`]. `$1` selects `active` (the focused window) or
-/// `list` (every window). Each result line is `x y width height` in global
-/// logical pixels; any other outcome must exit non-zero or print nothing.
+/// `list` (every window). Each result line is eight tab-separated fields —
+/// `x  y  width  height  pid  class  title  handle` — in global logical pixels,
+/// with `handle` the window's `QUuid` (KWin's `internalId`, which
+/// `ScreenShot2.CaptureWindow` takes). Tabs rather than spaces because a
+/// window's title carries spaces, and a tab rather than a rarer delimiter
+/// because it survives the journal, which is how the scripting route's output
+/// comes back. Any other outcome must exit non-zero or print nothing.
 const KWIN_PROBE: &str = r##"
 set -u
 mode="${1:-active}"
@@ -151,36 +191,60 @@ run_limited() {
         "$@"
     fi
 }
+# A tab or a newline inside a field would break the record the caller parses,
+# so those become spaces.
+clean() {
+    printf '%s' "${1:-}" | tr '\t\n' '  '
+}
+emit() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$(clean "$6")" "$(clean "$7")" "$(clean "$8")"
+}
 tmp="$(mktemp "${TMPDIR:-/tmp}/vshot-kwin-XXXXXX.js")" || exit 3
 trap 'rm -f "$tmp"' EXIT
 
-# kdotool answers only the active-window question; listing goes through the
-# scripting probe either way.
+# kdotool answers only the active-window question, but it answers it over
+# D-Bus rather than through KWin's script logging, so it is the one route that
+# does not need the journal — and its window id is the same `QUuid`
+# `CaptureWindow` takes, which is what lets a window be recorded by name on
+# Plasma.  Listing goes through the scripting probe either way: kdotool would
+# need four more process invocations per window.
 if [ "$mode" = active ] && command -v kdotool >/dev/null 2>&1; then
-    # `getwindowgeometry` has no `--shell` form — kdotool 0.2.1 offers that only
-    # for `getmouselocation`, and asking anyway fails the whole command — so its
-    # labelled output is parsed instead:
-    #
-    #   Window {1d5f...}
-    #     Position: 400.0702150216,167.68492081784424
-    #     Geometry: 1066x709.9999999999989
-    #
-    # The fractions are kdotool's own arithmetic on whole logical pixels, so
-    # they are rounded back.
-    geo="$(run_limited kdotool getactivewindow getwindowgeometry 2>/dev/null)" || geo=""
-    if [ -n "$geo" ] && command -v awk >/dev/null 2>&1; then
-        geo="$(printf '%s\n' "$geo" | awk '
-            /^[[:space:]]*Position:/ { split($2, at, ","); x = at[1]; y = at[2] }
-            /^[[:space:]]*Geometry:/ { split($2, size, "x"); w = size[1]; h = size[2] }
-            END {
-                if (w > 0 && h > 0) {
-                    printf "%d %d %d %d\n", int(x + 0.5), int(y + 0.5), int(w + 0.5), int(h + 0.5)
+    handle="$(run_limited kdotool getactivewindow 2>/dev/null)" || handle=""
+    if [ -n "$handle" ]; then
+        # `getwindowgeometry` has no `--shell` form — kdotool 0.2.1 offers that
+        # only for `getmouselocation`, and asking anyway fails the whole
+        # command — so its labelled output is parsed instead:
+        #
+        #   Window {1d5f...}
+        #     Position: 400.0702150216,167.68492081784424
+        #     Geometry: 1066x709.9999999999989
+        #
+        # The fractions are kdotool's own arithmetic on whole logical pixels, so
+        # they are rounded back.
+        geo="$(run_limited kdotool getwindowgeometry "$handle" 2>/dev/null)" || geo=""
+        if [ -n "$geo" ] && command -v awk >/dev/null 2>&1; then
+            geometry="$(printf '%s\n' "$geo" | awk '
+                /^[[:space:]]*Position:/ { split($2, at, ","); x = at[1]; y = at[2] }
+                /^[[:space:]]*Geometry:/ { split($2, size, "x"); w = size[1]; h = size[2] }
+                END {
+                    if (w > 0 && h > 0) {
+                        printf "%d %d %d %d\n", int(x + 0.5), int(y + 0.5), int(w + 0.5), int(h + 0.5)
+                    }
                 }
-            }
-        ')"
-        if [ -n "$geo" ]; then
-            printf '%s\n' "$geo"
-            exit 0
+            ')"
+            if [ -n "$geometry" ]; then
+                klass="$(run_limited kdotool getwindowclassname "$handle" 2>/dev/null)" || klass=""
+                title="$(run_limited kdotool getwindowname "$handle" 2>/dev/null)" || title=""
+                pid="$(run_limited kdotool getwindowpid "$handle" 2>/dev/null)" || pid=""
+                # A pid kdotool could not read (an application that does not
+                # report one) is not a pid: it becomes 0, which the caller
+                # reads as "unknown" rather than as a process.
+                case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+                set -- $geometry
+                emit "$1" "$2" "$3" "$4" "$pid" "$klass" "$title" "$handle"
+                exit 0
+            fi
         fi
     fi
 fi
@@ -195,12 +259,17 @@ fi
 
 if [ "$mode" = active ]; then
 cat > "$tmp" <<EOF
+function esc(value) {
+    return String(value === null || value === undefined ? "" : value).replace(/[\t\n]/g, " ");
+}
 const w = workspace.activeWindow || workspace.activeClient;
 if (w) {
     const g = w.frameGeometry || w.geometry;
     if (g && g.width > 0 && g.height > 0) {
-        console.info("$marker " + Math.round(g.x) + " " + Math.round(g.y)
-            + " " + Math.round(g.width) + " " + Math.round(g.height));
+        console.info("$marker " + Math.round(g.x) + "\t" + Math.round(g.y) + "\t"
+            + Math.round(g.width) + "\t" + Math.round(g.height) + "\t"
+            + (w.pid || 0) + "\t" + esc(w.resourceClass) + "\t" + esc(w.caption)
+            + "\t" + esc(w.internalId));
     } else {
         console.info("$marker null");
     }
@@ -210,10 +279,13 @@ if (w) {
 EOF
 else
 cat > "$tmp" <<EOF
+function esc(value) {
+    return String(value === null || value === undefined ? "" : value).replace(/[\t\n]/g, " ");
+}
 // Stacking order, bottom to top: the picker takes the last window under the
 // pointer, so the order is what makes that window the one on top.  KWin's own
 // hit test walks this same list from its end for the same reason.  It is a
-// property, not a method; `windowList()` is creation order and only stands in
+// property, not a method; \`windowList()\` is creation order and only stands in
 // for a KWin too old to have the stacking order at all.
 let stacking = workspace.stackingOrder;
 if (typeof stacking === "function") {
@@ -246,8 +318,10 @@ for (let index = 0; index < windows.length; ++index) {
     if (!g || !(g.width > 0) || !(g.height > 0)) {
         continue;
     }
-    console.info("$marker " + Math.round(g.x) + " " + Math.round(g.y)
-        + " " + Math.round(g.width) + " " + Math.round(g.height));
+    console.info("$marker " + Math.round(g.x) + "\t" + Math.round(g.y) + "\t"
+        + Math.round(g.width) + "\t" + Math.round(g.height) + "\t"
+        + (w.pid || 0) + "\t" + esc(w.resourceClass) + "\t" + esc(w.caption)
+        + "\t" + esc(w.internalId));
 }
 EOF
 fi
@@ -380,16 +454,23 @@ fn topmost_containing(rects: impl Iterator<Item = Rect>, point: Point) -> Option
 enum Compositor {
     Hyprland,
     Sway,
+    Niri,
     KWin,
 }
 
-const COMPOSITORS: [Compositor; 3] = [Compositor::Hyprland, Compositor::Sway, Compositor::KWin];
+const COMPOSITORS: [Compositor; 4] = [
+    Compositor::Hyprland,
+    Compositor::Sway,
+    Compositor::Niri,
+    Compositor::KWin,
+];
 
 impl Compositor {
     fn name(self) -> &'static str {
         match self {
             Self::Hyprland => "Hyprland",
             Self::Sway => "Sway",
+            Self::Niri => "niri",
             Self::KWin => "KWin",
         }
     }
@@ -398,6 +479,7 @@ impl Compositor {
         match self {
             Self::Hyprland => Session::Hyprland,
             Self::Sway => Session::Sway,
+            Self::Niri => Session::Niri,
             Self::KWin => Session::KWin,
         }
     }
@@ -406,6 +488,7 @@ impl Compositor {
         match self {
             Self::Hyprland => WindowCommand::hyprland(),
             Self::Sway => WindowCommand::sway(),
+            Self::Niri => WindowCommand::niri(),
             Self::KWin => WindowCommand::kwin(),
         }
     }
@@ -414,6 +497,7 @@ impl Compositor {
         match self {
             Self::Hyprland => parse_hyprland_active_window(stdout),
             Self::Sway => parse_sway_active_window(stdout),
+            Self::Niri => parse_niri_active_window(stdout),
             Self::KWin => parse_kwin_active_window(stdout),
         }
     }
@@ -442,11 +526,22 @@ impl Compositor {
     }
 
     /// The windows this compositor shows, as picking wants them.
+    ///
+    /// niri is the exception: it names its windows (`niri msg --json windows`)
+    /// but reports no absolute position for a tiled one, so it cannot answer
+    /// with the rectangles the picker highlights with.  That is not a failure
+    /// of this query — it is why a niri session picks through niri's own
+    /// crosshair (`capture::niri::pick_window`) instead of this list.
     fn window_list<R: WindowCommandRunner>(self, runner: &R) -> Result<Vec<WindowCandidate>> {
         match self {
             Self::Hyprland => hyprland_windows(runner),
             Self::Sway => run_command(runner, &WindowCommand::sway())
                 .and_then(|bytes| parse_sway_windows(&bytes)),
+            Self::Niri => Err(VshotError::WindowPickUnavailable(
+                "niri names its windows but gives no position for a tiled one, so it has no \
+                 rectangle list; picking uses niri's own crosshair"
+                    .into(),
+            )),
             Self::KWin => run_command(runner, &WindowCommand::kwin_list())
                 .and_then(|bytes| parse_kwin_windows(&bytes)),
         }
@@ -459,8 +554,10 @@ impl Compositor {
 /// `HYPRLAND_INSTANCE_SIGNATURE`, so `hyprctl` goes on answering and its
 /// windows would be read as if they were on the KDE desktop.
 ///
-/// A session whose compositor has neither query (niri) yields nothing to ask,
-/// which is an honest answer: the caller falls back to the pixels.
+/// niri is asked too, through its own IPC: it is the one compositor whose
+/// focused window is worth naming (a `--follow` recording and `record window
+/// active` both match on `app_id`/`title`) even though the rectangle it cannot
+/// give keeps it out of the picker's list.
 fn compositors_for(session: Session) -> Vec<Compositor> {
     COMPOSITORS
         .into_iter()
@@ -493,7 +590,7 @@ fn find_windows_for<R: WindowCommandRunner>(
     if reasons.is_empty() {
         return Err(VshotError::WindowPickUnavailable(
             "this session's compositor has no window list to offer (only Hyprland, Sway and \
-             KWin have one)"
+             KWin have one; niri picks through its own crosshair)"
                 .into(),
         ));
     }
@@ -541,8 +638,8 @@ fn find_active_window_for<R: WindowCommandRunner>(
     }
     if reasons.is_empty() {
         return Err(VshotError::ActiveWindowUnavailable(
-            "this session's compositor has no active-window query (only Hyprland, Sway and KWin \
-             have one)"
+            "this session's compositor has no active-window query (only Hyprland, Sway, niri \
+             and KWin have one)"
                 .into(),
         ));
     }
@@ -564,7 +661,7 @@ pub fn parse_hyprland_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
         ));
     }
     Ok(ActiveWindow {
-        geometry: Rect::new(at.0, at.1, size.0, size.1),
+        geometry: Some(Rect::new(at.0, at.1, size.0, size.1)),
         source: WindowSource::Hyprland,
         app_id: value
             .get("class")
@@ -576,7 +673,96 @@ pub fn parse_hyprland_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
+        handle: None,
     })
+}
+
+/// niri's `msg --json focused-window`: one window object, or `null` when a
+/// layer-shell surface holds the focus.  niri reports `app_id` and `title` on
+/// the object — which is what a window recording matches against the
+/// foreign-toplevel list — but *no position* for a tiled window, so the
+/// geometry stays `None`; niri's own screenshot is how a caller gets the
+/// focused window's pixels (see [`super::niri`]).
+pub fn parse_niri_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        VshotError::ActiveWindowUnavailable(format!("invalid niri JSON: {error}"))
+    })?;
+    if value.is_null() {
+        return Err(VshotError::ActiveWindowUnavailable(
+            "niri reports no focused window".into(),
+        ));
+    }
+    if value.get("id").and_then(Value::as_u64).is_none() {
+        return Err(VshotError::ActiveWindowUnavailable(
+            "niri's focused-window reply names no window id".into(),
+        ));
+    }
+    Ok(ActiveWindow {
+        // The floating case has a position niri states; the tiled one does not,
+        // and null is how niri spells that.  A caller that needs a rectangle
+        // reads `None` as "niri cannot place this window" and takes niri's own
+        // screenshot path; a caller that only needs the name does not care.
+        geometry: niri_position(&value),
+        source: WindowSource::Niri,
+        app_id: value
+            .get("app_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        handle: None,
+    })
+}
+
+/// The tile's top-left corner in global logical pixels, for a niri window that
+/// states one (`tile_pos_in_workspace_view`, filled for the floating space
+/// only — see [`super::niri::NiriWindow`]).
+///
+/// This is *not* the window's own frame: it is the tile's origin, which
+/// includes niri's border.  It is enough for the one caller that reads a
+/// rectangle off an active-window reply — sizing the frozen scene's selection
+/// — but the exact pixels of a niri window come from niri's own screenshot,
+/// never from this.  `None` for a tiled window, which niri does not place.
+fn niri_position(value: &Value) -> Option<Rect> {
+    let layout = value.get("layout")?;
+    let pair = |field: &str| {
+        layout.get(field)?.as_array().and_then(|pair| {
+            let [first, second] = pair.as_slice() else {
+                return None;
+            };
+            Some((first.as_f64()?, second.as_f64()?))
+        })
+    };
+    let (x, y) = pair("tile_pos_in_workspace_view")?;
+    // Prefer the window's own size where niri states it, so the rectangle is
+    // the window and not the tile; fall back to the tile minus its border.
+    let (width, height) = match pair("window_size") {
+        Some(size) => size,
+        None => {
+            let (tile_w, tile_h) = pair("tile_size")?;
+            let (offset_x, offset_y) = pair("window_offset_in_tile")?;
+            (tile_w - 2.0 * offset_x, tile_h - 2.0 * offset_y)
+        }
+    };
+    if !x.is_finite() || !y.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let to_i32 = |value: f64| {
+        (value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
+            .then_some(value.round() as i32)
+    };
+    let to_u32 =
+        |value: f64| (value >= 0.0 && value <= f64::from(u32::MAX)).then_some(value.round() as u32);
+    Some(Rect::new(
+        to_i32(x)?,
+        to_i32(y)?,
+        to_u32(width)?,
+        to_u32(height)?,
+    ))
 }
 
 pub fn parse_sway_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
@@ -599,7 +785,7 @@ pub fn parse_sway_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
         ));
     }
     Ok(ActiveWindow {
-        geometry: Rect::new(x, y, width, height),
+        geometry: Some(Rect::new(x, y, width, height)),
         source: WindowSource::Sway,
         app_id: node
             .get("app_id")
@@ -617,51 +803,147 @@ pub fn parse_sway_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
+        handle: None,
     })
 }
 
-/// Parses the KWin scripting probe's `x y width height` output (global
-/// logical pixels; x/y may be negative on multi-monitor layouts).
+/// One line of the KWin probe's output: the eight tab-separated fields
+/// [`KWIN_PROBE`] emits — geometry, pid, class, title, and the window's
+/// `QUuid`.  A line that is not that is an error, not a window: guessing at a
+/// truncated row would put a capture somewhere the window is not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KwinRow {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// The pid KWin reported, or 0 when it reported none.  `--app-audio` reads
+    /// it to find the window's own playback stream.
+    pub(crate) pid: i32,
+    pub(crate) app_id: String,
+    pub(crate) title: String,
+    /// The window's `internalId` — a `QUuid` string — which
+    /// `ScreenShot2.CaptureWindow` takes.  Empty when the field was blank.
+    pub(crate) handle: String,
+}
+
+impl KwinRow {
+    pub(crate) fn parse(line: &str) -> Result<Self> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 8 {
+            return Err(VshotError::ActiveWindowUnavailable(
+                "KWin probe did not report its eight fields".into(),
+            ));
+        }
+        let number = |value: &str, what: &str| -> Result<i64> {
+            value.parse::<i64>().map_err(|_| {
+                VshotError::ActiveWindowUnavailable(format!(
+                    "KWin probe {what} `{value}` is not an integer"
+                ))
+            })
+        };
+        let x = i32::try_from(number(fields[0], "coordinate")?).map_err(|_| {
+            VshotError::ActiveWindowUnavailable("KWin probe x is out of range".into())
+        })?;
+        let y = i32::try_from(number(fields[1], "coordinate")?).map_err(|_| {
+            VshotError::ActiveWindowUnavailable("KWin probe y is out of range".into())
+        })?;
+        let width = u32::try_from(number(fields[2], "width")?).map_err(|_| {
+            VshotError::ActiveWindowUnavailable(format!(
+                "KWin probe width `{}` is invalid",
+                fields[2]
+            ))
+        })?;
+        let height = u32::try_from(number(fields[3], "height")?).map_err(|_| {
+            VshotError::ActiveWindowUnavailable(format!(
+                "KWin probe height `{}` is invalid",
+                fields[3]
+            ))
+        })?;
+        if width == 0 || height == 0 {
+            return Err(VshotError::ActiveWindowUnavailable(
+                "KWin probe reported an empty window size".into(),
+            ));
+        }
+        let pid = i32::try_from(number(fields[4], "pid")?).unwrap_or(0);
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            pid,
+            app_id: fields[5].to_owned(),
+            title: fields[6].to_owned(),
+            handle: fields[7].to_owned(),
+        })
+    }
+
+    pub(crate) fn rect(&self) -> Rect {
+        Rect::new(self.x, self.y, self.width, self.height)
+    }
+}
+
+/// Every window KWin lists, as the probe's raw rows — geometry, pid, class,
+/// title and the window's `QUuid`.  `--app-audio` reads the pid out of it:
+/// KWin does not publish a window's process id over any protocol vshot
+/// binds, but its scripting interface does report one per window.
+pub(crate) fn kwin_rows<R: WindowCommandRunner>(runner: &R) -> Result<Vec<KwinRow>> {
+    let bytes = run_command(runner, &WindowCommand::kwin_list())?;
+    Ok(parse_kwin_rows(&bytes))
+}
+
+/// The KWin list probe's output, as rows.  Split from [`kwin_rows`] so a test
+/// can feed it the probe's bytes without a runner.
+pub(crate) fn parse_kwin_rows(bytes: &[u8]) -> Vec<KwinRow> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|line| KwinRow::parse(line.trim_end_matches(['\r', '\n'])).ok())
+        .collect()
+}
+
+/// The focused window as a raw KWin row, with its pid.  `Ok(None)` when KWin
+/// reports no active window or the probe is not there at all — a state, not a
+/// failure, for a caller that only wants the pid.
+pub(crate) fn kwin_active_row<R: WindowCommandRunner>(runner: &R) -> Result<Option<KwinRow>> {
+    let output = runner.run(&WindowCommand::kwin())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|error| {
+        VshotError::ActiveWindowUnavailable(format!("invalid KWin probe output: {error}"))
+    })?;
+    let Some(line) = text.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    Ok(KwinRow::parse(line).ok())
+}
+
+/// Parses the KWin scripting probe's output: one tab-separated
+/// `x y width height pid class title handle` record.  x/y may be negative on
+/// multi-monitor layouts.
 pub fn parse_kwin_active_window(bytes: &[u8]) -> Result<ActiveWindow> {
     let text = std::str::from_utf8(bytes).map_err(|error| {
         VshotError::ActiveWindowUnavailable(format!("invalid KWin probe output: {error}"))
     })?;
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    if parts.len() != 4 {
-        return Err(VshotError::ActiveWindowUnavailable(
-            "KWin probe did not report x y width height".into(),
-        ));
-    }
-    let parse_i32 = |value: &str| -> Result<i32> {
-        value.parse::<i32>().map_err(|_| {
-            VshotError::ActiveWindowUnavailable(format!(
-                "KWin probe coordinate `{value}` is not an integer"
-            ))
-        })
-    };
-    let parse_u32 = |value: &str| -> Result<u32> {
-        value.parse::<u32>().map_err(|_| {
-            VshotError::ActiveWindowUnavailable(format!(
-                "KWin probe dimension `{value}` is invalid"
-            ))
-        })
-    };
-    let x = parse_i32(parts[0])?;
-    let y = parse_i32(parts[1])?;
-    let width = parse_u32(parts[2])?;
-    let height = parse_u32(parts[3])?;
-    if width == 0 || height == 0 {
-        return Err(VshotError::ActiveWindowUnavailable(
-            "KWin probe reported an empty window size".into(),
-        ));
-    }
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| VshotError::ActiveWindowUnavailable("KWin probe printed nothing".into()))?;
+    let row = KwinRow::parse(line)?;
     Ok(ActiveWindow {
-        geometry: Rect::new(x, y, width, height),
+        geometry: Some(row.rect()),
         source: WindowSource::KWin,
-        // The probe reports geometry only; a window recording then falls back
-        // to the picker, which knows the labels.
-        app_id: String::new(),
-        title: String::new(),
+        app_id: row.app_id.clone(),
+        title: row.title.clone(),
+        // The one compositor whose active-window query also names the window
+        // in a way a later capture can be aimed at.  Recording a window on
+        // Plasma uses it to ask for the same window again by name, so the
+        // recording is of the window the user picked, not of whatever has the
+        // focus when the next frame is taken.
+        handle: (!row.handle.is_empty()).then(|| row.handle.clone()),
     })
 }
 
@@ -751,6 +1033,7 @@ pub fn parse_hyprland_windows(clients: &[u8], monitors: &[u8]) -> Result<Vec<Win
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
+                handle: None,
             },
         ));
     }
@@ -920,6 +1203,7 @@ fn collect_sway_windows(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned(),
+            handle: None,
         };
         if is_floating {
             floating.push(candidate);
@@ -933,24 +1217,31 @@ fn collect_sway_windows(
     }
 }
 
-/// The KWin probe in `list` mode: one `x y width height` line per window, in
+/// The KWin probe in `list` mode: one tab-separated record per window, in
 /// KWin's stacking order bottom to top, which the probe asks for by iterating
-/// `workspace.stackingOrder`.  The probe reports no titles, so every candidate
-/// is unlabelled.
+/// `workspace.stackingOrder`.  Every candidate carries the class, title and
+/// `QUuid` the probe reported, so picking a window to record can hand the
+/// handle straight to `ScreenShot2.CaptureWindow`.
 pub fn parse_kwin_windows(bytes: &[u8]) -> Result<Vec<WindowCandidate>> {
     let text = std::str::from_utf8(bytes).map_err(|error| {
         VshotError::WindowPickUnavailable(format!("invalid KWin list output: {error}"))
     })?;
     let mut windows = Vec::new();
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
             continue;
         }
-        let Ok(window) = parse_kwin_active_window(line.as_bytes()) else {
+        let Ok(row) = KwinRow::parse(line) else {
             continue;
         };
-        windows.push(WindowCandidate::unlabelled(window.geometry, String::new()));
+        windows.push(WindowCandidate {
+            geometry: row.rect(),
+            label: join_label(&row.app_id, &row.title),
+            app_id: row.app_id,
+            title: row.title,
+            handle: (!row.handle.is_empty()).then_some(row.handle),
+        });
     }
     Ok(windows)
 }
@@ -1189,7 +1480,7 @@ mod tests {
     fn parses_hyprland_active_window_geometry() {
         let json = br#"{"at":[-20,30],"size":[800,600],"class":"kitty"}"#;
         let window = parse_hyprland_active_window(json).unwrap();
-        assert_eq!(window.geometry, Rect::new(-20, 30, 800, 600));
+        assert_eq!(window.geometry, Some(Rect::new(-20, 30, 800, 600)));
         assert_eq!(window.source, WindowSource::Hyprland);
     }
 
@@ -1197,16 +1488,81 @@ mod tests {
     fn finds_focused_sway_leaf_recursively() {
         let json = br#"{"nodes":[{"nodes":[],"focused":false},{"nodes":[{"focused":true,"rect":{"x":10,"y":20,"width":400,"height":300}}]}]}"#;
         let window = parse_sway_active_window(json).unwrap();
-        assert_eq!(window.geometry, Rect::new(10, 20, 400, 300));
+        assert_eq!(window.geometry, Some(Rect::new(10, 20, 400, 300)));
+    }
+
+    /// niri's focused window: the app id and title are there, but a *tiled*
+    /// window has no position, so there is no rectangle.  That is the whole
+    /// reason niri has its own screenshot route — the labels are what a
+    /// window recording and `--follow` match on, and the pixels come from
+    /// niri itself.
+    #[test]
+    fn niri_names_the_focused_window_without_placing_a_tiled_one() {
+        let json = br#"{"id":12,"app_id":"Alacritty","title":"~/Dev","workspace_id":6,
+            "is_focused":true,
+            "layout":{"tile_size":[800.0,600.0],"window_offset_in_tile":[2.0,2.0],
+                      "tile_pos_in_workspace_view":null}}"#;
+        let window = parse_niri_active_window(json).unwrap();
+        assert_eq!(window.geometry, None);
+        assert_eq!(window.source, WindowSource::Niri);
+        assert_eq!(window.app_id, "Alacritty");
+        assert_eq!(window.title, "~/Dev");
+    }
+
+    /// A floating niri window *is* placed, and its rectangle comes back.
+    #[test]
+    fn niri_places_a_floating_window() {
+        let json = br#"{"id":13,"app_id":"kitty","title":"float","workspace_id":6,
+            "layout":{"tile_size":[404.0,304.0],"window_offset_in_tile":[2.0,2.0],
+                      "tile_pos_in_workspace_view":[100.0,200.0]}}"#;
+        let window = parse_niri_active_window(json).unwrap();
+        // The window is the tile minus the border on each side.
+        assert_eq!(window.geometry, Some(Rect::new(100, 200, 400, 300)));
+    }
+
+    /// A niri with nothing focused — a layer-shell surface holds the focus —
+    /// answers `null`, which is an honest "no window", not a parse failure.
+    #[test]
+    fn niri_reports_no_focused_window_as_an_answer() {
+        let error = parse_niri_active_window(b"null").unwrap_err();
+        assert!(format!("{error}").contains("no focused window"), "{error}");
     }
 
     #[test]
     fn parses_kwin_probe_geometry() {
-        let window = parse_kwin_active_window(b"1920 0 1600 900\n").unwrap();
-        assert_eq!(window.geometry, Rect::new(1920, 0, 1600, 900));
+        // The probe's real shape: eight tab-separated fields.
+        let line =
+            b"1920\t0\t1600\t900\t4242\tkonsole\t~/Dev\t{4eb70d17-e31f-4237-bffe-cb7cac1acf50}\n";
+        let window = parse_kwin_active_window(line).unwrap();
+        assert_eq!(window.geometry, Some(Rect::new(1920, 0, 1600, 900)));
         assert_eq!(window.source, WindowSource::KWin);
-        let window = parse_kwin_active_window(b"-20 30 800 600").unwrap();
-        assert_eq!(window.geometry, Rect::new(-20, 30, 800, 600));
+        assert_eq!(window.app_id, "konsole");
+        assert_eq!(window.title, "~/Dev");
+        assert_eq!(
+            window.handle.as_deref(),
+            Some("{4eb70d17-e31f-4237-bffe-cb7cac1acf50}")
+        );
+        // A negative coordinate is fine (a window on a left-hand output).
+        let line =
+            b"-20\t30\t800\t600\t0\tkitty\tHello VShot\t{00000000-0000-0000-0000-000000000001}";
+        let window = parse_kwin_active_window(line).unwrap();
+        assert_eq!(window.geometry, Some(Rect::new(-20, 30, 800, 600)));
+        assert_eq!(window.title, "Hello VShot");
+    }
+
+    /// The probe can report a window without a title (or without a pid kdotool
+    /// could read).  Both are "unknown", not errors: the window is still
+    /// recordable by its handle.
+    #[test]
+    fn parses_a_kwin_window_with_blank_labels() {
+        let line = b"0\t0\t100\t100\t0\t\t\t{00000000-0000-0000-0000-000000000002}";
+        let window = parse_kwin_active_window(line).unwrap();
+        assert_eq!(window.app_id, "");
+        assert_eq!(window.title, "");
+        assert_eq!(
+            window.handle.as_deref(),
+            Some("{00000000-0000-0000-0000-000000000002}")
+        );
     }
 
     #[test]
@@ -1313,12 +1669,23 @@ mod tests {
 
     #[test]
     fn lists_kwin_probe_lines_and_ignores_junk() {
-        let windows =
-            parse_kwin_windows(b"1920 0 1600 900\n-20 30 800 600\nnot a window\n").unwrap();
+        let line =
+            b"1920\t0\t1600\t900\t11\tdolphin\tHome\t{00000000-0000-0000-0000-000000000003}\n";
+        let mut bytes = line.to_vec();
+        bytes.extend_from_slice(
+            b"-20\t30\t800\t600\t0\tkitty\tx\t{00000000-0000-0000-0000-000000000004}\n",
+        );
+        bytes.extend_from_slice(b"not a window\n");
+        let windows = parse_kwin_windows(&bytes).unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].geometry, Rect::new(1920, 0, 1600, 900));
+        assert_eq!(windows[0].label, "dolphin — Home");
+        assert_eq!(
+            windows[0].handle.as_deref(),
+            Some("{00000000-0000-0000-0000-000000000003}")
+        );
         assert_eq!(windows[1].geometry, Rect::new(-20, 30, 800, 600));
-        assert!(windows[0].label.is_empty());
+        assert_eq!(windows[1].label, "kitty — x");
     }
 
     /// The KWin probe has to skip vshot's own overlay.
@@ -1348,13 +1715,33 @@ mod tests {
         assert!(KWIN_PROBE.contains("w.deleted"));
     }
 
+    /// The probe reports a `QUuid` — KWin's `internalId` — and that is what a
+    /// window recording aims `ScreenShot2.CaptureWindow` at, so the field and
+    /// its escaping have to survive.  Guard rather than behaviour: the value
+    /// comes out of JavaScript inside a shell script.
+    #[test]
+    fn the_kwin_probe_reports_the_windows_internal_id() {
+        assert!(
+            KWIN_PROBE.contains("w.internalId"),
+            "the scripting probe is expected to read the window's id"
+        );
+        assert!(
+            KWIN_PROBE.contains(r#"replace(/[\t\n]/g, " ")"#),
+            "and to strip the delimiters a title could carry"
+        );
+        // kdotool's own id is the same value, and it comes back over D-Bus
+        // rather than through the journal.
+        assert!(KWIN_PROBE.contains("kdotool getactivewindow"));
+    }
+
     #[test]
     fn rejects_unreliable_window_data() {
         assert!(parse_hyprland_active_window(br#"{"at":[0,0],"size":[0,1]}"#).is_err());
         assert!(parse_sway_active_window(br#"{"nodes":[]}"#).is_err());
         assert!(parse_kwin_active_window(b"1 2 3").is_err());
-        assert!(parse_kwin_active_window(b"a b c d").is_err());
-        assert!(parse_kwin_active_window(b"0 0 0 500").is_err());
+        assert!(parse_kwin_active_window(b"a\tb\tc\td\te\tf\tg\th").is_err());
+        assert!(parse_kwin_active_window(b"0\t0\t0\t500\t0\tx\ty\tz").is_err());
+        assert!(parse_niri_active_window(br#"{"app_id":"foot"}"#).is_err());
     }
 
     /// Answers every command the same way and remembers what it was asked, so a
@@ -1424,10 +1811,17 @@ mod tests {
     /// single line is the focused window.
     #[test]
     fn a_kde_session_reads_the_focused_window_from_the_probe() {
-        let runner = ScriptedRunner::replying(b"1920 0 1600 900\n");
+        let runner = ScriptedRunner::replying(
+            b"1920\t0\t1600\t900\t7\tkonsole\t~/Dev\t{00000000-0000-0000-0000-000000000005}\n",
+        );
         let window = find_active_window_for(Session::KWin, &runner).unwrap();
-        assert_eq!(window.geometry, Rect::new(1920, 0, 1600, 900));
+        assert_eq!(window.geometry, Some(Rect::new(1920, 0, 1600, 900)));
         assert_eq!(window.source, WindowSource::KWin);
+        assert_eq!(window.app_id, "konsole");
+        assert_eq!(
+            window.handle.as_deref(),
+            Some("{00000000-0000-0000-0000-000000000005}")
+        );
         assert_eq!(runner.asked(), ["bash"]);
     }
 
@@ -1437,11 +1831,12 @@ mod tests {
     fn an_unknown_session_asks_every_compositor_in_order() {
         let runner = ScriptedRunner::failing();
         assert!(find_active_window_for(Session::Unknown, &runner).is_err());
-        assert_eq!(runner.asked(), ["hyprctl", "swaymsg", "bash"]);
+        assert_eq!(runner.asked(), ["hyprctl", "swaymsg", "niri", "bash"]);
 
-        // The window list goes through the same three: Hyprland's first query
+        // The window list goes through the same set: Hyprland's first query
         // (`hyprctl clients`) is already failing here, so its monitor list is
-        // never reached.
+        // never reached, and niri answers with its own "no rectangle list"
+        // error rather than running a command.
         let runner = ScriptedRunner::failing();
         assert!(find_windows_for(Session::Unknown, &runner).is_err());
         assert_eq!(runner.asked(), ["hyprctl", "swaymsg", "bash"]);
@@ -1453,26 +1848,32 @@ mod tests {
         assert_eq!(compositors_for(Session::Sway), [Compositor::Sway]);
         assert_eq!(compositors_for(Session::KWin), [Compositor::KWin]);
         assert_eq!(compositors_for(Session::Unknown), COMPOSITORS);
-        // niri has no window list and no active-window geometry, so there is
-        // nothing to ask and the caller falls back to the pixels.
-        assert!(compositors_for(Session::Niri).is_empty());
+        // niri is asked about the focused window (which `--follow` and
+        // `record window active` need) but not about a rectangle list, which
+        // it does not have.
+        assert_eq!(compositors_for(Session::Niri), [Compositor::Niri]);
     }
 
-    /// A session whose compositor cannot answer says that, instead of claiming
-    /// some compositor failed.
     #[test]
-    fn a_compositor_without_window_queries_says_so() {
+    fn a_niri_session_names_the_focused_window() {
+        let runner = ScriptedRunner::replying(
+            br#"{"id":12,"app_id":"Alacritty","title":"~/Dev","workspace_id":6}"#,
+        );
+        let window = find_active_window_for(Session::Niri, &runner).unwrap();
+        assert_eq!(window.source, WindowSource::Niri);
+        assert_eq!(window.app_id, "Alacritty");
+        assert_eq!(window.title, "~/Dev");
+        assert_eq!(runner.asked(), ["niri"]);
+    }
+
+    /// niri names its windows but has no rectangle list, so the picker's list
+    /// query says exactly that instead of running a command that would answer
+    /// nothing.
+    #[test]
+    fn a_niri_session_has_no_rectangle_list() {
         let runner = ScriptedRunner::failing();
         let error = find_windows_for(Session::Niri, &runner).unwrap_err();
-        assert!(
-            format!("{error}").contains("no window list to offer"),
-            "{error}"
-        );
-        let error = find_active_window_for(Session::Niri, &runner).unwrap_err();
-        assert!(
-            format!("{error}").contains("no active-window query"),
-            "{error}"
-        );
-        assert!(runner.asked().is_empty());
+        assert!(format!("{error}").contains("no rectangle list"), "{error}");
+        assert!(runner.asked().is_empty(), "no command should have run");
     }
 }

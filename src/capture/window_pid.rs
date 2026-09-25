@@ -56,12 +56,36 @@ fn pid_for_session<R: WindowCommandRunner>(
     match session {
         Session::Hyprland => hyprland_pid(runner, name),
         Session::Niri => niri_pid(runner, name),
+        Session::KWin => kwin_pid(runner, name),
         // Sway has no ext_foreign_toplevel, so a window recording never runs
-        // on it; KWin's scripting interface reports geometry only.  Neither
-        // is an error here — the caller falls back to the microphone or to
-        // silence, and says which.
+        // on it.  That is not an error here — the caller falls back to the
+        // microphone or to silence, and says which.
         _ => Ok(None),
     }
+}
+
+/// KWin: the scripting probe lists every window with its `pid`, `class` and
+/// `title` (the fields [`super::window::KWIN_PROBE`] emits).  KWin publishes
+/// no window's process id over any protocol vshot binds, so this probe is the
+/// only route to it — and it is why `--app-audio` can work on Plasma, not just
+/// on Hyprland and niri.
+///
+/// The window is matched the way the recording matched it: by app id and title
+/// together, then by title alone.  A window KWin reports with no pid (it
+/// reported 0) is `None` — an unknown pid is not a pid.
+fn kwin_pid<R: WindowCommandRunner>(runner: &R, name: &Name) -> Result<Option<i32>> {
+    let rows = super::window::kwin_rows(runner)?;
+    let app_id_of = |row: &super::window::KwinRow| row.app_id.clone();
+    let title_of = |row: &super::window::KwinRow| row.title.clone();
+    let pid_of = |row: &super::window::KwinRow| (row.pid > 0).then_some(row.pid);
+    let exact = rows
+        .iter()
+        .find(|row| app_id_of(row) == name.app_id && title_of(row) == name.title);
+    let chosen = exact.or_else(|| {
+        rows.iter()
+            .find(|row| title_of(row) == name.title && !name.title.is_empty())
+    });
+    Ok(chosen.and_then(pid_of))
 }
 
 /// Hyprland: `hyprctl clients -j` lists every client with its `pid`, `class`
@@ -340,11 +364,38 @@ mod tests {
     }
 
     #[test]
-    fn a_session_without_a_pid_source_answers_none() {
-        // KWin and Sway have no pid to give; that is a `None`, not an error.
+    fn sway_has_no_pid_source() {
+        // Sway has no pid to give; that is a `None`, not an error.
         let runner = ScriptedRunner::new();
-        let pid = pid_for_session(Session::KWin, &runner, &name("a", "b")).expect("no error");
+        let pid = pid_for_session(Session::Sway, &runner, &name("a", "b")).expect("no error");
         assert_eq!(pid, None);
+    }
+
+    /// KWin reports a window's pid through the same scripting probe that names
+    /// its windows, so `--app-audio` works on Plasma too.  The rows are
+    /// tab-separated: `x y width height pid class title handle`.
+    #[test]
+    fn kwin_reads_a_pid_from_the_scripting_probe() {
+        let rows = b"0\t0\t941\t768\t4242\tkitty\tHello\t{11111111-1111-1111-1111-111111111111}\n\
+                     0\t0\t800\t600\t9000\tfirefox\tbrowser\t{22222222-2222-2222-2222-222222222222}\n";
+        assert_eq!(kwin_pid_of(rows, &name("firefox", "browser")), Some(9000));
+        assert_eq!(kwin_pid_of(rows, &name("kitty", "Hello")), Some(4242));
+    }
+
+    /// A window KWin reports without a pid (pid 0) is unknown, not process 0.
+    #[test]
+    fn kwin_reports_no_pid_when_the_probe_had_none() {
+        let rows = b"0\t0\t100\t100\t0\tnothing\tTitle\t{33333333-3333-3333-3333-333333333333}\n";
+        assert_eq!(kwin_pid_of(rows, &name("nothing", "Title")), None);
+    }
+
+    /// Picks a pid out of the probe's rows the way [`kwin_pid`] does, without
+    /// a runner in between.
+    fn kwin_pid_of(rows: &[u8], name: &Name) -> Option<i32> {
+        super::super::window::parse_kwin_rows(rows)
+            .into_iter()
+            .find(|row| row.app_id == name.app_id && row.title == name.title)
+            .and_then(|row| (row.pid > 0).then_some(row.pid))
     }
 
     #[test]

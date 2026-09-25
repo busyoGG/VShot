@@ -74,6 +74,7 @@ use crate::wayland::WaylandSession;
 use self::avcodec::{EncoderBackend, Recorder, VideoCodec};
 
 pub mod avcodec;
+mod kwin_window;
 mod pipewire;
 mod pipewire_audio;
 mod portal;
@@ -596,7 +597,16 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     // A window recording has a different frame source — the compositor's own
     // copy of one window — so it runs its own loop; everything around it (the
     // output path, the stop signal, the pid file, the report) is shared.
+    //
+    // Which loop depends on what the session speaks: the wlroots route is
+    // `ext_image_copy_capture_v1` over an `ext_foreign_toplevel_handle_v1`
+    // source, and a Plasma session speaks neither — it records a window through
+    // KWin's own `ScreenShot2.CaptureWindow`, aimed at the window's `QUuid`.
     if let RecordTarget::Window(target) = &request.target {
+        let session = crate::capture::active_output::Session::detect();
+        if session == crate::capture::active_output::Session::KWin {
+            return kwin_window::run(request, target);
+        }
         return window::run(request, target);
     }
 
@@ -1229,6 +1239,9 @@ fn record_loop(
     let mut timeline_ms = 0u64;
     let mut covered_us = 0u64;
 
+    // A capture the compositor *refused* is retried rather than counted as a
+    // dropped frame — see [`Refusals`].
+    let mut refusals = Refusals::default();
     loop {
         if interrupted.load(Ordering::Relaxed) {
             break;
@@ -1257,15 +1270,23 @@ fn record_loop(
         let frame = match grabbed {
             Ok(frame) => frame,
             Err(error) => {
-                consecutive_errors += 1;
-                if consecutive_errors >= 10 {
-                    return Err(VshotError::Recording(format!(
-                        "giving up after {consecutive_errors} frames in a row failed: {error}"
-                    )));
+                // A refusal is the compositor declining to be asked, which on
+                // KWin comes and goes; every other error is a hiccup — a
+                // workspace switch, a busy compositor, a frame that was not
+                // ready — and neither is fatal on its own.
+                if let VshotError::ScreenshotDenied(explanation) = &error {
+                    if !refusals.refused(explanation) {
+                        return Err(error);
+                    }
+                } else {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 10 {
+                        return Err(VshotError::Recording(format!(
+                            "giving up after {consecutive_errors} frames in a row failed: {error}"
+                        )));
+                    }
+                    eprintln!("vshot: dropping a frame: {error}");
                 }
-                // A hiccup (a workspace switch, a busy compositor) is not
-                // fatal; the frame is skipped and the loop moves on.
-                eprintln!("vshot: dropping a frame: {error}");
                 let now = Instant::now();
                 last_frame_at = now;
                 next_frame = now + interval;
@@ -1273,6 +1294,7 @@ fn record_loop(
             }
         };
         consecutive_errors = 0;
+        refusals.delivered();
         // The frame's timestamp is the moment its pixels were taken: what
         // counts is how long the *previous* frame was on screen, which is the
         // interval between two grab starts.  Anchoring on the grab's end
@@ -1353,6 +1375,79 @@ pub(crate) fn sleep_interruptible(duration: Duration, interrupted: &AtomicBool) 
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+/// How long a session keeps asking after the compositor starts *refusing* it,
+/// before it gives up for good.
+///
+/// A refusal is not a dropped frame.  A dropped frame is the compositor failing
+/// to hand over pixels; a refusal is the compositor declining to be asked, and
+/// KWin decides that per call: `checkPermissions` looks the caller's executable
+/// up in the desktop-file database on every `CaptureWindow` / `CaptureScreen`,
+/// so a client that was authorized a moment ago is told "no" while that database
+/// is being rebuilt.  That is measured, not theoretical: on a Plasma session
+/// whose `ksycoca` was being rewritten 2.5 times a second — the session's own
+/// doing, with nothing of vshot's running — a window recording ran for 42
+/// seconds and then died on ten refusals in a row, when a recording that had
+/// simply kept asking would have gone on.
+///
+/// A client that was never authorized at all fails on the same deadline, having
+/// printed the compositor's own explanation — which names the desktop file to
+/// write — the first time it was refused.  Ten seconds of retrying costs a
+/// recording nothing and is the difference between a file that ends where the
+/// user stopped it and one that ends mid-sentence.
+const DENIAL_GRACE: Duration = Duration::from_secs(10);
+
+/// How often the log repeats itself while the compositor keeps refusing.  The
+/// first refusal prints the compositor's explanation in full and every later one
+/// is a single line, so a retry running at the frame rate cannot bury the log.
+const DENIAL_LOG_EVERY: Duration = Duration::from_secs(1);
+
+/// The retry policy for a capture the compositor refused.  See [`DENIAL_GRACE`].
+#[derive(Default)]
+pub(super) struct Refusals {
+    /// When the current run of refusals began; `None` while captures work.
+    since: Option<Instant>,
+    /// When the one-line "still retrying" message was last printed.
+    logged_at: Option<Instant>,
+    /// Whether the compositor's own explanation has been printed.
+    explained: bool,
+}
+
+impl Refusals {
+    /// Records one refusal and answers whether the session should keep going.
+    /// The compositor's explanation goes to the log once; a run of refusals that
+    /// outlasts [`DENIAL_GRACE`] is not worth waiting out any longer.
+    pub(super) fn refused(&mut self, explanation: &str) -> bool {
+        self.refused_at(Instant::now(), explanation)
+    }
+
+    /// [`Self::refused`] against a caller-supplied clock, so a test can cross
+    /// [`DENIAL_GRACE`] without spending it.
+    fn refused_at(&mut self, now: Instant, explanation: &str) -> bool {
+        let since = *self.since.get_or_insert(now);
+        if !self.explained {
+            self.explained = true;
+            self.logged_at = Some(now);
+            eprintln!("vshot: {explanation}");
+        } else if self
+            .logged_at
+            .is_none_or(|logged| now.saturating_duration_since(logged) >= DENIAL_LOG_EVERY)
+        {
+            self.logged_at = Some(now);
+            eprintln!(
+                "vshot: the compositor refused the capture again; still retrying ({:.1}s so far)",
+                now.saturating_duration_since(since).as_secs_f64()
+            );
+        }
+        now.saturating_duration_since(since) <= DENIAL_GRACE
+    }
+
+    /// Records a capture that worked, which ends any run of refusals.
+    pub(super) fn delivered(&mut self) {
+        self.since = None;
+        self.logged_at = None;
     }
 }
 
@@ -1671,5 +1766,41 @@ mod tests {
             std::path::Path::new("/tmp/vshot-videos")
         );
         std::env::remove_var("XDG_VIDEOS_DIR");
+    }
+
+    /// A refusal is retried for the whole of [`DENIAL_GRACE`] and then gives up,
+    /// so a client that was never authorized fails — with the compositor's own
+    /// explanation, printed the first time — instead of retrying for ever.
+    #[test]
+    fn a_refusal_is_retried_and_then_given_up_on() {
+        let start = Instant::now();
+        let mut refusals = Refusals::default();
+        assert!(
+            refusals.refused_at(start, "KWin denied it"),
+            "a refusal is not fatal on the spot"
+        );
+        assert!(
+            refusals.refused_at(start + DENIAL_GRACE, "KWin denied it"),
+            "the whole grace period is worth waiting out"
+        );
+        assert!(
+            !refusals.refused_at(start + DENIAL_GRACE + Duration::from_millis(1), "denied"),
+            "a millisecond past the grace period is not"
+        );
+    }
+
+    /// A frame in between clears the run, so a session that is refused now and
+    /// then — which is what KWin's desktop-file database does under churn —
+    /// keeps recording instead of accumulating its way to the deadline.
+    #[test]
+    fn a_delivered_frame_restarts_the_retry_window() {
+        let start = Instant::now();
+        let mut refusals = Refusals::default();
+        assert!(refusals.refused_at(start, "denied"));
+        refusals.delivered();
+        assert!(
+            refusals.refused_at(start + DENIAL_GRACE * 2, "denied"),
+            "refusals from before the frame do not count towards the deadline"
+        );
     }
 }

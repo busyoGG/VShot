@@ -83,6 +83,12 @@ pub struct NiriWindow {
     pub id: u64,
     /// `app_id — title`, when niri reports either.
     pub label: String,
+    /// The app id niri reports (the Wayland `app_id`, or the X11 class), kept
+    /// apart from the label because a window recording matches one against the
+    /// foreign-toplevel list's own `app_id` — the joined label cannot do that.
+    pub app_id: String,
+    /// The window's title, as niri reports it.  May be empty.
+    pub title: String,
     pub workspace_id: Option<u64>,
     /// The tile's size in logical pixels, borders included.
     pub tile_size: Option<(f64, f64)>,
@@ -672,6 +678,8 @@ fn parse_window(bytes: &[u8], what: &str) -> Result<Option<NiriWindow>> {
     Ok(Some(NiriWindow {
         id,
         label: join_label(app_id, title),
+        app_id: app_id.to_owned(),
+        title: title.to_owned(),
         workspace_id: value.get("workspace_id").and_then(Value::as_u64),
         tile_size: pair("tile_size"),
         offset_in_tile: pair("window_offset_in_tile"),
@@ -979,6 +987,8 @@ mod tests {
         let window = NiriWindow {
             id: 5,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: None,
             tile_size: None,
             offset_in_tile: None,
@@ -994,6 +1004,8 @@ mod tests {
         let window = NiriWindow {
             id: 12,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
@@ -1031,6 +1043,8 @@ mod tests {
         let window = NiriWindow {
             id: 12,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
@@ -1053,6 +1067,8 @@ mod tests {
         let window = NiriWindow {
             id: 12,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
@@ -1075,6 +1091,8 @@ mod tests {
         let window = NiriWindow {
             id: 12,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
@@ -1090,6 +1108,8 @@ mod tests {
         let window = NiriWindow {
             id: 12,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
@@ -1106,6 +1126,8 @@ mod tests {
         let window = NiriWindow {
             id: 99,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,
@@ -1167,6 +1189,8 @@ mod tests {
         NiriWindow {
             id: 12,
             label: String::new(),
+            app_id: String::new(),
+            title: String::new(),
             workspace_id: Some(6),
             tile_size: None,
             offset_in_tile: None,

@@ -17,8 +17,9 @@
 //! run from a terminal can act on it and a keybinding loses it.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use zbus::blocking::{Connection, Proxy};
+use zbus::blocking::Proxy;
 use zbus::zvariant::Value;
 
 use crate::config;
@@ -28,6 +29,10 @@ use crate::config;
 /// showing "which application is this" finds the same program the notification
 /// came from.
 const APP_NAME: &str = "vshot";
+
+/// How long a notification may take before it is given up on.  Short, because
+/// the note is a courtesy and its caller is a live session — see `post`.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
 const APP_ICON: &str = "vshot";
 
 const SERVICE: &str = "org.freedesktop.Notifications";
@@ -166,7 +171,17 @@ fn enabled(kind: Kind) -> bool {
 }
 
 fn post(summary: &str, body: &str) -> zbus::Result<()> {
-    let connection = Connection::session()?;
+    // The call is bounded on purpose.  A notification is a courtesy, and this
+    // one is sent from a replay session's control loop the moment a save
+    // finishes — so a desktop bus that accepts the message and then never
+    // answers (a name with no owner that the bus keeps trying to activate, as a
+    // minimal or container session has) would otherwise park the session's main
+    // thread inside `Notify` for good, after the file is already written but
+    // before the client is told so.  A timeout turns that into the failure it
+    // is: the note is skipped and the caller moves on.
+    let connection = zbus::blocking::connection::Builder::session()?
+        .method_timeout(NOTIFY_TIMEOUT)
+        .build()?;
     let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE)?;
     // No actions and no hints: the daemon's defaults are what the rest of the
     // desktop already shows, and vshot has nothing to add to them.

@@ -160,6 +160,22 @@ impl Capturer {
         }
     }
 
+    /// One named window's own pixels, when the backend can be aimed at a
+    /// window by name, together with the density they are meant to be shown
+    /// at.
+    ///
+    /// `handle` is the compositor's own opaque window name — KWin's `QUuid`
+    /// (`internalId`), the value `ScreenShot2.CaptureWindow` takes.  A wlroots
+    /// session records a window through `ext_image_copy_capture_v1`, whose
+    /// source is the window's `ext_foreign_toplevel_handle_v1` and not a
+    /// string, so that path never comes through here and this answers `None`.
+    pub fn capture_window(&mut self, handle: &str, cursor: bool) -> Option<Result<(Frame, u32)>> {
+        match self {
+            Self::Kwin(capture) => Some(capture.capture_window(handle, cursor)),
+            Self::Wlr(_) => None,
+        }
+    }
+
     /// Captures one rectangle of an output, given in output-local logical
     /// coordinates.
     ///

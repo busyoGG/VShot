@@ -421,10 +421,10 @@ vshot record stop                               # 停止（读取 pid 文件发�
   目标没有"窗口"可挂，会被拒绝）。它可以**独立使用**（只要窗口自己的声音），也可以**和
   `--mic` 同时给**：麦克风是房间，应用音频是窗口，两者在 Rust 侧**逐样本相加**成 MP4 的那
   **一条**音轨（不是两条轨道，避免多数播放器只放第一条）。窗口的 pid 由合成器报告
-  （Hyprland、niri 会给；KWin 不给），vshot 拿这个 pid 去 PipeWire 的客户端表里找到该进程
-  的播放节点，只连那一个。实测（Hyprland）：两个 mpv 分别播 880 Hz 与 220 Hz，单独
-  `--app-audio` 录出的文件主频是 880 Hz——隔离正确。KWin 上（合成器不报 pid）会明确说明
-  做不到，而不是悄悄退回麦克风。窗口没在放声音时保留原有音源（首次录制则只录视频），
+  （Hyprland、niri 会给，KWin 由 scripting 探针报），vshot 拿这个 pid 去 PipeWire 的客户端
+  表里找到该进程的播放节点，只连那一个。实测（Hyprland）：两个 mpv 分别播 880 Hz 与 220 Hz，
+  单独 `--app-audio` 录出的文件主频是 880 Hz——隔离正确。Sway 与 labwc 不报窗口 pid，那两处
+  会明确说明做不到，而不是悄悄退回麦克风。窗口没在放声音时保留原有音源（首次录制则只录视频），
   而不是报错。`--portal` 与 `--app-audio` 互斥（portal 由合成器决定录哪个窗口，vshot 拿不到
   它的 pid 对应关系）。音轨同样是 AAC，与麦克风那条路共用编码与封装。
 - **跟随焦点（`--follow`）**：给若干窗口（`--follow NAME`，可重复），录制就跟着焦点在这些
@@ -697,6 +697,9 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 | 截屏 | wlr-screencopy | wlr-screencopy | KWin ScreenShot2 | wlr-screencopy | wlr-screencopy |
 | `window active` | `hyprctl activewindow -j` | niri 自己的 `screenshot-window` | KWin `CaptureActiveWindow` | `swaymsg -t get_tree` | ❌ 无 |
 | `window pick` | `hyprctl clients -j` | niri 自己的十字选窗 | KWin scripting 探针 / `kdotool` | `swaymsg -t get_tree` | ❌ 无 |
+| **录制/回录窗口**（`record window`、`replay start window`） | `ext_image_copy_capture_v1`（窗口自己的 dma-buf） | ❌ 无（协议只给 `zwlr_screencopy` 的输出捕获，没有任何 toplevel 捕获） | **KWin `ScreenShot2.CaptureWindow`**（按窗口 `QUuid` 抓，CPU 像素） | ❌ 无 | ❌ 无 |
+| 跟随焦点（`--follow`） | ✅ `hyprctl activewindow` | ⚠️ 焦点查询有（`niri msg focused-window`），但窗口录制本身不支持 | ✅ scripting 探针 / `kdotool` | ⚠️ 查询有，但窗口录制本身不支持 | ❌ 无 |
+| `--app-audio` 取窗口 pid | `hyprctl clients -j` | ⚠️ `niri msg windows` 有 pid，但窗口录制本身不支持 | ✅ scripting 探针的 `pid` 字段 | ❌ 无 | ❌ 无 |
 | pin 落在哪块屏 | `hyprctl cursorpos` + `monitors -j` | `focused-output`（只跟键盘焦点） | `org.kde.KWin.activeOutputName` | `swaymsg -t get_outputs` | ❌ 无 |
 | 滚动注入 | wlr 虚拟指针 | wlr 虚拟指针 | portal / uinput | wlr 虚拟指针 | uinput |
 
@@ -706,12 +709,19 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 
 - **Hyprland**——本机会话就是 Hyprland，也是主要开发与验证环境：截图、选区标注、窗口、长截图、pin 与滚动注入都在这里跑过。
 - **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——软件路径（CPU 转 NV12 再上传）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
-- **逐应用音频**——在 Hyprland 上实测：两个 mpv 分别播 880 Hz / 220 Hz，`record window --app-audio` 录出的文件主频为 880 Hz，隔离正确；无声窗口降级为只录视频。KWin 不报告窗口 pid，因此 `--app-audio` 在 Plasma 上明确拒绝而不是静默退回麦克风；niri 的 pid 路径只有单元测试，未现场验证。
+- **逐应用音频**——在 Hyprland 上实测：两个 mpv 分别播 880 Hz / 220 Hz，`record window --app-audio` 录出的文件主频为 880 Hz，隔离正确；无声窗口降级为只录视频。窗口 pid 的来源在**能录窗口**的合成器上都有（Hyprland、niri 由合成器直报，KWin 走 scripting 探针的 `pid` 字段），因此 `--app-audio` 在 Plasma 上也能按 pid 找到应用音频——niri 那条虽然有 pid 也走不通，因为 niri 根本录不了窗口（见下）；Sway 与 labwc 没有窗口 pid 来源，会明确拒绝而不是静默退回麦克风。niri 与 KWin 的 pid 路径只有单元测试与无头实测，未在真实音频会话上验证隔离。
 - **麦克风 + 应用音频共存**——在 Hyprland 上实测：一路虚拟麦克风源播 440 Hz、mpv 窗口播 880 Hz，`record window --mic --app-audio` 录出**单条** AAC 音轨，Goertzel 分析在整个时长内同时检出 440 Hz 与 880 Hz，长度与视频一致（8.000s 对 8.000s）。`--follow` 切窗时麦克风那一路**全程不断**（每秒 440 Hz 幅度恒为 0.212），只有应用那一路换到新窗口（880 Hz → 660 Hz）。回录路径（`replay start window --mic --app-audio`）同样含两路。
 - **跟随焦点（`--follow`）**——在 Hyprland 上用两个不同尺寸/音调的 mpv 实测：焦点 A → B → A 得到一个 14.0 s 的文件，宽度始终 900（B 的 600×340 被缩放进 A 的 900×500 画布），音轨按时间窗分析为 880 Hz → 220 Hz → 880 Hz。焦点查询、白名单匹配与"保持在原窗"三类判断都有单元测试；**报不出焦点的合成器未实测**（Hyprland 能报）。
-- **niri**——平铺与浮窗两条截图路径都已实机验证：平铺窗口拿两个并排 kitty 测（残差 0.45/0.51 每通道），浮窗走 niri 的 `tile_pos_in_workspace_view` 坐标加 `matches_at_position` 验证，实机结果正确。浮窗截图若出现错位，用 `--no-blend` 绕开定位。
-- **KWin/Plasma**——D-Bus 采集（`CaptureScreen` 的尺寸与不透明性、`native-resolution`、格式字段）、窗口列表与长截图均已实测，其中采集与窗口列表的自动化测试是在**无头 `--virtual` KWin** 上跑的，因此：
-  - `--cursor` 传了 `include-cursor` 但**是否真的画出光标未验证**（无头输出上没有指针可画）；
+- **niri**——平铺与浮窗两条**截图**路径都已实机验证：平铺窗口拿两个并排 kitty 测（残差 0.45/0.51 每通道），浮窗走 niri 的 `tile_pos_in_workspace_view` 坐标加 `matches_at_position` 验证，实机结果正确；浮窗截图若出现错位，用 `--no-blend` 绕开定位。niri 的焦点查询（`niri msg --json focused-window`）与窗口列表已接进统一的窗口表，供选窗与像素检测的候选名单使用。**但 niri 上录不了窗口**：实测 niri 25.11 的 Wayland 全局里只有 `zwlr_screencopy_manager_v1`（输出捕获）和 `zwlr_foreign_toplevel_manager_v1`，而 `ext_foreign_toplevel_list_v1`、`ext_foreign_toplevel_image_capture_source_manager_v1`、`ext_image_copy_capture_manager_v1` **一个都没有**，所以 `record window` 与 `replay start window` 在连接阶段就会明确报错；它的 portal 也没实现 ScreenCast（`niri-portals.conf` 只映射了 Access / Notification / Secret），`--portal` 同样兜不住。niri 上要"某一扇窗"的画面，只能录输出再裁选区——那是区域录制，不是窗口录制。
+- **KWin/Plasma**——D-Bus 采集（`CaptureScreen` 的尺寸与不透明性、`native-resolution`、格式字段）、窗口列表与长截图均已实测，其中采集与窗口列表的自动化测试是在**无头 `--virtual` KWin** 上跑的。此外**窗口录制/回录（`record window`、`replay start window`）已在本机无头 `--virtual` KWin 6.7.5 上实机验证**：
+  - 路由是 `org.kde.KWin.ScreenShot2.CaptureWindow`，按窗口的 `QUuid`（scripting 探针报的 `internalId`）抓那扇窗自己的像素，装饰含在内；
+  - 这条接口是 KWin 的**受限接口**，而且授权是**每次调用**都查一遍：KWin 把调用方的 pid 换成可执行文件路径，再去桌面文件数据库里找 `Exec=` 指向它、并声明了 `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` 的那个 `.desktop`。这个查找走 KService/ksycoca，而 ksycoca 在被重写期间会查出空结果，于是**刚授权过的客户端也会被临时拒绝**。实测：本机 KDE 会话里 `~/.cache/ksycoca6_*` 在**没有任何 vshot 进程**时也被每秒重写约 2.5 次，一次 42 秒的窗口录制因此在连续 10 次拒绝后整个失败。所以这类拒绝**不再按丢帧处理**：vshot 按帧率重试最多 10 秒，日志每秒最多一行（完整解释只在第一次打印），期间恢复就接着录，超过 10 秒才带着 KWin 自己的解释放弃。两个方向都在真机上验证过：拒绝约 5.5 秒后恢复 → 录制继续并正常收尾（90 秒的录制不受影响）；拒绝持续超过 10 秒 → 按预期中止并把原因写清楚。窗口、整屏两条录制/回录回路都按这个规则走；
+  - scripting 探针已扩展成 8 个制表符分隔字段（`x y width height pid class title handle`），所以 KDE 上**也有了窗口 pid**——`--app-audio` 在 Plasma 上不再被拒绝，而是照常按 pid 找到应用音频；
+  - 窗口捕获**关掉了阴影**（`include-shadow=false`）：录像是 NV12、没有 alpha，带阴影的透明外圈会变成一圈黑边并把画布撑大（实测一个 941×768 的窗口带阴影回来是 1072×898）；
+  - 画布尺寸**向上取偶**：`ScreenShot2` 给的是窗口的客户区几何，可能是奇数宽/高，而 NV12 没有奇数形式（奇数会让 libavutil 的转换直接断言崩溃），所以录制/回录打开的画布是偶数，多出的一列/一行由 fit 路径补齐。实测：941×768 的窗口录成 942×768 的 h264 文件；
+  - `--follow` 已实测：两个窗口间切焦点，录制跟着切，一次会话一个文件，时长连续；
+  - 回录（`replay start window`）已实测：环形缓冲、保存、状态查询都跑通；
+  - **仍未验证**：`--cursor`（无头输出没有指针可画）、窗口被点选时 `--pick` 的整段交互、以及 Scroll injection（见下）。
   - **长截图已验证可用**。KWin 的 `CaptureArea` 是私有 API（参数顺序未核实），所以 KDE 上抓整屏再裁，每帧开销明显高于别的合成器；
   - **滚动注入未验证**。`portal` 走 KWin 自带的 EIS 服务端，但本机 Hyprland 的 portal 不实现 RemoteDesktop，**这条从未在真机上跑通过**，需要 KDE 上验收；`uinput` 依赖 `/dev/uinput` 写权限。
 - **Sway**——只有探针实现与单元测试，**没有现场验证**。

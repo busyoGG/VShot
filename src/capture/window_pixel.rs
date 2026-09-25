@@ -217,12 +217,13 @@ pub fn detect_active_window(scene: &SceneSnapshot, cursor: Option<Point>) -> Res
             )
         })?;
     Ok(ActiveWindow {
-        geometry,
+        geometry: Some(geometry),
         source: WindowSource::Pixel,
         // Pixel detection sees a rectangle, not a name; a window recording
         // that needs a name takes the picker instead.
         app_id: String::new(),
         title: String::new(),
+        handle: None,
     })
 }
 
@@ -1315,7 +1316,7 @@ mod tests {
         let window = detect_active_window(&canvas.scene(), None).unwrap();
         assert_eq!(window.source, WindowSource::Pixel);
         // The window as it looks, stroke included — not the content inside it.
-        assert_eq!(window.geometry, Rect::new(100, 80, 200, 140));
+        assert_eq!(window.geometry, Some(Rect::new(100, 80, 200, 140)));
     }
 
     #[test]
@@ -1347,7 +1348,7 @@ mod tests {
         }
         let window = detect_active_window(&canvas.scene(), None).unwrap();
         assert_eq!(window.source, WindowSource::Pixel);
-        assert_eq!(window.geometry, Rect::new(100, 80, 200, 140));
+        assert_eq!(window.geometry, Some(Rect::new(100, 80, 200, 140)));
     }
 
     #[test]
@@ -1371,7 +1372,7 @@ mod tests {
         // The vivid stroke marks the focused window even though the wide
         // neighbour's edge is the longer line on the shared rows.
         let window = detect_active_window(&canvas.scene(), None).unwrap();
-        assert_eq!(window.geometry, Rect::new(10, 40, 80, 220));
+        assert_eq!(window.geometry, Some(Rect::new(10, 40, 80, 220)));
     }
 
     #[test]
@@ -1387,7 +1388,7 @@ mod tests {
         // Both strokes are vivid, so neither window wins on colour and the
         // pointer settles it.
         let window = detect_active_window(&canvas.scene(), Some(Point::new(300, 210))).unwrap();
-        assert_eq!(window.geometry, Rect::new(240, 170, 120, 90));
+        assert_eq!(window.geometry, Some(Rect::new(240, 170, 120, 90)));
     }
 
     #[test]
@@ -1397,13 +1398,13 @@ mod tests {
         canvas.fill(10, 10, 90, 90, [90, 90, 90, 255]);
         // The cursor picks window A even though B is a valid candidate too.
         let window = detect_active_window(&canvas.scene(), Some(Point::new(250, 150))).unwrap();
-        assert_eq!(window.geometry, Rect::new(150, 60, 210, 180));
+        assert_eq!(window.geometry, Some(Rect::new(150, 60, 210, 180)));
         // B is above the size thresholds as well, so the cursor over B wins.
         let window = detect_active_window(&canvas.scene(), Some(Point::new(40, 40))).unwrap();
-        assert_eq!(window.geometry, Rect::new(10, 10, 90, 90));
+        assert_eq!(window.geometry, Some(Rect::new(10, 10, 90, 90)));
         // Without a cursor the larger window wins.
         let window = detect_active_window(&canvas.scene(), None).unwrap();
-        assert_eq!(window.geometry, Rect::new(150, 60, 210, 180));
+        assert_eq!(window.geometry, Some(Rect::new(150, 60, 210, 180)));
     }
 
     #[test]
@@ -1411,14 +1412,14 @@ mod tests {
         let mut canvas = Canvas::new(400, 300, [30, 30, 30, 255]);
         canvas.fill(20, 20, 50, 40, [180, 180, 180, 255]);
         let window = detect_active_window(&canvas.scene(), None).unwrap();
-        assert_eq!(window.geometry, Rect::new(20, 20, 50, 40));
+        assert_eq!(window.geometry, Some(Rect::new(20, 20, 50, 40)));
     }
 
     #[test]
     fn uniform_fullscreen_content_degrades_to_the_whole_frame() {
         let canvas = Canvas::new(400, 300, [50, 90, 130, 255]);
         let window = detect_active_window(&canvas.scene(), None).unwrap();
-        assert_eq!(window.geometry, Rect::new(0, 0, 400, 300));
+        assert_eq!(window.geometry, Some(Rect::new(0, 0, 400, 300)));
     }
 
     #[test]
@@ -1453,7 +1454,7 @@ mod tests {
             detect_active_window(&canvas.scene(), None)
                 .unwrap()
                 .geometry,
-            Rect::new(20, 40, 160, 220)
+            Some(Rect::new(20, 40, 160, 220))
         );
         // A vivid stroke says *this* window is focused, so it outranks the
         // window merely under the pointer — but the pointer still has to be
@@ -1463,7 +1464,7 @@ mod tests {
             detect_active_window(&canvas.scene(), Some(Point::new(300, 150)))
                 .unwrap()
                 .geometry,
-            Rect::new(20, 40, 160, 220)
+            Some(Rect::new(20, 40, 160, 220))
         );
         // Picking is offered both windows, stroke included.
         let candidates = detect_window_candidates(&canvas.scene());
@@ -1515,7 +1516,7 @@ mod tests {
             detect_active_window(&scene, Some(Point::new(600, 150)))
                 .unwrap()
                 .geometry,
-            Rect::new(550, 60, 210, 180)
+            Some(Rect::new(550, 60, 210, 180))
         );
         // The gray-stroked window is still offered for picking by hand.
         let candidates = detect_window_candidates(&scene);
@@ -1565,18 +1566,18 @@ mod tests {
             detect_active_window(&scene, Some(Point::new(100, 80)))
                 .unwrap()
                 .geometry,
-            Rect::new(20, 20, 180, 120)
+            Some(Rect::new(20, 20, 180, 120))
         );
         assert_eq!(
             detect_active_window(&scene, Some(Point::new(600, 150)))
                 .unwrap()
                 .geometry,
-            Rect::new(475, 50, 250, 200)
+            Some(Rect::new(475, 50, 250, 200))
         );
         // Without a pointer to place the intent, the bigger window wins.
         assert_eq!(
             detect_active_window(&scene, None).unwrap().geometry,
-            Rect::new(475, 50, 250, 200)
+            Some(Rect::new(475, 50, 250, 200))
         );
         // Nothing offered for picking crosses the seam either.
         assert!(detect_window_candidates(&scene)
@@ -1621,6 +1622,6 @@ mod tests {
         .unwrap()])
         .unwrap();
         let window = detect_active_window(&scene, None).unwrap();
-        assert_eq!(window.geometry, Rect::new(50, 40, 100, 70));
+        assert_eq!(window.geometry, Some(Rect::new(50, 40, 100, 70)));
     }
 }

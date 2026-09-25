@@ -779,7 +779,7 @@ pub(super) fn picker_scene(
 
 /// The picker's backdrop for the callers that have no capture of their own
 /// yet: it connects to the compositor and the backend itself.
-fn picker_scene_standalone() -> Result<crate::model::SceneSnapshot> {
+pub(super) fn picker_scene_standalone() -> Result<crate::model::SceneSnapshot> {
     let wayland = crate::wayland::WaylandSession::connect()?;
     let topology = wayland.output_infos()?;
     let mut capture = crate::capture::Capturer::connect()?;
