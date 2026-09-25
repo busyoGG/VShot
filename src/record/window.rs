@@ -122,13 +122,17 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
     // The audio track, when one was asked for: opened before the encoder,
     // because the AAC encoder's rate and channel count come from the
     // negotiation and the MP4's audio stream is declared in its header.
-    // `--app-audio` takes the window's own application's sound, which is the
-    // one place a window recording differs from the other shapes; the
-    // microphone is the fallback everywhere.
-    let mic = match (&request.mic, request.app_audio) {
-        (_, true) => super::open_app_audio(&toplevel.name)?,
-        (mic, false) => super::open_microphone_for(mic.as_ref())?,
+    // `--mic` and `--app-audio` are independent and may both be given: the
+    // microphone is the room, the application audio is the window's own sound,
+    // and a person wants to hear both at once, so they are summed into the one
+    // track the file has.
+    let app_audio = if request.app_audio {
+        super::open_app_audio(&toplevel.name)?
+    } else {
+        None
     };
+    let mic = super::open_soundtrack_with(request.mic.as_ref(), app_audio)?;
+    let mic_format = mic.format();
     let path = prepare_output_path(request)?;
     // The hardware backend, resolved once.  A window capture always delivers
     // dma-bufs; on NVENC — which cannot import one — the recorder keeps the
@@ -136,14 +140,14 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
     // instead.  That readback is on the capture side, so the shape's fourcc is
     // still what the frames arrive as.
     let backend = request.encoder_backend.resolve();
-    let mut recorder = match (&mic, backend) {
-        (Some(mic), _) => Recorder::start_dmabuf_mic(
+    let mut recorder = match (mic_format, backend) {
+        (Some(format), _) => Recorder::start_dmabuf_mic(
             &path,
             shape.width,
             shape.height,
             request.encoder,
             shape.fourcc,
-            mic.format(),
+            format,
             backend,
         )?,
         (None, _) => Recorder::start_dmabuf(
@@ -176,12 +180,10 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
 
     let interrupted = super::install_stop_handler()?;
     super::write_pid_file()?;
-    // The microphone has been running through the setup; arming keeps the
+    // The streams have been running through the setup; arming keeps the
     // samples from here on, so the soundtrack starts where the recording
     // does.
-    if let Some(mic) = &mic {
-        mic.arm();
-    }
+    mic.arm();
     let outcome = loop_over(
         &mut capture,
         &mut recorder,
@@ -318,19 +320,18 @@ pub(super) fn loop_over<
     request: &RecordRequest,
     follow: &Follow,
     source: Name,
-    mic: Option<super::pipewire_audio::Mic>,
+    mic: super::pipewire_audio::Soundtrack,
     interrupted: &AtomicBool,
     mut control: impl FnMut(&mut S) -> Result<bool>,
 ) -> Result<()> {
     let started = Instant::now();
     let interval = request.frame_interval();
-    // The microphone's buffer, reused across frames.
-    let mut mic_samples: Vec<f32> = Vec::new();
-    // The microphone and the window are both moved through the loop, because a
+    // The soundtrack and the window are both moved through the loop, because a
     // `--follow` switch replaces them: the capture points at a new window, and
-    // (`--app-audio` only) the soundtrack is reopened on that window's own
-    // application.  The `Mic` is the session's, and the audio is drained
-    // through whatever it holds at the time.
+    // (`--app-audio` only) the application stream is reopened on that window's
+    // own application while the microphone beside it keeps running.  The
+    // `Soundtrack` is the session's, and the audio is drained through whatever
+    // it holds at the time.
     let mut mic = mic;
     let mut source = source;
     // When the focus is next asked for.  `None` on a recording without
@@ -525,9 +526,7 @@ pub(super) fn loop_over<
         let encode_started = Instant::now();
         encode_window_frame(capture, recorder, &frame, duration_ms)?;
         // The soundtrack for the interval this frame covered.
-        if let Some(mic) = mic.as_ref() {
-            super::pump_microphone(mic, recorder, &mut mic_samples)?;
-        }
+        super::pump_soundtrack(&mut mic, recorder)?;
         if debug_enabled() {
             encoded += 1;
             eprintln!(
@@ -547,8 +546,8 @@ pub(super) fn loop_over<
     // The soundtrack of the tail interval, queued before the last frame is
     // sent again: `finish` flushes the audio encoder after the video's, so
     // the samples have to be in by then.
-    if let Some(mic) = mic.as_ref() {
-        super::pump_microphone(mic, recorder, &mut mic_samples)?;
+    if !mic.is_empty() {
+        super::pump_soundtrack(&mut mic, recorder)?;
     }
     if let Some(frame) = capture.last_frame() {
         let now = Instant::now();
@@ -577,7 +576,7 @@ fn follow_focus<S: crate::record::avcodec::VideoSink + crate::record::avcodec::A
     request: &RecordRequest,
     follow: &Follow,
     source: &mut Name,
-    mic: &mut Option<super::pipewire_audio::Mic>,
+    mic: &mut super::pipewire_audio::Soundtrack,
 ) {
     let focused = match ProcessWindowProvider.active_window() {
         Ok(focused) => focused,
@@ -627,16 +626,27 @@ fn follow_focus<S: crate::record::avcodec::VideoSink + crate::record::avcodec::A
             );
             *source = target;
             if request.app_audio {
+                // The microphone keeps running across the switch; only the
+                // window's own application stream moves with the window.  A
+                // window whose application is silent right now leaves the
+                // stream that was playing, which is better than falling back
+                // to the microphone under a window whose audio was asked for.
                 match super::app_audio_node(source) {
                     Ok(Some(node)) => match super::pipewire_audio::Mic::open(Some(&node)) {
                         Ok(opened) => {
-                            opened.arm();
-                            *mic = Some(opened);
+                            if let Err(error) = mic.set_app(Some(opened), recorder) {
+                                eprintln!(
+                                    "vshot: the new window's audio could not be mixed in: {error}"
+                                );
+                            }
                         }
                         Err(error) => {
                             eprintln!("vshot: the new window's audio could not be opened: {error}")
                         }
                     },
+                    // The new application is not playing anything: keep the
+                    // stream that was playing, rather than dropping to the
+                    // microphone.
                     Ok(None) => {}
                     Err(error) => {
                         eprintln!("vshot: the new window's audio could not be found: {error}")

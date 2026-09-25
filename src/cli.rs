@@ -387,12 +387,14 @@ cannot blend)."
         /// Do not record the microphone, even when the config remembers it.
         #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
         no_mic: bool,
-        /// Record the recorded *window's own* audio instead of the microphone:
-        /// the sound the application that owns the window is playing, and
-        /// nothing else. Only `record window` has a window to attach it to.
-        /// The window's pid comes from the compositor (Hyprland and niri
-        /// report it; KWin does not), and the sound from PipeWire.
-        #[arg(long = "app-audio", global = true, conflicts_with = "mic")]
+        /// Also record the recorded *window's own* audio: the sound the
+        /// application that owns the window is playing. It may be combined
+        /// with `--mic` — both are summed into the video's one audio track —
+        /// or used on its own for the window's sound and nothing else. Only
+        /// `record window` has a window to attach it to. The window's pid
+        /// comes from the compositor (Hyprland and niri report it; KWin does
+        /// not), and the sound from PipeWire.
+        #[arg(long = "app-audio", global = true)]
         app_audio: bool,
         /// Follow the focus between windows while recording one of them: give
         /// the windows to follow (`--follow NAME`, repeated) and the recording
@@ -509,9 +511,10 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
         /// Do not keep the microphone, even when the config remembers one.
         #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
         no_mic: bool,
-        /// Keep the recorded window's own application's audio in the ring
-        /// (`replay start window` only), as `record --app-audio` does.
-        #[arg(long = "app-audio", global = true, conflicts_with = "mic")]
+        /// Also keep the recorded window's own application's audio in the ring
+        /// (`replay start window` only), as `record --app-audio` does. It may
+        /// be combined with `--mic`: both are summed into the ring's one track.
+        #[arg(long = "app-audio", global = true)]
         app_audio: bool,
         /// Follow the focus between windows while replaying one of them, as
         /// `record --follow` does: give the windows to follow (`--follow
@@ -1752,6 +1755,26 @@ mod tests {
             Cli::try_parse_action_from(["vshot", "record", "monitor", "--mic", "--no-mic"])
                 .is_err()
         );
+
+        // `--mic` and `--app-audio` do not contradict: they are summed into
+        // one track, so a window recording may carry both at once.  `--no-portal`
+        // is given because a config test in another thread sets a remembered
+        // `portal: true` in the process environment now and then, and a portal
+        // recording refuses `--app-audio` (it never learns the window's pid).
+        let action = Cli::try_parse_action_from([
+            "vshot",
+            "record",
+            "window",
+            "--no-portal",
+            "--mic",
+            "--app-audio",
+        ])
+        .unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record window --mic --app-audio` is a start");
+        };
+        assert_eq!(request.mic, Some(crate::record::MicChoice::Default));
+        assert!(request.app_audio, "both audio sources can be kept at once");
 
         // `record stop` takes no options, and the microphone flags are
         // options like any other.

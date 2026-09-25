@@ -341,7 +341,8 @@ vshot record window --portal                    # the same, with windows in the 
 vshot record monitor --mic                      # record the microphone into the same MP4
 vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
 vshot record monitor --no-mic                   # refuse the microphone the config remembers
-vshot record window --app-audio                 # record only that window's own sound (not the mic)
+vshot record window --app-audio                 # record that window's own sound (may combine with --mic)
+vshot record window --mic --app-audio           # microphone + the window's own sound, summed into one track
 vshot record window --follow GameA --follow GameB   # record whichever of the two has the focus
 vshot record monitor --encoder-backend nvenc    # NVIDIA encode (default auto: VAAPI, then NVENC)
 vshot record mics                               # list this session's audio inputs
@@ -453,21 +454,25 @@ vshot record stop                               # stop the running recording
   reference `pw-cat` capture (-24.1 dB against -24.3 dB). A session with no
   default input says so and names `wpctl status` instead of quoting PipeWire's
   bare "no target node available".
-- **Per-application audio (`--app-audio`).** Records **not the microphone** but
-  the sound the recorded window is *playing itself* — nothing another
-  application is playing gets in. It only means something on
-  `vshot record window` / `vshot replay start window` (other targets have no
-  window to attach it to and are refused), and it conflicts with `--mic`. The
-  window's pid comes from the compositor (Hyprland and niri report it; KWin does
-  not); vshot takes that pid to PipeWire's client table, finds that process's
-  playback node and connects only to it. Measured (Hyprland): two mpv players at
-  880 Hz and 220 Hz produced a file whose dominant frequency is 880 Hz — the
-  isolation holds. On KWin (no pid from the compositor) it says so rather than
-  quietly falling back to the microphone. A window playing nothing is a note on
-  stderr and a video-only recording, not an error. `--portal` and `--app-audio`
-  conflict too (the portal's compositor decides which window, and vshot has no
-  pid mapping for it). The audio track is AAC, sharing the encode and mux with
-  the microphone route.
+- **Per-application audio (`--app-audio`).** Additionally records the sound the
+  recorded window is *playing itself* — nothing another application is playing
+  gets in. It only means something on `vshot record window` /
+  `vshot replay start window` (other targets have no window to attach it to and
+  are refused). It can be used **on its own** (that window's sound and nothing
+  else) or **together with `--mic`**: the microphone is the room, the
+  application audio is the window, and the two are **summed sample-for-sample**
+  in Rust into the MP4's **one** audio track — not two tracks most players
+  would play only the first of. The window's pid comes from the compositor
+  (Hyprland and niri report it; KWin does not); vshot takes that pid to
+  PipeWire's client table, finds that process's playback node and connects only
+  to it. Measured (Hyprland): two mpv players at 880 Hz and 220 Hz produced a
+  `--app-audio`-only file whose dominant frequency is 880 Hz — the isolation
+  holds. On KWin (no pid from the compositor) it says so rather than quietly
+  falling back to the microphone. A window playing nothing keeps the source it
+  had (a recording just starting goes video-only), not an error. `--portal` and
+  `--app-audio` conflict (the portal's compositor decides which window, and
+  vshot has no pid mapping for it). The audio track is AAC, sharing the encode
+  and mux with the microphone route.
 - **Following the focus (`--follow`).** Give the windows to follow (`--follow
   NAME`, repeated) and the recording moves between them as the focus does —
   whichever of them has the focus is the one being recorded, and while the
@@ -478,9 +483,12 @@ vshot record stop                               # stop the running recording
   can follow. A switch is the **same path a resize takes**: the new window's
   pixels are fitted into the canvas the file was opened with, so one MP4 keeps
   one frame size and the timeline is continuous. With `--app-audio` the
-  soundtrack follows too, to the new window's own application (both are 48 kHz
-  stereo — the format does not change, so the audio stream declared in the
-  MP4's header stays valid). The focus is asked for at most every 250 ms, and
+  application stream follows too, to the new window's own application — while
+  the microphone beside it **keeps running**; a switch replaces only the
+  application half (both are 48 kHz stereo — the format does not change, so the
+  audio stream declared in the MP4's header stays valid; a new window whose
+  application is silent keeps the previous one rather than falling back to the
+  microphone). The focus is asked for at most every 250 ms, and
   only when `--follow` was given. Measured (Hyprland): A (900x500, 880 Hz) to
   B (600x340, 220 Hz) and back to A over a 14-second recording produced a
   14.0 s file, 900 wide throughout, whose audio analysed by time window
@@ -598,7 +606,7 @@ GOP.
 | `--encoder` | h264 (default), hevc or av1, as for `record` |
 | `--encoder-backend` | `auto` (default), `vaapi` or `nvenc`, as for `record` |
 | `--mic [DEVICE]` | Keep the microphone in the ring too, as `record --mic` does; `--no-mic` refuses it |
-| `--app-audio` | Keep only the recorded window's own sound (`replay start window`), as `record --app-audio` |
+| `--app-audio` | Additionally keep the recorded window's own sound (`replay start window`), as `record --app-audio`; may combine with `--mic`, summed into one track |
 | `--follow NAME` | Switch source as the focus moves between these windows (`replay start window`), as `record --follow` |
 | `--save-dir DIR` | Where a `replay save` with no path lands (strftime-expanded; default the videos directory) |
 | `--background` | `replay start` only: detach the session from the terminal so it outlives the shell |
@@ -789,6 +797,7 @@ Where nothing is adapted, vshot **degrades automatically instead of erroring**: 
 - **Hyprland** — this machine's session is Hyprland and it is the main development and verification environment: capture, selection and annotation, windows, long screenshots, pins, and scroll injection have all run here.
 - **Recording encoder backends** — this machine (7900 XT) is VAAPI: zero-copy dma-buf, h264/hevc/av1, `--fps`, mid-recording window resizes, the portal and replay have all been measured on that route. NVENC's **routing and failure path** are verified (`--encoder-backend nvenc` fails cleanly on a machine with no NVIDIA, with the specific reason, e.g. `no CUDA device for NVENC`), but **a real NVENC encode has never run on NVIDIA hardware** — the software path (CPU NV12 conversion and upload) and its window-fit code are written from code review with no live data.
 - **Per-application audio** — measured on Hyprland: two mpv players at 880 Hz and 220 Hz produced a `record window --app-audio` file whose dominant frequency is 880 Hz, so the isolation holds; a window playing nothing degrades to a video-only recording. KWin does not report a window pid, so `--app-audio` refuses plainly on Plasma instead of quietly falling back to the microphone; niri's pid path has unit tests only.
+- **Microphone + application audio together** — measured on Hyprland: a virtual microphone source at 440 Hz and an mpv window at 880 Hz produced, from `record window --mic --app-audio`, **one** AAC track in which Goertzel analysis finds both 440 Hz and 880 Hz across the whole length, matching the video (8.000 s against 8.000 s). On a `--follow` switch the microphone runs **unbroken throughout** (440 Hz at a steady 0.212 amplitude every second) while only the application stream moves to the new window (880 Hz to 660 Hz). The replay path (`replay start window --mic --app-audio`) carries both too.
 - **Focus following (`--follow`)** — measured on Hyprland with two mpv windows at different sizes and tones: switching focus A -> B -> A produced one 14.0 s file, 900 wide throughout (B's 600x340 fitted into A's canvas), whose audio is 880 Hz, then 220 Hz, then 880 Hz by time window. The focus query, the whitelist match and the "stay put" cases have unit tests; a compositor that cannot report its focus is untested here (Hyprland can).
 - **niri** — both the tiled and floating capture paths were verified on a real session: tiled windows were measured with two side-by-side kitty windows (residual 0.45/0.51 per channel), and floating windows go through niri's `tile_pos_in_workspace_view` coordinates plus `matches_at_position` verification, with correct results on the real session. If a floating window capture comes out misaligned, `--no-blend` bypasses the locating step.
 - **KWin/Plasma** — D-Bus capture (the size and opacity of `CaptureScreen`, `native-resolution`, format fields), the window list, and long screenshots have all been tested, where the capture and window list automation ran against a **headless `--virtual` KWin**, and therefore:

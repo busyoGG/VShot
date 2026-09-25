@@ -574,7 +574,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     // comes after the pick and the region check on purpose — a request that
     // never reaches the encoder must not have opened anything, and a
     // cancelled pick must leave nothing behind.
-    let mic = open_microphone(request)?;
+    let mic = open_soundtrack(request.mic.as_ref())?;
+    let mic_format = mic.format();
 
     // --- the encoder and muxer --------------------------------------------
     let (encoded_width, encoded_height) = geometry;
@@ -601,14 +602,14 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     } else {
         probe_zero_copy(&mut capture, &source, encoded_width, encoded_height)
     };
-    let recorder = match (dmabuf_fourcc, &mic) {
-        (Some(fourcc), Some(mic)) => Recorder::start_dmabuf_mic(
+    let recorder = match (dmabuf_fourcc, mic_format) {
+        (Some(fourcc), Some(format)) => Recorder::start_dmabuf_mic(
             &path,
             encoded_width,
             encoded_height,
             request.encoder,
             fourcc,
-            mic.format(),
+            format,
             backend,
         )?,
         (Some(fourcc), None) => Recorder::start_dmabuf(
@@ -619,12 +620,12 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             fourcc,
             backend,
         )?,
-        (None, Some(mic)) => Recorder::start_mic(
+        (None, Some(format)) => Recorder::start_mic(
             &path,
             encoded_width,
             encoded_height,
             request.encoder,
-            mic.format(),
+            format,
             backend,
         )?,
         (None, None) => Recorder::start(
@@ -657,12 +658,10 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     let interrupted = install_stop_handler()?;
 
     write_pid_file()?;
-    // Everything before this line is setup, and the microphone has been
-    // running through it: arming keeps the samples from here on, so the
-    // soundtrack starts where the recording does.
-    if let Some(mic) = &mic {
-        mic.arm();
-    }
+    // Everything before this line is setup, and the streams have been running
+    // through it: arming keeps the samples from here on, so the soundtrack
+    // starts where the recording does.
+    mic.arm();
     // The loop writes the file and reports what went into it; the pid file
     // goes away whatever happened, because a stale pid would make the next
     // `stop` signal an unrelated process.
@@ -672,7 +671,7 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
         request,
         dmabuf_fourcc.is_some(),
         recorder,
-        mic.as_ref(),
+        mic,
         &interrupted,
     );
     let _ = std::fs::remove_file(pid_file());
@@ -712,17 +711,30 @@ fn prepare_output_path(request: &RecordRequest) -> Result<std::path::PathBuf> {
 }
 
 /// Opens the microphone when the request asked for one, at the same time the
-/// caller opens its frame source.  Returns `None` for a silent recording.
+/// caller opens its frame source.  Returns a silent [`Soundtrack`] when
+/// nothing was asked for.
 ///
-/// This is shared by the three recording loops: they all end up feeding the
-/// same [`Recorder`], whose audio side is armed by the loop once the video
-/// side is ready.
-pub(crate) fn open_microphone(request: &RecordRequest) -> Result<Option<pipewire_audio::Mic>> {
-    open_microphone_for(request.mic.as_ref())
+/// This is shared by the recording loops that have no single application to
+/// attach to (a screen, the whole desktop, a region, the portal): their only
+/// audio source is the microphone.
+pub(crate) fn open_soundtrack(choice: Option<&MicChoice>) -> Result<pipewire_audio::Soundtrack> {
+    open_soundtrack_with(choice, None)
 }
 
-/// The microphone side of [`open_microphone`], shared with the replay loop: a
-/// replay takes the same [`MicChoice`], so the opening is written once.
+/// Builds the recording's whole soundtrack: the microphone the request asked
+/// for, plus (when `app` is given) the recorded window's own application
+/// audio, summed into one stream.  Either half may be absent.
+pub(crate) fn open_soundtrack_with(
+    choice: Option<&MicChoice>,
+    app: Option<pipewire_audio::Mic>,
+) -> Result<pipewire_audio::Soundtrack> {
+    let mic = open_microphone_for(choice)?;
+    pipewire_audio::Soundtrack::new(mic, app)
+}
+
+/// The microphone side of [`open_soundtrack`], shared with the window loop: a
+/// window recording takes the same [`MicChoice`], so the opening is written
+/// once.
 pub(crate) fn open_microphone_for(
     choice: Option<&MicChoice>,
 ) -> Result<Option<pipewire_audio::Mic>> {
@@ -810,34 +822,15 @@ pub(crate) fn app_audio_node(name: &crate::capture::window_copy::Name) -> Result
     }
 }
 
-/// Drains the microphone into the recorder: every sample that arrived since
+/// Drains the soundtrack into the recorder: every sample that arrived since
 /// the last call is queued and encoded, so the soundtrack follows the video's
-/// own frames rather than a timer of its own.
-///
-/// `samples` is reused across calls (the loop owns it) so a recording does not
-/// allocate per frame.
-pub(crate) fn pump_microphone(
-    mic: &pipewire_audio::Mic,
+/// own frames rather than a timer of its own.  When `--mic` and `--app-audio`
+/// were both asked for, the two streams are summed here, sample-for-sample.
+pub(crate) fn pump_soundtrack(
+    soundtrack: &mut pipewire_audio::Soundtrack,
     recorder: &mut impl crate::record::avcodec::AudioSink,
-    samples: &mut Vec<f32>,
 ) -> Result<()> {
-    let channels = mic.format().channels.max(1) as usize;
-    // One second of audio in one read: far more than any frame interval
-    // produces, so the ring is drained in one or two calls and the buffer
-    // never has to grow again.
-    let room = mic.format().rate.max(8000) as usize * channels;
-    if samples.len() < room {
-        samples.resize(room, 0.0);
-    }
-    loop {
-        let read = mic.read(samples)?;
-        if read == 0 {
-            break;
-        }
-        // `read` is frames (samples per channel); the slice is interleaved.
-        recorder.audio_feed(&samples[..read * channels], read)?;
-    }
-    recorder.audio_pump()
+    soundtrack.pump(recorder)
 }
 
 /// Installs the SIGINT/SIGTERM flag every recording shape stops on.
@@ -1176,15 +1169,11 @@ fn record_loop(
     request: &RecordRequest,
     zero_copy: bool,
     mut recorder: Recorder,
-    mic: Option<&pipewire_audio::Mic>,
+    mut mic: pipewire_audio::Soundtrack,
     interrupted: &Arc<AtomicBool>,
 ) -> Result<(usize, f64)> {
     let started = Instant::now();
     let interval = request.frame_interval();
-    // The microphone's own buffer, reused across frames: the soundtrack is
-    // drained into the encoder once per video frame, so the audio timeline
-    // and the video timeline are fed by the same clock.
-    let mut mic_samples: Vec<f32> = Vec::new();
     let mut scratch = SceneScratch {
         outputs: Vec::new(),
     };
@@ -1278,9 +1267,7 @@ fn record_loop(
         // The soundtrack for the interval this frame covered: everything the
         // microphone has produced since the last frame is queued and encoded
         // now, so the audio track grows with the video's own frame clock.
-        if let Some(mic) = mic {
-            pump_microphone(mic, &mut recorder, &mut mic_samples)?;
-        }
+        pump_soundtrack(&mut mic, &mut recorder)?;
         if debug_enabled() {
             let (shape, kind) = match &frame {
                 Grabbed::Software(frame) => (

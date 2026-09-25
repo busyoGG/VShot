@@ -397,7 +397,11 @@ fn screen_session(
         resolve_source(&request.target, &mut capture, &topology, request.cursor)?;
 
     // --- the microphone ---------------------------------------------------
-    let mic = super::open_microphone_for(request.mic.as_ref())?;
+    // A screen, the whole desktop or a region has no single application, so
+    // `--app-audio` has nothing to attach to here (the CLI refuses it); the
+    // soundtrack is the microphone the request asked for.
+    let mut mic = super::open_soundtrack(request.mic.as_ref())?;
+    let mic_format = mic.format();
 
     // --- the encoder and the ring -----------------------------------------
     // `auto` resolves once, here, so the probe and the open agree; NVENC has
@@ -417,7 +421,7 @@ fn screen_session(
         encoded_height,
         request.encoder,
         dmabuf_fourcc,
-        mic.as_ref().map(|mic| mic.format()),
+        mic_format,
         retention,
         gop_frames,
         request.fps,
@@ -443,16 +447,14 @@ fn screen_session(
         }
     }
 
-    if let Some(mic) = &mic {
-        mic.arm();
-    }
+    mic.arm();
     session_loop(
         &mut capture,
         &source,
         request,
         dmabuf_fourcc.is_some(),
         &mut recorder,
-        mic.as_ref(),
+        &mut mic,
         listener,
         interrupted,
     )
@@ -470,12 +472,16 @@ fn window_session(
 ) -> Result<()> {
     use super::avcodec::VideoSink;
     let (mut capture, shape, name) = super::window::open_window_capture(target)?;
-    // The window's own application's sound when `--app-audio` asked for it,
-    // else the microphone.
-    let mic = match (&request.mic, request.app_audio) {
-        (_, true) => super::open_app_audio(&name)?,
-        (mic, false) => super::open_microphone_for(mic.as_ref())?,
+    // `--mic` and `--app-audio` are independent and may both be given: the
+    // microphone is the room, the window's own application audio is the
+    // window's sound, and the ring keeps both summed into its one track.
+    let app_audio = if request.app_audio {
+        super::open_app_audio(&name)?
+    } else {
+        None
     };
+    let mic = super::open_soundtrack_with(request.mic.as_ref(), app_audio)?;
+    let mic_format = mic.format();
     let gop_frames = request.gop_frames();
     let retention = request
         .window
@@ -488,7 +494,7 @@ fn window_session(
         shape.height,
         request.encoder,
         Some(shape.fourcc),
-        mic.as_ref().map(|mic| mic.format()),
+        mic_format,
         retention,
         gop_frames,
         request.fps,
@@ -508,12 +514,11 @@ fn window_session(
             gop_frames
         );
     }
-    if let Some(mic) = &mic {
-        mic.arm();
-    }
+    mic.arm();
     // The recording window loop wants a `RecordRequest`; what it reads that
     // matters here is the frame rate and the `--app-audio` flag, which tells a
-    // `--follow` switch to carry the soundtrack across to the new window.
+    // `--follow` switch to carry the application stream across to the new
+    // window while the microphone keeps running.
     let loop_request = super::RecordRequest {
         target: request.target.clone(),
         output: None,
@@ -525,7 +530,7 @@ fn window_session(
         portal: false,
         mic: None,
         // The audio side is already resolved into `mic` above; the loop takes
-        // the `Mic` itself.
+        // the `Soundtrack` itself.
         app_audio: request.app_audio,
         follow: request.follow.clone(),
     };
@@ -576,13 +581,12 @@ fn session_loop(
     request: &ReplayRequest,
     zero_copy: bool,
     recorder: &mut ReplayRecorder,
-    mic: Option<&super::pipewire_audio::Mic>,
+    mic: &mut super::pipewire_audio::Soundtrack,
     listener: &UnixListener,
     interrupted: &AtomicBool,
 ) -> Result<()> {
     let started = Instant::now();
     let interval = request.frame_interval();
-    let mut mic_samples: Vec<f32> = Vec::new();
     let mut scratch = super::SceneScratch::new();
     let mut next_frame = started;
     let mut last_frame_at = started;
@@ -649,9 +653,7 @@ fn session_loop(
                 duration_ms,
             )?,
         }
-        if let Some(mic) = mic {
-            super::pump_microphone(mic, recorder, &mut mic_samples)?;
-        }
+        super::pump_soundtrack(mic, recorder)?;
         next_frame += interval;
         let now = Instant::now();
         if now > next_frame + interval {

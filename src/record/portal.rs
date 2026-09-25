@@ -256,17 +256,20 @@ fn record(
 
     // The microphone, when one was asked for: opened before the encoder,
     // because the AAC encoder's rate and channel count come from the
-    // negotiation and the MP4's audio stream is declared in its header.
-    let mic = super::open_microphone(request)?;
+    // negotiation and the MP4's audio stream is declared in its header.  The
+    // portal records a whole stream, not a window, so it has no application to
+    // attach `--app-audio` to — only the microphone.
+    let mut mic = super::open_soundtrack(request.mic.as_ref())?;
+    let mic_format = mic.format();
     let path = prepare_output_path(request)?;
-    let mut recorder = match (shape, &mic) {
-        (Shape::Dmabuf, Some(mic)) => Recorder::start_dmabuf_mic(
+    let mut recorder = match (shape, mic_format) {
+        (Shape::Dmabuf, Some(format)) => Recorder::start_dmabuf_mic(
             &path,
             geometry.width,
             geometry.height,
             request.encoder,
             fourcc,
-            mic.format(),
+            format,
             backend,
         )?,
         (Shape::Dmabuf, None) => Recorder::start_dmabuf(
@@ -277,12 +280,12 @@ fn record(
             fourcc,
             backend,
         )?,
-        (Shape::Software, Some(mic)) => Recorder::start_mic(
+        (Shape::Software, Some(format)) => Recorder::start_mic(
             &path,
             geometry.width,
             geometry.height,
             request.encoder,
-            mic.format(),
+            format,
             backend,
         )?,
         (Shape::Software, None) => Recorder::start(
@@ -318,9 +321,7 @@ fn record(
     // The microphone has been running through the negotiation and the
     // picker; arming keeps the samples from here on, so the soundtrack
     // starts where the recording does.
-    if let Some(mic) = &mic {
-        mic.arm();
-    }
+    mic.arm();
     let outcome = loop_over(
         &mut stream,
         &mut recorder,
@@ -328,7 +329,7 @@ fn record(
         shape,
         fourcc,
         geometry,
-        mic.as_ref(),
+        &mut mic,
         &interrupted,
     );
     let _ = std::fs::remove_file(super::pid_file());
@@ -358,11 +359,9 @@ fn loop_over(
     shape: Shape,
     fourcc: u32,
     geometry: pipewire::Geometry,
-    mic: Option<&super::pipewire_audio::Mic>,
+    mic: &mut super::pipewire_audio::Soundtrack,
     interrupted: &AtomicBool,
 ) -> Result<()> {
-    // The microphone's buffer, reused across frames.
-    let mut mic_samples: Vec<f32> = Vec::new();
     // The clock the recording's own length is measured against: the first
     // frame's arrival.  Everything before it is the negotiation, which the
     // user may have spent answering a picker.
@@ -478,9 +477,7 @@ fn loop_over(
             }
         }
         // The soundtrack for the interval this frame covered.
-        if let Some(mic) = mic {
-            super::pump_microphone(mic, recorder, &mut mic_samples)?;
-        }
+        super::pump_soundtrack(mic, recorder)?;
         if debug_enabled() {
             eprintln!(
                 "vshot: frame {}: muxed in {:.1}ms (on screen {duration_ms}ms, PipeWire \
@@ -501,9 +498,7 @@ fn loop_over(
     // The soundtrack of the tail interval, queued before the last frame is
     // sent again: `finish` flushes the audio encoder after the video's, so
     // the samples have to be in by then.
-    if let Some(mic) = mic {
-        super::pump_microphone(mic, recorder, &mut mic_samples)?;
-    }
+    super::pump_soundtrack(mic, recorder)?;
     let now = Instant::now();
     covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;
     let step = (covered_us / 1000).saturating_sub(timeline_ms);

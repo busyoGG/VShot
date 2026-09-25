@@ -771,6 +771,31 @@ ended:
 	return -1;
 }
 
+/*
+ * Frames waiting in the ring: how many frames `vshot_pwa_read` can return
+ * right now without blocking.  0 is "nothing has arrived yet", the normal
+ * state between two video frames, and is not a failure.
+ *
+ * The mixing path reads the same number of frames from two streams by taking
+ * the smaller of their two counts, so one stream cannot slide ahead of the
+ * other: what is summed is always the same span of wall-clock time.  The
+ * count only ever grows between a query and the `read` that follows it — the
+ * recording thread is the ring's only reader — which is what makes the
+ * read-after-query return exactly the frames asked for.
+ */
+int vshot_pwa_queued_frames(VshotPwa *pw)
+{
+	int frames;
+
+	if (pw == NULL)
+		return -1;
+
+	pthread_mutex_lock(&pw->lock);
+	frames = (int)vshot_pwa_queued(pw);
+	pthread_mutex_unlock(&pw->lock);
+	return frames;
+}
+
 const char *vshot_pwa_error(VshotPwa *pw)
 {
 	static char fallback[512];
