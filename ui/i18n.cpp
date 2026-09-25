@@ -199,16 +199,32 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("There is no config directory, so nothing can be saved."),
          QString::fromUtf8("没有配置目录，所以什么都存不下。")},
         {QStringLiteral("Annotation editor"), QString::fromUtf8("标注编辑器")},
-        {QStringLiteral("Command-line defaults"),
-         QString::fromUtf8("命令行默认值")},
         {QStringLiteral("The style the toolbar opens with next time. Leaving the editor "
                         "writes this back, whether or not the capture went through."),
          QString::fromUtf8("下次打开工具栏时的样式。退出编辑器时写回，"
                            "跟这次截图有没有成无关。")},
-        {QStringLiteral("Used only for arguments the command line does not give. An "
-                        "argument, or an environment variable, always wins over these."),
-         QString::fromUtf8("只用于命令行没给出的参数。命令行参数与环境变量"
-                           "永远优先于这里。")},
+        // One clause per page heading, all ending the same way: the defaults
+        // are only defaults, and the command line still wins over them.
+        {QStringLiteral("Where a screenshot is written. Used only where the command line "
+                        "gives nothing: an argument, or an environment variable, always "
+                        "wins over these."),
+         QString::fromUtf8("截图写到哪里。只用于命令行没给出的参数："
+                           "命令行参数与环境变量永远优先于这里。")},
+        {QStringLiteral("Defaults for the long scrolling capture. Used only where the "
+                        "command line gives nothing: an argument, or an environment "
+                        "variable, always wins over these."),
+         QString::fromUtf8("长滚动截图的默认值。只用于命令行没给出的参数："
+                           "命令行参数与环境变量永远优先于这里。")},
+        {QStringLiteral("What happens once the text is out. Used only where the command "
+                        "line gives nothing: an argument, or an environment variable, "
+                        "always wins over these."),
+         QString::fromUtf8("文字出来之后做什么。只用于命令行没给出的参数："
+                           "命令行参数与环境变量永远优先于这里。")},
+        {QStringLiteral("Defaults for `record` and `replay`. Used only where the command "
+                        "line gives nothing: an argument, or an environment variable, "
+                        "always wins over these."),
+         QString::fromUtf8("`record` 与 `replay` 的默认值。只用于命令行没给出的参数："
+                           "命令行参数与环境变量永远优先于这里。")},
         {QStringLiteral("Opening tool"), QString::fromUtf8("默认工具")},
         {QStringLiteral("The tool editing starts with; session changes are not saved here"),
          QString::fromUtf8("编辑状态的起始工具；会话中的切换不写回这里")},
@@ -234,19 +250,25 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("All levels are lossless; slower ones buy a smaller file"),
          QString::fromUtf8("各档全部无损；越慢换来越小的文件")},
         {QStringLiteral("Default monitor"), QString::fromUtf8("默认输出")},
-        {QStringLiteral("An output name, or `current` for the output under the pointer"),
-         QString::fromUtf8("输出名，或 `current` 表示指针所在的那块")},
-        {QStringLiteral("the pointer's output"),
-         QString::fromUtf8("指针所在的那块")},
-        {QStringLiteral("built-in default"),
-         QString::fromUtf8("内置默认")},
-        {QStringLiteral("built-in default (auto)"),
-         QString::fromUtf8("内置默认（auto）")},
-        {QStringLiteral("default"), QString::fromUtf8("默认")},
-        {QStringLiteral("Pins"), QString::fromUtf8("浮层")},
+        {QStringLiteral("Which output a capture takes when the command line names none. Leave it "
+                        "empty to use whichever output the pointer is on -- `current` says the "
+                        "same thing -- or write a name like `eDP-1` to pin one down"),
+         QString::fromUtf8("命令行不指定时从哪块屏幕截图。留空就用指针所在的那块"
+                           "——`current` 是同一个意思——"
+                           "或者写 `eDP-1` 这样的名字钉住一块")},
+        {QStringLiteral("follow the pointer"), QString::fromUtf8("跟随指针")},
+        // A combo box's leading entry names the built-in default, so the label
+        // is built from that name rather than being a word of its own.
+        {QStringLiteral("%1 (built-in default)"), QString::fromUtf8("%1（内置默认）")},
+        // "Pins" used to be the card heading the density row sat under on the
+        // command-line page; the row is on the pin page now, under "Pin size",
+        // so the entry went with it.
         {QStringLiteral("Density"), QString::fromUtf8("密度")},
-        {QStringLiteral("Device pixels per logical pixel, 1-4; inferred when unset"),
-         QString::fromUtf8("每逻辑像素对应多少设备像素，1-4；不设则自动推断")},
+        {QStringLiteral("inferred"), QString::fromUtf8("自动推断")},
+        {QStringLiteral("Device pixels per logical pixel, 1-4; `inferred` works it out from the "
+                        "screen the pin is on"),
+         QString::fromUtf8("每逻辑像素对应多少设备像素，1-4；"
+                           "`inferred` 表示按 pin 所在的那块屏幕自动推断")},
         {QStringLiteral("Scrolling capture"), QString::fromUtf8("滚动截图")},
         {QStringLiteral("Scroll notches"), QString::fromUtf8("滚动格数")},
         {QStringLiteral("Wheel notches sent at a time"),
@@ -272,11 +294,8 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Encoder"), QString::fromUtf8("编码器")},
         {QStringLiteral("All three encode on the GPU's media engine"),
          QString::fromUtf8("三者都跑 GPU 的媒体引擎")},
-        {QStringLiteral("built-in default (h264)"),
-         QString::fromUtf8("内置默认（h264）")},
         {QStringLiteral("Frame rate"), QString::fromUtf8("帧率")},
-        {QStringLiteral("1-240; the built-in default is 60"),
-         QString::fromUtf8("1-240；内置默认 60")},
+        {QStringLiteral("1-240"), QString::fromUtf8("1-240")},
         {QStringLiteral("Through the desktop portal"),
          QString::fromUtf8("走桌面 portal")},
         {QStringLiteral("Needs xdg-desktop-portal and libpipewire; `record all` cannot use it"),
@@ -298,8 +317,6 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Hardware encoder"), QString::fromUtf8("硬件编码器")},
         {QStringLiteral("auto tries VAAPI then NVENC; NVENC records the software path"),
          QString::fromUtf8("auto 先试 VAAPI 再试 NVENC；NVENC 走软件路径")},
-        {QStringLiteral("built-in default (auto)"),
-         QString::fromUtf8("内置默认（auto）")},
         {QStringLiteral("Follow the focus"), QString::fromUtf8("跟随焦点")},
         {QStringLiteral("no windows to follow"),
          QString::fromUtf8("不跟随任何窗口")},
@@ -323,15 +340,15 @@ const QHash<QString, QString> &chineseTable()
          QString::fromUtf8("快捷键触发的保存，用它来报收")},
         {QStringLiteral("Replay"), QString::fromUtf8("回录")},
         {QStringLiteral("History kept"), QString::fromUtf8("保留时长")},
-        {QStringLiteral("Seconds of history the ring holds, 1-3600; the built-in default is 30"),
-         QString::fromUtf8("内存环保留的历史秒数，1-3600；内置默认 30")},
+        {QStringLiteral("Seconds of history the ring holds, 1-3600"),
+         QString::fromUtf8("内存环保留的历史秒数，1-3600")},
         {QStringLiteral("Key-frame distance"), QString::fromUtf8("关键帧间隔")},
         {QStringLiteral("1-10 seconds; smaller makes a save start closer to the moment you asked "
                         "for, at the cost of a bigger ring"),
          QString::fromUtf8("1-10 秒；越小，一次保存越贴近你要的时间点，代价是内存环更大")},
-        {QStringLiteral("1-240; the built-in default is 30, which halves the encoder's work over "
-                        "a long session"),
-         QString::fromUtf8("1-240；内置默认 30，长时间挂着时把编码量减半")},
+        {QStringLiteral("1-240; a rate below the recording's halves the encoder's work over a "
+                        "long session"),
+         QString::fromUtf8("1-240；比录制更低的帧率能把长时间挂着的编码量减半")},
         {QStringLiteral("An experimental route for a compositor vshot cannot capture directly"),
          QString::fromUtf8("对于 vshot 无法直接捕获的合成器，这是一条实验性的路线")},
         {QStringLiteral("Kept in the ring beside the video, as an AAC track"),
@@ -379,11 +396,13 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Follow the colour scheme instead of a colour of its own"),
          QString::fromUtf8("跟随配色方案，不用自己的颜色")},
         {QStringLiteral("Pin appearance"), QString::fromUtf8("Pin 浮层")},
-        {QStringLiteral("How a pinned image is drawn. A pin is a layer surface with "
-                        "nothing but the image in it, so its corners, the shadow "
-                        "behind it and the line around it are all vshot's to draw."),
-         QString::fromUtf8("pin 图怎么画。pin 是只装着图片的 layer surface，"
+        {QStringLiteral("How a pinned image is drawn, and at what size. A pin is a layer "
+                        "surface with nothing but the image in it, so its corners, the "
+                        "shadow behind it and the line around it are all vshot's to "
+                        "draw."),
+         QString::fromUtf8("pin 图怎么画、按什么尺寸画。pin 是只装着图片的 layer surface，"
                            "所以它的圆角、身下的阴影和外面那道线都得 vshot 自己画。")},
+        {QStringLiteral("Pin size"), QString::fromUtf8("Pin 尺寸")},
         {QStringLiteral("0 draws square corners, which is what a screenshot usually wants"),
          QString::fromUtf8("0 表示直角，截图一般就该是直角")},
         {QStringLiteral("0 draws square corners, which is what a screenshot usually wants; the "

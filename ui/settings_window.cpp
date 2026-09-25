@@ -95,6 +95,35 @@ const QColor kChevron(0x9a, 0xa3, 0xae);
 /// of 32px plus its 1px border top and bottom; change one and change the other.
 constexpr int kControlHeight = 34;
 
+// The built-in defaults for the settings whose value is optional -- the ones a
+// `cli` key can leave unsaid.  These are the numbers the window opens on, so
+// that what a user reads is what the CLI will actually use; `spinValue` writes
+// the sentinel back when one is left alone, so the file stays free of a value
+// nobody chose and a later version's default can still reach this user.
+//
+// They are duplicated here because the Qt side cannot ask the Rust side for
+// them.  `vshot-settings-check` reads them back out of `src/cli.rs` and
+// `src/record/`, so a default changed over there fails that check instead of
+// silently disagreeing with what the window shows.
+constexpr int kDefaultLongNotches = 1;
+constexpr int kDefaultLongMaxHeight = 30'000;
+constexpr int kDefaultLongMaxFrames = 6'000;
+constexpr int kDefaultLongTimeout = 120;
+constexpr int kDefaultLongIgnoreTop = 0;
+constexpr int kDefaultPinDensity = 0;  // not a density: "work it out from the screen"
+constexpr int kDefaultRecordFps = 60;
+constexpr int kDefaultReplayWindow = 30;
+constexpr int kDefaultReplayGop = 1;
+constexpr int kDefaultReplayFps = 30;
+
+// The same idea for the ones a combo box carries: the name of the entry the
+// CLI falls back to, which the box's leading entry shows so the default is
+// readable rather than implied by the word "default".
+constexpr const char *kDefaultPngCompression = "fast";
+constexpr const char *kDefaultEncoder = "h264";
+constexpr const char *kDefaultEncoderBackend = "auto";
+constexpr const char *kDefaultLongInject = "auto";
+
 /// The stylesheet.  Object names rather than widget classes carry the
 /// structure, so a card's rows and a page's headings can be told apart without
 /// subclassing everything.
@@ -230,6 +259,15 @@ public:
         : QSpinBox(parent)
     {
         setButtonSymbols(QAbstractSpinBox::NoButtons);
+        // The arrows are painted in a strip the line edit also covers: in a
+        // 120px box the line edit is 108px wide and the arrows start at 94, so
+        // a click on an arrow lands on the line edit and the spin box's own
+        // `mousePressEvent` never sees it -- which is why the arrows did
+        // nothing.  The filter is what puts them back in reach; the handlers
+        // below still serve the pixels of the strip the line edit does not
+        // cover, and a box that is ever laid out wide enough for the two to
+        // stop overlapping keeps working either way.
+        lineEdit()->installEventFilter(this);
     }
 
 protected:
@@ -239,6 +277,50 @@ protected:
         QPainter painter(this);
         paintChevron(painter, upBox(), kChevron, false);
         paintChevron(painter, downBox(), kChevron, true);
+    }
+
+    /// Whether `position`, in this widget's coordinates, is on one of the two
+    /// arrows -- the strip the line edit overlaps.
+    bool onArrow(const QPointF &position) const
+    {
+        return upBox().contains(position) || downBox().contains(position);
+    }
+
+    /// The arrows live on the line edit, so the clicks on them arrive here
+    /// rather than at `mousePressEvent`.  `position()` on the event is in the
+    /// *line edit's* coordinates and the arrows are laid out in the spin box's,
+    /// so the point is mapped across before it is tested.
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == lineEdit()) {
+            if (event->type() == QEvent::MouseButtonPress) {
+                auto *mouse = static_cast<QMouseEvent *>(event);
+                if (mouse->button() == Qt::LeftButton) {
+                    const QPointF position =
+                        lineEdit()->mapTo(this, mouse->position().toPoint());
+                    if (upBox().contains(position)) {
+                        stepUp();
+                        setFocus(Qt::MouseFocusReason);
+                        return true;
+                    }
+                    if (downBox().contains(position)) {
+                        stepDown();
+                        setFocus(Qt::MouseFocusReason);
+                        return true;
+                    }
+                }
+            } else if (event->type() == QEvent::MouseMove) {
+                // The arrows are hit targets, so say so under the pointer.  Not
+                // consumed: the line edit still wants the move for its own
+                // selection.
+                auto *mouse = static_cast<QMouseEvent *>(event);
+                const QPointF position =
+                    lineEdit()->mapTo(this, mouse->position().toPoint());
+                lineEdit()->setCursor(onArrow(position) ? Qt::PointingHandCursor
+                                                        : Qt::IBeamCursor);
+            }
+        }
+        return QSpinBox::eventFilter(watched, event);
     }
 
     void mousePressEvent(QMouseEvent *event) override
@@ -323,12 +405,19 @@ protected:
     }
 };
 
-/// A combo box whose entries are the same names the config file accepts, with
-/// a leading entry for "the file says nothing".
-ModernComboBox *choiceBox(QWidget *parent, const QStringList &values, const QString &emptyLabel)
+/// A combo box whose entries are the same names the config file accepts, with a
+/// leading entry for "the file says nothing".
+///
+/// That leading entry *names* the built-in default instead of saying the word
+/// "default".  The box is the only place a user can find out which codec or
+/// compression level the CLI falls back to, and a row reading "built-in
+/// default" left them to guess; `builtin` is that name.  What it means is still
+/// "no key in the file" -- picking it writes nothing -- so a default left alone
+/// keeps following the built-in one.
+ModernComboBox *choiceBox(QWidget *parent, const QStringList &values, const QString &builtin)
 {
     auto *box = new ModernComboBox(parent);
-    box->addItem(emptyLabel, QString());
+    box->addItem(uiTr("%1 (built-in default)").arg(builtin), QString());
     for (const QString &value : values) {
         box->addItem(value, value);
     }
@@ -343,25 +432,51 @@ void selectChoice(QComboBox *box, const QString &value)
     box->setCurrentIndex(index < 0 ? 0 : index);
 }
 
-/// A spin box with an explicit "not set" value.  Zero is the sentinel the
-/// config layer uses for "the file says nothing", so the special value text is
-/// what makes an unset default visible instead of looking like a real zero.
-ModernSpinBox *optionalSpin(QWidget *parent, int maximum, const QString &suffix)
+/// A spin box whose value is optional.
+///
+/// Zero is the sentinel the config layer reads as "the file says nothing", and
+/// a box showing that zero -- or the word "default" -- left the built-in
+/// default invisible: nothing in the window said that `--fps` means 60, or that
+/// an unset scroll timeout means two minutes.  So the box opens on the built-in
+/// default itself, and the number on screen is the number the CLI will use.
+/// Nothing is lost by it: `spinValue` writes the sentinel back while the value
+/// is still the default, so a default left alone stays out of the file and
+/// keeps following the built-in one.
+///
+/// `inferredText` is for the one box where zero is an answer of its own rather
+/// than just "unset": a pin density of zero means "work it out from the
+/// screen", and that is worth saying in words.
+ModernSpinBox *optionalSpin(QWidget *parent, int builtin, int maximum, const QString &suffix,
+                            const QString &inferredText = QString())
 {
     auto *spin = new ModernSpinBox(parent);
     spin->setRange(0, maximum);
-    spin->setSpecialValueText(uiTr("default"));
-    spin->setValue(0);
+    if (!inferredText.isEmpty()) {
+        spin->setSpecialValueText(inferredText);
+    }
+    spin->setValue(builtin);
     if (!suffix.isEmpty()) {
         spin->setSuffix(suffix);
     }
     return spin;
 }
 
-/// Reads a spin box back into the config: 0 (the "default" entry) stays 0.
-std::uint32_t spinValue(const QSpinBox *spin)
+/// The value a box opens on: what the file remembers, or the built-in default
+/// when the file says nothing (which is what its zero means).
+template <typename T> int rememberedOr(T remembered, int builtin)
 {
-    return static_cast<std::uint32_t>(std::max(0, spin->value()));
+    return remembered == 0 ? builtin : static_cast<int>(remembered);
+}
+
+/// Reads a spin box back into the config: a value still sitting on its built-in
+/// default is written as the sentinel, which is how the file says "nothing
+/// here, use the built-in".  Writing the number instead would freeze today's
+/// default into the file and stop a later version's better one from reaching
+/// this user.
+std::uint32_t spinValue(const QSpinBox *spin, int builtin)
+{
+    const int value = std::max(0, spin->value());
+    return static_cast<std::uint32_t>(value == builtin ? 0 : value);
 }
 
 /// The two answers the microphone row always offers, and the data the combo
@@ -570,6 +685,14 @@ QWidget *newPage(QScrollArea *scroll)
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(4, 2, 10, 14);
     layout->setSpacing(14);
+    // The scroll area stretches the page to at least its viewport, and a page
+    // shorter than that would otherwise have its spare height shared out
+    // between the cards -- and, inside every card, between the rows -- which
+    // spreads a three-card page's rows far apart.  The trailing stretch takes
+    // all of the spare height instead, so a card stays as tall as its own rows
+    // want.  Everything added to a page goes *before* this item: see the
+    // `insertWidget` calls in [`addCard`] and [`addPageHeading`].
+    layout->addStretch(1);
     scroll->setWidget(page);
     return page;
 }
@@ -597,7 +720,9 @@ QWidget *addCard(QWidget *page, const QString &heading)
     columnLayout->addWidget(card);
 
     auto *pageLayout = qobject_cast<QVBoxLayout *>(page->layout());
-    pageLayout->addWidget(column);
+    // Before the page's trailing stretch (see [`newPage`]), so the cards stack
+    // from the top instead of being spread down the page.
+    pageLayout->insertWidget(pageLayout->count() - 1, column);
     return card;
 }
 
@@ -683,7 +808,8 @@ void addPageHeading(QWidget *page, const QString &title, const QString &hint)
     hintLabel->setWordWrap(true);
     layout->addWidget(hintLabel);
     auto *pageLayout = qobject_cast<QVBoxLayout *>(page->layout());
-    pageLayout->addWidget(header);
+    // Before the page's trailing stretch, so the heading stays at the top.
+    pageLayout->insertWidget(pageLayout->count() - 1, header);
 }
 
 /// The four rows that describe a shadow, on whichever card they are given.
@@ -776,11 +902,46 @@ QIcon sectionIcon(int index, const QColor &color)
         painter.drawLine(QPointF(5.5, 16.5), QPointF(3.0, 17.0));
         painter.drawLine(QPointF(3.0, 17.0), QPointF(3.5, 14.5));
     } else if (index == 1) {
-        // A chevron prompt: the command line.
-        painter.drawLine(QPointF(4.0, 5.5), QPointF(8.0, 9.0));
-        painter.drawLine(QPointF(8.0, 9.0), QPointF(4.0, 12.5));
-        painter.drawLine(QPointF(10.0, 13.0), QPointF(15.0, 13.0));
+        // A framed picture with a corner turned down: the output, where a
+        // screenshot is written.
+        QPainterPath frame;
+        frame.moveTo(3.0, 4.0);
+        frame.lineTo(15.0, 4.0);
+        frame.lineTo(15.0, 15.0);
+        frame.lineTo(3.0, 15.0);
+        frame.closeSubpath();
+        painter.drawPath(frame);
+        painter.drawLine(QPointF(3.0, 10.5), QPointF(7.5, 6.0));
+        painter.drawLine(QPointF(7.5, 6.0), QPointF(11.0, 9.5));
     } else if (index == 2) {
+        // A page with an arrow down it: the scrolling capture, which stitches
+        // one long page out of many frames of a scroll.
+        painter.drawLine(QPointF(4.0, 3.5), QPointF(14.0, 3.5));
+        painter.drawLine(QPointF(4.0, 15.0), QPointF(14.0, 15.0));
+        painter.drawLine(QPointF(9.0, 5.5), QPointF(9.0, 13.0));
+        painter.drawLine(QPointF(9.0, 13.0), QPointF(6.5, 10.5));
+        painter.drawLine(QPointF(9.0, 13.0), QPointF(11.5, 10.5));
+    } else if (index == 3) {
+        // A pair of brackets around two short lines: text recognition, which
+        // reads the words out of the picture.
+        painter.drawLine(QPointF(4.0, 3.5), QPointF(4.0, 6.5));
+        painter.drawLine(QPointF(4.0, 3.5), QPointF(7.0, 3.5));
+        painter.drawLine(QPointF(14.0, 3.5), QPointF(14.0, 6.5));
+        painter.drawLine(QPointF(14.0, 3.5), QPointF(11.0, 3.5));
+        painter.drawLine(QPointF(4.0, 14.5), QPointF(4.0, 11.5));
+        painter.drawLine(QPointF(4.0, 14.5), QPointF(7.0, 14.5));
+        painter.drawLine(QPointF(14.0, 14.5), QPointF(14.0, 11.5));
+        painter.drawLine(QPointF(14.0, 14.5), QPointF(11.0, 14.5));
+        painter.drawLine(QPointF(6.5, 7.5), QPointF(11.5, 7.5));
+        painter.drawLine(QPointF(6.5, 10.5), QPointF(9.5, 10.5));
+    } else if (index == 4) {
+        // A lens with a dot at its centre: recording, one window or one
+        // output, which is what this section's defaults are for.
+        painter.drawEllipse(QPointF(9.0, 9.0), 5.0, 5.0);
+        painter.setBrush(color);
+        painter.drawEllipse(QPointF(9.0, 9.0), 1.8, 1.8);
+        painter.setBrush(Qt::NoBrush);
+    } else if (index == 5) {
         // A window with a rounded top-left corner and a title strip: the
         // file dialog's own shape, which is what this section configures.
         QPainterPath frame;
@@ -838,19 +999,40 @@ public:
         sidebar_->setFocusPolicy(Qt::NoFocus);
         sidebar_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         sidebar_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-        sidebar_->addItem(new QListWidgetItem(sectionIcon(0, QColor(kInkDim)),
-                                              uiTr("Annotation editor")));
-        sidebar_->addItem(new QListWidgetItem(sectionIcon(1, QColor(kInkDim)),
-                                              uiTr("Command-line defaults")));
-        sidebar_->addItem(new QListWidgetItem(sectionIcon(2, QColor(kInkDim)),
-                                              uiTr("File dialogs")));
-        sidebar_->addItem(new QListWidgetItem(sectionIcon(3, QColor(kInkDim)),
-                                              uiTr("Pin appearance")));
+        // One page per feature rather than one page per kind of setting.  The
+        // command-line defaults used to share a single page -- output, pin
+        // density, scrolling capture, recognition and the two recording cards
+        // -- which meant that finding a recording option meant scrolling past
+        // three unrelated cards, and that the page's heading had to describe
+        // all of them at once.  The section icons are indexed by row, so the
+        // order here and in [`sectionIcon`] is the same order.
+        const QStringList sections = {
+            uiTr("Annotation editor"),
+            uiTr("Output"),
+            uiTr("Scrolling capture"),
+            uiTr("Text recognition"),
+            uiTr("Recording"),
+            uiTr("File dialogs"),
+            uiTr("Pin appearance"),
+        };
+        for (int row = 0; row < sections.size(); ++row) {
+            sidebar_->addItem(new QListWidgetItem(sectionIcon(row, QColor(kInkDim)),
+                                                  sections.at(row)));
+        }
         bodyLayout->addWidget(sidebar_, 0);
 
         pages_ = new QStackedWidget(body);
+        // Named so the offline check can walk the pages and say which settings
+        // landed on which one; the sidebar's own item text is what it compares
+        // them against.
+        pages_->setObjectName(QStringLiteral("pages"));
+        // Added in the sidebar's order: the row index is the page index, which
+        // is what `currentRowChanged` below relies on.
         pages_->addWidget(buildEditorPage());
-        pages_->addWidget(buildCliPage());
+        pages_->addWidget(buildOutputPage());
+        pages_->addWidget(buildScrollingPage());
+        pages_->addWidget(buildRecognitionPage());
+        pages_->addWidget(buildRecordingPage());
         pages_->addWidget(buildDialogPage());
         pages_->addWidget(buildPinPage());
         bodyLayout->addWidget(pages_, 1);
@@ -1080,16 +1262,18 @@ private:
                             shown.isEmpty() ? rememberedReplayMicrophone() : shown);
     }
 
-    QWidget *buildCliPage()
+    QWidget *buildOutputPage()
     {
         QScrollArea *scroll = newScrollPage(pages_);
         QWidget *page = newPage(scroll);
-        addPageHeading(page, uiTr("Command-line defaults"),
-                       uiTr("Used only for arguments the command line does not give. An "
-                            "argument, or an environment variable, always wins over these."));
+        addPageHeading(page, uiTr("Output"),
+                       uiTr("Where a screenshot is written. Used only where the command line "
+                            "gives nothing: an argument, or an environment variable, always "
+                            "wins over these."));
 
-        QWidget *output = addCard(page, uiTr("Output"));
-        compressionBox_ = choiceBox(output, compressionNames(), uiTr("built-in default"));
+        QWidget *output = addCard(page, QString());
+        compressionBox_ =
+            choiceBox(output, compressionNames(), QString::fromLatin1(kDefaultPngCompression));
         compressionBox_->setObjectName(QStringLiteral("pngCompression"));
         compressionBox_->setMinimumWidth(200);
         selectChoice(compressionBox_, config_.cli.pngCompression);
@@ -1100,67 +1284,84 @@ private:
         monitorEdit_ = new QLineEdit(output);
         monitorEdit_->setObjectName(QStringLiteral("monitor"));
         monitorEdit_->setMinimumWidth(220);
-        monitorEdit_->setPlaceholderText(uiTr("the pointer's output"));
+        monitorEdit_->setPlaceholderText(uiTr("follow the pointer"));
         monitorEdit_->setText(config_.cli.monitor);
         addRow(output, uiTr("Default monitor"),
-               uiTr("An output name, or `current` for the output under the pointer"),
+               uiTr("Which output a capture takes when the command line names none. Leave it "
+                    "empty to use whichever output the pointer is on -- `current` says the "
+                    "same thing -- or write a name like `eDP-1` to pin one down"),
                monitorEdit_, false);
 
-        QWidget *pins = addCard(page, uiTr("Pins"));
-        densitySpin_ = optionalSpin(pins, 4, QString());
-        densitySpin_->setObjectName(QStringLiteral("pinDensity"));
-        densitySpin_->setMinimumWidth(120);
-        densitySpin_->setValue(static_cast<int>(config_.cli.pinDensity));
-        addRow(pins, uiTr("Density"),
-               uiTr("Device pixels per logical pixel, 1-4; inferred when unset"),
-               densitySpin_, true);
+        return scroll;
+    }
 
-        QWidget *scrolling = addCard(page, uiTr("Scrolling capture"));
-        notchesSpin_ = optionalSpin(scrolling, 1000, QString());
+    QWidget *buildScrollingPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("Scrolling capture"),
+                       uiTr("Defaults for the long scrolling capture. Used only where the "
+                            "command line gives nothing: an argument, or an environment "
+                            "variable, always wins over these."));
+
+        QWidget *scrolling = addCard(page, QString());
+        notchesSpin_ = optionalSpin(scrolling, kDefaultLongNotches, 1000, QString());
         notchesSpin_->setObjectName(QStringLiteral("longNotches"));
         notchesSpin_->setMinimumWidth(120);
-        notchesSpin_->setValue(static_cast<int>(config_.cli.longNotches));
+        notchesSpin_->setValue(rememberedOr(config_.cli.longNotches, kDefaultLongNotches));
         addRow(scrolling, uiTr("Scroll notches"),
                uiTr("Wheel notches sent at a time"), notchesSpin_, true);
 
-        maxHeightSpin_ = optionalSpin(scrolling, 1'000'000, uiTr(" px"));
+        maxHeightSpin_ = optionalSpin(scrolling, kDefaultLongMaxHeight, 1'000'000, uiTr(" px"));
         maxHeightSpin_->setObjectName(QStringLiteral("longMaxHeight"));
         maxHeightSpin_->setMinimumWidth(120);
-        maxHeightSpin_->setValue(static_cast<int>(config_.cli.longMaxHeight));
+        maxHeightSpin_->setValue(rememberedOr(config_.cli.longMaxHeight, kDefaultLongMaxHeight));
         addRow(scrolling, uiTr("Max height"), QString(), maxHeightSpin_, false);
 
-        maxFramesSpin_ = optionalSpin(scrolling, 1'000'000, QString());
+        maxFramesSpin_ = optionalSpin(scrolling, kDefaultLongMaxFrames, 1'000'000, QString());
         maxFramesSpin_->setObjectName(QStringLiteral("longMaxFrames"));
         maxFramesSpin_->setMinimumWidth(120);
-        maxFramesSpin_->setValue(static_cast<int>(config_.cli.longMaxFrames));
+        maxFramesSpin_->setValue(rememberedOr(config_.cli.longMaxFrames, kDefaultLongMaxFrames));
         addRow(scrolling, uiTr("Max frames"), QString(), maxFramesSpin_, false);
 
-        timeoutSpin_ = optionalSpin(scrolling, 86'400, uiTr(" s"));
+        timeoutSpin_ = optionalSpin(scrolling, kDefaultLongTimeout, 86'400, uiTr(" s"));
         timeoutSpin_->setObjectName(QStringLiteral("longTimeout"));
         timeoutSpin_->setMinimumWidth(120);
-        timeoutSpin_->setValue(static_cast<int>(config_.cli.longTimeout));
+        timeoutSpin_->setValue(rememberedOr(config_.cli.longTimeout, kDefaultLongTimeout));
         addRow(scrolling, uiTr("Timeout"), QString(), timeoutSpin_, false);
 
-        ignoreTopSpin_ = optionalSpin(scrolling, 100'000, uiTr(" px"));
+        ignoreTopSpin_ = optionalSpin(scrolling, kDefaultLongIgnoreTop, 100'000, uiTr(" px"));
         ignoreTopSpin_->setObjectName(QStringLiteral("longIgnoreTop"));
         ignoreTopSpin_->setMinimumWidth(120);
-        ignoreTopSpin_->setValue(static_cast<int>(config_.cli.longIgnoreTop));
+        ignoreTopSpin_->setValue(rememberedOr(config_.cli.longIgnoreTop, kDefaultLongIgnoreTop));
         addRow(scrolling, uiTr("Ignore top"),
                uiTr("Rows at the top of every frame left out of the match, for sticky "
                     "headers"),
                ignoreTopSpin_, false);
 
-        injectBox_ = choiceBox(scrolling, injectNames(), uiTr("built-in default (auto)"));
+        injectBox_ = choiceBox(scrolling, injectNames(), QString::fromLatin1(kDefaultLongInject));
         injectBox_->setObjectName(QStringLiteral("longInject"));
         injectBox_->setMinimumWidth(200);
         selectChoice(injectBox_, config_.cli.longInject);
         addRow(scrolling, uiTr("Scroll backend"), QString(), injectBox_, false);
 
+        return scroll;
+    }
+
+    QWidget *buildRecognitionPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("Text recognition"),
+                       uiTr("What happens once the text is out. Used only where the command "
+                            "line gives nothing: an argument, or an environment variable, "
+                            "always wins over these."));
+
         // The OCR engine itself is not here -- it is a command and a timeout,
         // which the README documents for hand-editing -- but the notification
         // is: it is the part of the feature a user wants to change *after*
         // seeing it work, and that is what this window is for.
-        QWidget *recognition = addCard(page, uiTr("Text recognition"));
+        QWidget *recognition = addCard(page, QString());
         ocrNotifySwitch_ = new ModernSwitch(recognition);
         ocrNotifySwitch_->setObjectName(QStringLiteral("ocrNotify"));
         ocrNotifySwitch_->setChecked(config_.cli.ocrNotify);
@@ -1170,12 +1371,25 @@ private:
                     "needs a notification daemon"),
                ocrNotifySwitch_, true);
 
+        return scroll;
+    }
+
+    QWidget *buildRecordingPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("Recording"),
+                       uiTr("Defaults for `record` and `replay`. Used only where the command "
+                            "line gives nothing: an argument, or an environment variable, "
+                            "always wins over these."));
+
         // Recording is the one card whose control asks the running session a
         // question -- which audio inputs it has -- so the answer is what the
         // row offers: a name has to be a PipeWire node's own, and nobody can
         // type one of those from memory.
         QWidget *recording = addCard(page, uiTr("Recording"));
-        recordEncoderBox_ = choiceBox(recording, encoderNames(), uiTr("built-in default (h264)"));
+        recordEncoderBox_ =
+            choiceBox(recording, encoderNames(), QString::fromLatin1(kDefaultEncoder));
         recordEncoderBox_->setObjectName(QStringLiteral("recordEncoder"));
         recordEncoderBox_->setMinimumWidth(200);
         selectChoice(recordEncoderBox_, config_.cli.recordEncoder);
@@ -1183,8 +1397,8 @@ private:
                uiTr("All three encode on the GPU's media engine"),
                recordEncoderBox_, true);
 
-        recordEncoderBackendBox_ =
-            choiceBox(recording, encoderBackendNames(), uiTr("built-in default (auto)"));
+        recordEncoderBackendBox_ = choiceBox(recording, encoderBackendNames(),
+                                             QString::fromLatin1(kDefaultEncoderBackend));
         recordEncoderBackendBox_->setObjectName(QStringLiteral("recordEncoderBackend"));
         recordEncoderBackendBox_->setMinimumWidth(200);
         selectChoice(recordEncoderBackendBox_, config_.cli.recordEncoderBackend);
@@ -1192,12 +1406,11 @@ private:
                uiTr("auto tries VAAPI then NVENC; NVENC records the software path"),
                recordEncoderBackendBox_, false);
 
-        recordFpsSpin_ = optionalSpin(recording, 240, uiTr(" fps"));
+        recordFpsSpin_ = optionalSpin(recording, kDefaultRecordFps, 240, uiTr(" fps"));
         recordFpsSpin_->setObjectName(QStringLiteral("recordFps"));
         recordFpsSpin_->setMinimumWidth(120);
-        recordFpsSpin_->setValue(static_cast<int>(config_.cli.recordFps));
-        addRow(recording, uiTr("Frame rate"), uiTr("1-240; the built-in default is 60"),
-               recordFpsSpin_, false);
+        recordFpsSpin_->setValue(rememberedOr(config_.cli.recordFps, kDefaultRecordFps));
+        addRow(recording, uiTr("Frame rate"), uiTr("1-240"), recordFpsSpin_, false);
 
         recordFollowEdit_ = new QLineEdit(recording);
         recordFollowEdit_->setObjectName(QStringLiteral("recordFollow"));
@@ -1266,24 +1479,24 @@ private:
     {
         QWidget *replay = addCard(page, uiTr("Replay"));
 
-        replayWindowSpin_ = optionalSpin(replay, 3600, uiTr(" s"));
+        replayWindowSpin_ = optionalSpin(replay, kDefaultReplayWindow, 3600, uiTr(" s"));
         replayWindowSpin_->setObjectName(QStringLiteral("replayWindow"));
         replayWindowSpin_->setMinimumWidth(120);
-        replayWindowSpin_->setValue(static_cast<int>(config_.cli.replayWindow));
+        replayWindowSpin_->setValue(rememberedOr(config_.cli.replayWindow, kDefaultReplayWindow));
         addRow(replay, uiTr("History kept"),
-               uiTr("Seconds of history the ring holds, 1-3600; the built-in default is 30"),
-               replayWindowSpin_, true);
+               uiTr("Seconds of history the ring holds, 1-3600"), replayWindowSpin_, true);
 
-        replayGopSpin_ = optionalSpin(replay, 10, uiTr(" s"));
+        replayGopSpin_ = optionalSpin(replay, kDefaultReplayGop, 10, uiTr(" s"));
         replayGopSpin_->setObjectName(QStringLiteral("replayGop"));
         replayGopSpin_->setMinimumWidth(120);
-        replayGopSpin_->setValue(static_cast<int>(config_.cli.replayGop));
+        replayGopSpin_->setValue(rememberedOr(config_.cli.replayGop, kDefaultReplayGop));
         addRow(replay, uiTr("Key-frame distance"),
                uiTr("1-10 seconds; smaller makes a save start closer to the moment you asked "
                     "for, at the cost of a bigger ring"),
                replayGopSpin_, false);
 
-        replayEncoderBox_ = choiceBox(replay, encoderNames(), uiTr("built-in default (h264)"));
+        replayEncoderBox_ =
+            choiceBox(replay, encoderNames(), QString::fromLatin1(kDefaultEncoder));
         replayEncoderBox_->setObjectName(QStringLiteral("replayEncoder"));
         replayEncoderBox_->setMinimumWidth(200);
         selectChoice(replayEncoderBox_, config_.cli.replayEncoder);
@@ -1291,8 +1504,8 @@ private:
                uiTr("All three encode on the GPU's media engine"),
                replayEncoderBox_, false);
 
-        replayEncoderBackendBox_ =
-            choiceBox(replay, encoderBackendNames(), uiTr("built-in default (auto)"));
+        replayEncoderBackendBox_ = choiceBox(replay, encoderBackendNames(),
+                                             QString::fromLatin1(kDefaultEncoderBackend));
         replayEncoderBackendBox_->setObjectName(QStringLiteral("replayEncoderBackend"));
         replayEncoderBackendBox_->setMinimumWidth(200);
         selectChoice(replayEncoderBackendBox_, config_.cli.replayEncoderBackend);
@@ -1300,13 +1513,13 @@ private:
                uiTr("auto tries VAAPI then NVENC; NVENC records the software path"),
                replayEncoderBackendBox_, false);
 
-        replayFpsSpin_ = optionalSpin(replay, 240, uiTr(" fps"));
+        replayFpsSpin_ = optionalSpin(replay, kDefaultReplayFps, 240, uiTr(" fps"));
         replayFpsSpin_->setObjectName(QStringLiteral("replayFps"));
         replayFpsSpin_->setMinimumWidth(120);
-        replayFpsSpin_->setValue(static_cast<int>(config_.cli.replayFps));
+        replayFpsSpin_->setValue(rememberedOr(config_.cli.replayFps, kDefaultReplayFps));
         addRow(replay, uiTr("Frame rate"),
-               uiTr("1-240; the built-in default is 30, which halves the encoder's work over "
-                    "a long session"),
+               uiTr("1-240; a rate below the recording's halves the encoder's work over a "
+                    "long session"),
                replayFpsSpin_, false);
 
         replayFollowEdit_ = new QLineEdit(replay);
@@ -1383,8 +1596,8 @@ private:
 
         QWidget *shape = addCard(page, uiTr("Shape"));
         // Both spin boxes stop at 0 and say what that means, rather than using
-        // the optional-spin shape the CLI page uses: there is no "unset" here,
-        // only a size, and 0 is a legitimate one for each.
+        // the optional-spin shape the pin density row uses: there is no
+        // "unset" here, only a size, and 0 is a legitimate one for each.
         //
         // The ceiling is the config layer's, not a round number picked here: a
         // value the file accepts has to be reachable from the window, or a
@@ -1442,12 +1655,32 @@ private:
         QScrollArea *scroll = newScrollPage(pages_);
         QWidget *page = newPage(scroll);
         addPageHeading(page, uiTr("Pin appearance"),
-                       uiTr("How a pinned image is drawn. A pin is a layer surface with "
-                            "nothing but the image in it, so its corners, the shadow "
-                            "behind it and the line around it are all vshot's to draw."));
+                       uiTr("How a pinned image is drawn, and at what size. A pin is a layer "
+                            "surface with nothing but the image in it, so its corners, the "
+                            "shadow behind it and the line around it are all vshot's to "
+                            "draw."));
+
+        // The pin's own size, which is a `cli` default rather than a `pin` one:
+        // it is the density a pin is read at, not how the overlay paints.  It
+        // sits here anyway because this is the page a user opens when a pin
+        // looks wrong, and a density that does not match the screen is one of
+        // the two reasons for that.
+        // Not "Size": the annotation editor's text card already owns that
+        // string, and `uiTr` looks up by the English text, so a second "Size"
+        // would render as the text tool's 字号.
+        QWidget *density = addCard(page, uiTr("Pin size"));
+        densitySpin_ = optionalSpin(density, kDefaultPinDensity, 4, QString(),
+                                    uiTr("inferred"));
+        densitySpin_->setObjectName(QStringLiteral("pinDensity"));
+        densitySpin_->setMinimumWidth(120);
+        densitySpin_->setValue(rememberedOr(config_.cli.pinDensity, kDefaultPinDensity));
+        addRow(density, uiTr("Density"),
+               uiTr("Device pixels per logical pixel, 1-4; `inferred` works it out from the "
+                    "screen the pin is on"),
+               densitySpin_, true);
 
         QWidget *shape = addCard(page, uiTr("Shape"));
-        // The radius has no "unset" state, unlike the CLI page's options: zero
+        // The radius has no "unset" state, unlike the density row above: zero
         // is the default and means square corners, which is what a screenshot
         // wants. So this is a plain spin box that stops at zero and says what
         // that means, the way the dialog page's pair does.
@@ -1596,18 +1829,22 @@ private:
         CliPreferences &cli = config.cli;
         cli.pngCompression = compressionBox_->currentData().toString();
         cli.monitor = monitorEdit_->text().trimmed();
-        cli.pinDensity = spinValue(densitySpin_);
-        cli.longNotches = spinValue(notchesSpin_);
-        cli.longMaxHeight = spinValue(maxHeightSpin_);
-        cli.longMaxFrames = spinValue(maxFramesSpin_);
-        cli.longTimeout = spinValue(timeoutSpin_);
-        cli.longIgnoreTop = spinValue(ignoreTopSpin_);
+        // Every spin box is read back with the built-in default it opened on: a
+        // value still sitting there is written as the sentinel, which is what
+        // keeps an untouched default out of the file and lets a later version's
+        // default reach anyone who never chose one.
+        cli.pinDensity = spinValue(densitySpin_, kDefaultPinDensity);
+        cli.longNotches = spinValue(notchesSpin_, kDefaultLongNotches);
+        cli.longMaxHeight = spinValue(maxHeightSpin_, kDefaultLongMaxHeight);
+        cli.longMaxFrames = spinValue(maxFramesSpin_, kDefaultLongMaxFrames);
+        cli.longTimeout = spinValue(timeoutSpin_, kDefaultLongTimeout);
+        cli.longIgnoreTop = spinValue(ignoreTopSpin_, kDefaultLongIgnoreTop);
         cli.longInject = injectBox_->currentData().toString();
         cli.ocrNotify = ocrNotifySwitch_->isChecked();
 
         cli.recordEncoder = recordEncoderBox_->currentData().toString();
         cli.recordEncoderBackend = recordEncoderBackendBox_->currentData().toString();
-        cli.recordFps = spinValue(recordFpsSpin_);
+        cli.recordFps = spinValue(recordFpsSpin_, kDefaultRecordFps);
         cli.recordPortal = recordPortalSwitch_->isChecked();
         cli.recordFollow = parseFollowText(recordFollowEdit_->text());
         cli.recordNotify = recordNotifySwitch_->isChecked();
@@ -1619,11 +1856,11 @@ private:
             (microphone == kNoMicrophone || microphone == kDefaultMicrophone) ? QString()
                                                                              : microphone;
 
-        cli.replayWindow = spinValue(replayWindowSpin_);
-        cli.replayGop = spinValue(replayGopSpin_);
+        cli.replayWindow = spinValue(replayWindowSpin_, kDefaultReplayWindow);
+        cli.replayGop = spinValue(replayGopSpin_, kDefaultReplayGop);
         cli.replayEncoder = replayEncoderBox_->currentData().toString();
         cli.replayEncoderBackend = replayEncoderBackendBox_->currentData().toString();
-        cli.replayFps = spinValue(replayFpsSpin_);
+        cli.replayFps = spinValue(replayFpsSpin_, kDefaultReplayFps);
         cli.replayFollow = parseFollowText(replayFollowEdit_->text());
         cli.replayPortal = replayPortalSwitch_->isChecked();
         const QString replayMicrophone = replayMicBox_->currentData().toString();

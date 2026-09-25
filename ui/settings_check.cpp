@@ -19,6 +19,7 @@
 // platform plugin; no compositor, because the dialog is never shown.
 
 #include "config.hpp"
+#include "i18n.hpp"
 #include "settings_window.hpp"
 
 #include <QApplication>
@@ -33,10 +34,17 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QLayout>
 #include <QLineEdit>
+#include <QListWidget>
+#include <QMouseEvent>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QScrollArea>
 #include <QSpinBox>
+#include <QStackedWidget>
 #include <QTemporaryDir>
+#include <QVBoxLayout>
 
 #include <cstdio>
 #include <memory>
@@ -427,12 +435,30 @@ void checkTheWindowOpensOnTheStoredValues()
            "the active colour button shows the stored active colour",
            colorOf(dialog.get(), "pinActiveColorButton").name());
 
-    // A field the file says nothing about shows the "not set" entry, and the
-    // spin boxes show their special text rather than a real zero.
-    expect(find<QSpinBox>(dialog.get(), "longMaxHeight")->value() == 0,
-           "an unset height limit reads as unset");
-    expect(!find<QSpinBox>(dialog.get(), "longMaxHeight")->specialValueText().isEmpty(),
-           "an unset spin box says so instead of showing a zero");
+    // A field the file *does* mention is shown as itself -- including the ones
+    // whose leading entry is the built-in default, where a box wired to the
+    // wrong index would sit on that entry and look plausible.
+    expect(find<QSpinBox>(dialog.get(), "pinDensity")->value() == 2,
+           "the pin density the file sets is shown as itself",
+           QString::number(find<QSpinBox>(dialog.get(), "pinDensity")->value()));
+    expect(find<QComboBox>(dialog.get(), "pngCompression")->currentText() ==
+               QStringLiteral("fastest"),
+           "the compression the file sets is shown as itself",
+           find<QComboBox>(dialog.get(), "pngCompression")->currentText());
+    expect(find<QComboBox>(dialog.get(), "recordEncoder")->currentText() ==
+               QStringLiteral("av1"),
+           "the encoder the file sets is shown as itself",
+           find<QComboBox>(dialog.get(), "recordEncoder")->currentText());
+    // And one the file says nothing about opens on the built-in default rather
+    // than on a zero or the word "default": what the window shows is then what
+    // the CLI will actually use.  This file does not mention `--max-height`, and
+    // 30000 is the number `src/cli.rs` falls back to for it.
+    QSpinBox *maxHeight = find<QSpinBox>(dialog.get(), "longMaxHeight");
+    expect(maxHeight->value() == 30000, "an unset height limit opens on the built-in default",
+           QString::number(maxHeight->value()));
+    expect(maxHeight->specialValueText().isEmpty(),
+           "an ordinary spin box has no special text left over",
+           maxHeight->specialValueText());
 }
 
 void checkClearingOneColorLeavesTheOther()
@@ -568,6 +594,279 @@ void checkTheOcrEngineSurvivesASave()
                .arg(external.value(QStringLiteral("timeout")).toInt()));
 }
 
+/// The page a widget is on, as an index into the sidebar, or -1 when it is not
+/// on any of them.
+///
+/// Walks the parent chain rather than looking at the stacked widget directly:
+/// every row is nested a few widgets deep (row, card, column, page), and the
+/// nesting is an implementation detail this check should not have to know.
+int pageOf(QWidget *widget, QStackedWidget *pages)
+{
+    for (QWidget *at = widget; at != nullptr; at = at->parentWidget()) {
+        const int index = pages->indexOf(at);
+        if (index >= 0) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+/// That the sidebar and the pages agree, and that every setting sits on the
+/// page its own name promises.
+///
+/// The window's row index *is* the page index -- `currentRowChanged` switches
+/// on it -- so a page added without a sidebar item, or added in a different
+/// order, silently shows one page while the sidebar highlights another.  The
+/// split into one page per feature is exactly the change that can do that, and
+/// nothing about the window looks wrong when it happens: the settings are all
+/// still there, just not where the sidebar says they are.  So both halves are
+/// pinned: the counts match, and a known widget from each feature is found on
+/// the page that feature names.
+void checkEverySettingIsOnThePageTheSidebarNames()
+{
+    std::printf("--- the sidebar and the pages agree --------------------------------\n");
+    writeConfig(QStringLiteral("{}"));
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    if (!dialog) {
+        std::printf("FAIL  the settings dialog could not be built\n");
+        ++failures;
+        return;
+    }
+
+    QListWidget *sidebar = find<QListWidget>(dialog.get(), "sidebar");
+    QStackedWidget *pages = find<QStackedWidget>(dialog.get(), "pages");
+    if (sidebar == nullptr || pages == nullptr) {
+        return;
+    }
+
+    expect(sidebar->count() == pages->count(),
+           "there is one sidebar entry per page",
+           QStringLiteral("%1 entries, %2 pages")
+               .arg(sidebar->count())
+               .arg(pages->count()));
+
+    // The settings that moved in this split, plus one that stayed put, each
+    // named by the sidebar entry it now belongs under.  A widget wired to a
+    // page it does not belong on -- the recording rows left behind on the
+    // output page, say -- is what this catches.
+    const struct {
+        const char *widget;
+        const char *section;
+    } expected[] = {
+        {"pngCompression", "Output"},
+        {"monitor", "Output"},
+        {"longNotches", "Scrolling capture"},
+        {"longInject", "Scrolling capture"},
+        {"ocrNotify", "Text recognition"},
+        {"recordEncoder", "Recording"},
+        {"recordMic", "Recording"},
+        {"replayWindow", "Recording"},
+        {"replaySaveDir", "Recording"},
+        {"pinDensity", "Pin appearance"},
+        {"pinRadius", "Pin appearance"},
+        {"dialogRadius", "File dialogs"},
+        {"width", "Annotation editor"},
+    };
+    for (const auto &row : expected) {
+        QWidget *widget = dialog->findChild<QWidget *>(QString::fromLatin1(row.widget));
+        if (widget == nullptr) {
+            expect(false, "the setting named in this check exists", row.widget);
+            continue;
+        }
+        // Through `uiTr`, because the sidebar carries the translated section
+        // name: this runs under whatever locale the machine has, and the
+        // English source text is only what the table is keyed by.
+        const QString wanted = vshot::uiTr(row.section);
+        const int index = pageOf(widget, pages);
+        const QString section =
+            (index >= 0 && index < sidebar->count()) ? sidebar->item(index)->text() : QString();
+        expect(section == wanted, "the setting is on the page the sidebar names",
+               QStringLiteral("%1 -> %2 (wanted %3)")
+                   .arg(QString::fromLatin1(row.widget), section, wanted));
+    }
+
+    // Every page ends with a stretch, which is what keeps a short page's cards
+    // and rows at their natural height instead of spreading them down the
+    // viewport.  Without it the cards are spaced out and the window looks
+    // broken; with it, `addCard`'s insert-before-the-stretch is what has to
+    // keep holding, so the invariant is asserted here rather than left to the
+    // eye.
+    for (int index = 0; index < pages->count(); ++index) {
+        QScrollArea *scroll = qobject_cast<QScrollArea *>(pages->widget(index));
+        if (scroll == nullptr) {
+            expect(false, "every page is a scroll area", QString::number(index));
+            continue;
+        }
+        QWidget *page = scroll->widget();
+        auto *layout = page == nullptr ? nullptr : qobject_cast<QVBoxLayout *>(page->layout());
+        if (layout == nullptr) {
+            expect(false, "every page has a box layout", QString::number(index));
+            continue;
+        }
+        const int last = layout->count() - 1;
+        QLayoutItem *item = last >= 0 ? layout->itemAt(last) : nullptr;
+        expect(item != nullptr && item->spacerItem() != nullptr,
+               "the page ends with a stretch, so its cards keep their own height",
+               sidebar->item(index)->text());
+    }
+}
+
+/// The numbers the window opens on have to be the numbers the CLI will use.
+///
+/// The two sides cannot see each other -- the window is C++, the defaults live
+/// in the Rust command line -- so every one of them is written down twice, which
+/// is the arrangement that drifts.  Someone raises the recording frame rate in
+/// `src/record/mod.rs` and the window goes on advertising the old one, which is
+/// worse than showing nothing at all: it looks authoritative.  So the values
+/// are read back out of the Rust source here, and a change there that the window
+/// has not followed fails this check.
+void checkTheBuiltInDefaultsAreTheClis()
+{
+    std::printf("--- the defaults the window shows are the CLI's -------------------\n");
+    writeConfig(QStringLiteral("{}"));
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    if (!dialog) {
+        std::printf("FAIL  the settings dialog could not be built\n");
+        ++failures;
+        return;
+    }
+
+    const QString sourceDir = QString::fromUtf8(VSHOT_SOURCE_DIR);
+    auto readSource = [&](const QString &relative) -> QString {
+        QFile file(sourceDir + QLatin1Char('/') + relative);
+        if (!file.open(QIODevice::ReadOnly)) {
+            expect(false, "the source file this check reads is in the tree", relative);
+            return QString();
+        }
+        return QString::fromUtf8(file.readAll());
+    };
+
+    // The ones the Rust side gives a name to: `pub const DEFAULT_FPS: u32 = 60;`.
+    const struct {
+        const char *widget;
+        const char *file;
+        const char *marker;
+    } named[] = {
+        {"recordFps", "src/record/mod.rs", "DEFAULT_FPS: u32 = "},
+        {"replayFps", "src/record/replay.rs", "DEFAULT_FPS: u32 = "},
+        {"replayWindow", "src/record/replay.rs", "DEFAULT_WINDOW: u64 = "},
+        {"replayGop", "src/record/replay.rs", "DEFAULT_GOP: u64 = "},
+    };
+    for (const auto &row : named) {
+        const QString source = readSource(QString::fromLatin1(row.file));
+        const QString marker = QString::fromLatin1(row.marker);
+        const int at = source.indexOf(marker);
+        int rust = -1;
+        if (at >= 0) {
+            QString digits;
+            for (int i = at + marker.size(); i < source.size(); ++i) {
+                const QChar c = source.at(i);
+                if (c.isDigit()) {
+                    digits.append(c);
+                } else if (c != QLatin1Char('_')) {
+                    break;
+                }
+            }
+            rust = digits.toInt();
+        }
+        QSpinBox *box = dialog->findChild<QSpinBox *>(QString::fromLatin1(row.widget));
+        expect(rust >= 0 && box != nullptr && box->value() == rust,
+               "the number the window opens on is the CLI's",
+               QStringLiteral("%1 shows %2, %3 says %4")
+                   .arg(QString::fromLatin1(row.widget))
+                   .arg(box == nullptr ? -1 : box->value())
+                   .arg(QString::fromLatin1(row.file))
+                   .arg(rust));
+    }
+
+    // The scrolling-capture ones have no constant of their own: they are inline
+    // fallbacks in `src/cli.rs`, of the form
+    // `max_height.or(defaults.max_height).unwrap_or(30_000)`.
+    const QString cli = readSource(QStringLiteral("src/cli.rs"));
+    const struct {
+        const char *widget;
+        const char *field;
+    } inlineDefaults[] = {
+        {"longNotches", "notches"},
+        {"longMaxHeight", "max_height"},
+        {"longMaxFrames", "max_frames"},
+        {"longTimeout", "timeout"},
+        {"longIgnoreTop", "ignore_top"},
+    };
+    for (const auto &row : inlineDefaults) {
+        const QString field = QString::fromLatin1(row.field);
+        const QRegularExpression re(QStringLiteral("%1\\.or\\(defaults\\.%1\\)\\.unwrap_or\\(([0-9_]+)\\)")
+                                        .arg(field));
+        const QRegularExpressionMatch match = re.match(cli);
+        int rust = -1;
+        if (match.hasMatch()) {
+            rust = match.captured(1).replace(QLatin1Char('_'), QString()).toInt();
+        }
+        QSpinBox *box = dialog->findChild<QSpinBox *>(QString::fromLatin1(row.widget));
+        expect(rust >= 0 && box != nullptr && box->value() == rust,
+               "the number the window opens on is the CLI's",
+               QStringLiteral("%1 shows %2, cli.rs says %3")
+                   .arg(QString::fromLatin1(row.widget))
+                   .arg(box == nullptr ? -1 : box->value())
+                   .arg(rust));
+    }
+
+    // The arrows have to be usable.  They are painted in a strip the spin box's
+    // own line edit covers, and a click there used to land on the line edit and
+    // do nothing at all -- the arrows were decoration.
+    QSpinBox *fps = dialog->findChild<QSpinBox *>(QStringLiteral("recordFps"));
+    QLineEdit *fpsEdit = fps == nullptr ? nullptr : fps->findChild<QLineEdit *>();
+    if (fps != nullptr && fpsEdit != nullptr) {
+        const int before = fps->value();
+        // The middle of the upper arrow, in the spin box's coordinates: the
+        // strip starts 26px from the right edge and is 16px wide.
+        const QPoint onUp(fps->width() - 26 + 8, fps->height() / 4);
+        QMouseEvent press(QEvent::MouseButtonPress, QPointF(fpsEdit->mapFrom(fps, onUp)),
+                          QPointF(fps->mapToGlobal(onUp)), Qt::LeftButton, Qt::LeftButton,
+                          Qt::NoModifier);
+        QApplication::sendEvent(fpsEdit, &press);
+        expect(fps->value() == before + 1, "a click on the up arrow steps the box up",
+               QStringLiteral("%1 -> %2").arg(before).arg(fps->value()));
+        const QPoint onDown(fps->width() - 26 + 8, fps->height() * 3 / 4);
+        QMouseEvent pressDown(QEvent::MouseButtonPress, QPointF(fpsEdit->mapFrom(fps, onDown)),
+                              QPointF(fps->mapToGlobal(onDown)), Qt::LeftButton, Qt::LeftButton,
+                              Qt::NoModifier);
+        QApplication::sendEvent(fpsEdit, &pressDown);
+        expect(fps->value() == before, "a click on the down arrow steps the box back down",
+               QStringLiteral("%1").arg(fps->value()));
+    }
+
+    // A default left alone must stay out of the file.  The file is for what the
+    // user chose; a number in it would freeze today's default and stop a later
+    // version's better one from ever reaching them.
+    find<QPushButton>(dialog.get(), "saveButton")->click();
+    QFile file(configPath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        expect(false, "the config file can be read back after a save");
+        return;
+    }
+    const QString saved = QString::fromUtf8(file.readAll());
+    expect(!saved.contains(QStringLiteral("30000")) && !saved.contains(QStringLiteral("6000")),
+           "defaults nobody touched are not written into the file", saved.trimmed());
+
+    // The leading entry of each combo box names the built-in default rather than
+    // saying the word "default", so a user can read which level or codec they
+    // get without guessing.
+    QComboBox *compression = find<QComboBox>(dialog.get(), "pngCompression");
+    expect(compression->currentIndex() == 0 &&
+               compression->itemText(0).contains(QStringLiteral("fast")),
+           "the compression box names its built-in default", compression->itemText(0));
+    QComboBox *encoder = find<QComboBox>(dialog.get(), "recordEncoder");
+    expect(encoder->currentIndex() == 0 && encoder->itemText(0).contains(QStringLiteral("h264")),
+           "the encoder box names its built-in default", encoder->itemText(0));
+    // The pin density is the one box whose zero is an answer of its own rather
+    // than "unset", so it is the one that keeps a special text.
+    QSpinBox *density = find<QSpinBox>(dialog.get(), "pinDensity");
+    expect(density->value() == 0 && !density->specialValueText().isEmpty(),
+           "the pin density opens on zero and says what that means",
+           density->specialValueText());
+}
+
 void checkTheDesktopEntryAndIconAgree()
 {
     std::printf("--- the launcher entry, the icon and the window agree --------------\n");
@@ -669,6 +968,8 @@ int main(int argc, char **argv)
     checkClearingOneColorLeavesTheOther();
     checkCancelChangesNothing();
     checkTheOcrEngineSurvivesASave();
+    checkEverySettingIsOnThePageTheSidebarNames();
+    checkTheBuiltInDefaultsAreTheClis();
     checkTheDesktopEntryAndIconAgree();
 
     std::printf("--- result ---------------------------------------------------------\n");
