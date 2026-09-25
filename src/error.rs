@@ -90,12 +90,18 @@ pub enum VshotError {
     /// Scrolling capture: the selection is not usable for a long screenshot.
     #[error("long screenshot region is unusable: {0}")]
     LongShotRegion(String),
-    /// Screen recording: the encoder, the frame loop or the muxer failed.
-    /// The message is a complete sentence because the causes span several
-    /// layers (a missing VAAPI driver, a rejected surface size, a write that
-    /// could not keep up).
-    #[error("screen recording failed: {0}")]
+    /// Screen recording or replay: the encoder, the frame loop, the muxer or
+    /// the control channel failed.  The message is a complete sentence because
+    /// the causes span several layers (a missing VAAPI driver, a rejected
+    /// surface size, a write that could not keep up, no session to talk to).
+    #[error("recording failed: {0}")]
     Recording(String),
+    /// A complete sentence that needs no prefix: a replay session's own error
+    /// relayed to the client that triggered it is already worded for the user,
+    /// so wrapping it again would read as "recording failed: recording
+    /// failed: ...".
+    #[error("{0}")]
+    Bare(String),
 }
 
 pub type Result<T> = std::result::Result<T, VshotError>;

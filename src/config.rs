@@ -40,6 +40,7 @@ pub struct CliDefaults {
     pub pin: PinDefaults,
     pub ocr: OcrDefaults,
     pub record: RecordDefaults,
+    pub replay: ReplayDefaults,
 }
 
 /// Defaults for `vshot record`.
@@ -54,12 +55,49 @@ pub struct RecordDefaults {
     /// The codec `--encoder` falls back to: `h264` (the built-in default),
     /// `hevc` or `av1`.
     pub encoder: Option<String>,
+    /// The hardware encoder `--encoder-backend` falls back to: `auto` (the
+    /// built-in default, VAAPI where it opens else NVENC), `vaapi` or
+    /// `nvenc`.
+    pub encoder_backend: Option<String>,
     /// The frame rate `--fps` falls back to, 1-240.
     pub fps: Option<u32>,
     /// Whether a recording goes through the desktop portal without
     /// `--portal`.  `null` (the default) keeps the compositor's own
     /// protocols; `--no-portal` overrides a remembered `true`.
     pub portal: Option<bool>,
+}
+
+/// Defaults for `vshot replay`: the memory-replay settings the flags fall back
+/// to when they are not given.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ReplayDefaults {
+    /// How many seconds of history the ring keeps; `--window` overrides it.
+    /// 30 unless the file says otherwise.
+    pub window: Option<u64>,
+    /// The codec `--encoder` falls back to for a replay: `h264` (the built-in
+    /// default), `hevc` or `av1`.
+    pub encoder: Option<String>,
+    /// The hardware encoder `--encoder-backend` falls back to for a replay:
+    /// `auto` (the default), `vaapi` or `nvenc`.
+    pub encoder_backend: Option<String>,
+    /// The frame rate `--fps` falls back to, 1-240.
+    pub fps: Option<u32>,
+    /// The key-frame distance in seconds (1-10): a smaller value makes a save
+    /// start closer to the requested edge at the cost of a bigger ring.
+    pub gop: Option<u64>,
+    /// The microphone the replay keeps in the ring, if any: an empty string is
+    /// the session's default source, a name is a PipeWire node.  `null` (the
+    /// default) means the replay is silent.
+    pub mic: Option<String>,
+    /// Whether a replay uses the desktop portal instead of the compositor's
+    /// own protocols, as `record --portal` does.
+    pub portal: Option<bool>,
+    /// Where a triggered save lands; strftime is expanded.  The videos
+    /// directory with a timestamped name when unset.
+    pub save_dir: Option<String>,
+    /// Whether a save raises a desktop notification.  Absent means yes.
+    pub notify: Option<bool>,
 }
 
 /// Text recognition, used by `vshot ocr` and the editor's text tool.

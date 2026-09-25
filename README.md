@@ -17,6 +17,8 @@ Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕
 - **monitor / all**——按名字或指针位置截一块输出，或把整个桌面按逻辑位置拼合
 - **window active / pick**——焦点窗口，或实时桌面上高亮点选；KWin 与 niri 直接交出窗口自己的像素
 - **长截图**——框选会滚动的内容，自动发滚轮、逐帧抓取、按内容对齐拼成一张长图
+- **录屏**——把屏幕、整个桌面、一块矩形或一扇窗自己的像素录成 MP4，GPU 硬编（VAAPI 或 NVENC 可选），音轨可选麦克风或**所录窗口自己的声音**
+- **回录**——一直在编码但只留最近 N 秒在内存里，按键就把刚才那段拷成 MP4（流拷贝，不重编）
 - **pin 浮层**——把图片或剪贴板内容钉在屏幕上：拖动、滚轮缩放、双击关闭、一键显隐、Space 进标注编辑
 - **剪贴板贴图**——颜色、图片、复制的图片文件、纯文本（按 HTML / markdown / 代码 / 普通文本渲染成卡片）
 - **OCR 取字**——框选一块区域把文字读出来（中英日），走 `vshot ocr`，编辑器工具栏里也有「取字」按钮，识别完弹一条桌面通知
@@ -125,9 +127,17 @@ vshot ocr --input shot.png                  # 读一个已有的图片文件
 vshot record monitor eDP-1 --output clip.mp4    # 录一块屏
 vshot record monitor --fps 30                   # 你当前所在的那块（NAME 省略即 current），30fps
 vshot record all                                # 整个桌面，默认存视频目录
+vshot record region --geometry '0,0 800x600'    # 一块矩形，桌面坐标
 vshot record window                             # 焦点窗口自己的像素，盖住也录得完整
 vshot record stop                               # 停止正在进行的录制
 vshot record monitor current --duration 30      # 录 30 秒自动停
+
+# 回录：把最近一段留在内存里，需要时随时落盘
+vshot replay start monitor --background         # 后台挂着，默认留最近 30 秒
+vshot replay save                               # 把这一段写成一个 MP4
+vshot replay save /tmp/clip.mp4 --seconds 10    # 只取最近 10 秒
+vshot replay status                             # 现在握着多少历史
+vshot replay stop                               # 结束回录会话
 ```
 
 
@@ -318,6 +328,8 @@ for text in (result.txts or []):
 vshot record monitor eDP-1 --output clip.mp4    # 一块屏；NAME 同 `vshot monitor`
 vshot record monitor                            # NAME 省略即 `current`：你当前所在的那块
 vshot record all                                # 多屏按逻辑位置拼合
+vshot record region --geometry '0,0 800x600'    # 一块矩形（桌面坐标，同 `vshot region --geometry`）
+vshot record region                             # 在冻结桌面上拖出矩形
 vshot record window                             # 焦点窗口自己的像素（不是它所在的屏幕区域）
 vshot record window firefox                     # 按 app id 或标题选窗口
 vshot record window --pick                      # 点选一扇窗来录
@@ -329,6 +341,8 @@ vshot record window --portal                    # 同上，但选择器列的是
 vshot record monitor --mic                      # 同时录麦克风（会话的默认输入设备）
 vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
 vshot record monitor --no-mic                   # 配置里记着麦克风时强制不录
+vshot record window --app-audio                 # 只录这扇窗自己的声音（不是麦克风）
+vshot record monitor --encoder-backend nvenc    # NVIDIA 硬编（默认 auto：先 VAAPI，再 NVENC）
 vshot record mics                               # 列出这台机器上能录的音频输入
 vshot record stop                               # 停止（读取 pid 文件发信号）
 ```
@@ -339,6 +353,14 @@ vshot record stop                               # 停止（读取 pid 文件发�
   合成器能报指针位置时（Hyprland）就是指针所在的那块，否则是焦点所在的那块。都不报告时
   会明确报错，让你用 `monitor NAME` 或 `all`。
 
+- **区域录屏（`record region`）**：录一块输出上的矩形，桌面逻辑坐标与 `vshot region
+  --geometry` 同格式（`x,y 宽x高`），必须落在单块输出内（没有合成器调用能复制跨屏区域；跨了
+  会明确报错）。不给 `--geometry` 时在冻结桌面上拖出矩形（与 `vshot region` 同一套选区器），
+  确认前不打开麦克风、不创建文件，取消选区什么都不会留下。wlroots 会话上合成器把矩形直接
+  渲染进 dma-buf，与 `record monitor` 一样零拷贝（实测 800×600 @120fps 稳定 241 帧/2 秒）；
+  编码尺寸是矩形的逻辑尺寸 × 该输出的 scale（2 倍屏上 400×300 录出 800×600）。录制跟随矩形
+  内的内容变化，但矩形本身固定在你画的位置。`--portal` 与 `region` 互斥：portal 的选择器只
+  提供整块屏幕/整扇窗口，给不了矩形。
 - **窗口录屏 ≠ 窗口区域录屏**：`record window` 录的是窗口**自己的像素**，由合成器把窗口本身
   复制出来（`ext_image_copy_capture_v1`，源是窗口的 `ext_foreign_toplevel_handle_v1`）。
   所以：被别的窗口盖住的窗口录出来是完整的；被拖到屏幕外一半的窗口也是完整的；窗口背后有
@@ -347,11 +369,14 @@ vshot record stop                               # 停止（读取 pid 文件发�
   窗口）。窗口怎么指定：给 app id 或标题（先整名，再大小写不敏感的子串），`--pick` 点选，
   不写就是焦点那扇。合成器没有这套协议时会明确说明，让你改录屏幕。
 - **窗口录屏中缩放窗口**：录制中窗口被**缩放**不会中断录制——合成器会重发新尺寸的缓冲约束，
-  vshot 按新约束重建捕获缓冲池，并在 GPU 上把新尺寸的画面**等比缩放适配进录制自己的画布**
+  vshot 按新约束重建捕获缓冲池，并把新尺寸的画面**等比缩放适配进录制自己的画布**
   （比画布大就缩小，小就原尺寸居中，两侧加黑边），所以一条 MP4 的帧尺寸从第一包到 trailer
-  始终不变，而文件是窗口完整的历史。窗口被**关闭**则在那里结束——文件正常收尾（trailer
-  完整），stderr 说明原因。窗口所在输出如果**关着/禁用/断开**，永远不会有帧送过来，这种情况
-  几秒后会报错而不是一直等。
+  始终不变，而文件是窗口完整的历史。适配在 VAAPI（dma-buf）路上由 GPU 的 `scale_vaapi`
+  滤镜链完成；在 NVENC 的软件路上由 CPU 做同样的等比缩放（录制本来就是那条路唯一的兼容
+  选择）。窗口被**关闭**则在那里结束——文件正常收尾（trailer 完整），stderr 说明原因。
+  窗口所在输出如果**关着/禁用/断开**，永远不会有帧送过来，这种情况几秒后会报错而不是一直等。
+  实测：一扇浮窗在录制中被依次拉到 500×400、900×700、320×240，逐次被适配进开录时的画布，
+  文件尺寸始终不变、帧数与时长相符、录制不中断。
 
 - **录制怎么停**：`vshot record stop`（不需要显示器，可直接绑快捷键），或启动它的终端里
   按 Ctrl+C。两种方式都会先把文件正常收尾（libavformat 写完 trailer、采样表与索引）再退出，
@@ -370,6 +395,14 @@ vshot record stop                               # 停止（读取 pid 文件发�
   wf-recorder 同一条路线——运行时用 `dlopen` 加载，所以没有 ffmpeg 库的机器上截图照常
   工作，只是 `record` 会说明缺什么。需要 `ffmpeg` 与 `libva`（AMD/Intel 的 VAAPI）。
   码流每帧都是 IDR（全帧内），任意播放器可读，且任何位置都能跳。
+- **编码后端（`--encoder-backend`）**：`auto`（默认）、`vaapi`、`nvenc` 三选一。`auto`
+  先试 VAAPI（AMD/Intel），打不开再试 NVENC（NVIDIA）；写死某一个时只用那个，打不开就
+  明确报错并说明是哪一层失败（例如 `no CUDA device for NVENC`）。两条路的编码器名、
+  像素格式与私有选项各自独立设置，`--encoder h264/hevc/av1` 在两条路上都能选。
+  **NVENC 没有 dma-buf 导入**，所以它走**软件路径**：帧在 CPU 上转成 NV12 再上传，
+  零拷贝只在 VAAPI 上可用，NVENC 的 CPU 占用因此略高（编码本身仍在 GPU 上）。多显卡
+  机器上 NVENC 默认用第一个 CUDA 设备，`VSHOT_NVENC_DEVICE=<索引>` 换一个。
+  NVIDIA 机器还需要 `ffmpeg` 构建时带 `nvenc`（多数发行版默认带）。
 - **麦克风（`--mic`）**：把麦克风录进同一个 MP4，编码是 AAC（ffmpeg 自己的编码器，和
   视频同一条 libavcodec 路线）。不带名字用会话的默认输入设备，给名字或节点序号录别的输入
   （`wpctl status` 列得出来；序号比如 `--mic 55` 就是那个 monitor）。麦克风在视频编码器之前
@@ -380,15 +413,26 @@ vshot record stop                               # 停止（读取 pid 文件发�
   monitor，回放音量与参考 `pw-cat` 抓到的完全一致（-24.1 dB 对 -24.3 dB）。
   没有默认输入设备的会话会明确报错并提示看 `wpctl status`，而不是丢一句 PipeWire 的
   "no target node available"。
+- **逐应用音频（`--app-audio`）**：录的**不是麦克风**，而是所录那扇窗**自己在播的声音**——
+  别的应用在响什么都不会进去。只在 `vshot record window` / `vshot replay start window` 上
+  有意义（其它目标没有"窗口"可挂，会被拒绝），并且与 `--mic` 互斥。窗口的 pid 由合成器报告
+  （Hyprland、niri 会给；KWin 不给），vshot 拿这个 pid 去 PipeWire 的客户端表里找到该进程
+  的播放节点，只连那一个。实测（Hyprland）：两个 mpv 分别播 880 Hz 与 220 Hz，录出的
+  文件主频是 880 Hz——隔离正确。KWin 上（合成器不报 pid）会明确说明做不到，而不是悄悄退回
+  麦克风。窗口没在放声音时提示一句后只录视频，而不是报错。`--portal` 与 `--app-audio` 也
+  互斥（portal 由合成器决定录哪个窗口，vshot 拿不到它的 pid 对应关系）。音轨同样是 AAC，
+  与麦克风那条路共用编码与封装。
 - **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），
   所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，
   或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
-- **记住的默认值**：`--encoder`、`--fps`、`--portal`、`--mic` 不写时，去配置文件的 `cli.record`
-  段取值（见 [`cli`——命令行默认值](#cli命令行默认值)）；设置窗口的「录制」一栏改的就是这四个键。
-  `--no-portal` 与 `--no-mic` 是对**那一次**录制把记着的值关掉——有了它们，配置里记着
-  `portal: true` 或某个麦克风时也不必每次先改配置。`vshot record mics` 列出这次会话里能录的
-  音频输入，每行是 `节点序号	节点名	说明`（节点名就是 `--mic` 收的值），设置窗口的麦克风
-  下拉读的正是它；没有输入设备的会话会说明一句，而不是报错。
+- **记住的默认值**：`--encoder`、`--encoder-backend`、`--fps`、`--portal`、`--mic` 不写时，
+  去配置文件的 `cli.record` 段取值（见 [`cli`——命令行默认值](#cli命令行默认值)）；
+  `replay` 对应 `cli.replay` 段。`--no-portal` 与 `--no-mic` 是对**那一次**录制把记着的值
+  关掉——有了它们，配置里记着 `portal: true` 或某个麦克风时也不必每次先改配置。
+  `vshot record mics` 列出这次会话里能录的音频输入，每行是 `节点序号	节点名	说明`
+  （节点名就是 `--mic` 收的值），设置窗口的麦克风下拉读的正是它；没有输入设备的会话会说明
+  一句，而不是报错。（`--app-audio` 只认命令行，不进配置文件——它录的是"这一扇窗的声音"，
+  换个窗口就不是同一个意思了。）
 
 - **`--portal`：走桌面 portal 录制**（`org.freedesktop.portal.ScreenCast`）。合成器自己的捕获
   协议（wlr-screencopy、KWin 的 ScreenShot2、`ext_image_copy_capture_v1`）各自只在部分桌面
@@ -408,6 +452,100 @@ vshot record stop                               # 停止（读取 pid 文件发�
 > （复用/每帧新建 coded buffer、`vaSyncSurface`/`vaSyncBuffer`、单线程转换全都一样崩）。
 > 同一台机器上 libavcodec 的 `h264_vaapi` 跑几百帧零故障，所以编码边界交给
 > libavcodec；这是工程决定，不是审美。
+
+## 回录
+
+`vshot replay` 是「一直在录，但不落盘」的录屏：屏幕持续编码，编码后的包进一个**内存环**，
+`vshot replay save` 把环里现有的内容拷成一个 MP4 —— **流拷贝，不重新编码** —— 所以触发几乎不
+花时间，触发之前不写任何东西到磁盘。适合打游戏时挂着，出精彩操作按一下就把刚才那几十秒留下。
+
+```sh
+vshot replay start monitor --background     # 后台挂起，默认留最近 30 秒
+vshot replay save                           # 落盘到视频目录，带时间戳
+vshot replay save /tmp/clip.mp4 --seconds 10
+vshot replay status                         # 环现在覆盖多少秒、已服务多少次保存
+vshot replay stop
+```
+
+`start` 的目标和 `record` 完全一样：`monitor [NAME]`（不写即你当前所在的那块）、`all`、
+`region`（`--geometry` 或冻结桌面上拖出）、`window`（焦点窗口、按名字、或 `--pick`）。帧走相同的
+捕获后端、相同的 libavcodec GPU 编码器，`record` 用零拷贝 dma-buf 的地方回录也用。
+
+### 为什么是「边采边编」而不是「触发时再编」
+
+回录要能拿到**已经过去**的几十秒，这些帧在你按键之前就产生了。若把它们以原始帧留在内存：
+4K60 的 NV12 每帧约 12 MB，30 秒约 22 GB，显存和内存都扛不住。而同样 30 秒、30 Mbps 的**编码后**
+数据只有约 110 MB。所以回录必须一直在编码——这是「能回看过去」的物理代价，无法绕开。能省的是
+编码本身的成本：硬编、按需降帧率、有界 GOP。
+
+### 内存环与关键帧对齐
+
+- **有界 GOP**：编码器用 `--gop` 秒的关键帧间隔（默认 1），而不是录制那样的全帧内编码。环因此
+  只是全帧内码流的一小部分，而且每个 GOP 边界都是一次保存可以起头的地方。
+- **环保留 `--window` + 一个 GOP**：一次保存从「不晚于 `now - seconds` 的最后一个关键帧」开始，
+  那个关键帧可能比目标时间点早最多一个 GOP，所以环要多留这一截，否则会正好把要用的关键帧丢掉。
+- **保存从关键帧起头**：MP4 的第一个视频包不是关键帧的话，播放器在下一个关键帧之前什么都显示不
+  出来。因此保存对齐到关键帧，文件至少有你要求的秒数、并且从第一个字节就能解码。要的比环里有的
+  还多就给全部。
+
+### 参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--window N` | 内存里保留多少秒（1–3600，默认 30）。不写时跟随配置里的 `cli.replay.window` |
+| `--fps N` | 回录默认 **30**（录制默认 60）：回录会长时间挂着，30 fps 把编码量减半 |
+| `--gop N` | 关键帧间隔秒数（1–10，默认 1）。越小，一次保存越贴近目标时间点，代价是环更大 |
+| `--encoder` | h264（默认）、hevc 或 av1，同 `record` |
+| `--encoder-backend` | `auto`（默认）/ `vaapi` / `nvenc`，同 `record` |
+| `--mic [DEVICE]` | 把麦克风一起留在环里，同 `record --mic`；`--no-mic` 强制不收 |
+| `--app-audio` | 只留所录窗口自己的声音（`replay start window`），同 `record --app-audio` |
+| `--save-dir DIR` | `replay save` 不给路径时的落盘目录（展开 strftime，默认视频目录） |
+| `--background` | 只对 `replay start`：让会话脱离终端，活得比启动它的 shell 久 |
+
+### 快捷键
+
+控制走 `$XDG_RUNTIME_DIR/vshot-replay-<uid>.sock`，`save`/`status`/`stop` 都不需要显示器，可直接
+在合成器里绑：
+
+```
+bind = SUPER, R, exec, vshot replay start monitor --background
+bind = SUPER SHIFT, R, exec, vshot replay save
+bind = SUPER ALT, R, exec, vshot replay stop
+```
+
+按一下 `save` 会发一条桌面通知，告诉你文件落在哪、多长。
+
+### 配置
+
+配置文件的 `cli.replay` 段给出默认值（目前是手改文件；设置窗口的录制一栏还没有回录的行）：
+
+```jsonc
+"cli": {
+  "replay": {
+    "window": 30,            // 保留秒数
+    "fps": 30,
+    "encoder": "h264",       // h264 / hevc / av1
+    "encoder-backend": null, // auto / vaapi / nvenc；null 即 auto
+    "gop": 1,                // 关键帧间隔秒数（1-10）
+    "mic": null,             // "" 是默认输入设备，名字是某个 PipeWire 节点
+    "portal": false,         // 回录暂不支持 portal
+    "save-dir": null,        // 落盘目录，null 用视频目录
+    "notify": true           // save 是否发通知
+  }
+}
+```
+
+命令行永远压过文件。一个写坏的值（未知编码器名、越界的秒数）回落到内置默认，而不是让整个回录
+失败。回录一次只跑一个会话（pid 文件挡着第二个），`VSHOT_REPLAY_SOCKET` 覆盖控制 socket，
+`VSHOT_REPLAY_PIDFILE` 覆盖 `replay stop` 读的 pid 文件。
+
+### 回录当前不支持
+
+- **portal**：portal 自己的出帧循环还没接到内存环上，`replay start --portal` 会明确拒绝，让你改用
+  `record ... --portal`。
+- **窗口回录的空闲语义**：`window` 走的是 `ext_image_copy_capture_v1`，合成器在窗口内容不变时
+  不复制帧（与 `record window` 相同）。所以一个静止窗口在环里可能长时间只有很少的帧；动起来的
+  窗口则正常。这是协议本身的按需出帧，不是回录的缺陷。
 
 ## pin 浮层
 
@@ -540,6 +678,8 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 ### 验证到哪一步了
 
 - **Hyprland**——本机会话就是 Hyprland，也是主要开发与验证环境：截图、选区标注、窗口、长截图、pin 与滚动注入都在这里跑过。
+- **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——软件路径（CPU 转 NV12 再上传）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
+- **逐应用音频**——在 Hyprland 上实测：两个 mpv 分别播 880 Hz / 220 Hz，`record window --app-audio` 录出的文件主频为 880 Hz，隔离正确；无声窗口降级为只录视频。KWin 不报告窗口 pid，因此 `--app-audio` 在 Plasma 上明确拒绝而不是静默退回麦克风；niri 的 pid 路径只有单元测试，未现场验证。
 - **niri**——平铺与浮窗两条截图路径都已实机验证：平铺窗口拿两个并排 kitty 测（残差 0.45/0.51 每通道），浮窗走 niri 的 `tile_pos_in_workspace_view` 坐标加 `matches_at_position` 验证，实机结果正确。浮窗截图若出现错位，用 `--no-blend` 绕开定位。
 - **KWin/Plasma**——D-Bus 采集（`CaptureScreen` 的尺寸与不透明性、`native-resolution`、格式字段）、窗口列表与长截图均已实测，其中采集与窗口列表的自动化测试是在**无头 `--virtual` KWin** 上跑的，因此：
   - `--cursor` 传了 `include-cursor` 但**是否真的画出光标未验证**（无头输出上没有指针可画）；
@@ -551,16 +691,18 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 
 ### 光标（`--cursor`）
 
-vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一个"叠加指针"标志（`wlr-screencopy` 的 `overlay_cursor`，KWin 是 `include-cursor`），画不画、画在哪、什么时候画，全由合成器决定。由此有两条实测结论：
+vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一个"叠加指针"标志（`wlr-screencopy` 的 `overlay_cursor`，KWin 是 `include-cursor`），画不画、画在哪、什么时候画，全由合成器决定。由此有三条实测结论：
 
 - **终端里敲命令后截图没有光标，不是 bug**。终端（kitty 实测，`mouse_hide_wait` 默认 3.0 秒）在鼠标不动几秒后会把指针藏掉——对合成器执行 `set_cursor(null)`，此后合成器层面**真的没有光标可画**，任何走 screencopy 的工具都一样（`grim -c` 同时刻也抓不到）。回车后动一下鼠标再去截，或者给 kitty 设 `mouse_hide_wait 0`（打字时指针不再自动隐藏）。其它终端/程序的同类"打字后藏指针"行为同理。
 - **niri 把指针画进的是窗口截图，不是输出帧**。niri 上 `window active` / `window pick` 走它自己的 `screenshot-window`，`--cursor` 映射为该调用的 `--show-pointer`，光标画在窗口图里；`--show-pointer` 是 25.11 之后才有的参数，旧版 niri 会拒绝整个请求，vshot 检测到后自动去掉该参数重试并提示"指针画不进窗口"。输出级路径（`monitor`、`all`、`region`）仍是 screencopy 的 `overlay_cursor`。
+- **Hyprland 上开着 `hypr-dynamic-cursors` 时，指针会被烤进帧里，vshot 自己绕开**。该插件在光标被放大期间（摇晃找光标，或它自带的 magnify dispatcher）会锁住软件光标，此后合成器把指针画进它合成的帧里，而 screencopy 交出的正是这张帧——所以**不传 `--cursor` 也照样有光标**；放大结束后那块残留像素还会一直留在屏上（同时刻 `grim` 抓到的残留与 vshot 完全一致，可见是合成器侧行为，不是 vshot 特有）。vshot 在读整屏前会临时关掉插件，并把指针 warp 到它原来就在的位置——这个指针事件正是合成器切回硬件光标、并重绘那块残留矩形的触发点——读完帧立刻开回来；插件没装、或本来就关着时什么都不做。截图里因此不会出现残留光标，屏上的残留也顺带被清掉。
 
 `--cursor` 对 `long` 无效（见下一条）；KWin 上是否真的画出光标未验证。
 
 ### 已知不稳定点
 
 - **`--cursor` 在 `long` 上无效**——`src/longshot.rs` 的抓帧调用把光标参数写死为 `false`（`longshot::run` 的签名里也没有这个形参），所以 `vshot long --cursor` 会被接受但静默忽略。其余捕获路径（`region`、`monitor`、`all`、`window active`）的 `--cursor` 在本机 Hyprland 上实测有效。KWin 上 `include-cursor` 虽然传了，但**是否真的画出光标未验证**。
+- **抓取正好卡在放大过程中时，帧里可能仍有一个指针**——`hypr-dynamic-cursors` 在放大期间持有软件光标锁，而关掉插件不会让它立刻释放，所以这一瞬间抓的帧会带一个**正常大小**的指针（放大后的那个不会进帧）。放大结束后插件自己解锁，问题自愈：之后任何时候再截都是干净的。
 - **像素识别（`--pixel`）**——无缝无边框平铺（无 gaps、无阴影）与完全均匀的桌面上没有任何像素信号，此时如实报错而不是猜。合成器不给焦点窗口描有色的边时，它答的是**指针下的窗口**，可能与合成器报的焦点窗口不一致。`VSHOT_PIXEL_DEBUG=1` 查每一级的判定。
 - **niri 半透明窗口定位**——模板匹配要求窗口内容在渲染与抓帧之间不变；视频、动画会让模板过期（会带新渲染重试至多 3 次），几乎全透明或悬在输出边缘之外的窗口定位不到（退回 niri 原样的透明渲染）。
 - **KDE 窗口列表探针**——依赖 journald 收到 KWin 的 `console.info`。KWin 从 tty 起、日志只进那台 tty 时，无论等多久都取不到行。装了 `kdotool` 时优先走它（结果经 D-Bus 回给自己，不经 journal），绕开这个依赖。
@@ -659,9 +801,19 @@ vshot settings
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | 自动推断 |
 | `record.encoder` | `record --encoder` | `h264` |
+| `record.encoder-backend` | `record --encoder-backend` | `auto` |
 | `record.fps` | `record --fps` | `60` |
 | `record.portal` | `record --portal` | `false` |
 | `record.mic` | `record --mic` | 不录 |
+| `replay.window` | `replay --window` | `30` |
+| `replay.fps` | `replay --fps` | `30` |
+| `replay.encoder` | `replay --encoder` | `h264` |
+| `replay.encoder-backend` | `replay --encoder-backend` | `auto` |
+| `replay.gop` | `replay --gop` | `1` |
+| `replay.mic` | `replay --mic` | 不录 |
+| `replay.portal` | `replay --portal` | `false` |
+| `replay.save-dir` | `replay --save-dir` | 视频目录 |
+| `replay.notify` | `replay save` 落盘后弹通知 | `true` |
 | `ocr.engine` | `vshot ocr` 用哪个引擎 | `builtin` |
 | `ocr.external.command` | `engine: "external"` 时跑的程序（数组） | 无 |
 | `ocr.external.stdin` | 把 PNG 走 stdin 而不是给路径 | `false` |
@@ -670,7 +822,7 @@ vshot settings
 
 `pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件。`cli` 段里不认识的键会被忽略，不会让整个文件失效——一个键写错只损失那一个键，其余照常生效。
 
-`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 那四项（编码器、帧率、portal、麦克风）；`ocr.engine` 与 `ocr.external` 要手改文件——**`ocr.notify` 这个开关只写「关」**，因为键不存在就是「开」，写一个 `true` 进去等于什么都没说。麦克风那一项是**从当前会话检测出来的**，旁边那个按钮重新检测：检测不到也不报错，只是行里只剩「不录音」和「会话默认输入」两个选项。
+`ocr.engine` 只认 `builtin` 与 `external` 两个值；写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了。同样，`engine: "external"` 而没有 `command`、或者命令跑不起来，都是明确报错（详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 那四项（编码器、帧率、portal、麦克风）；`ocr.engine`、`ocr.external` 与 `record.encoder-backend`（以及 `replay` 那一份）要手改文件——**`ocr.notify` 这个开关只写「关」**，因为键不存在就是「开」，写一个 `true` 进去等于什么都没说。麦克风那一项是**从当前会话检测出来的**，旁边那个按钮重新检测：检测不到也不报错，只是行里只剩「不录音」和「会话默认输入」两个选项。
 
 `color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）。注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 
@@ -724,6 +876,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_PIXEL_DEBUG=1` | 窗口像素识别每一级看到了什么 |
 | `VSHOT_SESSION_DEBUG=1` | 本次会话被判成了哪个合成器、依据是什么 |
 | `VSHOT_LONG_DEBUG_DIR=<dir>` | 长截图落盘每一帧与每次拼接决定 |
+| `VSHOT_NVENC_DEVICE=N` | 指定 NVENC 用第 N 个 CUDA 设备（多显卡机器；默认第一个） |
 | `VSHOT_OCR_MODELS=<dir>` | OCR 模型目录，覆盖 `/usr/share/vshot/models` 与可执行文件旁的查找 |
 | `VSHOT_PIN_SOCKET` | pin daemon 监听的 socket 路径 |
 | `VSHOT_PIN_DENSITY=N` | 每张 pin 图的来源密度，等同 `--density` |
@@ -731,8 +884,10 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_PIN_FOCUS_DEBUG=1` | daemon 打印 pin 渲染面每一次焦点变化 |
 | `VSHOT_PIN_SOURCE_FILE` | 覆盖截图工具记录的路径（默认 `/tmp/screenshot-path`） |
 | `VSHOT_RECORD_PIDFILE` | `vshot record stop` 读取的 pid 文件路径（默认 `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`） |
-| `VSHOT_RECORD_DEBUG=1` | 录制循环打印每帧的阶段（抓取/编码/入封装）与所用 libavcodec 版本 |
+| `VSHOT_RECORD_DEBUG=1` | 录制/回录循环打印每帧的阶段（抓取/编码/入封装）与所用 libavcodec 版本 |
 | `VSHOT_PORTAL_SHM=1` | `record --portal` 改为要内存帧而不是 dma-buf（合成器的缓冲导入不了时的备用路线） |
+| `VSHOT_REPLAY_SOCKET` | 回录控制 socket 的路径（默认 `$XDG_RUNTIME_DIR/vshot-replay-<uid>.sock`） |
+| `VSHOT_REPLAY_PIDFILE` | `vshot replay stop` 读取的 pid 文件路径（默认 `$XDG_RUNTIME_DIR/vshot-replay-<uid>.pid`） |
 
 > 只要给 daemon 开了任一 `VSHOT_PIN_*_DEBUG`，它就不再把自己的 stderr 丢给 `/dev/null`，踪迹因此可读。变量必须在 daemon 启动时就位；已经在常驻的那个要先 `vshot pin --quit`。
 
@@ -744,6 +899,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 - **像素识别**：无缝无边框平铺与完全均匀的桌面没有像素信号，此时如实报错而不是猜；合成器不给焦点窗口描色的边时，`window active --pixel` 答的是"指针下的窗口"；
 - **文本**：Qt 文本框接受任意 Unicode（含输入法提交的 CJK）；未携带位图的旧 helper 结果回退到 Rust 内置 5x7 字体，该回退路径仅支持可打印 ASCII；
 - **`monitor current`** 依赖 overlay 上收到 pointer enter/motion；通用 Wayland 没有可读取的全局鼠标坐标，因此不会用第一个 output 猜测；
+- **回录**：`replay start --portal` 尚不支持（portal 的出帧循环还没接到内存环，会明确拒绝）；`window` 回录受协议按需出帧影响，静止窗口在环里可能长时间只有很少的帧；一次只跑一个会话；
 - 原生 screencopy 等待合成器返回帧最多 10 秒，超时返回错误而不是永久阻塞。
 
 ## 验证
@@ -805,4 +961,11 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-ke2e \
 
 ## 许可证
 
-MIT（见 `LICENSE`）。
+**GPL-3.0-or-later**（见 `LICENSE`）：vshot 按 GNU 通用公共许可证第 3 版或任何更新版本发布，再分发（含修改版）须以同一许可提供完整对应源码。此前的版本（含 v0.1.0–v0.1.2）按 MIT 发布；改用 GPL 是为了让整条依赖链没有灰区：
+
+- **Qt 6 / LayerShellQt**——动态链接，按这两者提供的 GPL 选项使用（Qt 另有 LGPL-3.0 选项，LayerShellQt 另有 LGPL-2.0-or-later 选项）。Qt 库可自行替换：`vshot` 主程序根本不链接 Qt，界面在独立的 `vshot-qt-ui` 里。
+- **FFmpeg**（录屏，可选依赖）——Arch 的构建是 GPL-3.0，运行时以 dlopen 加载。MIT 时代「dlopen 是否构成结合」是个灰区；vshot 自身改为 GPL 后，无论怎么认定都兼容。
+- **Rust 依赖**——MIT / Apache-2.0 / BSD 等宽松许可，均与 GPL 兼容。
+- **OCR 模型**（`/usr/share/vshot/models`）——来自 RapidOCR / PaddleOCR，Apache-2.0；字典来自 oar-ocr，Apache-2.0。
+
+`LICENSE` 是 GPLv3 全文，`NOTICE` 是第三方组件声明，两者都随包安装到 `/usr/share/licenses/vshot/`。对使用者：使用、修改、再分发照旧自由；修改版再分发须一并提供源码，且不能把 vshot 的代码并进闭源产品。

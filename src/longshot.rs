@@ -30,6 +30,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::capture::hypr_cursor;
 use crate::capture::Capturer;
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
@@ -196,6 +197,10 @@ pub fn run(
         region.origin.x + (region.size.width / 2) as i32,
         region.origin.y + (region.size.height / 2) as i32,
     );
+    // The parking below is a pointer event, and this session's plugin paints the
+    // pointer into the frames it composites after one (see `hypr_cursor`), so it
+    // is held off until every frame this stitch is made of has been read.
+    let _cursors_suspended = hypr_cursor::suspend();
     injector.move_pointer(center)?;
 
     // The region picker's surface leaves the screen asynchronously; a frame

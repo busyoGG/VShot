@@ -114,6 +114,20 @@ pub fn recording_failed(reason: &str) {
     );
 }
 
+/// A replay save is triggered from a keybinding, so the notification is the
+/// only receipt of where the file went.  Like the recording's, a failure to
+/// send only reaches stderr.
+pub fn replay_saved(path: &std::path::Path, seconds: f64) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    let summary = if chinese {
+        "回录已保存"
+    } else {
+        "Replay saved"
+    };
+    let body = format!("{} — {:.1}s", path.display(), seconds);
+    send(summary, &preview(&body));
+}
+
 /// Sends a notification, unless the user turned them off (`cli.ocr.notify`).
 fn send(summary: &str, body: &str) {
     if !notifications_enabled() {

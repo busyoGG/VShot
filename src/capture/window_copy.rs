@@ -809,6 +809,28 @@ impl WindowCapture {
         })
     }
 
+    /// Reads one delivered frame back to system memory as packed RGBA.
+    ///
+    /// The VAAPI path never needs this — its encoder imports the dma-buf.  On
+    /// NVENC, which cannot, the recording loop calls this and feeds the pixels
+    /// to the encoder's software path.  The frame's slot is found by the
+    /// descriptor's fd, which is unique within a session's pool.
+    pub fn read_frame_rgba(&self, frame: &DmabufFrame) -> Result<Vec<u8>> {
+        let live = self
+            .state
+            .live
+            .as_ref()
+            .ok_or_else(|| VshotError::WaylandProtocol("no window capture session".into()))?;
+        let slot = live
+            .slots
+            .iter()
+            .find(|slot| slot.gbm.fd() == frame.fd)
+            .ok_or_else(|| {
+                VshotError::WaylandProtocol("the captured buffer is not in the pool".into())
+            })?;
+        slot.gbm.read_rgba()
+    }
+
     /// Whether the compositor has delivered any frame at all yet.  A window
     /// whose output never commits (a disabled or disconnected monitor) never
     /// gets one, which the recording's first-frame timeout turns into an

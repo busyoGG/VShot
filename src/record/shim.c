@@ -392,6 +392,7 @@ typedef struct VshotAvApi {
     AVPacket *(*packet_alloc)(void);
     void (*packet_free)(AVPacket **pkt);
     void (*packet_unref)(AVPacket *pkt);
+    int (*packet_ref)(AVPacket *dst, const AVPacket *src);
     unsigned (*codec_version)(void);
     // libavutil
     AVFrame *(*frame_alloc)(void);
@@ -481,6 +482,11 @@ int vshot_av_enc_available(void);
 int vshot_av_enc_filter_available(void);
 const char *vshot_av_enc_load_error(void);
 unsigned vshot_av_enc_version(void);
+// A one-shot probe of a hardware backend: can it be opened at all on this
+// machine?  Used by `--encoder-backend auto` to pick one and by the Rust side
+// to fall back to the software path when the GPU's encoder cannot import a
+// compositor buffer.  `backend` is VSHOT_BACKEND_VAAPI or VSHOT_BACKEND_NVENC.
+int vshot_av_enc_backend_probe(int backend, char *err, size_t err_len);
 
 static void *try_open(const char *const *names) {
     for (int i = 0; names[i]; i++) {
@@ -554,6 +560,7 @@ static VshotAvApi *load_api(void) {
     NEED(table.packet_alloc, codec, "av_packet_alloc");
     NEED(table.packet_free, codec, "av_packet_free");
     NEED(table.packet_unref, codec, "av_packet_unref");
+    NEED(table.packet_ref, codec, "av_packet_ref");
     NEED(table.codec_version, codec, "avcodec_version");
     NEED(table.frame_alloc, util, "av_frame_alloc");
     NEED(table.frame_free, util, "av_frame_free");
@@ -654,11 +661,168 @@ typedef struct VshotDmabufMap {
 // writing out of bounds.
 #define VSHOT_MAX_PENDING 64
 
+// ---------------------------------------------------------------------------
+// The replay ring: encoded packets kept in memory, newest window only
+// ---------------------------------------------------------------------------
+// A replay session encodes exactly like a recording, but its packets go into
+// this ring instead of a file.  Nothing reaches the disk until a save is
+// triggered, and then the packets are copied straight into an MP4 (a stream
+// copy, no re-encode), so the steady state costs one encode and one in-memory
+// push — a recording minus the disk write — and the trigger costs one mux.
+//
+// Eviction is by time: the ring keeps `window_ms` of history, which the caller
+// sizes as the user's window plus one key-frame interval — a save starts at the
+// newest key frame that is not newer than `newest - window`, and a key frame
+// sits up to one GOP before that edge.  An MP4 whose first video packet is not
+// a key frame shows nothing, which is why the start is key-frame aligned rather
+// than cut at the exact window edge.
+
+typedef struct VshotReplayPkt {
+    AVPacket *pkt;  // our own reference to the encoder's packet
+    int is_audio;
+    int is_key;
+    int64_t ms;     // presentation time on the millisecond timeline
+    int64_t dur_ms; // how long the packet covers
+} VshotReplayPkt;
+
+typedef struct VshotReplay {
+    VshotReplayPkt *pkts;
+    int cap;
+    int head; // index of the oldest entry
+    int count;
+    int64_t window_ms;
+    int64_t newest_ms; // end of the newest packet
+    int64_t oldest_ms; // start of the oldest packet
+    int64_t saved;     // how many saves have run
+} VshotReplay;
+
+static VshotReplay *replay_create(int64_t window_ms, int fps) {
+    VshotReplay *r = calloc(1, sizeof(*r));
+    if (!r) {
+        return NULL;
+    }
+    // Room for the window at the rate the session actually runs, plus its
+    // audio: a video packet per frame and roughly one AAC packet per 21 ms.
+    // Sizing on the real rate (not the CLI ceiling) keeps a 4K120 ring a
+    // quarter of what a 240-fps worst case would reserve, while still holding
+    // the whole window.  The extra second is the slack a save scans back
+    // through for a key frame.
+    if (fps < 1) {
+        fps = 1;
+    }
+    if (fps > 480) {
+        fps = 480;
+    }
+    int64_t seconds = (window_ms + 1000) / 1000 + 1;
+    int64_t per_sec = (int64_t)fps + 48; // video frames + ~48 audio packets a second
+    int64_t cap = seconds * per_sec + 1024;
+    if (cap > 1048576) {
+        cap = 1048576;
+    }
+    r->pkts = calloc((size_t)cap, sizeof(*r->pkts));
+    if (!r->pkts) {
+        free(r);
+        return NULL;
+    }
+    r->cap = (int)cap;
+    r->window_ms = window_ms;
+    return r;
+}
+
+static void replay_evict_one(VshotReplay *r) {
+    if (r->count == 0) {
+        return;
+    }
+    VshotReplayPkt *e = &r->pkts[r->head];
+    if (e->pkt) {
+        api->packet_unref(e->pkt);
+        api->packet_free(&e->pkt);
+    }
+    r->head = (r->head + 1) % r->cap;
+    r->count--;
+    r->oldest_ms = r->count > 0 ? r->pkts[r->head].ms : r->newest_ms;
+}
+
+static void replay_destroy(VshotReplay *r) {
+    if (!r) {
+        return;
+    }
+    while (r->count > 0) {
+        replay_evict_one(r);
+    }
+    free(r->pkts);
+    free(r);
+}
+
+// Keeps one packet's worth of history.  The packet is reference-copied, so the
+// caller is free to unref its own as soon as this returns.
+static int replay_push(VshotReplay *r, AVPacket *src, int is_audio, int is_key, int64_t ms,
+                       int64_t dur_ms) {
+    if (!r) {
+        return 0;
+    }
+    if (r->count == r->cap) {
+        replay_evict_one(r);
+    }
+    int slot = (r->head + r->count) % r->cap;
+    AVPacket *copy = api->packet_alloc();
+    if (!copy) {
+        return -1;
+    }
+    if (api->packet_ref(copy, src) < 0) {
+        api->packet_free(&copy);
+        return -1;
+    }
+    r->pkts[slot].pkt = copy;
+    r->pkts[slot].is_audio = is_audio;
+    r->pkts[slot].is_key = is_key;
+    r->pkts[slot].ms = ms;
+    r->pkts[slot].dur_ms = dur_ms > 0 ? dur_ms : 1;
+    r->count++;
+    if (ms + r->pkts[slot].dur_ms > r->newest_ms) {
+        r->newest_ms = ms + r->pkts[slot].dur_ms;
+    }
+    if (r->count == 1) {
+        r->oldest_ms = ms;
+    }
+    // Time-based eviction.  The caller sized the ring's window as the user's
+    // window plus one key-frame interval, so evicting past it would drop the
+    // key frame a save of the full window needs.
+    int64_t retain = r->window_ms;
+    while (r->count > 1 && r->oldest_ms < r->newest_ms - retain) {
+        replay_evict_one(r);
+    }
+    return 0;
+}
+
+// The two hardware encoder backends.  VAAPI is the default on AMD and Intel
+// (a render node), NVENC the NVIDIA one (a CUDA device).  They differ in the
+// hw device type, the frames' pixel format, the encoder name suffix and the
+// private option names — every one of those reads `enc->backend` rather than
+// assuming VAAPI, so a session is one backend end to end.
+#define VSHOT_BACKEND_VAAPI 0
+#define VSHOT_BACKEND_NVENC 1
+
 struct VshotAvEnc {
     AVBufferRef *device;
     AVBufferRef *frames;    // NV12 pool for the software path
     AVCodecContext *ctx;
+    // Which hardware encoder this session runs: VSHOT_BACKEND_VAAPI or
+    // VSHOT_BACKEND_NVENC.  Chosen once at open time from `--encoder-backend`.
+    int backend;
+    // The software path's letterbox staging: a canvas-sized RGBA buffer the
+    // incoming frame is fitted into when the source was resized mid-session.
+    // A dma-buf session does that fitting in its filtergraph; this one has no
+    // graph, so it is done on the CPU here.  Allocated lazily, on the first
+    // frame that needs it.
+    uint8_t *sw_fit;        // canvas-sized RGBA scratch
+    size_t sw_fit_cap;
     AVFrame *sw;            // reused NV12 software frame (software path)
+    // --- replay ---
+    // When set, the packets go into this ring instead of a muxer or the raw
+    // byte buffer: a recording that keeps its last window in memory.
+    VshotReplay *replay;
+    int64_t replay_next_ms; // the video timeline, in milliseconds
     // --- zero-copy path ---
     int dmabuf;             // 1 when this session encodes dma-bufs
     unsigned fourcc;        // the dma-buf format this session was opened for
@@ -760,6 +924,23 @@ static int drain_packets(VshotAvEnc *enc) {
             api->packet_free(&pkt);
             return -1;
         }
+        if (pkt->size > 0 && enc->replay) {
+            // The replay ring: keep the packet (a reference copy) and its
+            // place on the millisecond timeline, and drop the oldest history
+            // past the window.  Nothing is written anywhere — that is the
+            // whole point of a replay.
+            int64_t duration = pop_duration(enc);
+            int is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+            int64_t ms = enc->replay_next_ms;
+            enc->replay_next_ms += duration;
+            if (replay_push(enc->replay, pkt, 0, is_key, ms, duration) != 0) {
+                set_err(enc, "keeping a packet in the replay ring failed", 0);
+                api->packet_free(&pkt);
+                return -1;
+            }
+            api->packet_unref(pkt);
+            continue;
+        }
         if (pkt->size > 0 && enc->mux) {
             // Straight into the muxer.  It gets the packet's own timeline
             // and its key-frame flag, so nothing is reassembled here: that
@@ -850,22 +1031,46 @@ static void convert_rgba_to_nv12(uint8_t *y_plane, uint8_t *uv_plane, int width,
     }
 }
 
-// The encoder name for a short codec word: "h264" -> "h264_vaapi".  The
-// caller passes one of the names `vshot record --encoder` accepts.
-static const char *vaapi_encoder_name(const char *codec, char *scratch, size_t scratch_size) {
-    snprintf(scratch, scratch_size, "%s_vaapi", codec);
+// The encoder name for a short codec word: "h264" -> "h264_vaapi" on the VAAPI
+// backend, "h264" -> "h264_nvenc" on NVENC.  The caller passes one of the names
+// `vshot record --encoder` accepts.
+static const char *backend_encoder_name(int backend, const char *codec, char *scratch,
+                                        size_t scratch_size) {
+    snprintf(scratch, scratch_size, "%s_%s", codec,
+             backend == VSHOT_BACKEND_NVENC ? "nvenc" : "vaapi");
     return scratch;
 }
 
-static int open_encoder(VshotAvEnc *enc, int width, int height, const char *codec, int qp) {
-    int ret = api->hwdevice_ctx_create(&enc->device, AV_HWDEVICE_TYPE_VAAPI,
+// The pixel format the encoder takes on each backend: a VAAPI surface, or a
+// CUDA device pointer.
+static enum AVPixelFormat backend_pix_fmt(int backend) {
+    return backend == VSHOT_BACKEND_NVENC ? AV_PIX_FMT_CUDA : AV_PIX_FMT_VAAPI;
+}
+
+static int open_encoder(VshotAvEnc *enc, int width, int height, const char *codec, int qp,
+                        int gop_frames) {
+    // The hardware device: a render node for VAAPI, a CUDA device for NVENC.
+    // NVENC's device is named by index (the ffmpeg CUDA hwcontext counts
+    // devices); `VSHOT_NVENC_DEVICE` overrides it for a multi-GPU machine.
+    int ret;
+    if (enc->backend == VSHOT_BACKEND_NVENC) {
+        const char *index = getenv("VSHOT_NVENC_DEVICE");
+        ret = api->hwdevice_ctx_create(&enc->device, AV_HWDEVICE_TYPE_CUDA, index, NULL, 0);
+        if (ret < 0) {
+            set_err(enc, "no CUDA device could be opened for NVENC encoding", ret);
+            return -1;
+        }
+    } else {
+        ret = api->hwdevice_ctx_create(&enc->device, AV_HWDEVICE_TYPE_VAAPI,
                                        "/dev/dri/renderD128", NULL, 0);
-    if (ret < 0) {
-        set_err(enc, "no VAAPI device could be opened for encoding", ret);
-        return -1;
+        if (ret < 0) {
+            set_err(enc, "no VAAPI device could be opened for encoding", ret);
+            return -1;
+        }
     }
     char name[64];
-    const AVCodec *encoder = api->find_encoder_by_name(vaapi_encoder_name(codec, name, sizeof(name)));
+    const AVCodec *encoder =
+        api->find_encoder_by_name(backend_encoder_name(enc->backend, codec, name, sizeof(name)));
     if (!encoder) {
         snprintf(enc->err, sizeof(enc->err), "this ffmpeg build has no %s encoder", name);
         return -1;
@@ -879,14 +1084,20 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     enc->ctx->height = height;
     enc->ctx->time_base = (AVRational){1, 1000000};
     enc->ctx->framerate = (AVRational){0, 1};
-    enc->ctx->pix_fmt = AV_PIX_FMT_VAAPI;
+    enc->ctx->pix_fmt = backend_pix_fmt(enc->backend);
     // Every frame its own IDR: this encoder only produces I frames when it
     // is told at open time (the radeonsi VCN ignores mid-stream requests),
     // and idr_interval counts *I frames*, so any interval above 0 produces
     // a stream whose only key frame is the first — unseekable and
     // uncuttable.  An all-intra stream is what the direct-libva path
     // produced too; the bitrate is higher, every frame decodes on its own.
-    enc->ctx->gop_size = 0;
+    //
+    // A replay wants the opposite: a bounded GOP (`gop_frames` > 0) so a
+    // window of history costs a fraction of an all-intra stream and every
+    // GOP boundary is a place a save can start from.  `idr_interval` stays 0
+    // for the recording case (all-intra) and is set to the GOP length for a
+    // replay, which makes the encoder emit a key frame every `gop_frames`.
+    enc->ctx->gop_size = gop_frames > 0 ? gop_frames : 0;
     // Ask libavcodec for the parameter sets as extradata (SPS/PPS for
     // H.264, VPS/SPS/PPS for HEVC, the sequence header OBU for AV1)
     // instead of leaving the muxer to pick them out of the stream.  This
@@ -907,22 +1118,39 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     // itself reaches them from the context.  Every option is checked: an
     // unrecognised name fails silently otherwise, and a stream without
     // key frames is the exact bug a wrong name produced here once.
-    // `idr_interval` is the VAAPI encoders' name for the key-frame
-    // distance (`g` is the generic name and these encoders do not take it
-    // — the first recordings had no IDR at all because of that).
-    if (api->opt_set(enc->ctx, "rc_mode", "CQP", AV_OPT_SEARCH_CHILDREN) < 0 ||
-        api->opt_set_int(enc->ctx, "idr_interval", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
+    //
+    // The names differ by backend.  VAAPI's are `rc_mode=CQP` (a string) and
+    // `idr_interval` for the key-frame distance (`g` is the generic name and
+    // these encoders do not take it — the first recordings had no IDR at all
+    // because of that).  NVENC's are `rc=constqp` (an int, so it is set from
+    // the enum's numeric value) and the generic `g`, with `forced-idr` so a
+    // key frame is a real IDR.  The key-frame distance itself is carried by
+    // `ctx->gop_size` on both (0 = every frame an I frame), which NVENC reads
+    // through its `g` option and VAAPI through `idr_interval`.
+    if (enc->backend == VSHOT_BACKEND_NVENC) {
+        // NVENC_RC_CONSTQP == 0 in the encoder's own enum; the string is not
+        // accepted for an integer AVOption.
+        if (api->opt_set_int(enc->ctx, "rc", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
+            snprintf(enc->err, sizeof(enc->err),
+                     "this ffmpeg build's %s_nvenc encoder does not take the constqp "
+                     "rate-control option",
+                     codec);
+            return -1;
+        }
+        api->opt_set_int(enc->ctx, "forced-idr", 1, AV_OPT_SEARCH_CHILDREN);
+    } else if (api->opt_set(enc->ctx, "rc_mode", "CQP", AV_OPT_SEARCH_CHILDREN) < 0 ||
+               api->opt_set_int(enc->ctx, "idr_interval", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
         snprintf(enc->err, sizeof(enc->err),
                  "this ffmpeg build's %s encoder does not take the CQP rate-control options",
                  codec);
         return -1;
     }
     // The quality knob is per-encoder.  H.264 and HEVC carry a private `qp`
-    // option, which is what libavcodec's `explicit_qp` reads.  The AV1
-    // encoder has no such option and takes its CQP level from the generic
-    // `global_quality` field instead — exactly what ffmpeg's own `-qp`
-    // sets.  Requiring `qp` from every encoder is what made `--encoder av1`
-    // fail to open.
+    // option on both backends, which is what libavcodec's `explicit_qp`
+    // reads.  The AV1 encoder has no such option and takes its CQP level from
+    // the generic `global_quality` field instead — exactly what ffmpeg's own
+    // `-qp` sets.  Requiring `qp` from every encoder is what made
+    // `--encoder av1` fail to open.
     if (api->opt_set_int(enc->ctx, "qp", qp, AV_OPT_SEARCH_CHILDREN) < 0) {
         enc->ctx->global_quality = qp;
     }
@@ -934,6 +1162,17 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
                  "the %s encoder on this ffmpeg build takes no bf option", codec);
         return -1;
     }
+    // How many pictures the encoder keeps in flight.  The default (2) leaves
+    // the zero-copy chain starved at 4K: the filtergraph's `scale_vaapi`
+    // blocks on an output surface the encoder has not returned yet, which at
+    // 4K costs ~19 ms on a fraction of frames — enough, against a 16.7 ms
+    // budget, to make a 4K60 session run at ~58 fps (measured).  A deeper
+    // queue lets the conversion run ahead of the encoder, and the stall goes
+    // away.  The option is private to the VAAPI encoders; NVENC's equivalent
+    // is `async_depth` too (it bounds how many frames the encoder accepts
+    // before it makes the caller wait), and a build without it keeps the
+    // default.
+    api->opt_set_int(enc->ctx, "async_depth", 8, AV_OPT_SEARCH_CHILDREN);
     // The colour properties the zero-copy chain carries: the packed RGB
     // the compositor produces is full-range BT.709.  These match the
     // parameters wf-recorder records with on this hardware.
@@ -1344,17 +1583,29 @@ static int open_filtergraph_dmabuf(VshotAvEnc *enc, int sw_format) {
 // calls this with `dmabuf == 0` after sizing `enc->sw`, the zero-copy path
 // with `dmabuf == 1` and the buffer's fourcc.
 static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec, int qp,
-                       int dmabuf, unsigned fourcc) {
+                       int dmabuf, unsigned fourcc, int gop_frames) {
     enc->width = width;
     enc->height = height;
     enc->in_w = width;
     enc->in_h = height;
     enc->dmabuf = dmabuf;
     enc->fourcc = fourcc;
-    if (open_encoder(enc, width, height, codec, qp) != 0) {
+    if (open_encoder(enc, width, height, codec, qp, gop_frames) != 0) {
         return -1;
     }
     int ret;
+    if (dmabuf && enc->backend == VSHOT_BACKEND_NVENC) {
+        // NVENC has no dma-buf import: ffmpeg's CUDA hwcontext maps only CUDA
+        // device memory and CUDA arrays, never an AV_PIX_FMT_DRM_PRIME frame,
+        // so a Wayland capture buffer cannot be handed to it without a copy
+        // through system memory.  The caller asks for the software path
+        // instead (see `Recorder::open` on the Rust side); reaching here with
+        // `dmabuf` set is a bug worth naming rather than a crash to debug.
+        snprintf(enc->err, sizeof(enc->err),
+                 "the NVENC backend cannot import a compositor dma-buf; it records the "
+                 "software path");
+        return -1;
+    }
     if (dmabuf) {
         int sw_format = fourcc_to_sw_format(fourcc);
         if (sw_format < 0) {
@@ -1383,21 +1634,21 @@ static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec
             return -1;
         }
         AVHWFramesContext *frames = (AVHWFramesContext *)enc->frames->data;
-        frames->format = AV_PIX_FMT_VAAPI;
+        frames->format = backend_pix_fmt(enc->backend);
         frames->sw_format = AV_PIX_FMT_NV12;
         frames->width = width;
         frames->height = height;
         frames->initial_pool_size = 0;
         ret = api->hwframe_ctx_init(enc->frames);
         if (ret < 0) {
-            set_err(enc, "could not initialise the VAAPI frame pool", ret);
+            set_err(enc, "could not initialise the hardware frame pool", ret);
             return -1;
         }
         enc->ctx->hw_frames_ctx = api->buffer_ref(enc->frames);
     }
     char name[64];
     const AVCodec *encoder =
-        api->find_encoder_by_name(vaapi_encoder_name(codec, name, sizeof(name)));
+        api->find_encoder_by_name(backend_encoder_name(enc->backend, codec, name, sizeof(name)));
     ret = api->open2(enc->ctx, encoder, NULL);
     if (ret < 0) {
         set_err(enc, "opening the encoder failed", ret);
@@ -1428,9 +1679,8 @@ static int finish_open(VshotAvEnc *enc, int width, int height, const char *codec
 // The exported interface
 // ---------------------------------------------------------------------------
 
-VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp,
-                                int idr_period) {
-    (void)idr_period; // every frame is an IDR; see open_encoder
+VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp, int gop_frames,
+                                int backend) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -1451,7 +1701,8 @@ VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp
     if (!enc) {
         return NULL;
     }
-    if (finish_open(enc, width, height, codec, qp, 0, 0) != 0) {
+    enc->backend = backend;
+    if (finish_open(enc, width, height, codec, qp, 0, 0, gop_frames) != 0) {
         snprintf(create_error, sizeof(create_error), "%s", enc->err);
         vshot_av_enc_destroy(enc);
         return NULL;
@@ -1460,8 +1711,7 @@ VshotAvEnc *vshot_av_enc_create(int width, int height, const char *codec, int qp
 }
 
 VshotAvEnc *vshot_av_enc_create_dmabuf(int width, int height, const char *codec, int qp,
-                                       int idr_period, unsigned fourcc) {
-    (void)idr_period; // every frame is an IDR; see open_encoder
+                                       int gop_frames, unsigned fourcc, int backend) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -1478,7 +1728,8 @@ VshotAvEnc *vshot_av_enc_create_dmabuf(int width, int height, const char *codec,
     if (!enc) {
         return NULL;
     }
-    if (finish_open(enc, width, height, codec, qp, 1, fourcc) != 0) {
+    enc->backend = backend;
+    if (finish_open(enc, width, height, codec, qp, 1, fourcc, gop_frames) != 0) {
         snprintf(create_error, sizeof(create_error), "%s", enc->err);
         vshot_av_enc_destroy(enc);
         return NULL;
@@ -1521,8 +1772,97 @@ void vshot_av_enc_destroy(VshotAvEnc *enc) {
     if (enc->device && api) {
         api->buffer_unref(&enc->device);
     }
+    if (enc->replay && api) {
+        replay_destroy(enc->replay);
+        enc->replay = NULL;
+    }
+    free(enc->sw_fit);
     free(enc->out);
     free(enc);
+}
+
+// Fits one source RGBA frame into the encoder's canvas on the CPU: scaled
+// down when it is larger than the canvas, centred at its own size when it is
+// smaller, over a black background.  This is the software path's answer to the
+// dma-buf chain's `scale_vaapi` + letterbox: `record window` can be resized
+// mid-recording, one file holds one frame size, so the new frames are fitted
+// into the size the file was opened with.
+//
+// A frame already at the canvas size is returned as it is — the common case,
+// and the one that must not pay for a copy.
+static const uint8_t *fit_rgba_to_canvas(VshotAvEnc *enc, const uint8_t *rgba) {
+    int canvas_w = enc->width;
+    int canvas_h = enc->height;
+    if (enc->in_w == canvas_w && enc->in_h == canvas_h) {
+        return rgba;
+    }
+    size_t needed = (size_t)canvas_w * (size_t)canvas_h * 4;
+    if (enc->sw_fit == NULL || enc->sw_fit_cap < needed) {
+        uint8_t *grown = realloc(enc->sw_fit, needed);
+        if (grown == NULL) {
+            snprintf(enc->err, sizeof(enc->err), "out of memory for the fit staging buffer");
+            return NULL;
+        }
+        enc->sw_fit = grown;
+        enc->sw_fit_cap = needed;
+    }
+    // The same arithmetic the fit graph uses: scale down until it fits, never
+    // up, and keep the result even-sized (a NV12 chroma plane is half size).
+    int scaled_w = enc->in_w;
+    int scaled_h = enc->in_h;
+    if (enc->in_w > canvas_w || enc->in_h > canvas_h) {
+        double scale = (double)canvas_w / (double)enc->in_w;
+        double by_height = (double)canvas_h / (double)enc->in_h;
+        if (by_height < scale) {
+            scale = by_height;
+        }
+        scaled_w = ((int)((double)enc->in_w * scale)) & ~1;
+        scaled_h = ((int)((double)enc->in_h * scale)) & ~1;
+        if (scaled_w < 2) {
+            scaled_w = 2;
+        }
+        if (scaled_h < 2) {
+            scaled_h = 2;
+        }
+    }
+    int offset_x = (canvas_w - scaled_w) / 2;
+    int offset_y = (canvas_h - scaled_h) / 2;
+    // Black bars, opaque: the plate the dma-buf chain composes over.
+    for (size_t i = 0; i < (size_t)canvas_w * (size_t)canvas_h; i++) {
+        enc->sw_fit[i * 4 + 0] = 0;
+        enc->sw_fit[i * 4 + 1] = 0;
+        enc->sw_fit[i * 4 + 2] = 0;
+        enc->sw_fit[i * 4 + 3] = 255;
+    }
+    // Nearest-neighbour row copy: the recording is a record of what was on
+    // screen, and this path exists for compatibility, not for resampling
+    // quality.  A row that lands outside the canvas (a scaled size that
+    // rounded up by a pixel) is skipped.
+    for (int y = 0; y < scaled_h; y++) {
+        int destination_y = offset_y + y;
+        if (destination_y < 0 || destination_y >= canvas_h) {
+            continue;
+        }
+        int source_y = (int)((long)y * enc->in_h / scaled_h);
+        if (source_y >= enc->in_h) {
+            source_y = enc->in_h - 1;
+        }
+        const uint8_t *source_row = rgba + (size_t)source_y * (size_t)enc->in_w * 4;
+        uint8_t *destination_row =
+            enc->sw_fit + ((size_t)destination_y * (size_t)canvas_w + (size_t)offset_x) * 4;
+        for (int x = 0; x < scaled_w; x++) {
+            int source_x = (int)((long)x * enc->in_w / scaled_w);
+            if (source_x >= enc->in_w) {
+                source_x = enc->in_w - 1;
+            }
+            const uint8_t *source_pixel = source_row + (size_t)source_x * 4;
+            destination_row[x * 4 + 0] = source_pixel[0];
+            destination_row[x * 4 + 1] = source_pixel[1];
+            destination_row[x * 4 + 2] = source_pixel[2];
+            destination_row[x * 4 + 3] = 255;
+        }
+    }
+    return enc->sw_fit;
 }
 
 // Sends one RGBA frame; the packets it produces are accumulated for `take`.
@@ -1538,7 +1878,13 @@ int vshot_av_enc_send(VshotAvEnc *enc, const uint8_t *rgba) {
         return -1;
     }
     double t_start = trace_enabled() ? now_ms() : 0.0;
-    convert_rgba_to_nv12(enc->sw->data[0], enc->sw->data[1], enc->width, enc->height, rgba);
+    // A frame of a source that was resized mid-session arrives at the new
+    // size and is fitted into the canvas the file was opened with.
+    const uint8_t *fitted = fit_rgba_to_canvas(enc, rgba);
+    if (fitted == NULL) {
+        return -1;
+    }
+    convert_rgba_to_nv12(enc->sw->data[0], enc->sw->data[1], enc->width, enc->height, fitted);
     double t_convert = trace_enabled() ? now_ms() : 0.0;
 
     AVFrame *hw = api->frame_alloc();
@@ -1786,14 +2132,19 @@ int vshot_av_enc_resize_fit(VshotAvEnc *enc, int in_w, int in_h, unsigned fourcc
     if (!api || !enc || !enc->ctx) {
         return -1;
     }
-    if (!enc->dmabuf) {
-        snprintf(enc->err, sizeof(enc->err),
-                 "resizing the fit chain needs a dma-buf session");
-        return -1;
-    }
     if (in_w <= 0 || in_h <= 0) {
         snprintf(enc->err, sizeof(enc->err), "refusing a %dx%d resize", in_w, in_h);
         return -1;
+    }
+    if (!enc->dmabuf) {
+        // The software path has no filtergraph to rebuild: the fit is done on
+        // the CPU, in `vshot_av_enc_send`, and all this has to do is record
+        // the new input size the frames will arrive at.  The encoder's canvas
+        // — and so the file's shape — stays what it was opened for, exactly
+        // as on the dma-buf path.
+        enc->in_w = in_w;
+        enc->in_h = in_h;
+        return 0;
     }
     // A rebuild is also how a compositor that changes its offered format
     // across a resize is followed: the new fourcc becomes the session's.
@@ -1997,6 +2348,11 @@ unsigned vshot_av_enc_version(void) {
  * microphone's PipeWire negotiation settled on, which is why the microphone
  * client is opened before the recorder.  A sample rate the AAC encoder does
  * not take is resampled to 48 kHz inside the encoder.
+ *
+ * The same encoder also carries an application's own playback (`--app-audio`):
+ * the client is a PipeWire capture stream bound to that application's output
+ * node, and the samples arrive here exactly as a microphone's do.  Nothing
+ * below distinguishes the two — one capture source, one AAC stream.
  */
 
 // The sample rates the AAC encoder takes, best first.
@@ -2147,7 +2503,24 @@ void vshot_rec_free(VshotRec *rec);
 // encoder's own sample timeline is rescaled into the muxer's time base, the
 // same conversion the video packets go through.
 static int vshot_audio_write_packet(VshotAudioEnc *audio, VshotRec *rec, AVPacket *pkt) {
-    if (!rec || !rec->audio_stream || !rec->fmt) {
+    if (!rec) {
+        return 0;
+    }
+    // A replay keeps its audio in the ring too, on the same millisecond
+    // timeline the video packets use, so a save can interleave the two by
+    // time.  The encoder's timeline is samples; the rate turns it into ms.
+    if (rec->enc && rec->enc->replay) {
+        int64_t ms = audio->rate > 0 ? pkt->pts * 1000 / audio->rate : 0;
+        int64_t dur = audio->rate > 0 ? pkt->duration * 1000 / audio->rate : 0;
+        int is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+        if (replay_push(rec->enc->replay, pkt, 1, is_key, ms, dur) != 0) {
+            snprintf(audio->err, sizeof(audio->err),
+                     "keeping an audio packet in the replay ring failed");
+            return -1;
+        }
+        return 0;
+    }
+    if (!rec->audio_stream || !rec->fmt) {
         return 0;
     }
     AVRational sample = {1, audio->rate};
@@ -2408,7 +2781,8 @@ static int rec_open_muxer(VshotRec *rec, const char *path, int width, int height
 }
 
 static VshotRec *rec_start(const char *path, int width, int height, const char *codec, int qp,
-                           int dmabuf, unsigned fourcc, int mic_rate, int mic_channels) {
+                           int dmabuf, unsigned fourcc, int mic_rate, int mic_channels,
+                           int backend) {
     api = load_api();
     if (!api) {
         return NULL;
@@ -2416,6 +2790,16 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
     if (!path || !path[0] || !codec || !codec[0] || width <= 0 || height <= 0) {
         snprintf(create_error, sizeof(create_error), "the recorder was given an empty shape");
         return NULL;
+    }
+    // NVENC cannot import a compositor dma-buf, so a request that pairs the two
+    // is recorded through the software path instead — the capture side hands
+    // over RGBA pixels, which the shim converts and uploads.  The Rust side
+    // makes the same decision before it opens the capture pool; this is the
+    // belt to that suspenders, because a zero-copy request that reached here
+    // would otherwise fail at the filtergraph.
+    if (dmabuf && backend == VSHOT_BACKEND_NVENC) {
+        dmabuf = 0;
+        fourcc = 0;
     }
     VshotRec *rec = calloc(1, sizeof(VshotRec));
     if (!rec) {
@@ -2434,8 +2818,8 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
             return NULL;
         }
     }
-    rec->enc = dmabuf ? vshot_av_enc_create_dmabuf(width, height, codec, qp, 0, fourcc)
-                      : vshot_av_enc_create(width, height, codec, qp, 0);
+    rec->enc = dmabuf ? vshot_av_enc_create_dmabuf(width, height, codec, qp, 0, fourcc, backend)
+                      : vshot_av_enc_create(width, height, codec, qp, 0, backend);
     if (!rec->enc) {
         // `vshot_av_enc_load_error` reads the same module-level buffer this
         // would write, so copy through a local first.
@@ -2454,28 +2838,31 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
 }
 
 // Starts a recording: an encoder for `codec` plus the MP4 file at `path`.
-// Returns NULL with the reason in `vshot_rec_load_error`.
-VshotRec *vshot_rec_start(const char *path, int width, int height, const char *codec, int qp) {
-    return rec_start(path, width, height, codec, qp, 0, 0, 0, 0);
+// `backend` is VSHOT_BACKEND_VAAPI (0) or VSHOT_BACKEND_NVENC (1).  Returns
+// NULL with the reason in `vshot_rec_load_error`.
+VshotRec *vshot_rec_start(const char *path, int width, int height, const char *codec, int qp,
+                          int backend) {
+    return rec_start(path, width, height, codec, qp, 0, 0, 0, 0, backend);
 }
 
 // The same, with a microphone: a soundtrack is recorded beside the video
 // when both the rate and the channel count are positive.
 VshotRec *vshot_rec_start_mic(const char *path, int width, int height, const char *codec, int qp,
-                              int mic_rate, int mic_channels) {
-    return rec_start(path, width, height, codec, qp, 0, 0, mic_rate, mic_channels);
+                              int mic_rate, int mic_channels, int backend) {
+    return rec_start(path, width, height, codec, qp, 0, 0, mic_rate, mic_channels, backend);
 }
 
 // The zero-copy variant: the frames are dma-bufs with this fourcc.
 VshotRec *vshot_rec_start_dmabuf(const char *path, int width, int height, const char *codec,
-                                 int qp, unsigned fourcc) {
-    return rec_start(path, width, height, codec, qp, 1, fourcc, 0, 0);
+                                 int qp, unsigned fourcc, int backend) {
+    return rec_start(path, width, height, codec, qp, 1, fourcc, 0, 0, backend);
 }
 
 // The zero-copy variant with a microphone.
 VshotRec *vshot_rec_start_dmabuf_mic(const char *path, int width, int height, const char *codec,
-                                     int qp, unsigned fourcc, int mic_rate, int mic_channels) {
-    return rec_start(path, width, height, codec, qp, 1, fourcc, mic_rate, mic_channels);
+                                     int qp, unsigned fourcc, int mic_rate, int mic_channels,
+                                     int backend) {
+    return rec_start(path, width, height, codec, qp, 1, fourcc, mic_rate, mic_channels, backend);
 }
 
 // Feeds one RGBA frame and hands its packets to the muxer.  `duration_ms` is
@@ -2670,4 +3057,355 @@ const char *vshot_rec_audio_error(VshotRec *rec) {
 unsigned vshot_rec_version(void) {
     api = load_api();
     return api ? api->codec_version() : 0;
+}
+
+// Whether a hardware backend can be opened on this machine at all.  This is
+// what `--encoder-backend auto` asks: it opens the backend's device (a render
+// node, a CUDA device) and looks the encoder up, then closes both.  No frames
+// are encoded, so the probe is cheap and side-effect free.  Returns 0 on
+// success, -1 with `err` filled in otherwise.  It is the same work
+// `open_encoder` does up to the point a device is in hand, so a backend the
+// probe accepts is one a recording will accept too (modulo the encode itself).
+int vshot_av_enc_backend_probe(int backend, char *err, size_t err_len) {
+    if (err != NULL && err_len > 0) {
+        err[0] = '\0';
+    }
+    api = load_api();
+    if (!api) {
+        if (err != NULL && err_len > 0) {
+            snprintf(err, err_len, "%s", vshot_av_enc_load_error());
+        }
+        return -1;
+    }
+    AVBufferRef *device = NULL;
+    int ret;
+    if (backend == VSHOT_BACKEND_NVENC) {
+        const char *index = getenv("VSHOT_NVENC_DEVICE");
+        ret = api->hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_CUDA, index, NULL, 0);
+        if (ret < 0) {
+            char text[AV_ERROR_MAX_STRING_SIZE] = {0};
+            api->strerror(ret, text, sizeof(text));
+            if (err != NULL && err_len > 0) {
+                snprintf(err, err_len, "no CUDA device for NVENC: %s",
+                         text[0] ? text : "the CUDA hwcontext could not be created");
+            }
+            return -1;
+        }
+    } else {
+        ret = api->hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128",
+                                       NULL, 0);
+        if (ret < 0) {
+            char text[AV_ERROR_MAX_STRING_SIZE] = {0};
+            api->strerror(ret, text, sizeof(text));
+            if (err != NULL && err_len > 0) {
+                snprintf(err, err_len, "no VAAPI device: %s",
+                         text[0] ? text : "/dev/dri/renderD128 could not be opened");
+            }
+            return -1;
+        }
+    }
+    api->buffer_unref(&device);
+    // The device opened; the encoder has to exist in this build too.
+    char name[64];
+    const AVCodec *encoder =
+        api->find_encoder_by_name(backend_encoder_name(backend, "h264", name, sizeof(name)));
+    if (!encoder) {
+        if (err != NULL && err_len > 0) {
+            snprintf(err, err_len, "this ffmpeg build has no %s encoder", name);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// The replay recorder: the same encoder, a ring instead of a file
+// ---------------------------------------------------------------------------
+
+// Starts a replay session: an encoder in ring mode, no muxer and no file.
+// `window_ms` is how much history the ring keeps; `gop_frames` is the key-frame
+// distance (a bounded GOP keeps the ring small and gives every save a place to
+// start from); `fps` sizes the ring for the rate the session really runs.
+// `dmabuf` selects the zero-copy input, exactly as for a recording.
+VshotRec *vshot_rec_start_replay(int width, int height, const char *codec, int qp, int dmabuf,
+                                 unsigned fourcc, int mic_rate, int mic_channels,
+                                 int64_t window_ms, int gop_frames, int fps, int backend) {
+    api = load_api();
+    if (!api) {
+        return NULL;
+    }
+    if (!codec || !codec[0] || width <= 0 || height <= 0) {
+        snprintf(create_error, sizeof(create_error), "the replay was given an empty shape");
+        return NULL;
+    }
+    // As in `rec_start`: NVENC records the software path, never a dma-buf.
+    if (dmabuf && backend == VSHOT_BACKEND_NVENC) {
+        dmabuf = 0;
+        fourcc = 0;
+    }
+    if (window_ms <= 0) {
+        snprintf(create_error, sizeof(create_error), "the replay window has to be positive");
+        return NULL;
+    }
+    VshotRec *rec = calloc(1, sizeof(VshotRec));
+    if (!rec) {
+        snprintf(create_error, sizeof(create_error), "out of memory for the replay");
+        return NULL;
+    }
+    if (mic_rate > 0 && mic_channels > 0) {
+        char detail[256] = {0};
+        rec->audio = vshot_audio_enc_create(mic_rate, mic_channels, detail, sizeof(detail));
+        if (!rec->audio) {
+            snprintf(create_error, sizeof(create_error), "%s", detail);
+            free(rec);
+            return NULL;
+        }
+    }
+    // The encoder opens with a bounded GOP; the ring is created before the
+    // encoder so a packet can never arrive without a place to go.
+    VshotReplay *ring = replay_create(window_ms, fps);
+    if (!ring) {
+        snprintf(create_error, sizeof(create_error), "out of memory for the replay ring");
+        vshot_rec_free(rec);
+        return NULL;
+    }
+    rec->enc = dmabuf
+                   ? vshot_av_enc_create_dmabuf(width, height, codec, qp, gop_frames, fourcc,
+                                                backend)
+                   : vshot_av_enc_create(width, height, codec, qp, gop_frames, backend);
+    if (!rec->enc) {
+        char detail[sizeof(create_error)];
+        snprintf(detail, sizeof(detail), "%s", vshot_av_enc_load_error());
+        snprintf(create_error, sizeof(create_error), "%s", detail);
+        replay_destroy(ring);
+        vshot_rec_free(rec);
+        return NULL;
+    }
+    rec->enc->replay = ring;
+    rec->enc->replay_next_ms = 0;
+    return rec;
+}
+
+// How much history the ring currently holds, in seconds.
+double vshot_rec_replay_span(VshotRec *rec) {
+    if (!rec || !rec->enc || !rec->enc->replay) {
+        return 0.0;
+    }
+    VshotReplay *r = rec->enc->replay;
+    if (r->count == 0) {
+        return 0.0;
+    }
+    return (double)(r->newest_ms - r->oldest_ms) / 1000.0;
+}
+
+// One entry of a save, kept so the ring can be walked in time order.
+typedef struct ReplayPick {
+    int index;
+    int64_t ms;
+} ReplayPick;
+
+static int replay_pick_cmp(const void *a, const void *b) {
+    int64_t x = ((const ReplayPick *)a)->ms;
+    int64_t y = ((const ReplayPick *)b)->ms;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+// Writes the last `seconds` of the ring to a new MP4 at `path`, as a stream
+// copy: the packets are handed to a fresh muxer unchanged, so the save costs a
+// remux and no re-encode.  The start is aligned to a key frame at or before
+// the requested edge, because a file whose first video packet is not a key
+// frame shows nothing until the next one.  `out_ms`, when not NULL, receives
+// the file's real length in milliseconds (the requested edge rounded back to a
+// key frame can make it a little longer).
+int vshot_rec_replay_save(VshotRec *rec, const char *path, int seconds, int64_t *out_ms) {
+    if (out_ms) {
+        *out_ms = 0;
+    }
+    if (!rec || !rec->enc) {
+        return -1;
+    }
+    VshotReplay *r = rec->enc->replay;
+    if (!r || r->count == 0) {
+        snprintf(rec->err, sizeof(rec->err), "the replay buffer is empty; nothing to save");
+        return -1;
+    }
+    if (!api->format_loaded) {
+        snprintf(rec->err, sizeof(rec->err),
+                 "libavformat is not installed, so a replay cannot be written (install ffmpeg)");
+        return -1;
+    }
+    if (!path || !path[0]) {
+        snprintf(rec->err, sizeof(rec->err), "the replay save was given no path");
+        return -1;
+    }
+    if (seconds <= 0) {
+        seconds = (int)(r->window_ms / 1000);
+    }
+    // The edge the save wants: `seconds` before the newest packet.  The file
+    // then starts at the last key frame at or before that edge, so it holds at
+    // least `seconds` and is decodable from its first byte.
+    int64_t want_ms = r->newest_ms - (int64_t)seconds * 1000;
+    int chosen = -1;
+    for (int i = 0; i < r->count; i++) {
+        VshotReplayPkt *e = &r->pkts[(r->head + i) % r->cap];
+        if (!e->is_audio && e->is_key && e->ms <= want_ms) {
+            chosen = i;
+        }
+    }
+    if (chosen < 0) {
+        // No key frame that old (the window is short, or the save asks for
+        // more than the ring holds): the earliest key frame is the answer.
+        for (int i = 0; i < r->count; i++) {
+            VshotReplayPkt *e = &r->pkts[(r->head + i) % r->cap];
+            if (!e->is_audio && e->is_key) {
+                chosen = i;
+                break;
+            }
+        }
+    }
+    if (chosen < 0) {
+        // Nothing is a key frame (should not happen with a bounded GOP): fall
+        // back to the oldest entry, so a save still produces a file.
+        chosen = 0;
+    }
+    int64_t base_ms = r->pkts[(r->head + chosen) % r->cap].ms;
+
+    // Everything from the base onward, in time order (a hardware encoder's
+    // delay can leave an audio packet just ahead of a video one).
+    if (r->count <= 0 || r->count > r->cap) {
+        snprintf(rec->err, sizeof(rec->err), "the replay ring is in an inconsistent state");
+        return -1;
+    }
+    ReplayPick *picks = calloc((size_t)r->count, sizeof(*picks));
+    if (!picks) {
+        snprintf(rec->err, sizeof(rec->err), "out of memory ordering the replay save");
+        return -1;
+    }
+    int npick = 0;
+    for (int i = 0; i < r->count; i++) {
+        int idx = (r->head + i) % r->cap;
+        if (r->pkts[idx].ms >= base_ms) {
+            picks[npick].index = idx;
+            picks[npick].ms = r->pkts[idx].ms;
+            npick++;
+        }
+    }
+    qsort(picks, (size_t)npick, sizeof(*picks), replay_pick_cmp);
+
+    // The container: the same shape the recorder builds, from the same codec
+    // parameters, so the file is what `record` would have written.
+    AVFormatContext *fmt = NULL;
+    if (api->format_alloc_output(&fmt, NULL, "mp4", path) < 0 || !fmt) {
+        snprintf(rec->err, sizeof(rec->err), "could not open an MP4 muxer for %s", path);
+        free(picks);
+        return -1;
+    }
+    AVStream *vstream = api->format_new_stream(fmt, NULL);
+    if (!vstream) {
+        snprintf(rec->err, sizeof(rec->err), "could not add a video stream to the replay's MP4");
+        api->format_free_context(fmt);
+        free(picks);
+        return -1;
+    }
+    vstream->time_base = (AVRational){1, 1000};
+    if (api->parameters_from_context(vstream->codecpar, rec->enc->ctx) < 0) {
+        snprintf(rec->err, sizeof(rec->err), "the MP4 muxer refused the codec parameters");
+        api->format_free_context(fmt);
+        free(picks);
+        return -1;
+    }
+    vstream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    vstream->codecpar->width = rec->enc->width;
+    vstream->codecpar->height = rec->enc->height;
+    AVStream *astream = NULL;
+    if (rec->audio) {
+        astream = api->format_new_stream(fmt, NULL);
+        if (!astream) {
+            snprintf(rec->err, sizeof(rec->err), "could not add an audio stream to the replay's MP4");
+            api->format_free_context(fmt);
+            free(picks);
+            return -1;
+        }
+        astream->time_base = (AVRational){1, rec->audio->rate};
+        if (api->parameters_from_context(astream->codecpar, rec->audio->ctx) < 0) {
+            snprintf(rec->err, sizeof(rec->err), "the MP4 muxer refused the audio codec parameters");
+            api->format_free_context(fmt);
+            free(picks);
+            return -1;
+        }
+        astream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        astream->codecpar->sample_rate = rec->audio->rate;
+    }
+    if (!(fmt->oformat->flags & AVFMT_NOFILE)) {
+        if (api->io_open(&fmt->pb, path, AVIO_FLAG_WRITE) < 0) {
+            snprintf(rec->err, sizeof(rec->err), "could not open %s for writing", path);
+            api->format_free_context(fmt);
+            free(picks);
+            return -1;
+        }
+    }
+    if (api->format_write_header(fmt, NULL) < 0) {
+        snprintf(rec->err, sizeof(rec->err), "writing the replay's MP4 header failed");
+        if (fmt->pb) {
+            api->io_closep(&fmt->pb);
+        }
+        api->format_free_context(fmt);
+        free(picks);
+        return -1;
+    }
+    AVRational vtb = vstream->time_base;
+    AVRational atb = astream ? astream->time_base : (AVRational){1, 1000};
+    AVRational ms = {1, 1000};
+    int written = 0;
+    for (int i = 0; i < npick; i++) {
+        VshotReplayPkt *e = &r->pkts[picks[i].index];
+        int64_t rel = e->ms - base_ms;
+        if (rel < 0) {
+            rel = 0;
+        }
+        e->pkt->stream_index = e->is_audio ? astream->index : vstream->index;
+        AVRational tb = e->is_audio ? atb : vtb;
+        e->pkt->pts = e->pkt->dts = api->rescale_q(rel, ms, tb);
+        e->pkt->duration = api->rescale_q(e->dur_ms, ms, tb);
+        if (api->format_write_frame(fmt, e->pkt) < 0) {
+            snprintf(rec->err, sizeof(rec->err),
+                     "writing a replay packet to the MP4 muxer failed");
+            if (fmt->pb) {
+                api->io_closep(&fmt->pb);
+            }
+            api->format_free_context(fmt);
+            free(picks);
+            return -1;
+        }
+        written++;
+    }
+    if (api->format_write_trailer(fmt) < 0) {
+        snprintf(rec->err, sizeof(rec->err), "writing the replay's MP4 trailer failed");
+        if (fmt->pb) {
+            api->io_closep(&fmt->pb);
+        }
+        api->format_free_context(fmt);
+        free(picks);
+        return -1;
+    }
+    if (fmt->pb) {
+        api->io_closep(&fmt->pb);
+    }
+    api->format_free_context(fmt);
+    // The length the file really has: the last packet's end, on the same
+    // millisecond timeline the save wrote.  Computed before `picks` is freed.
+    if (out_ms) {
+        int64_t end_ms = 0;
+        for (int i = 0; i < npick; i++) {
+            VshotReplayPkt *e = &r->pkts[picks[i].index];
+            int64_t rel = e->ms - base_ms + e->dur_ms;
+            if (rel > end_ms) {
+                end_ms = rel;
+            }
+        }
+        *out_ms = end_ms;
+    }
+    free(picks);
+    r->saved++;
+    return written;
 }

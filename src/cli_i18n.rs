@@ -80,9 +80,12 @@ const COMMANDS: &[(&str, &str, &str)] = &[
   window active       焦点窗口：优先合成器元数据，--pixel 则改用像素识别
   window pick         你点中的那扇窗：实时桌面上高亮候选、其余压暗
   long                一块会滚动的区域：vshot 替你滚动，边动边抓帧，再拼成一张长图
-  record monitor|all|window
-                      录成 MP4，GPU 编码：一块屏、整个桌面，或一扇窗自己的像素（见下）
+  record monitor|all|region|window
+                      录成 MP4，GPU 编码：一块屏、整个桌面、一块屏上的矩形，或一扇窗自己的
+                      像素（见下）
   record mics|stop    能录的音频输入列表，以及结束录制的那道信号
+  replay start|save|status|stop
+                      回录：把最近一段留在内存里，按键随时拷成 MP4（流拷贝，不重编）
 
 输出目标：每次捕获恰好去 --output / --clipboard / --pin 中的一个，--cursor 与
 --png-compression 对所有捕获生效；具体取值见上方 Options。
@@ -221,7 +224,9 @@ ScreenShot2），编码在 GPU 的媒体引擎上完成。--mic 可把麦克风�
 或 hevc、av1；不写时跟随配置里的 `cli.record.encoder`）。`monitor [NAME]` 录一块输出，NAME 缺省
 即 `current`（问你当前所在的那块：
 合成器能报指针位置时是指针那块，否则是焦点那块），`all` 把每块输出按各自的逻辑位置拼合录制，
-`window [NAME]` 录一扇窗自己的像素（不是它所在的屏幕区域）：被别的窗口盖住也录得完整，拖到屏幕
+`region` 录一块输出上的一块矩形（在冻结桌面上拖出，或用 --geometry 固定；wlroots 会话上由合成器
+直接渲染进 dma-buf，与 `monitor` 一样零拷贝），`window [NAME]` 录一扇窗自己的像素（不是它所在的
+屏幕区域）：被别的窗口盖住也录得完整，拖到屏幕
 外一半也录得完整，窗口背后有什么都不会出现。窗口按 app id 或标题指定（先整名，再大小写不敏感的
 子串），`--pick` 点选，不写就是焦点那扇。VIDEO_PATH 与截图路径
 一样展开 strftime；默认是视频目录下的
@@ -278,6 +283,21 @@ VSHOT_RECORD_NO_OVERLAY=1 强制黑边走备用合成路径而不是 GPU overlay
         "与 `vshot all` 相同的拼合方式，但逐帧进行：多显示器桌面按实际布局合成为一段视频。",
     ),
     (
+        "record region",
+        "录屏幕上的一块矩形——一个区域，而不是整块输出",
+        r#"矩形用桌面逻辑坐标表示，格式与 `vshot region --geometry` 相同（`x,y 宽x高`），且必须落在
+单块输出内：没有任何一个合成器调用能复制横跨两块输出的区域。不给 --geometry 时把冻结的桌面
+交给 Qt overlay，在那里拖出矩形——就是 `vshot region` 那套选区器，跑在实时桌面上——确认之前
+不打开任何设备、不创建任何文件，所以取消选区不会留下任何东西。
+
+wlroots 会话上合成器把这块矩形直接渲染进 dma-buf，与 `record monitor` 一样零拷贝进编码器；
+会话没有 linux-dmabuf 时退回软件路径。录制跟随区域内容变化，所以被拖进矩形里的窗口会一起录；
+但矩形本身固定在你画的位置——想换一块区域录制，停止后再开一次。
+
+加 `--portal` 时录的是 portal 选择器挑中的那一路流，矩形就不是这条命令说了算了：portal 提供
+的是整块屏幕或整扇窗口，录的是那边选中的屏幕。要录一块矩形，不要加 --portal。"#,
+    ),
+    (
         "record window",
         "录一扇窗自己的像素，而不是它所在的屏幕区域",
         r#"合成器把窗口本身复制给你，所以被别的窗口盖住的窗口录出来是完整的，被拖到屏幕外一半的
@@ -306,6 +326,92 @@ VSHOT_RECORD_NO_OVERLAY=1 强制黑边走备用合成路径而不是 GPU overlay
         "停止正在进行的录制",
         r#"读取 pid 文件（VSHOT_RECORD_PIDFILE 可覆盖）向录制进程发送 SIGTERM，并等它把文件
 收尾完毕后返回。没有录制在跑时如实报错。"#,
+    ),
+    (
+        "replay",
+        "在内存里滚动保留屏幕的最近一段，需要时随时落盘",
+        r#"回录是一段把最近若干秒留在内存里、而不是直接写文件的录制：屏幕持续编码，编码后的包进
+内存环，`vshot replay save` 把环里现有的内容拷成一个 MP4 —— 流拷贝，不重新编码 —— 所以触发几乎不
+花时间，触发之前不落盘。`--window` 秒就是一次保存能往回够到的范围。
+
+`replay start` 跑起这个会话：一直编码到被停止，期间随时服务保存。`replay save` 让正在跑的会话写
+一个文件，`replay status` 打印它现在握着多少历史，`replay stop` 结束它。控制通道是
+$XDG_RUNTIME_DIR 下的一个 socket，所以 save 与 stop 都不需要显示器，可以直接绑快捷键：
+    bind = SUPER, R, exec, vshot replay start --background
+    bind = SUPER SHIFT, R, exec, vshot replay save
+    bind = SUPER ALT, R, exec, vshot replay stop
+
+录制目标与 `record` 相同：`monitor [NAME]`（不写即你当前所在的那块）、`all`、`region`（--geometry
+或冻结桌面上拖出）、`window`（焦点窗口、按名字、或 `--pick`）。帧来自相同的捕获后端，走相同的
+libavcodec GPU 编码器，所以能录的会话就能回录，`record` 用零拷贝 dma-buf 的地方回录也用。
+
+编码器用有界关键帧间隔（`--gop` 秒，默认 1），因此环只是全帧内编码码流的一小部分，而且每个 GOP
+边界都是一次保存可以起头的地方。一次保存从「不晚于 `now - seconds` 的最后一个关键帧」开始，所以
+它至少有你要求的秒数，并且从第一个字节就能解码；要的比环里有的还多就给全部。
+
+`--fps` 对回录默认 30（录制默认 60）：回录会长时间挂着，30 fps 把编码量减半，而动起来的画面看起
+来依然顺。`--encoder` 选 h264（默认）、hevc 或 av1。`--mic` 像 `record --mic` 那样把麦克风一起留在
+环里。
+
+`replay save` 写进 `--save-dir`（展开 strftime，默认视频目录下带时间戳的名字），除非给了路径：
+`vshot replay save /tmp/clip.mp4`。`--background` 让会话脱离终端，从而活得比启动它的 shell 久。
+
+配置文件的 `cli.replay` 段给出默认值：`window`、`encoder`、`fps`、`gop`、`mic`、`save-dir` 与
+`notify`。命令行永远压过文件。
+
+VSHOT_REPLAY_SOCKET 覆盖控制 socket，VSHOT_REPLAY_PIDFILE 覆盖 `replay stop` 读的 pid 文件，
+VSHOT_RECORD_DEBUG=1 追踪每一帧。"#,
+    ),
+    (
+        "replay start",
+        "启动回录会话，把最近 `--window` 秒留在内存里",
+        r#"会话一直编码到被停止，期间服务 save 与 status。目标与 `record` 相同：`monitor`、`all`、
+`region`、`window`。`--background` 让它脱离终端，活得比启动它的 shell 久——快捷键里绑的就是这个
+形状。回录按会话只跑一个（pid 文件挡着第二个），控制走 $XDG_RUNTIME_DIR 下的 socket。"#,
+    ),
+    (
+        "replay save",
+        "把正在跑的会话的历史写成一个文件",
+        r#"把环里最近 `--seconds` 秒（不写就是整个 `--window`）拷进一个 MP4：一次流拷贝，不重新
+编码，所以几乎不花时间。不给 PATH 时写到 `--save-dir`（默认视频目录下带时间戳的名字）。文件从
+关键帧起头，所以它至少有你要的秒数，并且能从头解出来。没有回录在跑时如实报错。"#,
+    ),
+    (
+        "replay status",
+        "打印正在跑的会话握有多少历史",
+        r#"输出两列，制表符分隔：环当前覆盖的秒数，以及这个会话已经服务过多少次保存。没有回录在跑
+时报错。"#,
+    ),
+    (
+        "replay stop",
+        "结束正在跑的回录会话",
+        r#"通过控制 socket 让会话退出（读 VSHOT_REPLAY_PIDFILE 等它离开），并清掉 socket 与 pid
+文件。没有回录在跑时如实报错。"#,
+    ),
+    (
+        "replay start monitor",
+        "回录一块输出；NAME 缺省即 `current`（你当前所在的那块）",
+        r#"与 `record monitor` 相同的选择：不给名字就是 `current`，即你当前所在的那块输出；给了就是
+输出名。回录期间不冻结桌面，帧是实时抓的。"#,
+    ),
+    (
+        "replay start all",
+        "回录整个桌面：每块输出按各自的逻辑位置拼合",
+        "与 `vshot all` 相同的拼合方式，但逐帧进行；`record all` 一样支持。",
+    ),
+    (
+        "replay start region",
+        "回录屏幕上的一块矩形——一个区域，而不是整块输出",
+        r#"矩形用桌面逻辑坐标（`x,y 宽x高`），必须落在单块输出内。不给 --geometry 时把冻结桌面交给
+Qt overlay 拖出矩形，确认之前不打开任何设备、不创建任何文件，所以取消选区不会留下任何东西。
+wlroots 会话上走零拷贝 dma-buf，与 `record region` 相同。"#,
+    ),
+    (
+        "replay start window",
+        "回录一扇窗自己的像素，而不是它所在的屏幕区域",
+        r#"与 `record window` 相同的路线：合成器把窗口本身复制给你，所以被盖住、被拖到屏幕外的窗口
+也录得完整。窗口按 app id 或标题指定，`--pick` 点选，不写就是焦点那扇。窗口被缩放时会适配进回录
+的画布（大则缩小、居中、加黑边），因为一个环只有一个帧尺寸。"#,
     ),
     (
         "ocr",
@@ -348,7 +454,7 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "name",
-        "输出名；`current` 表示你当前所在的那块输出。`record window` 下是窗口的 app id 或标题，省略即焦点窗口。",
+        "输出名；`current` 表示你当前所在的那块输出。`record window` / `replay start window` 下是窗口的 app id 或标题，省略即焦点窗口。",
     ),
     ("notches", "捕获滚动时一次发送的滚轮格数。"),
     ("max_height", "拼接结果的高度上限，单位像素。"),
@@ -383,7 +489,7 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "fps",
-        "录制循环瞄准的帧率，1-240（默认 60）。不写 --fps 时跟随配置里的 `cli.record.fps`。每帧带着它在屏上的真实时长，所以低了也不会变速。",
+        "循环瞄准的帧率，1-240（录制默认 60，回录默认 30）。不写 --fps 时跟随配置里的 `cli.record.fps` / `cli.replay.fps`。每帧带着它在屏上的真实时长，所以低了也不会变速。",
     ),
     (
         "duration",
@@ -391,7 +497,7 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "encoder",
-        "视频编码器：h264（默认）、hevc 或 av1，三者都跑 GPU 的媒体引擎。不写 --encoder 时跟随配置里的 `cli.record.encoder`。某台机器的 ffmpeg 或显卡不支持所选编码器时，录制一开始就会说明是哪一个（例如 h264 的 4096 宽度上限）。",
+        "视频编码器：h264（默认）、hevc 或 av1，三者都跑 GPU 的媒体引擎。不写 --encoder 时跟随配置里的 `cli.record.encoder` / `cli.replay.encoder`。某台机器的 ffmpeg 或显卡不支持所选编码器时，录制一开始就会说明是哪一个（例如 h264 的 4096 宽度上限）。",
     ),
     (
         "portal",
@@ -399,15 +505,39 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "mic",
-        "把麦克风录进同一个 MP4。不带值就是会话的默认输入设备，给名字（或节点序号）则录另一个输入；音轨是 AAC，由 ffmpeg 自己的编码器编出。`vshot record mics` 列出这台机器上可以录的输入。",
+        "把麦克风一起收进来。录制时它进同一个 MP4，回录时它留在内存环里。不带值就是会话的默认输入设备，给名字（或节点序号）则收另一个输入；音轨是 AAC，由 ffmpeg 自己的编码器编出。`vshot record mics` 列出这台机器上可以录的输入。",
     ),
     (
         "no_mic",
-        "强制不录麦克风，即使配置里记着 `cli.record.mic`。",
+        "强制不收麦克风，即使配置里记着 `cli.record.mic` / `cli.replay.mic`。",
     ),
     (
         "no_portal",
         "强制不走 portal，即使配置里记着 `cli.record.portal`。`record all` 只能用这条：portal 一次只给一路流，整个桌面是合成器自己协议的活。",
+    ),
+    (
+        "window",
+        "在内存里保留多少秒的历史；不写时跟随配置里的 `cli.replay.window`，默认 30。",
+    ),
+    (
+        "gop",
+        "关键帧间隔的秒数（1-10）；不写时跟随配置里的 `cli.replay.gop`，默认 1。越小，一次保存越贴近你要的时间点，代价是内存环更大。",
+    ),
+    (
+        "save_dir",
+        "`replay save` 不给路径时落盘的目录；展开 strftime。默认是视频目录。",
+    ),
+    (
+        "background",
+        "让回录会话脱离终端（只对 `replay start` 有效）。",
+    ),
+    (
+        "seconds",
+        "从环里取多少秒；不写就是整个 `--window`。",
+    ),
+    (
+        "path",
+        "写到这个文件；不写时写到 `--save-dir`（默认视频目录下带时间戳的名字）。",
     ),
     (
         "no_blend",
@@ -415,7 +545,7 @@ const ARGS: &[(&str, &str)] = &[
     ),
     (
         "pick",
-        "点选一扇窗来录：实时桌面上高亮候选，点中的那扇被录。窗口在隐藏工作区上也能录到——录的是窗口自己的像素，不是屏幕上那一块。",
+        "点选一扇窗：实时桌面上高亮候选，点中的那扇被录/回录。窗口在隐藏工作区上也能录到——录的是窗口自己的像素，不是屏幕上那一块。",
     ),
 ];
 

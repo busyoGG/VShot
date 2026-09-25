@@ -212,6 +212,51 @@ impl GbmBuffer {
     pub fn height(&self) -> u32 {
         self.height
     }
+
+    /// Reads this buffer back to system memory as tightly packed RGBA.
+    ///
+    /// The zero-copy VAAPI path never calls this: the encoder imports the
+    /// dma-buf itself.  NVENC cannot — ffmpeg's CUDA hwcontext maps CUDA
+    /// memory only, never an `AV_PIX_FMT_DRM_PRIME` frame — so on NVIDIA the
+    /// capture side has to hand over pixels, and this is the copy that gets
+    /// them.  It is one `mmap` of the (CPU-accessible) buffer and one channel
+    /// swap per pixel: the buffer's memory order is BGRA (XRGB8888/ARGB8888
+    /// are `B,G,R,X` in little-endian memory) and the encoder's software path
+    /// takes RGBA.  The alpha byte is forced opaque, as on the software capture
+    /// paths, because a compositor's alpha byte is not a transparency the
+    /// recording should carry.
+    pub fn read_rgba(&self) -> Result<Vec<u8>> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let stride = self.stride as usize;
+        let offset = self.offset as usize;
+        let row_bytes = width * 4;
+        let length = offset + stride.saturating_mul(height.saturating_sub(1)) + row_bytes;
+        // SAFETY: the buffer is a dma-buf this process owns and the
+        // compositor has finished writing into (the frame's `ready` event
+        // precedes this call).  The mapping is read-only and lives only as
+        // long as `map`; the length covers the pixels and nothing is written
+        // through it.
+        let map =
+            unsafe { memmap2::MmapOptions::new().len(length).map(self.fd) }.map_err(|error| {
+                VshotError::WaylandProtocol(format!(
+                    "could not map the capture buffer for a CPU readback: {error}"
+                ))
+            })?;
+        let mut pixels = vec![0u8; width * height * 4];
+        for row in 0..height {
+            let source = &map[offset + row * stride..][..row_bytes];
+            let destination = &mut pixels[row * row_bytes..][..row_bytes];
+            for x in 0..width {
+                // BGRA in memory -> RGBA out; alpha forced opaque.
+                destination[x * 4] = source[x * 4 + 2];
+                destination[x * 4 + 1] = source[x * 4 + 1];
+                destination[x * 4 + 2] = source[x * 4];
+                destination[x * 4 + 3] = 255;
+            }
+        }
+        Ok(pixels)
+    }
 }
 
 impl Drop for GbmBuffer {

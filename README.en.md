@@ -17,6 +17,8 @@ Works with Hyprland, niri, KWin/Plasma, Sway, and basic capture on any composito
 - **monitor / all** — capture one output by name or by pointer position, or compose the whole desktop by logical position
 - **window active / pick** — the focused window, or click one on the live desktop; KWin and niri hand over the window's own pixels
 - **Long screenshot** — frame a scrolling region, and vshot sends the wheel, grabs frames, aligns them by content, and stitches one long image
+- **Screen recording** — one output, the whole desktop, a rectangle or a window's own pixels to an MP4, GPU-encoded (VAAPI or NVENC), with an optional microphone track or the recorded window's own audio
+- **Replay** — encode continuously but keep only the last N seconds in memory; a key writes that stretch to an MP4 (a stream copy, no re-encode)
 - **Pin overlay** — pin images or clipboard content to the screen: drag, wheel to zoom, double-click to close, one-key show/hide, Space to annotate
 - **Clipboard pinning** — colors, images, copied image files, plain text (rendered as a card as HTML / markdown / code / plain text)
 - **OCR** — frame a region and get its text back (Chinese, English and Japanese), through `vshot ocr` or the editor toolbar's *Text+* button, with a desktop notification when it finishes
@@ -125,9 +127,17 @@ vshot ocr --input shot.png                  # read an existing image file
 vshot record monitor eDP-1 --output clip.mp4    # one output
 vshot record monitor --fps 30                   # the output you are on (NAME defaults to current)
 vshot record all                                # every output, default video dir
+vshot record region --geometry '0,0 800x600'    # a rectangle, desktop coordinates
 vshot record window                             # one window's own pixels, occlusion and all
 vshot record stop                               # stop the recording that runs
 vshot record monitor current --duration 30      # stop itself after 30 seconds
+
+# Replay: keep the last stretch in memory, write it out on demand
+vshot replay start monitor --background         # run detached; keeps the last 30s by default
+vshot replay save                               # write that stretch to an MP4
+vshot replay save /tmp/clip.mp4 --seconds 10    # only the last 10 seconds
+vshot replay status                             # how much history it holds
+vshot replay stop                               # end the session
 ```
 
 The global options apply to every capture:
@@ -318,6 +328,8 @@ ScreenShot2 on Plasma) and encoding happens on the GPU's media engine.
 vshot record monitor eDP-1 --output clip.mp4    # one output; NAME as in `vshot monitor`
 vshot record monitor                            # NAME defaults to `current`: where you are
 vshot record all                                # every output, composed at its position
+vshot record region --geometry '0,0 800x600'    # a rectangle (desktop coords, like `vshot region --geometry`)
+vshot record region                             # drag the rectangle on the frozen desktop
 vshot record window                             # one window's own pixels (not the area it covers)
 vshot record window firefox                     # by app id or title
 vshot record window --pick                      # click the window to record
@@ -329,6 +341,8 @@ vshot record window --portal                    # the same, with windows in the 
 vshot record monitor --mic                      # record the microphone into the same MP4
 vshot record monitor --mic alsa_input.pci-0000_2f_00.4.analog-stereo
 vshot record monitor --no-mic                   # refuse the microphone the config remembers
+vshot record window --app-audio                 # record only that window's own sound (not the mic)
+vshot record monitor --encoder-backend nvenc    # NVIDIA encode (default auto: VAAPI, then NVENC)
 vshot record mics                               # list this session's audio inputs
 vshot record stop                               # stop the running recording
 ```
@@ -342,6 +356,21 @@ vshot record stop                               # stop the running recording
   otherwise. When nothing answers, vshot says so and points at `monitor NAME`
   and `all`.
 
+- **Region recording (`record region`).** Records a rectangle of one output,
+  in desktop logical coordinates in the same form `vshot region --geometry`
+  takes (`x,y widthxheight`), and it has to sit inside a single output (no
+  compositor call copies a region spanning two; crossing one is an explicit
+  error). Without `--geometry` the rectangle is dragged out on the frozen
+  desktop through the same picker `vshot region` uses — the microphone opens
+  and the file is created only after a rectangle is confirmed, so a cancelled
+  pick leaves nothing behind. On a wlroots session the compositor renders just
+  that rectangle into a dma-buf, zero-copy into the encoder exactly like
+  `record monitor` (measured: 800×600 at a steady 241 frames over 2 seconds at
+  120 fps); the encoded size is the rectangle's logical size times that
+  output's scale (400×300 on a 2x screen records as 800×600). The recording
+  follows the content inside the rectangle, but the rectangle itself stays
+  where it was drawn. `--portal` and `region` are mutually exclusive: the
+  portal's picker offers whole screens and whole windows, never a rectangle.
 - **A window recording is not a recording of the area a window covers.**
   `record window` records the window's *own pixels*, which the compositor
   copies out itself (`ext_image_copy_capture_v1`, with the window's
@@ -357,13 +386,19 @@ vshot record stop                               # stop the running recording
 - **Resizing a window mid-recording.** A window *resized* while recording does
   not end the recording: the compositor re-sends its buffer constraints at the
   new size, vshot rebuilds the capture pool for them, and the new frames are
-  fitted into the recording's own canvas on the GPU — scaled down when larger,
-  centred at their own size when smaller, letterboxed. One MP4 keeps one frame
-  size from its first packet to its trailer, and the file is the window's whole
-  history. A window that is *closed* ends the recording there: the file is
-  finished properly (trailer written) and stderr says why. If the window's
-  output is off, disabled or disconnected, no frame ever arrives; that is
-  reported after a few seconds rather than waited on forever.
+  fitted into the recording's own canvas — scaled down when larger, centred at
+  their own size when smaller, letterboxed — so one MP4 keeps one frame size
+  from its first packet to its trailer, and the file is the window's whole
+  history. On the VAAPI (dma-buf) route the fit is a GPU `scale_vaapi` filter
+  chain; on NVENC's software route the CPU does the same scaling, which is the
+  compatible choice that route already is. A window that is *closed* ends the
+  recording there: the file is finished properly (trailer written) and stderr
+  says why. If the window's output is off, disabled or disconnected, no frame
+  ever arrives; that is reported after a few seconds rather than waited on
+  forever. Measured: a floating window dragged to 500×400, 900×700 and then
+  320×240 while recording was fitted into the canvas it opened with each time —
+  the file's size never changed, frames and duration matched, and the
+  recording never broke.
 
 - **Stopping.** `vshot record stop` (no display needed, so it binds to a
   compositor keybinding) or Ctrl+C in the terminal that started it. Both
@@ -391,6 +426,17 @@ vshot record stop                               # stop the running recording
   the ffmpeg libraries still takes screenshots; only `record` reports what is
   missing. Needs `ffmpeg` and `libva` (for AMD/Intel VAAPI). Every frame is an
   IDR (all-intra), so any player reads it and any position is seekable.
+- **The encoder backend (`--encoder-backend`).** One of `auto` (the default),
+  `vaapi` or `nvenc`. `auto` tries VAAPI (AMD/Intel) first and falls back to
+  NVENC (NVIDIA) when that will not open; a fixed choice uses only that one and
+  reports the layer that failed (for example `no CUDA device for NVENC`). Each
+  route sets its own encoder name, pixel format and private options, and
+  `--encoder h264/hevc/av1` applies to both. **NVENC has no dma-buf import**, so
+  it records the **software path**: frames are converted to NV12 on the CPU and
+  uploaded, which costs more CPU than the zero-copy VAAPI route (the encode
+  itself is still on the GPU). On a multi-GPU machine NVENC uses the first CUDA
+  device; `VSHOT_NVENC_DEVICE=<index>` picks another. An NVIDIA machine also
+  needs an `ffmpeg` built with `nvenc` (most distributions ship one).
 - **The microphone (`--mic`).** Records an input into the same MP4, encoded as AAC
   (ffmpeg's own encoder, the same libavcodec route the video takes). A bare
   `--mic` takes the session's default source; a name or node serial records
@@ -406,20 +452,39 @@ vshot record stop                               # stop the running recording
   reference `pw-cat` capture (-24.1 dB against -24.3 dB). A session with no
   default input says so and names `wpctl status` instead of quoting PipeWire's
   bare "no target node available".
+- **Per-application audio (`--app-audio`).** Records **not the microphone** but
+  the sound the recorded window is *playing itself* — nothing another
+  application is playing gets in. It only means something on
+  `vshot record window` / `vshot replay start window` (other targets have no
+  window to attach it to and are refused), and it conflicts with `--mic`. The
+  window's pid comes from the compositor (Hyprland and niri report it; KWin does
+  not); vshot takes that pid to PipeWire's client table, finds that process's
+  playback node and connects only to it. Measured (Hyprland): two mpv players at
+  880 Hz and 220 Hz produced a file whose dominant frequency is 880 Hz — the
+  isolation holds. On KWin (no pid from the compositor) it says so rather than
+  quietly falling back to the microphone. A window playing nothing is a note on
+  stderr and a video-only recording, not an error. `--portal` and `--app-audio`
+  conflict too (the portal's compositor decides which window, and vshot has no
+  pid mapping for it). The audio track is AAC, sharing the encode and mux with
+  the microphone route.
 - **Width limit 4096.** That is the hardware H.264 encoder's limit (measured
   on this machine's 7900 XT VCN), so `record all` across two 4K screens
   (5760 wide) is refused with that explanation — record one output instead, or
   switch to `--encoder hevc`, which encodes the 7680-wide desktop here. A
   single 4K screen (3840) is fine.
-- **Remembered defaults.** When `--encoder`, `--fps`, `--portal` or `--mic` is not
-  given, the value comes from the config file's `cli.record` section (see
-  [`cli` — command-line defaults](#cli--command-line-defaults)); the settings
-  window's Recording card writes exactly those four keys, and `--no-portal` and
-  `--no-mic` turn a remembered value off for one recording. `vshot record mics`
-  lists the audio inputs this session has, one per line as a serial, a node name
-  and a description, tab-separated; the node name is what `--mic` takes, and
-  that listing is what the settings window's microphone row offers. A session
-  with no inputs says so rather than failing.
+- **Remembered defaults.** When `--encoder`, `--encoder-backend`, `--fps`, `--portal`
+  or `--mic` is not given, the value comes from the config file's `cli.record`
+  section (`cli.replay` for the replay side; see
+  [`cli` — command-line defaults](#cli--command-line-defaults)). The settings
+  window's Recording card writes the codec, frame rate, portal and microphone
+  keys; `encoder-backend` there is edited by hand. `--no-portal` and `--no-mic`
+  turn a remembered value off for one recording. `vshot record mics` lists the
+  audio inputs this session has, one per line as a serial, a node name and a
+  description, tab-separated; the node name is what `--mic` takes, and that
+  listing is what the settings window's microphone row offers. A session with no
+  inputs says so rather than failing. (`--app-audio` is command-line only and is
+  not a config key — it means "this window's sound", which a different window
+  would change.)
 
 - **`--portal` records through the desktop portal**
   (`org.freedesktop.portal.ScreenCast`). A compositor's own capture protocols
@@ -450,6 +515,122 @@ vshot record stop                               # stop the running recording
 > `h264_vaapi` runs the same hardware for hundreds of frames without a
 > fault on the same machine, so the encoder boundary belongs to libavcodec.
 > That is an engineering decision, not an aesthetic one.
+
+## Replay
+
+`vshot replay` is a recording that keeps its last stretch of history in memory
+instead of on disk. The screen is encoded continuously and the packets go into
+an in-memory ring; `vshot replay save` copies what the ring holds into an MP4 —
+a stream copy, no re-encode — so the trigger costs almost nothing and nothing
+is written to disk until it is asked for. Leave it running while you game, hit
+a key, and the last stretch is on disk.
+
+```sh
+vshot replay start monitor --background     # run detached; keeps the last 30s by default
+vshot replay save                           # write to the videos directory, timestamped
+vshot replay save /tmp/clip.mp4 --seconds 10
+vshot replay status                         # how many seconds it holds, how many saves served
+vshot replay stop
+```
+
+`start` takes the same targets `record` does: `monitor [NAME]` (a bare `replay
+monitor` means the output you are on), `all`, `region` (`--geometry`, or dragged
+out on the frozen desktop), `window` (the focused one, a name, or `--pick`). The
+frames come from the same capture backends and go to the same libavcodec GPU
+encoder, and the zero-copy dma-buf path is used wherever `record` uses it.
+
+### Why encode continuously, not on trigger
+
+A replay has to be able to reach back through the last stretch — frames that
+existed before you pressed the key. Keeping them as raw frames is what the
+numbers rule out: 4K60 NV12 is ~12 MB a frame, so 30 seconds is ~22 GB, more
+than any GPU or system memory wants to spare. The same 30 seconds as encoded
+packets at 30 Mbps is ~110 MB. So a replay must encode continuously; that is the
+physical price of being able to look back, and it cannot be avoided. What can be
+optimized is the encoding itself: hardware, a lower rate when asked, a bounded
+GOP.
+
+### The ring and key-frame alignment
+
+- **Bounded GOP.** The encoder runs with a `--gop`-second key-frame distance
+  (default 1) instead of the recording's all-intra stream. The ring is therefore
+  a fraction of an all-intra stream, and every GOP boundary is a place a save
+  can start from.
+- **The ring keeps `--window` + one GOP.** A save starts at the newest key frame
+  at or before `now - seconds`; that key frame can sit up to a GOP before the
+  edge, so the ring holds that extra interval — otherwise it would evict exactly
+  the key frame the save needs.
+- **A save starts on a key frame.** An MP4 whose first video packet is not a key
+  frame shows nothing until the next one. So the start is key-frame aligned: the
+  file holds at least the seconds asked for and decodes from its first byte.
+  Asking for more than the window holds gives everything there is.
+
+### Options
+
+| Option | Meaning |
+| --- | --- |
+| `--window N` | Seconds of history to keep (1–3600, default 30); the config's `cli.replay.window` when the flag is not given |
+| `--fps N` | A replay defaults to **30** (a recording to 60): it is left running for long stretches, and 30 fps halves the encoder's work |
+| `--gop N` | Key-frame distance in seconds (1–10, default 1). Smaller starts a save closer to the requested edge, at the cost of a bigger ring |
+| `--encoder` | h264 (default), hevc or av1, as for `record` |
+| `--encoder-backend` | `auto` (default), `vaapi` or `nvenc`, as for `record` |
+| `--mic [DEVICE]` | Keep the microphone in the ring too, as `record --mic` does; `--no-mic` refuses it |
+| `--app-audio` | Keep only the recorded window's own sound (`replay start window`), as `record --app-audio` |
+| `--save-dir DIR` | Where a `replay save` with no path lands (strftime-expanded; default the videos directory) |
+| `--background` | `replay start` only: detach the session from the terminal so it outlives the shell |
+
+### Keybindings
+
+Control goes through `$XDG_RUNTIME_DIR/vshot-replay-<uid>.sock`, and
+`save`/`status`/`stop` need no display, so they bind directly:
+
+```
+bind = SUPER, R, exec, vshot replay start monitor --background
+bind = SUPER SHIFT, R, exec, vshot replay save
+bind = SUPER ALT, R, exec, vshot replay stop
+```
+
+A `save` raises a desktop notification saying where the file went and how long
+it is.
+
+### Configuration
+
+The config file's `cli.replay` section supplies the defaults (edited by hand for
+now — the settings window's recording card does not have a replay row yet):
+
+```jsonc
+"cli": {
+  "replay": {
+    "window": 30,            // seconds of history
+    "fps": 30,
+    "encoder": "h264",       // h264 / hevc / av1
+    "encoder-backend": null, // auto / vaapi / nvenc; null means auto
+    "gop": 1,                // key-frame distance in seconds (1-10)
+    "mic": null,             // "" is the default input, a name is a PipeWire node
+    "portal": false,         // replay does not support the portal yet
+    "save-dir": null,        // null uses the videos directory
+    "notify": true           // whether a save raises a notification
+  }
+}
+```
+
+A flag always wins over the file. A value the file gets wrong (an unknown
+encoder name, a rate out of range) falls back to the built-in default rather
+than failing the whole replay. One session runs at a time (the pid file refuses
+a second); `VSHOT_REPLAY_SOCKET` overrides the control socket and
+`VSHOT_REPLAY_PIDFILE` the pid file `replay stop` reads.
+
+### What replay does not do yet
+
+- **Portal.** The portal's own frame loop is not wired to the ring;
+  `replay start --portal` refuses with a sentence telling you to record through
+  the portal instead.
+- **Window replay's idle semantics.** `window` goes through
+  `ext_image_copy_capture_v1`, whose compositor holds the copy until the
+  window's content changes (the same as `record window`). A still window can
+  therefore have very few frames in the ring for a long while; a window that
+  changes is fine. This is the protocol's on-demand copying, not a replay
+  defect.
 
 ## Pin overlay
 
@@ -582,6 +763,8 @@ Where nothing is adapted, vshot **degrades automatically instead of erroring**: 
 ### How far verification goes
 
 - **Hyprland** — this machine's session is Hyprland and it is the main development and verification environment: capture, selection and annotation, windows, long screenshots, pins, and scroll injection have all run here.
+- **Recording encoder backends** — this machine (7900 XT) is VAAPI: zero-copy dma-buf, h264/hevc/av1, `--fps`, mid-recording window resizes, the portal and replay have all been measured on that route. NVENC's **routing and failure path** are verified (`--encoder-backend nvenc` fails cleanly on a machine with no NVIDIA, with the specific reason, e.g. `no CUDA device for NVENC`), but **a real NVENC encode has never run on NVIDIA hardware** — the software path (CPU NV12 conversion and upload) and its window-fit code are written from code review with no live data.
+- **Per-application audio** — measured on Hyprland: two mpv players at 880 Hz and 220 Hz produced a `record window --app-audio` file whose dominant frequency is 880 Hz, so the isolation holds; a window playing nothing degrades to a video-only recording. KWin does not report a window pid, so `--app-audio` refuses plainly on Plasma instead of quietly falling back to the microphone; niri's pid path has unit tests only.
 - **niri** — both the tiled and floating capture paths were verified on a real session: tiled windows were measured with two side-by-side kitty windows (residual 0.45/0.51 per channel), and floating windows go through niri's `tile_pos_in_workspace_view` coordinates plus `matches_at_position` verification, with correct results on the real session. If a floating window capture comes out misaligned, `--no-blend` bypasses the locating step.
 - **KWin/Plasma** — D-Bus capture (the size and opacity of `CaptureScreen`, `native-resolution`, format fields), the window list, and long screenshots have all been tested, where the capture and window list automation ran against a **headless `--virtual` KWin**, and therefore:
   - `--cursor` passes `include-cursor` but **whether a cursor is really drawn is unverified** (there is no pointer to draw on a headless output);
@@ -593,16 +776,18 @@ Where nothing is adapted, vshot **degrades automatically instead of erroring**: 
 
 ### The cursor (`--cursor`)
 
-vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer" flag on the compositor's capture request (`wlr-screencopy`'s `overlay_cursor`, KWin's `include-cursor`), and whether, where, and when it is drawn is entirely up to the compositor. Two conclusions follow from measurement:
+vshot never draws a cursor itself; `--cursor` only sets an "overlay the pointer" flag on the compositor's capture request (`wlr-screencopy`'s `overlay_cursor`, KWin's `include-cursor`), and whether, where, and when it is drawn is entirely up to the compositor. Three conclusions follow from measurement:
 
 - **A capture with no cursor after typing a command in a terminal is not a bug.** A terminal (kitty measured, `mouse_hide_wait` defaults to 3.0 seconds) hides the pointer after a few seconds without mouse movement — it performs `set_cursor(null)` on the compositor, after which there **really is no cursor to draw** at the compositor level, and any tool going through screencopy sees the same thing (`grim -c` cannot grab it at that moment either). Move the mouse before capturing after pressing Enter, or set `mouse_hide_wait 0` for kitty (the pointer then no longer hides itself while typing). The same "hide the pointer while typing" behavior in other terminals and programs behaves identically.
 - **On niri the pointer is drawn into the window capture, not the output frame.** On niri, `window active` / `window pick` go through niri's own `screenshot-window`, and `--cursor` maps to that call's `--show-pointer`, so the cursor lands in the window image; `--show-pointer` only exists after 25.11, and an older niri rejects the whole request, which vshot detects and retries without the argument, saying "the pointer cannot be drawn into the window". The output-level paths (`monitor`, `all`, `region`) still use screencopy's `overlay_cursor`.
+- **On Hyprland running `hypr-dynamic-cursors` the pointer gets baked into the frame, and vshot steps around it.** While the cursor is magnified — shake to find, or the plugin's own magnify dispatcher — the plugin holds the compositor's software-cursor lock, and the compositor then draws the pointer into the frame it composites, which is the very frame screencopy hands out — so **the pointer is there without `--cursor` too**. Once the magnification ends, the pixels it left behind stay on screen (a `grim` grab at the same moment shows exactly the same residue, so this is compositor-side behavior rather than something vshot causes). Before reading a whole scene, vshot switches the plugin off and warps the pointer to where it already was — that pointer event is what makes the compositor fall back to its hardware cursor and repaint the rectangle the software cursor had occupied — then switches the plugin back on as soon as the frames are read. A session without the plugin, or with it switched off, is left alone entirely. Captures therefore carry no leftover cursor, and the residue on screen is cleared along the way.
 
 `--cursor` has no effect on `long` (see the next entry); whether KWin really draws a cursor is unverified.
 
 ### Known rough edges
 
 - **`--cursor` does nothing on `long`** — the frame grabbing in `src/longshot.rs` hardcodes the cursor argument to `false` (and `longshot::run` has no such parameter), so `vshot long --cursor` is accepted and silently ignored. On the other capture paths (`region`, `monitor`, `all`, `window active`) `--cursor` works as measured on this machine's Hyprland. On KWin `include-cursor` is passed, but **whether a cursor is really drawn is unverified**.
+- **A capture taken mid-magnification can still carry a pointer** — `hypr-dynamic-cursors` holds the software-cursor lock while the cursor is magnified, and switching the plugin off does not release it immediately, so a frame grabbed in that instant keeps a **normal-sized** pointer in it (the magnified one never makes it in). The plugin releases the lock when the magnification ends, so the problem heals itself: any capture taken after that is clean.
 - **Pixel detection (`--pixel`)** — a seamless borderless tiling layout (no gaps, no shadows) and a completely uniform desktop offer no pixel signal, and vshot reports that honestly instead of guessing. When the compositor draws no colored border around the focused window, it answers with **the window under the pointer**, which may differ from the compositor's focused window. `VSHOT_PIXEL_DEBUG=1` shows each level's verdict.
 - **niri translucent window locating** — template matching requires the window's content to stay put between the render and the frame grab; video and animation make the template stale (vshot retries with a fresh render up to 3 times), and a nearly fully transparent window or one hanging off the output's edge cannot be located at all (falling back to niri's own translucent render).
 - **The KDE window list probe** — depends on journald receiving KWin's `console.info`. When KWin is started from a tty and its log goes only to that tty, no line can be retrieved no matter how long you wait. With `kdotool` installed vshot prefers it (the result comes back over D-Bus, not the journal), bypassing that dependency.
@@ -701,9 +886,19 @@ command line > environment > config file > built-in default
 | `long.inject` | `long --inject` | `auto` |
 | `pin.density` | `pin --density` | inferred |
 | `record.encoder` | `record --encoder` | `h264` |
+| `record.encoder-backend` | `record --encoder-backend` | `auto` |
 | `record.fps` | `record --fps` | `60` |
 | `record.portal` | `record --portal` | `false` |
 | `record.mic` | `record --mic` | none |
+| `replay.window` | `replay --window` | `30` |
+| `replay.fps` | `replay --fps` | `30` |
+| `replay.encoder` | `replay --encoder` | `h264` |
+| `replay.encoder-backend` | `replay --encoder-backend` | `auto` |
+| `replay.gop` | `replay --gop` | `1` |
+| `replay.mic` | `replay --mic` | none |
+| `replay.portal` | `replay --portal` | `false` |
+| `replay.save-dir` | `replay --save-dir` | the videos directory |
+| `replay.notify` | whether `replay save` raises a notification | `true` |
 | `ocr.engine` | which engine `vshot ocr` uses | `builtin` |
 | `ocr.external.command` | the program to run when `engine` is `"external"` (an array) | none |
 | `ocr.external.stdin` | send the PNG on stdin instead of passing a path | `false` |
@@ -712,7 +907,7 @@ command line > environment > config file > built-in default
 
 `pin.density` follows the same order: `--density` > `VSHOT_PIN_DENSITY` > the config file. Unknown keys inside `cli` are ignored rather than making the whole file invalid — a misspelled key costs you that one setting, and the rest still apply.
 
-`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch and the four `record` keys (encoder, frame rate, portal, microphone); `ocr.engine` and `ocr.external` are edited by hand. That switch **only ever writes "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say. The microphone row is filled from the running session, with a button beside it to ask again: a session with no inputs is not an error there, the row simply offers the two answers that always exist.
+`ocr.engine` accepts only `builtin` and `external`; any other name is an **error** rather than a default, because a misspelled `external` would otherwise look like a working GPU engine. Likewise `engine: "external"` with no `command`, or a command that will not run, is reported plainly (see [Using a GPU](#using-a-gpu-the-external-engine)). The settings window covers `editor`, the common `cli` entries, the `ocr.notify` switch and the four `record` keys (encoder, frame rate, portal, microphone); `ocr.engine`, `ocr.external` and `record.encoder-backend` (and its `replay` twin) are edited by hand. That switch **only ever writes "off"**: an absent key already means on, so writing `true` would say nothing the file did not already say. The microphone row is filled from the running session, with a button beside it to ask again: a session with no inputs is not an error there, the row simply offers the two answers that always exist.
 
 `color` uses the CSS spelling: `#rrggbb`, or `#rrggbbaa` with the alpha **last** when it is not opaque. Note that this differs from Qt's own eight-digit order (`#aarrggbb`); both `vshot settings` and the config file follow CSS.
 
@@ -766,6 +961,7 @@ The shadow is built once and cached — blurred at a third of the size and scale
 | `VSHOT_PIXEL_DEBUG=1` | What each level of window pixel detection saw |
 | `VSHOT_SESSION_DEBUG=1` | Which compositor this session was judged to be, and on what basis |
 | `VSHOT_LONG_DEBUG_DIR=<dir>` | Write every long-screenshot frame and every stitch decision to disk |
+| `VSHOT_NVENC_DEVICE=N` | Use the Nth CUDA device for NVENC (multi-GPU machines; the first by default) |
 | `VSHOT_OCR_MODELS=<dir>` | OCR model directory, overriding `/usr/share/vshot/models` and the search beside the executable |
 | `VSHOT_PIN_SOCKET` | The socket path the pin daemon listens on |
 | `VSHOT_PIN_DENSITY=N` | The source density of every pinned image, same as `--density` |
@@ -773,8 +969,10 @@ The shadow is built once and cached — blurred at a third of the size and scale
 | `VSHOT_PIN_FOCUS_DEBUG=1` | The daemon prints every focus change of every pin render surface |
 | `VSHOT_PIN_SOURCE_FILE` | Overrides the screenshot tool's record path (default `/tmp/screenshot-path`) |
 | `VSHOT_RECORD_PIDFILE` | The pid file `vshot record stop` reads (default `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`) |
-| `VSHOT_RECORD_DEBUG=1` | The recording loop traces each frame's stage (grab/encode/mux) and the libavcodec version in use |
+| `VSHOT_RECORD_DEBUG=1` | The recording/replay loop traces each frame's stage (grab/encode/mux) and the libavcodec version in use |
 | `VSHOT_PORTAL_SHM=1` | `record --portal` asks for memory frames instead of dma-bufs (the fallback when a compositor's buffers cannot be imported) |
+| `VSHOT_REPLAY_SOCKET` | The replay control socket path (default `$XDG_RUNTIME_DIR/vshot-replay-<uid>.sock`) |
+| `VSHOT_REPLAY_PIDFILE` | The pid file `vshot replay stop` reads (default `$XDG_RUNTIME_DIR/vshot-replay-<uid>.pid`) |
 
 > As soon as any `VSHOT_PIN_*_DEBUG` is set for the daemon, it stops sending its stderr to `/dev/null`, so the traces are readable. The variables must be in place when the daemon starts; for one already resident, run `vshot pin --quit` first.
 
@@ -786,6 +984,7 @@ The shadow is built once and cached — blurred at a third of the size and scale
 - **Pixel detection**: a seamless borderless tiling layout and a completely uniform desktop have no pixel signal, and vshot reports that honestly instead of guessing; when the compositor draws no colored border around the focused window, `window active --pixel` answers with "the window under the pointer";
 - **Text**: the Qt text box accepts arbitrary Unicode (including CJK submitted by an input method); a result from an old helper that carries no bitmap falls back to Rust's built-in 5x7 font, which only supports printable ASCII;
 - **`monitor current`** depends on receiving pointer enter/motion on the overlay; generic Wayland has no readable global mouse position, so vshot never guesses with the first output;
+- **Replay**: `replay start --portal` is not supported yet (the portal's frame loop is not wired to the ring, and it refuses with a sentence saying so); a `window` replay is subject to the protocol's on-demand copying, so a still window can have very few frames in the ring for a long while; one session runs at a time;
 - Native screencopy waits up to 10 seconds for the compositor to return a frame, and times out with an error instead of blocking forever.
 
 ## Verification
@@ -845,4 +1044,11 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-ke2e \
 
 ## License
 
-MIT (see `LICENSE`).
+**GPL-3.0-or-later** (see `LICENSE`): vshot is released under the GNU General Public License, version 3 or any later version; redistributing it, modified or not, requires providing the complete corresponding source under the same terms. Earlier releases (through v0.1.2) were MIT; the move to the GPL removes every gray area in the dependency chain:
+
+- **Qt 6 / LayerShellQt** — dynamically linked and used under the GPL options both provide (Qt also offers LGPL-3.0, LayerShellQt LGPL-2.0-or-later). The Qt libraries can be replaced freely: the `vshot` CLI does not link Qt at all, and the interface lives in the separate `vshot-qt-ui` helper.
+- **FFmpeg** (recording, optional dependency) — Arch's build is GPL-3.0 and is loaded with dlopen at run time. Under MIT, whether dlopen makes one combined work was an open question; with vshot itself under the GPL, either answer is compatible.
+- **Rust crates** — MIT / Apache-2.0 / BSD and similar permissive licenses, all GPL-compatible.
+- **OCR models** (`/usr/share/vshot/models`) — from RapidOCR / PaddleOCR, Apache-2.0; the dictionary from oar-ocr, Apache-2.0.
+
+`LICENSE` carries the full GPLv3 text and `NOTICE` the third-party notices; both are installed to `/usr/share/licenses/vshot/`. For users: use, modification and redistribution stay free; redistributing a modified version now also means shipping its source, and vshot code can no longer be folded into a closed-source product.

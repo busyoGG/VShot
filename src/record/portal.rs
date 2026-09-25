@@ -166,7 +166,12 @@ fn record(
     // node on it.  It stays open for as long as the stream does.
     let remote = session.open_pipewire_remote(handle)?;
 
-    let allow_dmabuf = std::env::var_os("VSHOT_PORTAL_SHM").is_none();
+    // A dma-buf cast only works where the encoder can import it: VAAPI can,
+    // NVENC cannot, so on NVENC the portal is asked for memory frames from the
+    // start (`VSHOT_PORTAL_SHM` is the manual form of the same request).
+    let backend = request.encoder_backend.resolve();
+    let allow_dmabuf = backend != crate::record::avcodec::EncoderBackend::Nvenc
+        && std::env::var_os("VSHOT_PORTAL_SHM").is_none();
     // The node the portal names is registered with PipeWire by the portal's
     // own process, and for a window it can take a moment longer than the
     // answer to `Start`: the stream is created when the compositor has
@@ -235,6 +240,7 @@ fn record(
     } else {
         Shape::Software
     };
+    let backend = request.encoder_backend.resolve();
     if debug_enabled() {
         eprintln!(
             "vshot: the portal is casting {}x{} (spa format {}, {} frames)",
@@ -261,6 +267,7 @@ fn record(
             request.encoder,
             fourcc,
             mic.format(),
+            backend,
         )?,
         (Shape::Dmabuf, None) => Recorder::start_dmabuf(
             &path,
@@ -268,6 +275,7 @@ fn record(
             geometry.height,
             request.encoder,
             fourcc,
+            backend,
         )?,
         (Shape::Software, Some(mic)) => Recorder::start_mic(
             &path,
@@ -275,19 +283,25 @@ fn record(
             geometry.height,
             request.encoder,
             mic.format(),
+            backend,
         )?,
-        (Shape::Software, None) => {
-            Recorder::start(&path, geometry.width, geometry.height, request.encoder)?
-        }
+        (Shape::Software, None) => Recorder::start(
+            &path,
+            geometry.width,
+            geometry.height,
+            request.encoder,
+            backend,
+        )?,
     };
     if debug_enabled() {
         eprintln!(
-            "vshot: recording {}x{} at up to {} fps with {} through libavcodec {} and \
+            "vshot: recording {}x{} at up to {} fps with {} ({}) through libavcodec {} and \
              libavformat's MP4 muxer",
             geometry.width,
             geometry.height,
             request.fps,
             request.encoder.word(),
+            backend.word(),
             super::avcodec::libavcodec_version()
         );
         if recorder.audio_channels() > 0 {

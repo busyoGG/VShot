@@ -27,10 +27,13 @@ Capture targets
   window pick         the window you click, on a live desktop with the others dimmed
   long                a scrolling region: vshot scrolls it, grabs frames while it moves and
                       stitches them into one tall image
-  record monitor|all|window
-                      record to an MP4 on the GPU: a screen, the desktop, or one window's
-                      own pixels (see below)
+  record monitor|all|region|window
+                      record to an MP4 on the GPU: a screen, the desktop, a rectangle of one
+                      screen, or one window's own pixels (see below)
   record mics|stop    the audio inputs a recording could take, and the signal that ends one
+  replay start|save|status|stop
+                      keep the last stretch of the screen in memory and copy it to an MP4 on
+                      demand (a stream copy, no re-encode)
 
 Destination (every capture above goes to exactly one)
   -o, --output PATH   a PNG at PATH, with strftime expanded (shots/%Y%m%d-%H%M%S.png); the
@@ -308,7 +311,10 @@ reports what is missing. `monitor [NAME]` records one output, `current` — what
 `record monitor` means — asking the compositor which output you are on: the one under the \
 pointer where it reports that, the focused output \
 otherwise; a recording has nothing of its own on screen for the pointer to enter, so the seat \
-itself cannot answer), `all` records every output composed at its logical position.\n\n\
+itself cannot answer), `all` records every output composed at its logical position, and \
+`region` records one rectangle of one output — dragged out on the frozen desktop, or fixed \
+with --geometry — which on a wlroots session the compositor renders straight into a dma-buf \
+like `monitor` does.\n\n\
 --encoder picks the video codec: h264 (default), hevc or av1. All three run on the GPU's media \
 engine through the same libavcodec route; whether the hardware offers one is checked when the \
 recording opens, and the message names the encoder when it does not. HEVC is also the answer \
@@ -381,6 +387,13 @@ cannot blend)."
         /// Do not record the microphone, even when the config remembers it.
         #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
         no_mic: bool,
+        /// Record the recorded *window's own* audio instead of the microphone:
+        /// the sound the application that owns the window is playing, and
+        /// nothing else. Only `record window` has a window to attach it to.
+        /// The window's pid comes from the compositor (Hyprland and niri
+        /// report it; KWin does not), and the sound from PipeWire.
+        #[arg(long = "app-audio", global = true, conflicts_with = "mic")]
+        app_audio: bool,
         /// Video codec: h264 (default), hevc or av1; the config's
         /// `cli.record.encoder` when the flag is not given.
         #[arg(
@@ -389,6 +402,17 @@ cannot blend)."
             value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
         )]
         encoder: Option<String>,
+        /// Hardware encoder: auto (default; VAAPI where it opens, else NVENC),
+        /// vaapi (AMD/Intel) or nvenc (NVIDIA). The config's
+        /// `cli.record.encoder-backend` when the flag is not given. NVENC has
+        /// no dma-buf import, so it records the software path — expect a
+        /// higher CPU cost, and zero-copy where VAAPI is available.
+        #[arg(
+            long,
+            global = true,
+            value_parser = crate::record::avcodec::EncoderBackend::ALL.map(|backend| backend.word())
+        )]
+        encoder_backend: Option<String>,
         /// Record through the XDG desktop portal instead of the compositor's
         /// own protocols, which is also what the config's `cli.record.portal`
         /// asks for when the flag is not given. The portal shows the
@@ -398,6 +422,96 @@ cannot blend)."
         /// Refuse the portal, even when the config remembers it.
         #[arg(long = "no-portal", global = true, conflicts_with = "portal")]
         no_portal: bool,
+    },
+
+    /// Keep a rolling window of the screen in memory, and save it on demand.
+    #[command(
+        after_help = "A replay is a recording that holds its last seconds in memory instead of \
+writing them to a file: the screen is encoded continuously, the packets go into a ring, and \
+`vshot replay save` copies what the ring holds into an MP4 — a stream copy, no re-encode — so \
+the trigger costs almost nothing and nothing is written until it is asked for. The window \
+`--window` seconds wide is what a save can reach back through.\n\n\
+`replay start` runs the session: it encodes until it is stopped, and serves saves meanwhile. \
+`replay save` asks the running session to write a file, `replay status` prints how much history \
+it holds, and `replay stop` ends it. The control channel is a socket under \
+$XDG_RUNTIME_DIR, so `save` and `stop` need no display and work from a compositor keybinding:\n    \
+bind = SUPER, R, exec, vshot replay start --background\n    \
+bind = SUPER SHIFT, R, exec, vshot replay save\n    \
+bind = SUPER ALT, R, exec, vshot replay stop\n\n\
+The target is what `record` records: `monitor [NAME]` (a bare `replay monitor` means the output \
+you are on), `all`, `region` (--geometry, or dragged out on the frozen desktop), or `window` \
+(the focused one, a name, or `--pick`). The frames come from the same capture backends and go to \
+the same GPU encoder through libavcodec, so a session that can record can replay, and the \
+zero-copy dma-buf path is used wherever `record` uses it.\n\n\
+The encoder runs with a bounded key-frame distance (`--gop` seconds, default 1), so the ring is \
+a fraction of an all-intra stream and every GOP boundary is a place a save can start from. A \
+save starts at the newest key frame at or before `now - seconds`, so it holds at least the \
+seconds asked for and decodes from its first byte; asking for more than the window holds gives \
+everything there is.\n\n\
+`--fps` defaults to 30 for a replay (a recording defaults to 60): a replay is left running for \
+long stretches, and 30 fps halves the encoder's work while motion still looks smooth. \
+`--encoder` picks h264 (default), hevc or av1. `--mic` keeps the microphone in the ring beside \
+the video, the same way `record --mic` records it.\n\n\
+`replay save` writes to `--save-dir` (strftime-expanded, default the videos directory with a \
+timestamped name) unless it is given a path: `vshot replay save /tmp/clip.mp4`. `--background` \
+detaches the session from the terminal, so it outlives the shell that started it.\n\n\
+The config file's `cli.replay` section supplies the defaults: `window`, `encoder`, `fps`, `gop`, \
+`mic`, `save-dir` and `notify`. A flag always wins over the file.\n\n\
+VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid file \
+`replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."
+    )]
+    Replay {
+        #[command(subcommand)]
+        action: ReplayCommandLine,
+        /// Seconds of history to keep in memory; the config's `cli.replay.window`
+        /// when the flag is not given, else 30.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        window: Option<u64>,
+        /// Frame rate the loop aims for, 1-240; the config's `cli.replay.fps`
+        /// when the flag is not given, else 30.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=240))]
+        fps: Option<u32>,
+        /// Key-frame distance in seconds (1-10); the config's `cli.replay.gop`
+        /// when the flag is not given, else 1. A smaller value makes a save
+        /// start closer to the requested edge, at the cost of a bigger ring.
+        #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=10))]
+        gop: Option<u64>,
+        /// Video codec: h264 (default), hevc or av1; the config's
+        /// `cli.replay.encoder` when the flag is not given.
+        #[arg(
+            long,
+            global = true,
+            value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
+        )]
+        encoder: Option<String>,
+        /// Hardware encoder: auto (default), vaapi or nvenc; the config's
+        /// `cli.replay.encoder-backend` when the flag is not given. As on the
+        /// recording side, NVENC records the software path.
+        #[arg(
+            long,
+            global = true,
+            value_parser = crate::record::avcodec::EncoderBackend::ALL.map(|backend| backend.word())
+        )]
+        encoder_backend: Option<String>,
+        /// Keep the microphone in the ring beside the video. Without a name
+        /// the session's default source is used; `record mics` lists the ones
+        /// this session has. The config's `cli.replay.mic` is the fallback.
+        #[arg(long, global = true, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
+        mic: Option<String>,
+        /// Do not keep the microphone, even when the config remembers one.
+        #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
+        no_mic: bool,
+        /// Keep the recorded window's own application's audio in the ring
+        /// (`replay start window` only), as `record --app-audio` does.
+        #[arg(long = "app-audio", global = true, conflicts_with = "mic")]
+        app_audio: bool,
+        /// Directory a save lands in when `replay save` names no path;
+        /// strftime-expanded. Defaults to the videos directory.
+        #[arg(long, global = true, value_name = "DIR")]
+        save_dir: Option<PathBuf>,
+        /// Detach the session from the terminal (`replay start` only).
+        #[arg(long, global = true)]
+        background: bool,
     },
 
     /// Read the text out of a region of the screen.
@@ -442,6 +556,33 @@ pub enum RecordTargetCommand {
     },
     /// Record the complete desktop: every output composed at its logical position.
     All,
+    /// Record one rectangle of the screen — a region, not a whole output.
+    #[command(
+        after_help = "The rectangle is in desktop logical coordinates, in the same `x,y widthxheight` \
+form `vshot region --geometry` takes, and it has to sit inside a single output: no one compositor \
+call copies a region that spans two. Without --geometry the frozen scene is handed to the Qt \
+overlay and the rectangle is dragged out there — the same picker `vshot region` shows, on the \
+live desktop — and nothing is opened or written until a rectangle is confirmed, so a cancelled \
+pick leaves nothing behind.\n\n\
+On a wlroots session the compositor renders just that rectangle into a dma-buf, which goes to \
+the encoder without a copy through the CPU, exactly like `record monitor`; the software path \
+takes over when the session has no linux-dmabuf. `record region` follows the region as it \
+changes, so a window dragged inside the rectangle moves with it — but the rectangle itself \
+stays where it was drawn; moving the area being recorded means stopping and starting again.\n\n\
+`--portal` records one stream the compositor's picker chooses, so with it the rectangle is not \
+this command's own: the portal offers whole screens, and the recording is of the screen that \
+was picked there. Use `record region` without --portal to record a rectangle."
+    )]
+    Region {
+        /// Fixed global geometry in `x,y widthxheight` form; without it the
+        /// rectangle is dragged out on the frozen desktop.
+        #[arg(long, value_name = "GEOMETRY", allow_hyphen_values = true)]
+        geometry: Option<String>,
+        /// Explicitly request pointer-driven selection. This is the default
+        /// when geometry is omitted.
+        #[arg(long, conflicts_with = "geometry")]
+        interactive: bool,
+    },
     /// Record one window's own pixels — not the screen area it covers.
     #[command(
         after_help = "The compositor copies the window itself, so a window that is covered by \
@@ -472,6 +613,66 @@ windows rather than screens."
     Mics,
     /// Stop the recording that is running.
     Stop,
+}
+
+/// What `vshot replay` was asked to do.
+#[derive(Debug, Subcommand)]
+pub enum ReplayCommandLine {
+    /// Start a replay session, keeping the last `--window` seconds in memory.
+    Start {
+        #[command(subcommand)]
+        target: ReplayTargetCommand,
+    },
+    /// Write the running session's history to a file.
+    Save {
+        /// Where to write it; a timestamped file in the videos directory (or
+        /// `--save-dir`) when omitted.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// How many seconds to take from the ring; the whole window when
+        /// omitted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        seconds: Option<u64>,
+    },
+    /// Print how much history the running session holds.
+    Status,
+    /// End the replay session that is running.
+    Stop,
+}
+
+/// What `vshot replay start` keeps in the ring: the same targets `record`
+/// takes.
+#[derive(Debug, Subcommand)]
+pub enum ReplayTargetCommand {
+    /// Replay one output by name, or the one you are on with `current`.
+    Monitor {
+        /// Output name, or `current` for the output the compositor says you
+        /// are on. A bare `replay start monitor` means `current`.
+        #[arg(default_value = "current")]
+        name: String,
+    },
+    /// Replay the complete desktop: every output composed at its logical position.
+    All,
+    /// Replay one rectangle of the screen — a region, not a whole output.
+    Region {
+        /// Fixed global geometry in `x,y widthxheight` form; without it the
+        /// rectangle is dragged out on the frozen desktop.
+        #[arg(long, value_name = "GEOMETRY", allow_hyphen_values = true)]
+        geometry: Option<String>,
+        /// Explicitly request pointer-driven selection. This is the default
+        /// when geometry is omitted.
+        #[arg(long, conflicts_with = "geometry")]
+        interactive: bool,
+    },
+    /// Replay one window's own pixels — not the screen area it covers.
+    Window {
+        /// App id or title of the window; the focused window when omitted.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Pick the window to replay by clicking it.
+        #[arg(long)]
+        pick: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -614,6 +815,8 @@ pub enum Action {
     },
     /// Record the screen to a file; `Stop` ends a running recording.
     Record(RecordAction),
+    /// Keep a rolling window of the screen in memory; `Save` writes it out.
+    Replay(ReplayAction),
 }
 
 /// What `vshot record` was asked to do.
@@ -622,6 +825,26 @@ pub enum RecordAction {
     Start(crate::record::RecordRequest),
     /// `record mics`: list the session's audio inputs, one per line.
     Mics,
+    Stop,
+}
+
+/// What `vshot replay` was asked to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReplayAction {
+    /// `replay start`: run the session (in the foreground, or detached with
+    /// `--background`).
+    Start {
+        request: Box<crate::record::ReplayRequest>,
+        background: bool,
+    },
+    /// `replay save`: write the running session's history out.
+    Save {
+        path: Option<PathBuf>,
+        seconds: Option<u64>,
+    },
+    /// `replay status`: print how much history the session holds.
+    Status,
+    /// `replay stop`: end the session.
     Stop,
 }
 
@@ -665,10 +888,12 @@ impl Cli {
             fps,
             duration,
             encoder,
+            encoder_backend,
             portal,
             no_portal,
             mic,
             no_mic,
+            app_audio,
         } = &self.command
         {
             // A recording is a file, not an image: the screenshot
@@ -688,10 +913,12 @@ impl Cli {
                 || fps.is_some()
                 || duration.is_some()
                 || encoder.is_some()
+                || encoder_backend.is_some()
                 || *portal
                 || *no_portal
                 || mic.is_some()
-                || *no_mic;
+                || *no_mic
+                || *app_audio;
             match target {
                 RecordTargetCommand::Stop => {
                     if option_given {
@@ -736,6 +963,37 @@ impl Cli {
                         .into(),
                 ));
             }
+            // The portal's picker offers whole screens or whole windows; a
+            // rectangle of a screen is not something it can be asked for.
+            // Refusing it beats recording a screen and calling it a region.
+            if portal && matches!(target, RecordTargetCommand::Region { .. }) {
+                return Err(VshotError::InvalidDestination(
+                    "`--portal` records a whole screen or a whole window, not a rectangle of \
+                     one; drop --portal to record a region, or record a screen instead"
+                        .into(),
+                ));
+            }
+            // `--app-audio` records one window's application, so it needs a
+            // window to name that application.  A screen, the whole desktop or
+            // a region has no single one, and picking the sound by anything
+            // else would be a guess.
+            if *app_audio && !matches!(target, RecordTargetCommand::Window { .. }) {
+                return Err(VshotError::InvalidDestination(
+                    "`--app-audio` records the sound of one window's application, so it needs a \
+                     window: `vshot record window --app-audio`"
+                        .into(),
+                ));
+            }
+            // A portal window recording never learns which window it got (the
+            // compositor's picker decides, and the portal reports a stream, not
+            // a window), so the application behind it cannot be named.
+            if *app_audio && portal {
+                return Err(VshotError::InvalidDestination(
+                    "`--app-audio` needs the window's process, which a portal recording does not \
+                     learn; drop --portal to record a window's own audio"
+                        .into(),
+                ));
+            }
             let target = match target {
                 RecordTargetCommand::Monitor { name } => {
                     if name.trim().is_empty() {
@@ -746,6 +1004,18 @@ impl Cli {
                     crate::record::RecordTarget::Monitor(name.clone())
                 }
                 RecordTargetCommand::All => crate::record::RecordTarget::All,
+                RecordTargetCommand::Region {
+                    geometry,
+                    interactive: _,
+                } => {
+                    let target = match geometry {
+                        Some(geometry) => {
+                            crate::record::RegionTarget::Fixed(parse_geometry(geometry)?)
+                        }
+                        None => crate::record::RegionTarget::Pick,
+                    };
+                    crate::record::RecordTarget::Region(target)
+                }
                 RecordTargetCommand::Window { name, pick } => {
                     // One way to say which window, not three that fight.
                     if *pick && name.is_some() {
@@ -783,6 +1053,16 @@ impl Cli {
                     ))
                 })?,
             };
+            let encoder_backend = match encoder_backend.as_deref() {
+                None => crate::record::default_encoder_backend(),
+                Some(word) => {
+                    crate::record::avcodec::EncoderBackend::parse(word).ok_or_else(|| {
+                        VshotError::InvalidDestination(format!(
+                            "unknown encoder backend `{word}`: pick auto, vaapi or nvenc"
+                        ))
+                    })?
+                }
+            };
             // The microphone: `--mic` is on, `--no-mic` is off, and
             // neither means the config's remembered default (off unless it
             // was written).  An empty name is the default source.
@@ -808,10 +1088,181 @@ impl Cli {
                     cursor: self.cursor,
                     duration: *duration,
                     encoder,
+                    encoder_backend,
                     portal,
                     mic,
+                    app_audio: *app_audio,
                 },
             )));
+        }
+        if let Command::Replay {
+            action,
+            window,
+            fps,
+            gop,
+            encoder,
+            encoder_backend,
+            mic,
+            no_mic,
+            app_audio,
+            save_dir,
+            background,
+        } = &self.command
+        {
+            // A replay is not a capture: the screenshot destinations have no
+            // meaning, and a replay writes its file from the session, not the
+            // command line that triggered it.
+            if self.pin || self.clipboard {
+                return Err(VshotError::InvalidDestination(
+                    "--clipboard and --pin do not apply to the replay subcommand".into(),
+                ));
+            }
+            return match action {
+                ReplayCommandLine::Save { path, seconds } => {
+                    if self.output.is_some() || *background {
+                        return Err(VshotError::InvalidDestination(
+                            "`replay save` takes a PATH argument, not --output or --background"
+                                .into(),
+                        ));
+                    }
+                    Ok(Action::Replay(ReplayAction::Save {
+                        path: path.clone(),
+                        seconds: *seconds,
+                    }))
+                }
+                ReplayCommandLine::Status => {
+                    if self.output.is_some() || *background {
+                        return Err(VshotError::InvalidDestination(
+                            "`replay status` takes no options".into(),
+                        ));
+                    }
+                    Ok(Action::Replay(ReplayAction::Status))
+                }
+                ReplayCommandLine::Stop => {
+                    if self.output.is_some() || *background {
+                        return Err(VshotError::InvalidDestination(
+                            "`replay stop` takes no options".into(),
+                        ));
+                    }
+                    Ok(Action::Replay(ReplayAction::Stop))
+                }
+                ReplayCommandLine::Start { target } => {
+                    // `--background` belongs to `start` alone; the other three
+                    // shapes are one-shot control lines.
+                    let target = match target {
+                        ReplayTargetCommand::Monitor { name } => {
+                            if name.trim().is_empty() {
+                                return Err(VshotError::InvalidDestination(
+                                    "monitor name cannot be empty".into(),
+                                ));
+                            }
+                            crate::record::RecordTarget::Monitor(name.clone())
+                        }
+                        ReplayTargetCommand::All => crate::record::RecordTarget::All,
+                        ReplayTargetCommand::Region {
+                            geometry,
+                            interactive: _,
+                        } => {
+                            let target = match geometry {
+                                Some(geometry) => {
+                                    crate::record::RegionTarget::Fixed(parse_geometry(geometry)?)
+                                }
+                                None => crate::record::RegionTarget::Pick,
+                            };
+                            crate::record::RecordTarget::Region(target)
+                        }
+                        ReplayTargetCommand::Window { name, pick } => {
+                            if *pick && name.is_some() {
+                                return Err(VshotError::InvalidDestination(
+                                    "`replay start window` takes a window name or `--pick`, not \
+                                     both"
+                                        .into(),
+                                ));
+                            }
+                            let target = if *pick {
+                                crate::record::WindowTarget::Pick
+                            } else {
+                                match name.as_deref() {
+                                    Some(filter) if !filter.trim().is_empty() => {
+                                        crate::record::WindowTarget::Filter(filter.to_owned())
+                                    }
+                                    Some(_) => {
+                                        return Err(VshotError::InvalidDestination(
+                                            "the window name cannot be empty".into(),
+                                        ))
+                                    }
+                                    None => crate::record::WindowTarget::Active,
+                                }
+                            };
+                            crate::record::RecordTarget::Window(target)
+                        }
+                    };
+                    let encoder = match encoder.as_deref() {
+                        None => crate::record::default_replay_encoder(),
+                        Some(word) => {
+                            crate::record::avcodec::VideoCodec::parse(word).ok_or_else(|| {
+                                VshotError::InvalidDestination(format!(
+                                    "unknown encoder `{word}`: pick h264, hevc or av1"
+                                ))
+                            })?
+                        }
+                    };
+                    let encoder_backend = match encoder_backend.as_deref() {
+                        None => crate::record::default_replay_encoder_backend(),
+                        Some(word) => crate::record::avcodec::EncoderBackend::parse(word)
+                            .ok_or_else(|| {
+                                VshotError::InvalidDestination(format!(
+                                    "unknown encoder backend `{word}`: pick auto, vaapi or nvenc"
+                                ))
+                            })?,
+                    };
+                    let mic = if *no_mic {
+                        None
+                    } else {
+                        match mic {
+                            Some(name) if name.trim().is_empty() => {
+                                Some(crate::record::MicChoice::Default)
+                            }
+                            Some(name) => Some(crate::record::MicChoice::Device(name.clone())),
+                            None => crate::record::default_replay_mic(),
+                        }
+                    };
+                    // `--app-audio` needs a window to name the application, and
+                    // a portal replay never learns which window it got.
+                    if *app_audio && !matches!(target, crate::record::RecordTarget::Window(_)) {
+                        return Err(VshotError::InvalidDestination(
+                            "`--app-audio` keeps one window's application's audio, so it needs a \
+                             window: `vshot replay start window --app-audio`"
+                                .into(),
+                        ));
+                    }
+                    let portal = crate::record::default_replay_portal();
+                    if *app_audio && portal {
+                        return Err(VshotError::InvalidDestination(
+                            "`--app-audio` needs the window's process, which a portal replay does \
+                             not learn; drop --portal"
+                                .into(),
+                        ));
+                    }
+                    let request = crate::record::ReplayRequest {
+                        target,
+                        window: window.unwrap_or_else(crate::record::default_replay_window),
+                        fps: fps.unwrap_or_else(crate::record::default_replay_fps),
+                        encoder,
+                        encoder_backend,
+                        cursor: self.cursor,
+                        mic,
+                        app_audio: *app_audio,
+                        portal,
+                        save_dir: save_dir.clone(),
+                        gop_secs: gop.unwrap_or_else(crate::record::default_replay_gop),
+                    };
+                    Ok(Action::Replay(ReplayAction::Start {
+                        request: Box::new(request),
+                        background: *background,
+                    }))
+                }
+            };
         }
         if let Command::Settings = &self.command {
             // Nothing else applies: this subcommand captures nothing and has
@@ -995,6 +1446,11 @@ impl Cli {
                     "the record subcommand is not a screenshot capture target".into(),
                 ))
             }
+            Command::Replay { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the replay subcommand is not a screenshot capture target".into(),
+                ))
+            }
         };
         Ok(Request {
             target,
@@ -1123,6 +1579,71 @@ mod tests {
         // One way to name the window, not two that fight.
         assert!(Cli::try_parse_action_from(["vshot", "record", "window", "x", "--pick"]).is_err());
         assert!(Cli::try_parse_action_from(["vshot", "record", "window", ""]).is_err());
+
+        // `record region` takes a fixed rectangle or frames one; the two
+        // ways to say it are exclusive, like `vshot region`'s own.
+        //
+        // `--no-portal` because another test in this process points
+        // XDG_CONFIG_HOME at a config that remembers `portal: true`, and a
+        // remembered portal refuses a region (the portal has no rectangle
+        // source); this test is about the geometry, not the portal.
+        let action = Cli::try_parse_action_from([
+            "vshot",
+            "record",
+            "region",
+            "--no-portal",
+            "--geometry",
+            "10,20 300x200",
+        ])
+        .unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record region --geometry` is a start");
+        };
+        assert_eq!(
+            request.target,
+            crate::record::RecordTarget::Region(crate::record::RegionTarget::Fixed(
+                crate::geometry::Rect::new(10, 20, 300, 200)
+            ))
+        );
+
+        let action =
+            Cli::try_parse_action_from(["vshot", "record", "region", "--no-portal"]).unwrap();
+        let Action::Record(RecordAction::Start(request)) = action else {
+            panic!("`record region` is a start");
+        };
+        assert_eq!(
+            request.target,
+            crate::record::RecordTarget::Region(crate::record::RegionTarget::Pick)
+        );
+
+        assert!(
+            Cli::try_parse_action_from([
+                "vshot",
+                "record",
+                "region",
+                "--no-portal",
+                "--geometry",
+                "0,0 10x10",
+                "--interactive"
+            ])
+            .is_err(),
+            "--geometry and --interactive are two ways to say it, not both"
+        );
+
+        // The portal cannot hand over a rectangle of a screen, so it is
+        // refused rather than recording a whole screen and calling it one.
+        assert!(
+            Cli::try_parse_action_from([
+                "vshot",
+                "record",
+                "region",
+                "--portal",
+                "--geometry",
+                "0,0 10x10"
+            ])
+            .is_err(),
+            "--portal has no region shape"
+        );
 
         // The microphone: a bare `--mic` is the default source, a name is
         // that input, and `--no-mic` is a silence the config cannot override.

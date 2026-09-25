@@ -45,9 +45,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::capture::dmabuf::DmabufFrame;
 use crate::capture::window::{CompositorWindowProvider, ProcessWindowProvider};
 use crate::capture::window_copy::{self, Capture, Name, WindowCapture};
 use crate::error::{Result, VshotError};
+use crate::wayland::topology::OutputInfo;
 
 use super::avcodec::Recorder;
 use super::{debug_enabled, prepare_output_path, RecordRequest, WindowTarget};
@@ -76,23 +78,7 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         ));
     }
     let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
-    let index = match target {
-        WindowTarget::Filter(filter) => window_copy::select(&names, filter)?,
-        WindowTarget::Active => match ProcessWindowProvider.active_window() {
-            Ok(active) => window_copy::match_description(&names, &active.app_id, &active.title)?,
-            // The compositor's active-window query is a separate mechanism
-            // from the toplevel list, and on some sessions it is not there
-            // (KWin's probe reports geometry only).  Picking is the honest
-            // answer then: the user knows which window they mean.
-            Err(error) => {
-                return Err(VshotError::Recording(format!(
-                    "the focused window could not be resolved ({error}); name the window \
-                     (`vshot record window NAME`) or pick it (`vshot record window --pick`)"
-                )))
-            }
-        },
-        WindowTarget::Pick => pick(&names)?,
-    };
+    let index = resolve_window(target, &names)?;
     let toplevel = &toplevels[index];
     if debug_enabled() {
         eprintln!(
@@ -113,33 +99,48 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
     }
 
     // --- the output, encoder and muxer ------------------------------------
-    // The microphone, when one was asked for: opened before the encoder,
+    // The audio track, when one was asked for: opened before the encoder,
     // because the AAC encoder's rate and channel count come from the
     // negotiation and the MP4's audio stream is declared in its header.
-    let mic = super::open_microphone(request)?;
+    // `--app-audio` takes the window's own application's sound, which is the
+    // one place a window recording differs from the other shapes; the
+    // microphone is the fallback everywhere.
+    let mic = match (&request.mic, request.app_audio) {
+        (_, true) => super::open_app_audio(&toplevel.name)?,
+        (mic, false) => super::open_microphone_for(mic.as_ref())?,
+    };
     let path = prepare_output_path(request)?;
-    let mut recorder = match &mic {
-        Some(mic) => Recorder::start_dmabuf_mic(
+    // The hardware backend, resolved once.  A window capture always delivers
+    // dma-bufs; on NVENC — which cannot import one — the recorder keeps the
+    // zero-copy chain off and reads each frame back through system memory
+    // instead.  That readback is on the capture side, so the shape's fourcc is
+    // still what the frames arrive as.
+    let backend = request.encoder_backend.resolve();
+    let mut recorder = match (&mic, backend) {
+        (Some(mic), _) => Recorder::start_dmabuf_mic(
             &path,
             shape.width,
             shape.height,
             request.encoder,
             shape.fourcc,
             mic.format(),
+            backend,
         )?,
-        None => Recorder::start_dmabuf(
+        (None, _) => Recorder::start_dmabuf(
             &path,
             shape.width,
             shape.height,
             request.encoder,
             shape.fourcc,
+            backend,
         )?,
     };
     if debug_enabled() {
         eprintln!(
-            "vshot: recording {width}x{height} with {} through libavcodec {version} and \
+            "vshot: recording {width}x{height} with {} ({}) through libavcodec {version} and \
              libavformat's MP4 muxer",
             request.encoder.word(),
+            backend.word(),
             width = shape.width,
             height = shape.height,
             version = super::avcodec::libavcodec_version()
@@ -167,6 +168,7 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         request,
         mic.as_ref(),
         &interrupted,
+        |_sink| Ok(false),
     );
     let _ = std::fs::remove_file(super::pid_file());
 
@@ -185,6 +187,56 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
     )
 }
 
+/// Resolves which window a target names, against the compositor's toplevel
+/// list.  Shared by `record window` and `replay start window`.
+pub(super) fn resolve_window(target: &WindowTarget, names: &[&Name]) -> Result<usize> {
+    match target {
+        WindowTarget::Filter(filter) => window_copy::select(names, filter),
+        WindowTarget::Active => match ProcessWindowProvider.active_window() {
+            Ok(active) => window_copy::match_description(names, &active.app_id, &active.title),
+            // The compositor's active-window query is a separate mechanism
+            // from the toplevel list, and on some sessions it is not there
+            // (KWin's probe reports geometry only).  Picking is the honest
+            // answer then: the user knows which window they mean.
+            Err(error) => Err(VshotError::Recording(format!(
+                "the focused window could not be resolved ({error}); name the window \
+                 (`vshot record window NAME`) or pick it (`vshot record window --pick`)"
+            ))),
+        },
+        WindowTarget::Pick => pick(names),
+    }
+}
+
+/// Connects to the compositor's window capture and starts a session on the
+/// named window, returning the capture, the shape it will deliver, and the
+/// window's own name (which a `--app-audio` replay needs to find the
+/// application's pid).
+pub(super) fn open_window_capture(
+    target: &WindowTarget,
+) -> Result<(WindowCapture, window_copy::Shape, Name)> {
+    let mut capture = WindowCapture::connect()?;
+    let toplevels = capture.toplevels()?;
+    if toplevels.is_empty() {
+        return Err(VshotError::Recording(
+            "the compositor lists no windows to record".into(),
+        ));
+    }
+    let names: Vec<&Name> = toplevels.iter().map(|toplevel| &toplevel.name).collect();
+    let index = resolve_window(target, &names)?;
+    let toplevel = &toplevels[index];
+    if debug_enabled() {
+        eprintln!(
+            "vshot: recording the window `{}` (app_id `{}`, title `{}`)",
+            toplevel.label(),
+            toplevel.name.app_id,
+            toplevel.name.title
+        );
+    }
+    let name = toplevel.name.clone();
+    let shape = capture.start(toplevel)?;
+    Ok((capture, shape, name))
+}
+
 /// The frame loop.  Returns once the recording has run its course; the caller
 /// finishes the file either way.
 ///
@@ -201,12 +253,15 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
 /// what [`Capture::Resized`] carries, and it is the difference between a
 /// recording of the window's session and a recording cut short the first
 /// time its user drags a corner.
-fn loop_over(
+pub(super) fn loop_over<
+    S: crate::record::avcodec::VideoSink + crate::record::avcodec::AudioSink,
+>(
     capture: &mut WindowCapture,
-    recorder: &mut Recorder,
+    recorder: &mut S,
     request: &RecordRequest,
     mic: Option<&super::pipewire_audio::Mic>,
     interrupted: &AtomicBool,
+    mut control: impl FnMut(&mut S) -> Result<bool>,
 ) -> Result<()> {
     let started = Instant::now();
     let interval = request.frame_interval();
@@ -226,9 +281,16 @@ fn loop_over(
     // expected during a resize animation and are bounded separately (and
     // more generously) than frame errors: each one costs one grab wait.
     let mut consecutive_retries = 0u32;
+    // How many frames this session has encoded, for the debug trace.
+    let mut encoded = 0u64;
 
     loop {
         if interrupted.load(Ordering::Relaxed) {
+            break;
+        }
+        // A control line (a replay's save/stop) is served at a frame boundary,
+        // so the session's state is consistent when it is handled.
+        if control(recorder)? {
             break;
         }
         if let Some(seconds) = request.duration {
@@ -288,11 +350,10 @@ fn loop_over(
                 consecutive_retries = 0;
                 consecutive_errors = 0;
                 recorder.resize_fit(width, height, fourcc)?;
+                let (canvas_width, canvas_height) = recorder.canvas();
                 eprintln!(
                     "vshot: the window was resized to {width}x{height}; fitting it into the \
                      recording's {canvas_width}x{canvas_height} canvas",
-                    canvas_width = recorder.width(),
-                    canvas_height = recorder.height(),
                 );
                 continue;
             }
@@ -366,22 +427,15 @@ fn loop_over(
             u32::try_from(step).unwrap_or(1).max(1)
         };
         let encode_started = Instant::now();
-        recorder.frame_dmabuf(
-            frame.fd,
-            frame.fourcc,
-            frame.modifier,
-            frame.offset as i32,
-            frame.stride as i32,
-            duration_ms,
-        )?;
+        encode_window_frame(capture, recorder, &frame, duration_ms)?;
         // The soundtrack for the interval this frame covered.
         if let Some(mic) = mic {
             super::pump_microphone(mic, recorder, &mut mic_samples)?;
         }
         if debug_enabled() {
+            encoded += 1;
             eprintln!(
-                "vshot: frame {}: {}x{} muxed in {:.1}ms (on screen {duration_ms}ms)",
-                recorder.frames(),
+                "vshot: frame {encoded}: {}x{} encoded in {:.1}ms (on screen {duration_ms}ms)",
                 frame.width,
                 frame.height,
                 encode_started.elapsed().as_secs_f64() * 1000.0
@@ -406,17 +460,35 @@ fn loop_over(
         let due_ms = covered_us / 1000;
         let step = due_ms.saturating_sub(timeline_ms).max(1);
         if let Ok(step) = u32::try_from(step) {
-            recorder.frame_dmabuf(
-                frame.fd,
-                frame.fourcc,
-                frame.modifier,
-                frame.offset as i32,
-                frame.stride as i32,
-                step,
-            )?;
+            encode_window_frame(capture, recorder, &frame, step)?;
         }
     }
     Ok(())
+}
+
+/// Encodes one window frame the way the sink wants it: a dma-buf handed over
+/// as-is on VAAPI, or read back to RGBA on a backend that cannot import one
+/// (NVENC).  The two paths differ only in the copy in between; the timeline
+/// and the encoder call that follows are the same.
+fn encode_window_frame<S: crate::record::avcodec::VideoSink>(
+    capture: &WindowCapture,
+    recorder: &mut S,
+    frame: &DmabufFrame,
+    duration_ms: u32,
+) -> Result<()> {
+    if recorder.wants_dmabuf() {
+        recorder.frame_dmabuf(
+            frame.fd,
+            frame.fourcc,
+            frame.modifier,
+            frame.offset as i32,
+            frame.stride as i32,
+            duration_ms,
+        )
+    } else {
+        let rgba = capture.read_frame_rgba(frame)?;
+        recorder.frame_rgba(&rgba, duration_ms)
+    }
 }
 
 /// `nanosleep` in slices, so a stop signal is noticed within a few
@@ -458,7 +530,7 @@ fn pick(names: &[&Name]) -> Result<usize> {
     // The picker draws over a frozen picture of the desktop; for picking a
     // window to record, a picture of each output is enough, and it is what
     // `vshot window pick` hands over as well.
-    let scene = picker_scene()?;
+    let scene = picker_scene_standalone()?;
     let picked = crate::qt_overlay::pick_window(&scene, &candidates, || {
         ProcessWindowProvider.windows().ok()
     })?;
@@ -483,13 +555,19 @@ fn pick(names: &[&Name]) -> Result<usize> {
 /// at its logical position.  This is what `vshot window pick` hands over too,
 /// and the picker only draws over it — the window that gets recorded is
 /// decided by the click, not by the pixels.
-fn picker_scene() -> Result<crate::model::SceneSnapshot> {
-    let wayland = crate::wayland::WaylandSession::connect()?;
-    let topology = wayland.output_infos()?;
-    let mut capture = crate::capture::Capturer::connect()?;
+///
+/// The caller's own `Capturer` is used when it has one (a region recording
+/// connects one before its pick), and the captures go through the same
+/// backend the recording will use, so a session where the pick works is a
+/// session where the recording can read frames.
+pub(super) fn picker_scene(
+    capture: &mut crate::capture::Capturer,
+    topology: &[OutputInfo],
+    cursor: bool,
+) -> Result<crate::model::SceneSnapshot> {
     let mut outputs = Vec::with_capacity(topology.len());
-    for info in &topology {
-        let frame = capture.capture_output(&info.name, false)?;
+    for info in topology {
+        let frame = capture.capture_output(&info.name, cursor)?;
         outputs.push(crate::model::OutputSnapshot::new(
             info.global_id,
             info.name.clone(),
@@ -499,4 +577,13 @@ fn picker_scene() -> Result<crate::model::SceneSnapshot> {
         )?);
     }
     crate::model::SceneSnapshot::from_outputs(outputs)
+}
+
+/// The picker's backdrop for the callers that have no capture of their own
+/// yet: it connects to the compositor and the backend itself.
+fn picker_scene_standalone() -> Result<crate::model::SceneSnapshot> {
+    let wayland = crate::wayland::WaylandSession::connect()?;
+    let topology = wayland.output_infos()?;
+    let mut capture = crate::capture::Capturer::connect()?;
+    picker_scene(&mut capture, &topology, false)
 }

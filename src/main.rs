@@ -92,6 +92,26 @@ fn run() -> Result<()> {
                 cli::RecordAction::Stop => record::stop(),
             };
         }
+        Action::Replay(action) => {
+            // A replay is a long-lived session that owns its own ring, control
+            // socket and pid file; the control shapes are one-line requests.
+            return match action {
+                cli::ReplayAction::Start {
+                    request,
+                    background,
+                } => {
+                    if background {
+                        return replay_background(&request);
+                    }
+                    record::replay::run(&request)
+                }
+                cli::ReplayAction::Save { path, seconds } => {
+                    record::replay_save(path, seconds).map(|_| ())
+                }
+                cli::ReplayAction::Status => record::replay_status(),
+                cli::ReplayAction::Stop => record::replay_stop(),
+            };
+        }
         Action::Capture(request) => request,
     };
     let mut wayland = WaylandSession::connect()?;
@@ -391,6 +411,97 @@ events all look the same from here",
     finish_capture(edits, frame, density, &request, &mut wayland)
 }
 
+/// Starts a replay session detached from this terminal, so it outlives the
+/// shell that started it.  The session re-execs this same program with the
+/// same arguments minus `--background`; nothing of this process's stdio is
+/// inherited, and its pid file is written by the child once it is up.
+fn replay_background(request: &record::ReplayRequest) -> Result<()> {
+    let exe = std::env::current_exe().map_err(|error| {
+        VshotError::Recording(format!("cannot find the vshot executable: {error}"))
+    })?;
+    // Rebuild the child's arguments from the parsed request, so `--background`
+    // (which would re-detach forever) is dropped and every other choice the
+    // user made is carried over.
+    let mut args: Vec<std::ffi::OsString> = vec!["replay".into(), "start".into()];
+    match &request.target {
+        record::RecordTarget::Monitor(name) => {
+            args.push("monitor".into());
+            args.push(name.clone().into());
+        }
+        record::RecordTarget::All => args.push("all".into()),
+        record::RecordTarget::Region(record::RegionTarget::Fixed(rect)) => {
+            args.push("region".into());
+            args.push("--geometry".into());
+            args.push(
+                format!(
+                    "{},{} {}x{}",
+                    rect.origin.x, rect.origin.y, rect.size.width, rect.size.height
+                )
+                .into(),
+            );
+        }
+        record::RecordTarget::Region(record::RegionTarget::Pick) => {
+            args.push("region".into());
+        }
+        record::RecordTarget::Window(record::WindowTarget::Active) => args.push("window".into()),
+        record::RecordTarget::Window(record::WindowTarget::Pick) => {
+            args.push("window".into());
+            args.push("--pick".into());
+        }
+        record::RecordTarget::Window(record::WindowTarget::Filter(name)) => {
+            args.push("window".into());
+            args.push(name.clone().into());
+        }
+    }
+    args.push("--window".into());
+    args.push(request.window.to_string().into());
+    args.push("--fps".into());
+    args.push(request.fps.to_string().into());
+    args.push("--encoder".into());
+    args.push(request.encoder.word().into());
+    args.push("--encoder-backend".into());
+    args.push(request.encoder_backend.word().into());
+    if request.cursor {
+        args.push("--cursor".into());
+    }
+    match &request.mic {
+        Some(record::MicChoice::Default) => args.push("--mic".into()),
+        Some(record::MicChoice::Device(name)) => {
+            args.push("--mic".into());
+            args.push(name.clone().into());
+        }
+        None => {}
+    }
+    if request.app_audio {
+        args.push("--app-audio".into());
+    }
+    if request.portal {
+        args.push("--portal".into());
+    }
+    if let Some(dir) = &request.save_dir {
+        args.push("--save-dir".into());
+        args.push(dir.clone().into());
+    }
+
+    let child = std::process::Command::new(&exe)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(if std::env::var_os("VSHOT_RECORD_DEBUG").is_some() {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        })
+        .spawn()
+        .map_err(|error| {
+            VshotError::Recording(format!(
+                "could not start the replay session in the background: {error}"
+            ))
+        })?;
+    println!("vshot: replay session started (pid {})", child.id());
+    Ok(())
+}
+
 /// Reads the text out of a region of the screen, or out of an image file.
 ///
 /// The capture half is `vshot region`'s: the scene is frozen, the overlay
@@ -669,6 +780,11 @@ fn capture_scene(
             "no outputs are available to capture".into(),
         ));
     }
+    // A Hyprland session running `hypr-dynamic-cursors` can be drawing the
+    // pointer into the very frames this reads; see `hypr_cursor`.  The binding
+    // is named so it lives until the scene is complete — including on the `?`
+    // paths below, which is why it is not a plain `_`.
+    let _cursors_suspended = capture::hypr_cursor::suspend();
     let mut outputs = Vec::with_capacity(output_infos.len());
     for info in output_infos {
         let frame = capture.capture_output(&info.name, cursor)?;

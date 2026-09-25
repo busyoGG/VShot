@@ -843,6 +843,12 @@ void vshot_pwa_close(VshotPwa *pw)
  * wedged session cannot hang the CLI. */
 #define VSHOT_PWA_LIST_DEFAULT_TIMEOUT_MS 5000
 
+/* How many nodes/clients the per-application scan remembers.  A desktop with
+ * more playing applications than this is one the lookup was never going to
+ * pick the right one out of anyway, and the oldest entries are simply not
+ * candidates. */
+#define VSHOT_PWA_MAX_APP_NODES 128
+
 typedef struct vshot_pwa_list {
 	const struct vshot_pwa_api *api;
 	struct pw_thread_loop *loop;
@@ -857,7 +863,42 @@ typedef struct vshot_pwa_list {
 	int used;
 	int count;
 	int sync_seq;
+	/* Two modes share this scan: the source list (`mode` 0) writes every
+	 * Audio/Source; the per-application lookup (`mode` 1) writes the serial of
+	 * one application's playback node.
+	 *
+	 * The application lookup is a two-pass scan over the same registry walk,
+	 * because the pid is not on the node.  A node's own properties carry
+	 * `client.id`, and the *client* object — a separate global — is the one
+	 * that carries `application.process.id`.  So the pass records, for every
+	 * `Stream/Output/Audio` node, its serial and its `client.id`, and for
+	 * every client its pid; when the walk finishes the node whose client has
+	 * the wanted pid is picked.  Both tables are small (tens of entries) and
+	 * the scan is one round trip either way. */
+	int mode;
+	char pid[32];
+	/* Node id -> serial and client id, as text (the registry reports them as
+	 * strings in the properties). */
+	struct {
+		char node_id[24];
+		char serial[24];
+		char client_id[24];
+	} nodes[VSHOT_PWA_MAX_APP_NODES];
+	int node_count;
+	/* Client id -> pid, as text. */
+	struct {
+		char id[24];
+		char pid[24];
+	} clients[VSHOT_PWA_MAX_APP_NODES];
+	int client_count;
+	/* Set by the per-application scan when a node matched: the serial, which
+	 * is what `vshot_pwa_open`'s target wants. */
+	char found[32];
+	bool found_any;
 } VshotPwaList;
+
+#define VSHOT_PWA_LIST_SOURCES 0
+#define VSHOT_PWA_LIST_APP 1
 
 /* Cuts a byte string back to the last whole UTF-8 sequence.  Only called on a
  * field that hit its cap; without it a truncated multi-byte character would
@@ -906,10 +947,69 @@ static void vshot_pwa_list_global(void *data, uint32_t id, uint32_t permissions,
 	int written;
 	int room;
 
-	(void)id;
 	(void)permissions;
 	(void)version;
-	if (props == NULL || type == NULL || strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+	if (props == NULL || type == NULL)
+		return;
+	if (list->mode == VSHOT_PWA_LIST_APP) {
+		/* The application scan records the two halves of the mapping and
+		 * resolves it after the walk (see `vshot_pwa_find_app_node`): a
+		 * Stream/Output node contributes its serial and its client id, a
+		 * Client contributes its pid.  The pid is not on the node — a node's
+		 * `application.process.id` is unset — which is why this is two
+		 * passes and not one.
+		 *
+		 * A global's id is the callback's `id` argument; it is not repeated as
+		 * an `object.id` property on a client global (it is on a node's bound
+		 * info, but not in the registry's global props), which is why the
+		 * client's own id is taken from the argument and the node's
+		 * `client.id` is compared against it. */
+		if (strcmp(type, PW_TYPE_INTERFACE_Node) == 0) {
+			const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+			const char *serial;
+			const char *client_id;
+			if (media_class == NULL || strncmp(media_class, "Stream/Output", 13) != 0)
+				return;
+			serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
+			client_id = spa_dict_lookup(props, PW_KEY_CLIENT_ID);
+			if (serial == NULL || client_id == NULL)
+				return;
+			pthread_mutex_lock(&list->lock);
+			if (list->node_count < VSHOT_PWA_MAX_APP_NODES) {
+				int i = list->node_count;
+				snprintf(list->nodes[i].node_id, sizeof(list->nodes[i].node_id), "%u",
+					 id);
+				snprintf(list->nodes[i].serial, sizeof(list->nodes[i].serial), "%s",
+					 serial);
+				snprintf(list->nodes[i].client_id, sizeof(list->nodes[i].client_id), "%s",
+					 client_id);
+				list->node_count++;
+			}
+			pthread_mutex_unlock(&list->lock);
+			return;
+		}
+		if (strcmp(type, PW_TYPE_INTERFACE_Client) == 0) {
+			/* The registry's global for a client carries `pipewire.sec.pid`
+			 * (the process the protocol connection came from) but *not*
+			 * `application.process.id` — that one is set on the client's
+			 * bound info, which a registry walk never sees.  `sec.pid` is the
+			 * same process id, and it is the one a window recording has. */
+			const char *pid = spa_dict_lookup(props, PW_KEY_SEC_PID);
+			if (pid == NULL)
+				return;
+			pthread_mutex_lock(&list->lock);
+			if (list->client_count < VSHOT_PWA_MAX_APP_NODES) {
+				int i = list->client_count;
+				snprintf(list->clients[i].id, sizeof(list->clients[i].id), "%u", id);
+				snprintf(list->clients[i].pid, sizeof(list->clients[i].pid), "%s", pid);
+				list->client_count++;
+			}
+			pthread_mutex_unlock(&list->lock);
+			return;
+		}
+		return;
+	}
+	if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
 		return;
 	media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
 	if (media_class == NULL || strncmp(media_class, "Audio/Source", 12) != 0)
@@ -1023,6 +1123,7 @@ int vshot_pwa_list_sources(char *out, int out_len, int timeout_ms, char *err, in
 	list.out_len = out_len;
 	list.used = 0;
 	list.count = 0;
+	list.mode = VSHOT_PWA_LIST_SOURCES;
 	pthread_mutex_init(&list.lock, NULL);
 	out[0] = '\0';
 
@@ -1134,5 +1235,180 @@ out:
 	pthread_mutex_destroy(&list.lock);
 	if (list.used < out_len)
 		out[list.used] = '\0';
+	return result;
+}
+
+/* Finds the PipeWire node one application is playing into and writes its
+ * serial into `out` (room `out_len`): the node a capture stream binds to in
+ * order to record that application's audio and nothing else.
+ *
+ * The match is `application.process.id` == `pid` on a `Stream/Output/Audio`
+ * node — the pid of the process that opened the playback stream, which is the
+ * pid a window recording already has for the window it is recording.  The
+ * serial is written rather than the node id because that is what
+ * `PW_KEY_TARGET_OBJECT` accepts and it survives the node being recreated
+ * between the lookup and the connect.
+ *
+ * Returns 1 when a node was found (and `out` holds its serial), 0 when the
+ * application is not playing anything (not a failure — the recording simply
+ * has no application audio yet), or -1 with `err` filled in when the session
+ * could not be read at all. */
+int vshot_pwa_find_app_node(const char *pid, char *out, int out_len, int timeout_ms, char *err,
+			    int err_len)
+{
+	static const struct pw_registry_events registry_events = {
+		PW_VERSION_REGISTRY_EVENTS,
+		.global = vshot_pwa_list_global,
+	};
+	static const struct pw_core_events core_events = {
+		PW_VERSION_CORE_EVENTS,
+		.done = vshot_pwa_list_done,
+		.error = vshot_pwa_list_error,
+	};
+	const struct vshot_pwa_api *api = vshot_pwa_api_load(err, (size_t)err_len);
+	VshotPwaList list;
+	struct pw_context *context = NULL;
+	struct pw_core *core = NULL;
+	struct pw_registry *registry = NULL;
+	struct pw_properties *context_properties = NULL;
+	struct spa_hook registry_listener;
+	struct spa_hook core_listener;
+	struct timespec deadline;
+	bool locked = false;
+	int result = -1;
+
+	if (err != NULL && err_len > 0)
+		err[0] = '\0';
+	if (out != NULL && out_len > 0)
+		out[0] = '\0';
+	if (api == NULL)
+		return -1;
+	if (pid == NULL || pid[0] == '\0' || out == NULL || out_len <= 0) {
+		vshot_pwa_error_out(err, err_len, "the application lookup needs a pid and a buffer");
+		return -1;
+	}
+	if (timeout_ms <= 0)
+		timeout_ms = VSHOT_PWA_LIST_DEFAULT_TIMEOUT_MS;
+
+	memset(&list, 0, sizeof(list));
+	list.api = api;
+	list.mode = VSHOT_PWA_LIST_APP;
+	snprintf(list.pid, sizeof(list.pid), "%s", pid);
+	pthread_mutex_init(&list.lock, NULL);
+
+	api->init(NULL, NULL);
+
+	list.loop = api->thread_loop_new("vshot-appaudio", NULL);
+	if (list.loop == NULL) {
+		vshot_pwa_error_out(err, err_len, "the PipeWire thread loop could not be created");
+		goto out;
+	}
+
+	api->thread_loop_lock(list.loop);
+	locked = true;
+
+	context_properties = api->properties_new(PW_KEY_APP_NAME, "vshot", NULL);
+	context = api->context_new(api->thread_loop_get_loop(list.loop), context_properties, 0);
+	context_properties = NULL;
+	if (context == NULL) {
+		vshot_pwa_error_out(err, err_len, "the PipeWire context could not be created: %s",
+				    strerror(errno));
+		goto out;
+	}
+	core = api->context_connect(context, NULL, 0);
+	if (core == NULL) {
+		vshot_pwa_error_out(err, err_len, "the PipeWire session could not be reached: %s",
+				    strerror(errno));
+		goto out;
+	}
+
+	memset(&registry_listener, 0, sizeof(registry_listener));
+	memset(&core_listener, 0, sizeof(core_listener));
+	registry = api->core_get_registry(core, PW_VERSION_REGISTRY, 0);
+	if (registry == NULL) {
+		vshot_pwa_error_out(err, err_len, "the PipeWire registry could not be opened");
+		goto out;
+	}
+	api->registry_add_listener(registry, &registry_listener, &registry_events, &list);
+	api->core_add_listener(core, &core_listener, &core_events, &list);
+
+	pthread_mutex_lock(&list.lock);
+	list.sync_seq = api->core_sync(core, PW_ID_CORE, 0);
+	list.sync_sent = true;
+	pthread_mutex_unlock(&list.lock);
+
+	api->thread_loop_unlock(list.loop);
+	locked = false;
+
+	if (api->thread_loop_start(list.loop) < 0) {
+		vshot_pwa_error_out(err, err_len, "the PipeWire thread loop could not be started: %s",
+				    strerror(errno));
+		goto out;
+	}
+	list.started = true;
+
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += timeout_ms / 1000;
+	deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec += 1;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	for (;;) {
+		struct timespec now;
+		bool done;
+
+		pthread_mutex_lock(&list.lock);
+		done = list.done || list.failed;
+		pthread_mutex_unlock(&list.lock);
+		if (done)
+			break;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec > deadline.tv_sec ||
+		    (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+			vshot_pwa_error_out(err, err_len,
+					    "the PipeWire session did not answer within %d ms",
+					    timeout_ms);
+			goto out;
+		}
+
+		api->thread_loop_lock(list.loop);
+		api->thread_loop_timed_wait(list.loop, VSHOT_PWA_NEGOTIATION_SLICE_SEC);
+		api->thread_loop_unlock(list.loop);
+	}
+
+	/* Resolve the two halves: the first Stream/Output node whose client's pid
+	 * is the one asked for.  A client with several output streams (a browser
+	 * with several tabs playing) is one application, and the first node
+	 * carries its mix. */
+	pthread_mutex_lock(&list.lock);
+	for (int n = 0; n < list.node_count && result != 1; n++) {
+		for (int c = 0; c < list.client_count; c++) {
+			if (strcmp(list.nodes[n].client_id, list.clients[c].id) == 0 &&
+			    strcmp(list.clients[c].pid, list.pid) == 0) {
+				snprintf(out, (size_t)out_len, "%s", list.nodes[n].serial);
+				result = 1;
+				break;
+			}
+		}
+	}
+	if (result != 1)
+		result = 0;
+	pthread_mutex_unlock(&list.lock);
+
+out:
+	if (locked)
+		api->thread_loop_unlock(list.loop);
+	if (list.loop != NULL && list.started)
+		api->thread_loop_stop(list.loop);
+	if (core != NULL)
+		api->core_disconnect(core);
+	if (context != NULL)
+		api->context_destroy(context);
+	if (list.loop != NULL)
+		api->thread_loop_destroy(list.loop);
+	pthread_mutex_destroy(&list.lock);
 	return result;
 }

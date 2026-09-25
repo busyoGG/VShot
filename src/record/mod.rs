@@ -1,6 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 //! Screen recording: a frame loop over the existing capture backends, a
 //! hardware encoder on the GPU, and an MP4 file written by ffmpeg's own
 //! muxer.
+//!
+//! `record` writes that file; `replay` (`replay.rs`) runs the same frame loop
+//! and encoder but keeps the encoded packets in an in-memory ring, writing a
+//! file only when a save is triggered — and then as a stream copy, no
+//! re-encode.  The two share the frame source, the zero-copy probe, the
+//! encoder boundary and the audio side; what differs is the sink.
 //!
 //! The pieces, and why each is shaped the way it is:
 //!
@@ -62,13 +71,18 @@ use crate::model::{Frame, SceneSnapshot};
 use crate::wayland::topology::OutputInfo;
 use crate::wayland::WaylandSession;
 
-use self::avcodec::{Recorder, VideoCodec};
+use self::avcodec::{EncoderBackend, Recorder, VideoCodec};
 
 pub mod avcodec;
 mod pipewire;
 mod pipewire_audio;
 mod portal;
+pub(crate) mod replay;
 mod window;
+
+pub use replay::{
+    save as replay_save, status as replay_status, stop as replay_stop, ReplayRequest,
+};
 
 /// How many times per second frames are taken at most.  The loop always
 /// tries to keep up with this; a slower screen just produces fewer frames.
@@ -81,6 +95,11 @@ pub const DEFAULT_FPS: u32 = 60;
 /// hardware.
 const MAX_DIMENSION: u32 = 8192;
 
+/// How long the desktop is given to drop the picker's overlay before the
+/// first frame is grabbed: the Qt helper's surfaces leave asynchronously,
+/// and a frame taken too early would carry the picker into the video.
+const PICK_SETTLE: Duration = Duration::from_millis(200);
+
 /// What `vshot record` is asked to record.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecordTarget {
@@ -89,12 +108,28 @@ pub enum RecordTarget {
     /// Every output, composed at its logical position — the video shape of
     /// `vshot all`.
     All,
+    /// One rectangle of the desktop: the area `vshot region` would capture,
+    /// recorded as it changes.  The rectangle has to sit inside a single
+    /// output — no one compositor call copies a region that spans two — and
+    /// is picked interactively when it is not fixed with `--geometry`.
+    Region(RegionTarget),
     /// One window's *own pixels*, not the screen area it covers: the
     /// compositor copies the window itself, so a window that is covered by
     /// another one, or dragged half off the screen, still records whole.  That
     /// is the difference between this and recording the rectangle the window
     /// sits in, which is what a screen recording of that area would give.
     Window(WindowTarget),
+}
+
+/// Which rectangle `record region` records.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RegionTarget {
+    /// A fixed rectangle, in desktop logical coordinates (`x,y widthxheight`,
+    /// the same shape `vshot region --geometry` takes).
+    Fixed(Rect),
+    /// A rectangle framed on the frozen desktop by the same Qt overlay
+    /// `vshot region` uses.
+    Pick,
 }
 
 /// Which window `record window` records.
@@ -164,6 +199,80 @@ pub(crate) fn default_portal() -> bool {
     crate::config::load().record.portal.unwrap_or(false)
 }
 
+/// The remembered replay window: the config's `replay.window` when it is a
+/// usable value, else the replay default.  A value outside 1-3600 is the
+/// built-in default rather than an error, for the same reason as the encoder
+/// below.
+pub(crate) fn default_replay_window() -> u64 {
+    match crate::config::load().replay.window {
+        Some(seconds) if (1..=3600).contains(&seconds) => seconds,
+        _ => replay::DEFAULT_WINDOW,
+    }
+}
+
+/// The remembered replay frame rate: the config's `replay.fps` when it is in
+/// range, else the replay default (30).
+pub(crate) fn default_replay_fps() -> u32 {
+    match crate::config::load().replay.fps {
+        Some(fps) if (1..=240).contains(&fps) => fps,
+        _ => replay::DEFAULT_FPS,
+    }
+}
+
+/// The remembered replay codec: the config's `replay.encoder`, else h264.
+pub(crate) fn default_replay_encoder() -> VideoCodec {
+    let Some(remembered) = crate::config::load().replay.encoder else {
+        return VideoCodec::H264;
+    };
+    VideoCodec::parse(remembered.trim()).unwrap_or(VideoCodec::H264)
+}
+
+/// The remembered hardware backend: `--encoder-backend` overrides it, and the
+/// config's `record.encoder-backend` decides what "no flag" means.  `auto`
+/// unless it says otherwise, so a machine with an NVIDIA card records on it
+/// without anyone having to name the backend.
+pub(crate) fn default_encoder_backend() -> EncoderBackend {
+    let Some(remembered) = crate::config::load().record.encoder_backend else {
+        return EncoderBackend::Auto;
+    };
+    EncoderBackend::parse(remembered.trim()).unwrap_or(EncoderBackend::Auto)
+}
+
+/// The remembered replay backend: the config's `replay.encoder-backend`, else
+/// `auto`, the same shape as the recording side.
+pub(crate) fn default_replay_encoder_backend() -> EncoderBackend {
+    let Some(remembered) = crate::config::load().replay.encoder_backend else {
+        return EncoderBackend::Auto;
+    };
+    EncoderBackend::parse(remembered.trim()).unwrap_or(EncoderBackend::Auto)
+}
+
+/// The remembered replay microphone: the config's `replay.mic`, the same
+/// shape as `record.mic` (an empty string is the default source).
+pub(crate) fn default_replay_mic() -> Option<MicChoice> {
+    let remembered = crate::config::load().replay.mic?;
+    if remembered.is_empty() {
+        Some(MicChoice::Default)
+    } else {
+        Some(MicChoice::Device(remembered))
+    }
+}
+
+/// The remembered replay portal switch: the config's `replay.portal`, off
+/// unless it says otherwise.
+pub(crate) fn default_replay_portal() -> bool {
+    crate::config::load().replay.portal.unwrap_or(false)
+}
+
+/// The remembered key-frame distance: the config's `replay.gop` when it is in
+/// range, else the replay default (1 second).
+pub(crate) fn default_replay_gop() -> u64 {
+    match crate::config::load().replay.gop {
+        Some(seconds) if (1..=10).contains(&seconds) => seconds,
+        _ => replay::DEFAULT_GOP,
+    }
+}
+
 /// Lists the session's audio capture sources, for `vshot record mics` and
 /// the settings window.  This is the "automatic detection" side of the
 /// microphone option: the entries are what the session actually has.
@@ -205,12 +314,21 @@ pub struct RecordRequest {
     /// The video codec to encode with; h264 unless `--encoder` says
     /// otherwise.
     pub encoder: VideoCodec,
+    /// Which hardware encoder runs the session (`--encoder-backend`): VAAPI,
+    /// NVENC, or `auto` to pick whichever the machine has.  VAAPI unless the
+    /// config or the flag says otherwise.
+    pub encoder_backend: EncoderBackend,
     /// Take the frames from the XDG desktop portal instead of the
     /// compositor's own protocols (`--portal`).
     pub portal: bool,
     /// Record the microphone into the same MP4 (`--mic`), and which input.
     /// `None` is a silent recording — the sound is an opt-in.
     pub mic: Option<MicChoice>,
+    /// Record the recorded *window's own* audio (`--app-audio`) instead of the
+    /// microphone: the sound of the application the window belongs to, found
+    /// by the window's process id.  Only a window recording has a window to
+    /// attach it to.
+    pub app_audio: bool,
 }
 
 impl RecordRequest {
@@ -220,10 +338,12 @@ impl RecordRequest {
     }
 }
 
-/// Where the pid file lives: `VSHOT_RECORD_PIDFILE` overrides, else
-/// `$XDG_RUNTIME_DIR/vshot-record-<uid>.pid`, else `/tmp`.
-fn pid_file() -> std::path::PathBuf {
-    if let Some(override_path) = std::env::var_os("VSHOT_RECORD_PIDFILE") {
+/// Where a pid file lives: `VSHOT_<NAME>_PIDFILE` overrides, else
+/// `$XDG_RUNTIME_DIR/vshot-<name>-<uid>.pid`, else `/tmp`.  A recording and a
+/// replay each have their own, so stopping one never signals the other.
+pub(crate) fn pid_file_named(name: &str) -> std::path::PathBuf {
+    if let Some(override_path) = std::env::var_os(format!("VSHOT_{}_PIDFILE", name.to_uppercase()))
+    {
         let path = std::path::PathBuf::from(override_path);
         if !path.as_os_str().is_empty() {
             return path;
@@ -234,9 +354,15 @@ fn pid_file() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     runtime.join(format!(
-        "vshot-record-{}.pid",
+        "vshot-{}-{}.pid",
+        name,
         rustix::process::getuid().as_raw()
     ))
+}
+
+/// Where the recording's pid file lives.
+fn pid_file() -> std::path::PathBuf {
+    pid_file_named("record")
 }
 
 /// Whether a recording is already running, from the pid file's point of
@@ -289,9 +415,17 @@ pub fn stop() -> Result<()> {
 
 /// The frame source, in both of its shapes.  Sampling happens per frame so
 /// the loop and the encoder stay the only timing authorities.
-enum Source {
+pub(crate) enum Source {
     /// One output, captured alone: `record monitor`.
     Monitor { name: String },
+    /// One rectangle of one output, captured alone: `record region`.  The
+    /// rectangle is in output-local logical coordinates, which is the space
+    /// `capture_output_region` speaks.
+    Region {
+        name: String,
+        local: Rect,
+        scale: u32,
+    },
     /// Every output composed, at the scene's scale: `record all`.
     Scene { infos: Vec<OutputInfo> },
 }
@@ -299,7 +433,7 @@ enum Source {
 /// What one grab of the loop produced: either a software frame (the
 /// compatibility path, or `record all`'s composition) or a dma-buf the
 /// compositor just rendered into (the zero-copy fast path).
-enum Grabbed {
+pub(crate) enum Grabbed {
     Software(Frame),
     Dmabuf(DmabufFrame),
 }
@@ -313,7 +447,7 @@ impl Source {
     /// one (a scene composition, a compositor without linux-dmabuf) answers
     /// with a software frame instead — the fallback is per-frame, so a
     /// recording survives a compositor that changes its mind.
-    fn grab(
+    pub(crate) fn grab(
         &self,
         capture: &mut Capturer,
         cursor: bool,
@@ -329,10 +463,31 @@ impl Source {
                 }
                 capture.capture_output(name, cursor).map(Grabbed::Software)
             }
+            Source::Region { name, local, scale } => {
+                if zero_copy {
+                    if let Some(dmabuf) = capture.capture_region_dmabuf(name, *local, cursor)? {
+                        return Ok(Grabbed::Dmabuf(dmabuf));
+                    }
+                }
+                capture
+                    .capture_region(name, *local, *scale, cursor)
+                    .map(Grabbed::Software)
+            }
             Source::Scene { infos } => {
                 let scene = compose(capture, infos, cursor, scratch)?;
                 Ok(Grabbed::Software(scene.frame().clone()))
             }
+        }
+    }
+
+    /// What the loop's zero-copy probe should ask the compositor for, or
+    /// `None` when this source cannot use the dma-buf path at all (a scene
+    /// composition is built on the CPU by definition).
+    pub(crate) fn dmabuf_probe(&self) -> Option<(&str, Option<Rect>)> {
+        match self {
+            Source::Monitor { name } => Some((name, None)),
+            Source::Region { name, local, .. } => Some((name, Some(*local))),
+            Source::Scene { .. } => None,
         }
     }
 }
@@ -341,8 +496,16 @@ impl Source {
 /// reallocated 60 times a second.  `SceneSnapshot` has no incremental
 /// interface, so the scene is rebuilt per frame; this keeps only the
 /// bookkeeping the rebuild needs.
-struct SceneScratch {
+pub(crate) struct SceneScratch {
     outputs: Vec<crate::model::OutputSnapshot>,
+}
+
+impl SceneScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            outputs: Vec::new(),
+        }
+    }
 }
 
 /// Composes one scene: every output captured, laid out at its logical
@@ -395,137 +558,43 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     let topology = wayland.output_infos()?;
     let mut capture = Capturer::connect()?;
 
+    let (source, geometry) =
+        resolve_source(&request.target, &mut capture, &topology, request.cursor)?;
+    let path = prepare_output_path(request)?;
+
     // The microphone, when one was asked for: opened before the encoder,
     // because the audio encoder's rate and channel count come from the
-    // negotiation and the MP4's audio stream is declared in its header.
+    // negotiation and the MP4's audio stream is declared in its header.  It
+    // comes after the pick and the region check on purpose — a request that
+    // never reaches the encoder must not have opened anything, and a
+    // cancelled pick must leave nothing behind.
     let mic = open_microphone(request)?;
-
-    let (source, geometry) = match &request.target {
-        RecordTarget::Monitor(name) if name == "current" => {
-            let info = current_output(&topology)?;
-            monitor_source(info)?
-        }
-        RecordTarget::Monitor(name) => {
-            let info = topology
-                .iter()
-                .find(|info| &info.name == name)
-                .ok_or_else(|| {
-                    VshotError::IncompleteTopology(format!("unknown output `{name}`"))
-                })?;
-            monitor_source(info)?
-        }
-        RecordTarget::All => {
-            let width = topology
-                .iter()
-                .map(|info| info.geometry.right())
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .max()
-                .unwrap_or(0)
-                - topology
-                    .iter()
-                    .map(|info| info.geometry.left())
-                    .min()
-                    .unwrap_or(0);
-            let height = topology
-                .iter()
-                .map(|info| info.geometry.bottom())
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .max()
-                .unwrap_or(0)
-                - topology
-                    .iter()
-                    .map(|info| info.geometry.top())
-                    .min()
-                    .unwrap_or(0);
-            let scale = topology
-                .iter()
-                .map(|info| info.scale)
-                .max()
-                .unwrap_or(1)
-                .max(1);
-            let (width, height) = (
-                u32::try_from(width).map_err(|_| {
-                    VshotError::Recording("the desktop layout is too wide to record".into())
-                })?,
-                u32::try_from(height).map_err(|_| {
-                    VshotError::Recording("the desktop layout is too tall to record".into())
-                })?,
-            );
-            let encoded_width = width.saturating_mul(scale);
-            let encoded_height = height.saturating_mul(scale);
-            let cloned = topology.clone();
-            (
-                Source::Scene { infos: cloned },
-                (encoded_width, encoded_height),
-            )
-        }
-        // Handled at the top of `run`: a window recording has its own frame
-        // source and its own loop.
-        RecordTarget::Window(_) => unreachable!("window recordings run their own loop"),
-    };
-
-    // --- the output path --------------------------------------------------
-    let path = prepare_output_path(request)?;
 
     // --- the encoder and muxer --------------------------------------------
     let (encoded_width, encoded_height) = geometry;
+    // Which hardware encoder this session runs.  `auto` resolves once, here,
+    // so the probe, the pool and the open all agree on the backend.
+    let backend = request.encoder_backend.resolve();
 
-    // The zero-copy pool: only `record monitor` can use it (a composed
+    // The zero-copy pool: only a single-output source can use it (a composed
     // scene is built on the CPU by definition), and only when the session
-    // offers linux-dmabuf buffers of a shape the encoder accepts.  The
-    // probe is one extra capture, before the encoder opens.
-    let mut dmabuf_fourcc: Option<u32> = None;
-    if let Source::Monitor { name } = &source {
-        match capture.probe_dmabuf_offer(name) {
-            Ok(Some((fourcc, width, height, y_invert))) => {
-                if y_invert {
-                    if debug_enabled() {
-                        eprintln!(
-                            "vshot: zero-copy unavailable (compositor renders y-inverted); \
-                             using the software path"
-                        );
-                    }
-                } else if width != encoded_width || height != encoded_height {
-                    if debug_enabled() {
-                        eprintln!(
-                            "vshot: zero-copy offer is {width}x{height}, encoder is \
-                             {encoded_width}x{encoded_height}; using the software path"
-                        );
-                    }
-                } else if fourcc != crate::capture::dmabuf::DRM_FORMAT_ARGB8888
-                    && fourcc != crate::capture::dmabuf::DRM_FORMAT_XRGB8888
-                {
-                    if debug_enabled() {
-                        eprintln!(
-                            "vshot: zero-copy offer is fourcc 0x{fourcc:08x}, which the encoder \
-                             cannot import; using the software path"
-                        );
-                    }
-                } else {
-                    capture.build_dmabuf_pool(width, height, fourcc)?;
-                    dmabuf_fourcc = Some(fourcc);
-                    if debug_enabled() {
-                        eprintln!(
-                            "vshot: zero-copy capture enabled ({width}x{height}, fourcc \
-                             0x{fourcc:08x})"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                if debug_enabled() {
-                    eprintln!("vshot: no linux-dmabuf offer; using the software path");
-                }
-            }
-            Err(error) => {
-                if debug_enabled() {
-                    eprintln!("vshot: dma-buf probe failed ({error}); using the software path");
-                }
-            }
+    // offers linux-dmabuf buffers of a shape the encoder accepts.  A region
+    // probes its own rectangle, so the offer that comes back is the region's
+    // pixel size — the shape the pool is built for.  The probe is one extra
+    // capture, before the encoder opens.  NVENC has no dma-buf import at all
+    // (ffmpeg's CUDA hwcontext maps CUDA memory only), so it records the
+    // software path and the probe is skipped outright.
+    let dmabuf_fourcc = if backend == EncoderBackend::Nvenc {
+        if debug_enabled() {
+            eprintln!(
+                "vshot: the NVENC backend records the software path (no dma-buf import); \
+                 reading frames back through system memory"
+            );
         }
-    }
+        None
+    } else {
+        probe_zero_copy(&mut capture, &source, encoded_width, encoded_height)
+    };
     let recorder = match (dmabuf_fourcc, &mic) {
         (Some(fourcc), Some(mic)) => Recorder::start_dmabuf_mic(
             &path,
@@ -534,6 +603,7 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             request.encoder,
             fourcc,
             mic.format(),
+            backend,
         )?,
         (Some(fourcc), None) => Recorder::start_dmabuf(
             &path,
@@ -541,6 +611,7 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             encoded_height,
             request.encoder,
             fourcc,
+            backend,
         )?,
         (None, Some(mic)) => Recorder::start_mic(
             &path,
@@ -548,15 +619,23 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
             encoded_height,
             request.encoder,
             mic.format(),
+            backend,
         )?,
-        (None, None) => Recorder::start(&path, encoded_width, encoded_height, request.encoder)?,
+        (None, None) => Recorder::start(
+            &path,
+            encoded_width,
+            encoded_height,
+            request.encoder,
+            backend,
+        )?,
     };
     if debug_enabled() {
         eprintln!(
-            "vshot: recording {encoded_width}x{encoded_height} at {} fps with {} through \
+            "vshot: recording {encoded_width}x{encoded_height} at {} fps with {} ({}) through \
              libavcodec {} and libavformat's MP4 muxer",
             request.fps,
             request.encoder.word(),
+            backend.word(),
             avcodec::libavcodec_version()
         );
         if recorder.audio_channels() > 0 {
@@ -633,7 +712,15 @@ fn prepare_output_path(request: &RecordRequest) -> Result<std::path::PathBuf> {
 /// same [`Recorder`], whose audio side is armed by the loop once the video
 /// side is ready.
 pub(crate) fn open_microphone(request: &RecordRequest) -> Result<Option<pipewire_audio::Mic>> {
-    let Some(choice) = &request.mic else {
+    open_microphone_for(request.mic.as_ref())
+}
+
+/// The microphone side of [`open_microphone`], shared with the replay loop: a
+/// replay takes the same [`MicChoice`], so the opening is written once.
+pub(crate) fn open_microphone_for(
+    choice: Option<&MicChoice>,
+) -> Result<Option<pipewire_audio::Mic>> {
+    let Some(choice) = choice else {
         return Ok(None);
     };
     let target = match choice {
@@ -651,6 +738,55 @@ pub(crate) fn open_microphone(request: &RecordRequest) -> Result<Option<pipewire
     Ok(Some(mic))
 }
 
+/// Opens the captured window's own audio: the sound of the application the
+/// window belongs to.
+///
+/// The window is named the same way the capture names it (its foreign-toplevel
+/// `app_id` and `title`); the pid comes from the compositor's own IPC
+/// ([`crate::capture::window_pid`]), and the PipeWire node is the playback
+/// stream that pid opened ([`pipewire_audio::app_playback_node`]).  A window
+/// whose application is silent right now has no node, which is not an error —
+/// the recording goes on without a soundtrack, and the caller is told on
+/// stderr.
+///
+/// This is the whole of `--app-audio`.  It only has a window to attach to; a
+/// monitor, region or `all` recording has no single application, and the CLI
+/// refuses the combination before reaching here.
+pub(crate) fn open_app_audio(
+    name: &crate::capture::window_copy::Name,
+) -> Result<Option<pipewire_audio::Mic>> {
+    let pid = match crate::capture::window_pid::pid_for(name)? {
+        Some(pid) => pid,
+        None => {
+            eprintln!(
+                "vshot: this compositor cannot report the pid of the window `{}`, so its audio \
+                 cannot be picked out; recording without application audio",
+                crate::capture::window_pid::describe(name)
+            );
+            return Ok(None);
+        }
+    };
+    let node = match pipewire_audio::app_playback_node(pid)? {
+        Some(node) => node,
+        None => {
+            eprintln!(
+                "vshot: the window's application (pid {pid}) is not playing anything right now; \
+                 recording without application audio"
+            );
+            return Ok(None);
+        }
+    };
+    let mic = pipewire_audio::Mic::open(Some(&node))?;
+    if debug_enabled() {
+        let format = mic.format();
+        eprintln!(
+            "vshot: application audio (pid {pid}, node {node}) {} Hz, {} channel(s)",
+            format.rate, format.channels
+        );
+    }
+    Ok(Some(mic))
+}
+
 /// Drains the microphone into the recorder: every sample that arrived since
 /// the last call is queued and encoded, so the soundtrack follows the video's
 /// own frames rather than a timer of its own.
@@ -659,7 +795,7 @@ pub(crate) fn open_microphone(request: &RecordRequest) -> Result<Option<pipewire
 /// allocate per frame.
 pub(crate) fn pump_microphone(
     mic: &pipewire_audio::Mic,
-    recorder: &mut Recorder,
+    recorder: &mut impl crate::record::avcodec::AudioSink,
     samples: &mut Vec<f32>,
 ) -> Result<()> {
     let channels = mic.format().channels.max(1) as usize;
@@ -768,6 +904,240 @@ fn monitor_source(info: &OutputInfo) -> Result<(Source, (u32, u32))> {
         },
         (info.pixel_size.width, info.pixel_size.height),
     ))
+}
+
+/// Resolves what a `record`/`replay` request names into the frame source and
+/// the shape it encodes to.  Shared by both loops: a replay records exactly
+/// what a recording would, so the target resolution is the same.
+///
+/// A region frames its rectangle now, on a frozen picture of the desktop,
+/// before anything else has happened — a cancelled pick leaves nothing behind.
+/// `--geometry` skips the picker and the rectangle is used as given.
+pub(crate) fn resolve_source(
+    target: &RecordTarget,
+    capture: &mut Capturer,
+    topology: &[OutputInfo],
+    cursor: bool,
+) -> Result<(Source, (u32, u32))> {
+    let picked_region = match target {
+        RecordTarget::Region(RegionTarget::Fixed(region)) => Some(*region),
+        RecordTarget::Region(RegionTarget::Pick) => Some(pick_region(capture, topology, cursor)?),
+        _ => None,
+    };
+
+    match target {
+        RecordTarget::Monitor(name) if name == "current" => {
+            let info = current_output(topology)?;
+            monitor_source(info)
+        }
+        RecordTarget::Monitor(name) => {
+            let info = topology
+                .iter()
+                .find(|info| &info.name == name)
+                .ok_or_else(|| {
+                    VshotError::IncompleteTopology(format!("unknown output `{name}`"))
+                })?;
+            monitor_source(info)
+        }
+        RecordTarget::All => {
+            let width = topology
+                .iter()
+                .map(|info| info.geometry.right())
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+                - topology
+                    .iter()
+                    .map(|info| info.geometry.left())
+                    .min()
+                    .unwrap_or(0);
+            let height = topology
+                .iter()
+                .map(|info| info.geometry.bottom())
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+                - topology
+                    .iter()
+                    .map(|info| info.geometry.top())
+                    .min()
+                    .unwrap_or(0);
+            let scale = topology
+                .iter()
+                .map(|info| info.scale)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let (width, height) = (
+                u32::try_from(width).map_err(|_| {
+                    VshotError::Recording("the desktop layout is too wide to record".into())
+                })?,
+                u32::try_from(height).map_err(|_| {
+                    VshotError::Recording("the desktop layout is too tall to record".into())
+                })?,
+            );
+            let encoded_width = width.saturating_mul(scale);
+            let encoded_height = height.saturating_mul(scale);
+            Ok((
+                Source::Scene {
+                    infos: topology.to_vec(),
+                },
+                (encoded_width, encoded_height),
+            ))
+        }
+        RecordTarget::Region(_) => {
+            let region = picked_region.expect("the picker ran before this match");
+            region_source(topology, region)
+        }
+        // A window has its own frame source and its own loop; the caller
+        // handles it before this point.
+        RecordTarget::Window(_) => Err(VshotError::Recording(
+            "a window replay runs its own loop".into(),
+        )),
+    }
+}
+
+/// Probes the compositor's dma-buf offer for a source and, when it is one the
+/// encoder can import at the shape asked for, builds the zero-copy pool and
+/// returns the fourcc.  `None` means the software path: the offer was absent,
+/// y-inverted, the wrong shape, or an unsupported format — every case a
+/// recording falls back on rather than failing.
+///
+/// Shared by the recording and replay loops so both enable zero copy on the
+/// same terms.
+pub(crate) fn probe_zero_copy(
+    capture: &mut Capturer,
+    source: &Source,
+    encoded_width: u32,
+    encoded_height: u32,
+) -> Option<u32> {
+    let (name, region) = source.dmabuf_probe()?;
+    match capture.probe_dmabuf_offer_region(name, region) {
+        Ok(Some((fourcc, width, height, y_invert))) => {
+            if y_invert {
+                if debug_enabled() {
+                    eprintln!(
+                        "vshot: zero-copy unavailable (compositor renders y-inverted); using \
+                         the software path"
+                    );
+                }
+            } else if width != encoded_width || height != encoded_height {
+                if debug_enabled() {
+                    eprintln!(
+                        "vshot: zero-copy offer is {width}x{height}, encoder is \
+                         {encoded_width}x{encoded_height}; using the software path"
+                    );
+                }
+            } else if fourcc != crate::capture::dmabuf::DRM_FORMAT_ARGB8888
+                && fourcc != crate::capture::dmabuf::DRM_FORMAT_XRGB8888
+            {
+                if debug_enabled() {
+                    eprintln!(
+                        "vshot: zero-copy offer is fourcc 0x{fourcc:08x}, which the encoder \
+                         cannot import; using the software path"
+                    );
+                }
+            } else if let Err(error) = capture.build_dmabuf_pool(width, height, fourcc) {
+                if debug_enabled() {
+                    eprintln!(
+                        "vshot: building the zero-copy pool failed ({error}); using the \
+                               software path"
+                    );
+                }
+            } else {
+                if debug_enabled() {
+                    eprintln!(
+                        "vshot: zero-copy capture enabled ({width}x{height}, fourcc 0x{fourcc:08x})"
+                    );
+                }
+                return Some(fourcc);
+            }
+        }
+        Ok(None) => {
+            if debug_enabled() {
+                eprintln!("vshot: no linux-dmabuf offer; using the software path");
+            }
+        }
+        Err(error) => {
+            if debug_enabled() {
+                eprintln!("vshot: dma-buf probe failed ({error}); using the software path");
+            }
+        }
+    }
+    None
+}
+
+/// The output a region recording will read from, and the frame shape it
+/// produces.
+///
+/// The rectangle is in desktop logical coordinates and has to sit inside a
+/// single output — no compositor call copies a region that spans two — so the
+/// output is found first and the rectangle is moved into that output's own
+/// logical space, which is what the capture speaks.  The frame is the
+/// rectangle's own pixels, so the encoded shape is its logical size scaled by
+/// that output's scale.
+fn region_source(topology: &[OutputInfo], region: Rect) -> Result<(Source, (u32, u32))> {
+    if region.is_empty() {
+        return Err(VshotError::Recording(
+            "the region to record has no area".into(),
+        ));
+    }
+    let output = topology
+        .iter()
+        .find(|output| region.intersection(output.geometry) == Some(region))
+        .ok_or_else(|| {
+            VshotError::Recording(
+                "the region has to sit inside a single output; no compositor call copies a \
+                 region that spans two. Pick a smaller rectangle, or record the whole screen \
+                 with `vshot record monitor`"
+                    .into(),
+            )
+        })?;
+    let local = Rect::new(
+        region.origin.x - output.geometry.origin.x,
+        region.origin.y - output.geometry.origin.y,
+        region.size.width,
+        region.size.height,
+    );
+    let scale = output.scale.max(1);
+    let width = region.size.width.saturating_mul(scale);
+    let height = region.size.height.saturating_mul(scale);
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(VshotError::Recording(format!(
+            "the region encodes to {width}x{height}, beyond the encoder's {MAX_DIMENSION}-pixel \
+             limit; pick a smaller rectangle"
+        )));
+    }
+    Ok((
+        Source::Region {
+            name: output.name.clone(),
+            local,
+            scale,
+        },
+        (width, height),
+    ))
+}
+
+/// Frames the rectangle to record on the frozen desktop, through the same Qt
+/// overlay `vshot region` uses.  A cancelled pick comes back as an error, so
+/// the caller never reaches the encoder.
+///
+/// The picker draws over a picture of the desktop, which is why the scene is
+/// composed here rather than taken from the loop: the loop has not started
+/// yet, and what gets recorded is the rectangle the user framed, not the
+/// pixels under it.
+fn pick_region(capture: &mut Capturer, topology: &[OutputInfo], cursor: bool) -> Result<Rect> {
+    let scene = crate::record::window::picker_scene(capture, topology, cursor)?;
+    let region = crate::qt_overlay::select_region(&scene)?;
+    let region = crate::selection::validate_selection(&scene, region)?;
+    // The picker's surfaces leave asynchronously; a frame grabbed too early
+    // would carry them into the video.  The overlay is gone by the time the
+    // helper returns, but the compositor may still be compositing its last
+    // frame — the same settle the screenshot side uses after its pickers.
+    std::thread::sleep(PICK_SETTLE);
+    Ok(region)
 }
 
 /// Whether the loop traces each stage to stderr (`VSHOT_RECORD_DEBUG=1`).
@@ -924,7 +1294,7 @@ fn record_loop(
 
 /// `nanosleep` in slices, so a signal's flag is noticed within a few
 /// milliseconds even for a long interval.
-fn sleep_interruptible(duration: Duration, interrupted: &AtomicBool) {
+pub(crate) fn sleep_interruptible(duration: Duration, interrupted: &AtomicBool) {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         if interrupted.load(Ordering::Relaxed) {
@@ -936,12 +1306,18 @@ fn sleep_interruptible(duration: Duration, interrupted: &AtomicBool) {
 }
 
 fn write_pid_file() -> Result<()> {
-    let path = pid_file();
+    write_pid_file_named("record")
+}
+
+/// Writes a pid file for the process, so a later `stop` can signal it.  The
+/// name picks which file: a recording and a replay each own one.
+pub(crate) fn write_pid_file_named(name: &str) -> Result<()> {
+    let path = pid_file_named(name);
     std::fs::write(&path, std::process::id().to_string()).map_err(|source| {
         VshotError::Recording(format!(
-            "could not write the pid file {}: {source}; set VSHOT_RECORD_PIDFILE to a writable \
-             path",
-            path.display()
+            "could not write the pid file {}: {source}; set VSHOT_{}_PIDFILE to a writable path",
+            path.display(),
+            name.to_uppercase()
         ))
     })
 }
@@ -950,7 +1326,9 @@ fn write_pid_file() -> Result<()> {
 /// directory.  A missing `.mp4` suffix is added — `record` writes MP4, and a
 /// suffix mismatch is a worse mistake than an added suffix.  The caller
 /// prepares the directory; nothing is created here.
-fn resolve_output_path(requested: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+pub(crate) fn resolve_output_path(
+    requested: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf> {
     let raw = match requested {
         Some(path) => {
             let text = path.to_string_lossy().to_string();
@@ -984,7 +1362,7 @@ fn resolve_output_path(requested: Option<&std::path::Path>) -> Result<std::path:
 
 /// The videos directory: `$XDG_VIDEOS_DIR`, else the one the user-dirs file
 /// names, else `$HOME/Videos`.
-fn videos_directory() -> Option<std::path::PathBuf> {
+pub(crate) fn videos_directory() -> Option<std::path::PathBuf> {
     if let Some(directory) = std::env::var_os("XDG_VIDEOS_DIR") {
         let path = std::path::PathBuf::from(directory);
         if !path.as_os_str().is_empty() {
@@ -1098,8 +1476,10 @@ mod tests {
             cursor: false,
             duration: None,
             encoder: VideoCodec::H264,
+            encoder_backend: EncoderBackend::Auto,
             portal: false,
             mic: None,
+            app_audio: false,
         };
         assert_eq!(request.frame_interval(), Duration::from_nanos(16_666_666));
         request.fps = 30;
@@ -1174,6 +1554,43 @@ mod tests {
         };
         assert!(match_active(&active, &topology).is_none());
         assert!(match_active(&ActiveOutput::default(), &topology).is_none());
+    }
+
+    #[test]
+    fn a_region_resolves_to_its_output_and_its_own_pixels() {
+        let mut topology = [
+            output(1, "DP-3", Rect::new(0, 0, 1920, 1080)),
+            output(2, "DP-2", Rect::new(1920, 0, 3840, 2160)),
+        ];
+        // The rectangle is moved into its output's own logical space, and the
+        // frame shape is the region's pixels, scaled by that output's scale.
+        topology[1].scale = 2;
+        topology[1].pixel_size = crate::geometry::Size::new(7680, 4320);
+        let (source, (width, height)) =
+            region_source(&topology, Rect::new(2020, 100, 400, 300)).unwrap();
+        match source {
+            Source::Region { name, local, scale } => {
+                assert_eq!(name, "DP-2");
+                assert_eq!(local, Rect::new(100, 100, 400, 300));
+                assert_eq!(scale, 2);
+            }
+            _ => panic!("expected a region source"),
+        }
+        assert_eq!((width, height), (800, 600));
+
+        // A rectangle that hangs off its output is refused rather than
+        // silently clipped: no compositor call copies a region across two
+        // outputs, and a clipped recording would not be what was drawn.
+        let error = match region_source(&topology, Rect::new(1900, 100, 200, 200)) {
+            Err(error) => error,
+            Ok(_) => panic!("a region across two outputs must be refused"),
+        };
+        assert!(error.to_string().contains("single output"), "{error}");
+        let error = match region_source(&topology, Rect::new(0, 0, 0, 0)) {
+            Err(error) => error,
+            Ok(_) => panic!("an empty region must be refused"),
+        };
+        assert!(error.to_string().contains("no area"), "{error}");
     }
 
     /// One output of a laid-out desktop, for the matching tests above.

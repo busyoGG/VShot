@@ -1,10 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 VShot contributors
+
 pub mod active_output;
 pub mod dmabuf;
+pub mod hypr_cursor;
 pub mod kwin;
 pub mod niri;
 pub mod window;
 pub mod window_blend;
 pub mod window_copy;
+pub mod window_pid;
 pub mod window_pixel;
 pub mod wlr;
 
@@ -86,13 +91,43 @@ impl Capturer {
         }
     }
 
+    /// Captures one rectangle of an output straight into a dma-buf — the
+    /// zero-copy path of `record region`.  `Ok(None)` means this backend
+    /// cannot do it and the caller takes the software path, exactly like
+    /// [`Capturer::capture_output_dmabuf`].
+    pub fn capture_region_dmabuf(
+        &mut self,
+        name: &str,
+        region: Rect,
+        cursor: bool,
+    ) -> Result<Option<crate::capture::dmabuf::DmabufFrame>> {
+        match self {
+            Self::Wlr(capture) => match capture.capture_region_dmabuf(name, region, cursor) {
+                Ok(frame) => Ok(Some(frame)),
+                Err(VshotError::MissingCapability(_)) | Err(VshotError::UnsupportedOutput(_)) => {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+            Self::Kwin(_) => Ok(None),
+        }
+    }
+
     /// Asks the compositor what dma-buf it would offer for an output, by
     /// running one plain shm capture and reading the offer off it.  The
     /// recorder uses the answer to build its buffer pool before the loop
     /// starts.
-    pub fn probe_dmabuf_offer(&mut self, name: &str) -> Result<Option<(u32, u32, u32, bool)>> {
+    ///
+    /// `region` narrows the question to one rectangle of the output: the
+    /// offer a region capture carries is the region's own pixel size, which
+    /// is what a pool for it must be built for.
+    pub fn probe_dmabuf_offer_region(
+        &mut self,
+        name: &str,
+        region: Option<Rect>,
+    ) -> Result<Option<(u32, u32, u32, bool)>> {
         match self {
-            Self::Wlr(capture) => match capture.probe_dmabuf_offer(name) {
+            Self::Wlr(capture) => match capture.probe_dmabuf_offer_region(name, region) {
                 Ok(offer) => Ok(Some(offer)),
                 Err(VshotError::MissingCapability(_)) | Err(VshotError::UnsupportedOutput(_)) => {
                     Ok(None)

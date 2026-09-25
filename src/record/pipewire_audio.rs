@@ -51,6 +51,14 @@ mod binding {
             err: *mut c_char,
             err_len: c_int,
         ) -> c_int;
+        pub(super) fn vshot_pwa_find_app_node(
+            pid: *const c_char,
+            out: *mut c_char,
+            out_len: c_int,
+            timeout_ms: c_int,
+            err: *mut c_char,
+            err_len: c_int,
+        ) -> c_int;
         pub(super) fn vshot_pwa_open(
             target: *const c_char,
             timeout_ms: c_int,
@@ -97,6 +105,18 @@ read; install libpipewire and rebuild\n\0";
 
     #[allow(unused_variables)]
     pub(super) unsafe fn vshot_pwa_list_sources(
+        out: *mut c_char,
+        out_len: c_int,
+        timeout_ms: c_int,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> c_int {
+        -1
+    }
+
+    #[allow(unused_variables)]
+    pub(super) unsafe fn vshot_pwa_find_app_node(
+        pid: *const c_char,
         out: *mut c_char,
         out_len: c_int,
         timeout_ms: c_int,
@@ -221,6 +241,42 @@ fn take(pointer: *const c_char) -> String {
     unsafe { CStr::from_ptr(pointer) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// The PipeWire node serial one application is playing into, found by its
+/// process id (`application.process.id`).  `None` means the application has no
+/// playback stream right now — a window that is silent, or one whose audio is
+/// on another process — which is a state, not an error.  `Err` is a session
+/// that could not be read.
+pub fn app_playback_node(pid: i32) -> Result<Option<String>> {
+    if !available() {
+        return Err(VshotError::Recording(format!(
+            "recording an application's audio needs libpipewire: {}",
+            load_error()
+        )));
+    }
+    let pid = std::ffi::CString::new(pid.to_string())
+        .map_err(|_| VshotError::Recording("the pid contains a NUL byte".into()))?;
+    let mut buffer = [0 as c_char; 64];
+    let mut error = [0 as c_char; 512];
+    let status = unsafe {
+        binding::vshot_pwa_find_app_node(
+            pid.as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as c_int,
+            super::pipewire::milliseconds(OPEN_TIMEOUT),
+            error.as_mut_ptr(),
+            error.len() as c_int,
+        )
+    };
+    match status {
+        1 => Ok(Some(take(buffer.as_ptr()))),
+        0 => Ok(None),
+        _ => Err(VshotError::Recording(format!(
+            "could not look up the application's audio node: {}",
+            take(error.as_ptr())
+        ))),
+    }
 }
 
 /// The microphone's negotiated shape: the rate and channel count the audio

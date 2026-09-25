@@ -79,8 +79,9 @@ impl WindowCommand {
     }
 
     /// Every client Hyprland knows, so picking can offer the windows the user
-    /// sees rather than only the focused one.
-    fn hyprland_clients() -> Self {
+    /// sees rather than only the focused one.  `window_pid` reads it too, for
+    /// the `pid` each client carries.
+    pub(crate) fn hyprland_clients() -> Self {
         Self {
             program: OsString::from("hyprctl"),
             args: vec![OsString::from("clients"), OsString::from("-j")],

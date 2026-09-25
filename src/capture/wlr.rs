@@ -440,6 +440,31 @@ impl WlrCapture {
     /// buffer's shape does not match the pool, or the frame needs a
     /// y-flip the zero-copy chain cannot apply.
     pub fn capture_output_dmabuf(&mut self, name: &str, cursor: bool) -> Result<DmabufFrame> {
+        self.capture_dmabuf(name, None, cursor)
+    }
+
+    /// The zero-copy variant of `capture_region`: the compositor renders just
+    /// that rectangle into a dma-buf, which is what makes a small region both
+    /// cheap to copy and free of a CPU round trip.
+    pub fn capture_region_dmabuf(
+        &mut self,
+        name: &str,
+        region: Rect,
+        cursor: bool,
+    ) -> Result<DmabufFrame> {
+        self.capture_dmabuf(name, Some(region), cursor)
+    }
+
+    /// One dma-buf capture, of the whole output or of one rectangle inside it.
+    /// The pool is built for the capture's own shape, so a region capture
+    /// must have been probed with `probe_dmabuf_offer_region` first — the
+    /// offer's size is what the pool was built for.
+    fn capture_dmabuf(
+        &mut self,
+        name: &str,
+        region: Option<Rect>,
+        cursor: bool,
+    ) -> Result<DmabufFrame> {
         if self.state.pending.is_some() {
             return Err(VshotError::WaylandProtocol(
                 "a capture is already in progress".into(),
@@ -475,7 +500,13 @@ impl WlrCapture {
             })?;
         let qh = self.event_queue.handle();
         let overlay_cursor = if cursor { 1 } else { 0 };
-        let frame = manager.capture_output(overlay_cursor, &output, &qh, ());
+        let frame = match region {
+            Some(region) => {
+                let (x, y, width, height) = region_arguments(region)?;
+                manager.capture_output_region(overlay_cursor, &output, x, y, width, height, &qh, ())
+            }
+            None => manager.capture_output(overlay_cursor, &output, &qh, ()),
+        };
         self.state.pending = Some(PendingCapture {
             _frame: frame,
             buffer: None,
@@ -595,7 +626,16 @@ impl WlrCapture {
     /// linux-dmabuf offer whether or not a client wants the buffer, so the
     /// offer can be sampled without disturbing the compatibility capture.
     /// The fourcc comes back as the DRM fourcc the pool must use.
-    pub fn probe_dmabuf_offer(&mut self, name: &str) -> Result<(u32, u32, u32, bool)> {
+    ///
+    /// `region` narrows the question to one rectangle of the output.  A
+    /// region capture's offer is the region's own pixel size — that is what a
+    /// pool for it must be built for, and what `record region` probes before
+    /// its loop starts.
+    pub fn probe_dmabuf_offer_region(
+        &mut self,
+        name: &str,
+        region: Option<Rect>,
+    ) -> Result<(u32, u32, u32, bool)> {
         if self.state.manager_version < 3 {
             return Err(VshotError::MissingCapability(
                 "screencopy version 3 (linux-dmabuf buffers)".into(),
@@ -605,7 +645,7 @@ impl WlrCapture {
             return Err(VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()));
         }
         self.state.probe_offer = None;
-        let _frame = self.capture_output(name, false)?;
+        let _frame = self.capture(name, region, false)?;
         let y_invert = self.state.probe_y_invert;
         self.state
             .probe_offer
