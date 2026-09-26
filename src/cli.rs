@@ -16,67 +16,49 @@ use crate::model::PngCompression;
     name = "vshot",
     version,
     about = "Strict-freeze Wayland screenshots for wlroots and KWin/Plasma",
-    after_help = r#"vshot freezes the desktop once and captures from that still frame, so nothing on screen
-moves while a selection is being made.
+    after_help = r#"vshot freezes the desktop once and captures from that still frame, so nothing
+on screen moves while a selection is made.
 
 Capture targets
-  region              a rectangle dragged out in the frozen scene, or a fixed --geometry
-  monitor [NAME]      one output by name, or the output under the pointer with `current`
-  all                 every output, composed at its logical position
-  window active       the focused window: compositor metadata, or pixels with --pixel
-  window pick         the window you click, on a live desktop with the others dimmed
-  long                a scrolling region: vshot scrolls it, grabs frames while it moves and
-                      stitches them into one tall image
+  region, monitor, all, long   a screenshot of the frozen desktop
+  window active, window pick   the focused window, or one you click
   record monitor|all|region|window
-                      record to an MP4 on the GPU: a screen, the desktop, a rectangle of one
-                      screen, or one window's own pixels (see below)
-  record mics|stop    the audio inputs a recording could take, and the signal that ends one
+                               an MP4 on the GPU, one screen or one window
+  record mics|stop             the audio inputs a recording could take
   replay start|save|status|stop
-                      keep the last stretch of the screen in memory and copy it to an MP4 on
-                      demand (a stream copy, no re-encode)
+                               the last stretch of the screen kept in memory
 
 Destination (every capture above goes to exactly one)
-  -o, --output PATH   a PNG at PATH, with strftime expanded (shots/%Y%m%d-%H%M%S.png); the
-                      file's URI is copied to the clipboard afterwards. `-` writes the PNG
-                      to stdout and copies nothing.
+  -o, --output PATH   PNG at PATH, strftime-expanded
+                      (shots/%Y%m%d-%H%M%S.png); its file URI is copied to the
+                      clipboard afterwards, and `-` writes the PNG to stdout
   --clipboard         the PNG, copied to the clipboard
   --pin               the image pinned on screen, by the resident pin daemon
 
 Shared modifiers
   -c, --cursor        draw the compositor cursor into the capture
-  --png-compression   none | fastest | fast (default) | balanced | high, all lossless
+  --png-compression   none|fastest|fast (default)|balanced|high, lossless
 
-Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) are captured through
-wlr-screencopy; KWin/Plasma through its own org.kde.KWin.ScreenShot2, which KWin grants only
-to a client whose installed desktop file declares
-`X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` -- the package installs one for
-/usr/bin/vshot, so a build run straight out of target/ cannot capture under Plasma. The
-focused window's own pixels come from KWin's and niri's screenshot calls where those exist;
-the rectangle routes below them read Hyprland, Sway or KWin metadata. niri reports no position
-for a tiled window over IPC, so `window active` and `window pick` there go through niri's own
-screenshot (and, for picking, niri's own crosshair); `--pixel` asks for the pixel path instead.
+Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) through
+wlr-screencopy; KWin/Plasma through org.kde.KWin.ScreenShot2, granted only to a
+client whose installed desktop file declares
+`X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` -- the package
+installs one for /usr/bin/vshot, so a build run out of target/ cannot capture
+under Plasma. niri reports no position for a tiled window over IPC, so `window
+active` and `window pick` there use niri's own screenshot and crosshair.
 
-`vshot pin` captures nothing: it drives the resident pin daemon. It pins image files, or with
---clipboard whatever the clipboard holds -- a color, pinned as a card carrying the same color in
-hex, RGB, HSL, HSV and CMYK; an image; or text rendered as a card that keeps its HTML, markdown
-or code formatting. A pinned image is dragged to move, zoomed about its
-centre with the wheel, closed with a double-click; the pin under the pointer carries the
-black outline, and Space with the pointer on a pin opens the same annotator as
-`vshot region`. A pin covers every output it overlaps, so it can be dragged from one
-monitor onto another.
+`vshot pin` captures nothing: it drives the resident pin daemon, which pins
+image files or whatever --clipboard holds, and exits once nothing is pinned.
 
-On-screen selection, picking and the pin editor run as a Qt helper, `vshot-qt-ui`;
-VSHOT_QT_HELPER points at another copy of it. Other environment variables: VSHOT_LANG (UI
-language), VSHOT_PIXEL_DEBUG=1 (what window detection saw), VSHOT_SESSION_DEBUG=1 (which
-compositor the session was read as, and on what evidence), VSHOT_LONG_DEBUG_DIR=<dir> (every
-scrolling frame and stitching decision), VSHOT_PIN_FOCUS_DEBUG=1 (every time a pin surface is
-handed the keyboard or gives it back), VSHOT_PIN_SOCKET, VSHOT_PIN_DENSITY=N.
+Environment: VSHOT_QT_HELPER (which vshot-qt-ui), VSHOT_LANG (UI language),
+VSHOT_PIXEL_DEBUG=1, VSHOT_SESSION_DEBUG=1, VSHOT_LONG_DEBUG_DIR=<dir>,
+VSHOT_PIN_DEBUG=1, VSHOT_PIN_FOCUS_DEBUG=1, VSHOT_PIN_SOCKET,
+VSHOT_PIN_DENSITY=N.
 
-$XDG_CONFIG_HOME/vshot/config.json (or ~/.config/vshot/config.json) is optional and remembers
-things between runs: the `editor` section is the annotation editor's own style, written back
-when a session ends, and the `cli` section supplies defaults for flags not given here -- a
-command-line flag always wins over it. An unreadable or malformed file falls back to the
-built-in defaults.
+$XDG_CONFIG_HOME/vshot/config.json (or ~/.config/vshot/config.json) is
+optional: `editor` is the annotation editor's style, `cli` supplies defaults for
+flags not given here -- a command-line flag always wins. A malformed file falls
+back to the built-in defaults.
 
 Each subcommand keeps its own notes: `vshot <command> --help`."#,
     group = ArgGroup::new("destination")
@@ -88,11 +70,9 @@ pub struct Cli {
     /// Include the compositor cursor in each native screencopy capture.
     #[arg(short = 'c', long = "cursor", global = true)]
     pub cursor: bool,
-    /// Write the result to PATH, expanding strftime formats such as
-    /// `%Y%m%d`. For a capture this is PNG bytes, and the file URI is copied
-    /// to the Wayland clipboard afterwards; `-` writes the PNG to stdout.
-    /// For `record` it is the video file: `-` is refused there, no URI is
-    /// copied, and an `.mp4` suffix is added when PATH has none.
+    /// Write the result to PATH, strftime-expanded (`-` writes to stdout): PNG
+    /// bytes, with the file's URI copied to the clipboard. For `record` it is the
+    /// video file: `-` is refused and `.mp4` is added when PATH has none.
     #[arg(
         short = 'o',
         long = "output",
@@ -100,8 +80,7 @@ pub struct Cli {
         conflicts_with_all = ["clipboard", "pin"]
     )]
     pub output: Option<PathBuf>,
-    /// Copy the result to the Wayland clipboard: PNG bytes for a capture, the
-    /// recognized text for `vshot ocr`.
+    /// Copy the result to the clipboard: PNG bytes, or `vshot ocr`'s text.
     #[arg(long, global = true, conflicts_with = "output")]
     pub clipboard: bool,
     /// Pin the captured image on screen instead of writing it anywhere.
@@ -112,13 +91,8 @@ pub struct Cli {
     )]
     pub pin: bool,
     /// PNG compression level for images written to a file, stdout or the
-    /// clipboard: `none`, `fastest`, `fast` (the default), `balanced` or
-    /// `high`. Every level is lossless; the slower ones buy a smaller file.
-    /// `fast` and `fastest` use fdeflate and encode a 4K frame in tens of
-    /// milliseconds, while `balanced` (the DEFLATE level most PNG writers
-    /// default to) and `high` can take a second or more. Pinning an image
-    /// onto the screen writes nothing to disk, so this does not apply to
-    /// `--pin`.
+    /// clipboard: `none`, `fastest`, `fast` (the default), `balanced` or `high`,
+    /// all lossless. `--pin` writes nothing to disk.
     #[arg(long = "png-compression", global = true, value_name = "LEVEL")]
     pub png_compression: Option<String>,
 }
@@ -127,36 +101,31 @@ pub struct Cli {
 pub enum Command {
     /// Select a region from the frozen desktop, optionally using fixed geometry.
     #[command(
-        after_help = "Without --geometry the frozen scene is handed to the Qt overlay: drag a \
-rectangle, adjust it with the eight handles or the arrow keys (hold Shift for 10px steps) \
-while a magnifier and a size readout follow the pointer, then confirm with Enter, a \
-double-click inside the selection or the toolbar's OK. Esc or a right-click cancels the \
-whole capture, except that Esc inside a text box only closes that box. The toolbar \
-annotates the frame with Rect, Ellipse, Arrow, Draw, Text and Mosaic: Ctrl+Z / Ctrl+Y undo \
-and redo, Delete removes the selected annotation, and Ctrl+V pastes an image from the \
-clipboard while the toolbar's Image button picks one from disk. A pasted image lands centred \
-on the selection, shrunk to fit when it is larger, and comes up selected so its handles \
-resize it. The final PNG is re-rendered from the \
+        after_help = r#"Drag a rectangle on the frozen scene, adjust it with the eight handles or
+the arrow keys (hold Shift for 10px steps) while a magnifier and a size readout
+follow the pointer, then confirm with Enter, a double-click inside the selection
+or the toolbar's OK. Esc or a right-click cancels; Esc inside a text box closes
+only that box. The toolbar annotates with Rect, Ellipse, Arrow, Draw, Text and
+Mosaic: Ctrl+Z / Ctrl+Y undo and redo, Delete removes the selected annotation,
+Ctrl+V pastes a clipboard image. The final PNG is re-rendered from the
 annotations, so it matches the preview.
 
-VSHOT_QT_HELPER overrides which vshot-qt-ui is run, VSHOT_LANG its language (a value \
-starting with `zh` selects Chinese, any other non-empty value English; the default follows \
-the system locale)."
+VSHOT_QT_HELPER overrides which vshot-qt-ui is run, VSHOT_LANG its language."#
     )]
     Region {
         /// Fixed global geometry in `x,y widthxheight` form.
         #[arg(long, conflicts_with = "interactive", allow_hyphen_values = true)]
         geometry: Option<String>,
-        /// Explicitly request pointer-driven selection. This is the default when geometry is omitted.
+        /// Explicitly request pointer-driven selection; the default when geometry is omitted.
         #[arg(long, conflicts_with = "geometry")]
         interactive: bool,
     },
     /// Capture one monitor by name, or the monitor under the pointer with `current`.
     #[command(
-        after_help = "The output is named from the frozen overlay's topology, so every capture \
-needs an output that answers `zxdg_output_manager_v1`. `current` reads the pointer and therefore \
-needs a seat with a pointer capability, which a nested or virtual KWin does not offer; naming the \
-output works there."
+        after_help = r#"The output is named from the frozen overlay's topology, so every capture needs
+an output that answers `zxdg_output_manager_v1`. `current` reads the pointer, so
+it needs a seat with a pointer capability -- a nested or virtual KWin has none;
+name the output there."#
     )]
     Monitor {
         /// Output name, or `current` for the output under the pointer.
@@ -164,18 +133,17 @@ output works there."
     },
     /// Capture the complete frozen desktop scene.
     #[command(
-        after_help = "Every output is placed at its logical position, so a multi-monitor desktop \
-is composed as it is laid out and the gaps between outputs stay transparent."
+        after_help = r#"Every output is placed at its logical position, so a multi-monitor desktop is
+composed as it is laid out and the gaps between outputs stay transparent."#
     )]
     All,
     /// Capture the focused window, or pick one interactively.
     #[command(
-        after_help = "`active` resolves the focused window from compositor metadata where vshot \
-can query it (Hyprland, Sway, KWin/Plasma) and falls back to detecting it from the captured \
-pixels; `pick` highlights the windows of the live desktop (everything else is dimmed) and \
-captures the one you click. Picking re-captures the frame after the click and then hands it \
-to the same editor as `vshot region`, so a picked window is annotated on the frame that was \
-captured after the pick, not on the one the picking started from."
+        after_help = r#"`active` resolves the focused window from compositor metadata where vshot can
+query it (Hyprland, Sway, KWin/Plasma) and falls back to the captured pixels;
+`pick` highlights the windows of the live desktop (the rest dimmed) and captures
+the one you click. Picking re-captures the frame after the click, so the
+annotations go on the frame captured after the pick."#
     )]
     Window {
         #[command(subcommand)]
@@ -184,18 +152,15 @@ captured after the pick, not on the one the picking started from."
     /// Capture a region that scrolls: scroll it automatically, grab it frame
     /// by frame, and stitch the frames into one tall image.
     #[command(
-        after_help = "The region is picked interactively unless --geometry is given, then vshot \
-scrolls it with synthetic wheel events and grabs frames while it moves, stitching them into \
-one tall image. A hint bar is shown on screen for the duration: Enter, Space or a left click \
-on it finishes and keeps the stitched image, Esc or a right-click cancels. The selection has \
-to sit inside a single monitor. The wheel is sent every 120 ms and frames are grabbed as fast \
-as the compositor will hand them over, so the page is still moving while it is captured and \
-each frame overlaps the last. A capture ends when six wheels in a row move nothing (the page \
-has reached its end), or at --max-height, --max-frames or --timeout; a target that ignores the \
-wheel therefore ends the capture a moment after it starts.
+        after_help = r#"The region is picked interactively unless --geometry is given, then vshot
+scrolls it with synthetic wheel events and stitches the frames it grabs into one
+tall image. A hint bar shows for the duration: Enter, Space or a left click on it
+finishes and keeps the image, Esc or a right-click cancels. The selection must
+sit inside a single monitor. A capture ends when six wheels in a row move
+nothing, or at --max-height, --max-frames or --timeout.
 
-VSHOT_LONG_DEBUG_DIR=<dir> writes every grabbed frame as grab-NNNN.png and appends each \
-stitching decision to steps.log."
+VSHOT_LONG_DEBUG_DIR=<dir> writes every grabbed frame as grab-NNNN.png and
+appends each stitching decision to steps.log."#
     )]
     Long {
         /// Fixed global geometry in `x,y widthxheight` form; without it the
@@ -215,8 +180,7 @@ stitching decision to steps.log."
         #[arg(long)]
         timeout: Option<u64>,
         /// Rows at the top of every frame left out of the match, for sticky
-        /// headers and fixed toolbars.  Rows that never move are recognized on
-        /// their own; this is for the ones that do not sit still.
+        /// headers and fixed toolbars.
         #[arg(long = "ignore-top")]
         ignore_top: Option<u32>,
         /// Which wheel backend to use: `auto` (try them in order), `wlr` (the
@@ -229,30 +193,24 @@ stitching decision to steps.log."
     /// Manage pinned images shown by the resident pin daemon; see --help for
     /// what can be pinned and how the pins behave.
     #[command(
-        after_help = "Pins are owned by a resident daemon: the first `pin` starts it, and it \
-exits by itself once nothing is pinned any more. On screen, a pin is dragged to move it, the \
-wheel zooms about the image centre (0.1x-8x, the factor showing in the image's corner), a \
-double-click closes that pin, and the pin under the pointer carries the black outline -- that \
-is the one Space opens in the same editor as `vshot region`. Clicking a pin is what gives its \
-output the keyboard; the outline follows the pointer rather than the keyboard, because the \
-compositors in use never tell a layer surface that it has stopped being focused. A pin covers \
-every output it overlaps, so it can be \
-dragged from one monitor onto another. Right-clicking a pin opens its menu: a pinned color \
-card offers its formats to copy, and every pin offers `Save as…`, which writes the image out \
-as a PNG.
+        after_help = r#"Pins are owned by a resident daemon: the first `pin` starts it, and it exits by
+itself once nothing is pinned any more. A pin is dragged to move it, the wheel
+zooms about the image centre (0.1x-8x, the factor shown in its corner), a
+double-click closes it, and the pin under the pointer carries the black outline
+-- the one Space opens in the same editor as `vshot region`. Right-clicking a pin
+opens its menu: a pinned color card offers its formats to copy, and every pin
+offers `Save as…`, which writes the image out as a PNG.
 
-Visibility control goes to the running daemon over its socket, \
-so --toggle/--show/--hide take effect at once and do not start a second daemon. Wayland \
-clients cannot receive global keys, so there is no built-in hotkey: bind one in your \
-compositor, e.g. Hyprland:
+Visibility control goes to the running daemon over its socket, so
+--toggle/--show/--hide take effect at once and start no second daemon. Wayland
+clients cannot receive global keys, so bind a hotkey in your compositor, e.g.
+Hyprland:
     bind = SUPER, P, exec, vshot pin --toggle
     bind = SUPER SHIFT, P, exec, vshot pin --close-all
 
-VSHOT_PIN_SOCKET overrides the socket the daemon listens on, VSHOT_PIN_DENSITY=N the source \
-density of every pinned image, exactly like --density. VSHOT_PIN_DEBUG=1 and \
-VSHOT_PIN_FOCUS_DEBUG=1 make the daemon trace its density decisions and its surfaces' focus to \
-stderr; a debug switch also keeps the daemon's stderr attached to the terminal that started it, \
-so the trace is readable while the daemon lives on without it."
+VSHOT_PIN_SOCKET overrides the daemon's socket, VSHOT_PIN_DENSITY=N the source
+density of every pinned image, like --density. VSHOT_PIN_DEBUG=1 and
+VSHOT_PIN_FOCUS_DEBUG=1 trace density decisions and surface focus to stderr."#
     )]
     Pin {
         /// Image files to pin (starts the daemon when it is not running).
@@ -276,16 +234,14 @@ so the trace is readable while the daemon lives on without it."
         #[arg(long)]
         list: bool,
         /// Device pixels per logical pixel of the pinned image (1-4), e.g. 2
-        /// for a screenshot taken on a 2x output. vshot works this out by
-        /// itself from the capture, the image's own PNG density (a 96 DPI
-        /// declaration is 1x), the screenshot tool's record, or the image
-        /// size; this overrides all of that when the answer is wrong or
-        /// unknown.
+        /// for a screenshot taken on a 2x output. vshot infers it from the
+        /// capture, the image's own PNG density (96 DPI means 1x), the
+        /// screenshot tool's record or the image size; this overrides that
+        /// when the answer is wrong or unknown.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
         density: Option<u32>,
-        /// Internal: run one annotation editor for a pin-edit session JSON
-        /// written by the daemon, then render the result back onto the pin.
-        /// Not for interactive use.
+        /// Internal: render one pin-edit session JSON written by the daemon
+        /// and write the result back onto the pin. Not for interactive use.
         #[arg(long = "apply", hide = true, conflicts_with_all = ["toggle", "show", "hide", "close_all", "quit", "list", "density"])]
         apply: Option<PathBuf>,
     },
@@ -293,81 +249,55 @@ so the trace is readable while the daemon lives on without it."
     /// Edit the remembered settings in a window: the annotation editor's style
     /// and the command-line defaults, both from the shared config file.
     #[command(
-        after_help = "Opens a window over the same `$XDG_CONFIG_HOME/vshot/config.json` the \
-annotation editor and the CLI already read. Saving writes the file, so the next `vshot region` \
-opens with the chosen style and the next run falls back to the chosen defaults for flags that \
-are not given. Nothing is captured and no compositor protocol is needed beyond showing a window, \
-so this also works under a compositor vshot cannot otherwise capture."
+        after_help = r#"Opens a window over the same `$XDG_CONFIG_HOME/vshot/config.json` the annotation
+editor and the CLI read. Saving writes the file, so the next run uses the chosen
+style and the chosen defaults for flags that are not given. Nothing is captured,
+and no compositor protocol beyond showing a window is needed."#
     )]
     Settings,
 
     /// Record the screen to an MP4, on the GPU.
     #[command(
-        after_help = "Frames are taken through the same capture backends the screenshots use \
-(wlr-screencopy on wlroots sessions, KWin's ScreenShot2 on Plasma) and encoded on the GPU's \
-media engine. The encoder runs on libavcodec (ffmpeg's libraries, the same route wf-recorder \
-takes), loaded at run time: a machine without ffmpeg still takes screenshots, and `record` alone \
-reports what is missing. `monitor [NAME]` records one output, `current` — what a bare \
-`record monitor` means — asking the compositor which output you are on: the one under the \
-pointer where it reports that, the focused output \
-otherwise; a recording has nothing of its own on screen for the pointer to enter, so the seat \
-itself cannot answer), `all` records every output composed at its logical position, and \
-`region` records one rectangle of one output — dragged out on the frozen desktop, or fixed \
-with --geometry — which on a wlroots session the compositor renders straight into a dma-buf \
-like `monitor` does.\n\n\
---encoder picks the video codec: h264 (default), hevc or av1. All three run on the GPU's media \
-engine through the same libavcodec route; whether the hardware offers one is checked when the \
-recording opens, and the message names the encoder when it does not. HEVC is also the answer \
-for a composed desktop wider than 4096 pixels, which this class of GPU cannot encode as H.264.\n\n\
-A recording runs until it is stopped: `vshot record stop` sends the signal, or Ctrl+C in the \
-terminal that started it. Either way the file is finished properly (a seekable MP4 with its \
-sample table written) before the process exits. --duration SECONDS ends it by itself. \
---fps N sets the frame rate the loop aims for (1-240, default 60); each frame carries the wall \
-time it was on screen, so playback follows the real pace rather than a nominal rate. \
-`vshot record stop` needs no display and works from a keybinding:\n    \
-bind = SUPER, R, exec, vshot record monitor current\n    \
-bind = SUPER SHIFT, R, exec, vshot record stop\n\n\
-The output path comes from the global -o/--output: VIDEO_PATH is strftime-expanded, and the \
-default is vshot-%Y%m%d-%H%M%S.mp4 in the videos directory — $XDG_VIDEOS_DIR, else the one \
-xdg-user-dirs names, else ~/Videos — which is created when it is missing; an `.mp4` suffix is \
-added when the name has none. `-` (stdout) is refused — a video is not something a terminal \
-carries.\n\n\
-On a wlroots session whose compositor speaks linux-dmabuf, the frames go to the encoder \
-without a copy through the CPU; elsewhere (and for `record all`) the software path is used. \
-Either way the file looks the same.\n\n\
---portal records through the desktop portal (org.freedesktop.portal.ScreenCast) instead of the \
-compositor's own capture protocols, which is the route that works on a desktop whose protocols \
-vshot does not speak. The portal is not a silent fallback: the compositor shows its own picker, \
-and whatever is chosen there is what gets recorded — `record monitor --portal` asks it to offer \
-screens, `record window --portal` to offer windows, but a name or --pick does not decide the \
-source itself. A screen cast produces a frame when the screen changes and none while it does \
-not, so --fps is the rate asked of the compositor rather than the rate the file has, and a \
-still screen becomes one long frame. `record all --portal` is refused: the portal hands over one \
-stream, and it is the portal that chooses which screen that is. This needs libpipewire (and \
-xdg-desktop-portal); VSHOT_PORTAL_SHM=1 asks for memory frames instead of dma-bufs, the fallback \
-for a compositor whose buffers the encoder cannot import.\n\n\
---mic records the microphone into the same MP4: a bare `--mic` takes the session's default \
-source, a name (or a node serial) records another input, and the soundtrack is AAC, encoded by \
-ffmpeg's own encoder. The microphone is opened before the video encoder so its rate and channel \
-count can be declared in the MP4's header, and the samples are drained once per video frame, so \
-the two tracks share one clock. `--no-mic` refuses the microphone even when the config's \
-`cli.record.mic` remembers one; neither flag means \"whatever the config says\", and a session \
-with no default input answers with a sentence naming `wpctl status` instead of an opaque \
-PipeWire error. `record mics` lists the inputs a session actually has, which is also what the \
-settings window offers in its microphone row.\n\n\
-The config file's `cli.record` section supplies the defaults the flags fall back to: `encoder`, \
-`encoder-backend`, `fps`, `portal`, `mic`, `follow` and `notify`. A flag always wins over the \
-file — `--no-portal` is how a remembered `portal: true` is turned off for one recording, and \
-`--no-follow` is how a remembered `follow` list is — and a value the file gets wrong (an unknown \
-encoder name, a rate outside 1-240) falls back to the built-in default rather than failing the \
-recording. A remembered `follow` list is read only for a bare `record window` (no NAME, no \
-`--pick`), so it cannot turn a `record monitor` into the error `--follow` would be there.\n\n\
-A recording that never started leaves nothing behind, and a process killed outright leaves a \
-file without its sample table (players report it as such rather than showing a wrong video).\n\n\
-VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1 traces each \
-frame's stage and the libavcodec version in use, and VSHOT_RECORD_NO_OVERLAY=1 forces the \
-letterbox's fallback composition instead of the GPU overlay (a test hook for drivers that \
-cannot blend)."
+        after_help = r#"Encoded on the GPU's media engine through libavcodec, loaded at run time: a
+machine without ffmpeg still takes screenshots, and `record` alone reports what
+is missing.
+
+Targets: `monitor [NAME]` one output (a bare `record monitor` means `current`,
+the output you are on), `all` every output composed, `region` one rectangle of
+one output (--geometry, or dragged out on the frozen desktop), `window [NAME]`
+one window's own pixels, not the area it covers. HEVC is also the answer for a
+composed desktop wider than 4096 pixels, which this class of GPU cannot encode as
+H.264.
+
+A recording runs until it is stopped: `vshot record stop` sends the signal, or
+Ctrl+C in the terminal that started it; either way the file is finished properly
+(a seekable MP4 with its sample table written). `record stop` needs no display,
+so it binds well:
+    bind = SUPER SHIFT, R, exec, vshot record stop
+
+The output path comes from the global -o/--output: strftime-expanded, defaulting
+to vshot-%Y%m%d-%H%M%S.mp4 in the videos directory ($XDG_VIDEOS_DIR, else the one
+xdg-user-dirs names, else ~/Videos), created when missing. Frames reach the
+encoder without a CPU copy where the session speaks linux-dmabuf; the software
+path is used otherwise and for `record all`.
+
+--portal is not a silent fallback: the compositor's own picker chooses the
+source, so a name or --pick does not decide it, and `record all --portal` is
+refused because the portal hands over one stream. A screen cast only emits a
+frame when the screen changes, so --fps there is a cap rather than the file's
+rate. Needs libpipewire and xdg-desktop-portal; VSHOT_PORTAL_SHM=1 asks for
+memory frames instead of dma-bufs.
+
+A recording that never started leaves nothing behind; a process killed outright
+leaves a file without its sample table.
+
+Config keys: `cli.record` supplies `encoder`, `encoder-backend`, `fps`, `portal`,
+`mic`, `follow` and `notify`; a flag always wins, and a remembered `follow` list
+is read only for a bare `record window` (no NAME, no --pick).
+
+VSHOT_RECORD_PIDFILE overrides the pid file `stop` reads, VSHOT_RECORD_DEBUG=1
+traces each frame's stage, VSHOT_RECORD_NO_OVERLAY=1 forces the letterbox's
+fallback composition instead of the GPU overlay."#
     )]
     Record {
         #[command(subcommand)]
@@ -379,128 +309,103 @@ cannot blend)."
         /// Stop on its own after this many seconds.
         #[arg(long, global = true)]
         duration: Option<u64>,
-        /// Record the microphone into the MP4 beside the video. Without a
-        /// name the session's default source is used; give a node name to
-        /// record another input, and `record mics` lists the ones this
-        /// session has. The config's `cli.record.mic` is what a recording
-        /// with neither `--mic` nor `--no-mic` falls back to.
+        /// Record the microphone into the MP4 beside the video: a bare `--mic`
+        /// takes the session's default source, a name another input (AAC), and
+        /// `record mics` lists them. Without either flag `cli.record.mic`
+        /// decides.
         #[arg(long, global = true, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
         mic: Option<String>,
-        /// Do not record the microphone, even when the config remembers it.
+        /// Do not record the microphone, even when `cli.record.mic` remembers
+        /// one.
         #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
         no_mic: bool,
-        /// Also record the recorded *window's own* audio: the sound the
-        /// application that owns the window is playing. It may be combined
-        /// with `--mic` — both are summed into the video's one audio track —
-        /// or used on its own for the window's sound and nothing else. Only
-        /// `record window` has a window to attach it to. The window's pid
-        /// comes from the compositor (Hyprland and niri report it; KWin does
-        /// not), and the sound from PipeWire.
+        /// Record the window's own audio, summed with `--mic` into the one
+        /// track. `record window` only, and not with --portal. The pid comes
+        /// from the compositor: Hyprland, niri and KWin report it, Sway and
+        /// labwc have none and say so.
         #[arg(long = "app-audio", global = true)]
         app_audio: bool,
-        /// Follow the focus between windows while recording one of them: give
-        /// the windows to follow (`--follow NAME`, repeated) and the recording
-        /// moves to whichever of them the focus lands on, staying where it is
-        /// while the focus is anywhere else. Only `record window` and
-        /// `replay start window` have a window to move between, and `--follow`
-        /// cannot be combined with a window NAME. A bare `record window` with
-        /// no `--follow` at all follows the windows `cli.record.follow`
-        /// remembers.
+        /// Follow the focus between windows: `--follow NAME`, repeated, names
+        /// the windows the recording moves to. `record window` /
+        /// `replay start window` only, never with a window NAME or `--pick`;
+        /// without it, `cli.record.follow` / `cli.replay.follow`.
         #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
         follow: Vec<String>,
-        /// Do not follow the focus, even when the config's
-        /// `cli.record.follow` remembers windows to follow: this window, the
-        /// focused one, is the one recorded from beginning to end.
+        /// Do not follow the focus, even when `cli.record.follow` /
+        /// `cli.replay.follow` remembers windows.
         #[arg(long = "no-follow", global = true, conflicts_with = "follow")]
         no_follow: bool,
-        /// Video codec: h264 (default), hevc or av1; the config's
-        /// `cli.record.encoder` when the flag is not given.
+        /// Video codec: h264 (default), hevc or av1, all on the GPU's media
+        /// engine; the config's `cli.record.encoder` when the flag is not
+        /// given.
         #[arg(
             long,
             global = true,
             value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
         )]
         encoder: Option<String>,
-        /// Hardware encoder: auto (default; VAAPI where it opens, else Vulkan,
-        /// else NVENC), vaapi (AMD/Intel), vulkan (either vendor, and the only
-        /// zero-copy route on NVIDIA) or nvenc (NVIDIA). The config's
-        /// `cli.record.encoder-backend` when the flag is not given. All three
-        /// encode on the GPU's own media engine
-        /// (`h264/hevc/av1_vaapi`, `_vulkan` or `_nvenc`); there is no CPU
-        /// encoder here. VAAPI and Vulkan import the compositor's dma-buf, so
-        /// no pixels cross the CPU; NVENC has no dma-buf import, so its frames
-        /// are carried through the CPU — a higher CPU cost, with the encode
-        /// itself still on the GPU.
+        /// Hardware encoder: auto (default; VAAPI, else Vulkan, else NVENC),
+        /// vaapi, vulkan or nvenc; `cli.record.encoder-backend` when the flag is
+        /// not given. All encode on the GPU's media engine.
         #[arg(
             long,
             global = true,
             value_parser = crate::record::avcodec::EncoderBackend::ALL.map(|backend| backend.word())
         )]
         encoder_backend: Option<String>,
-        /// Record through the XDG desktop portal instead of the compositor's
-        /// own protocols, which is also what the config's `cli.record.portal`
-        /// asks for when the flag is not given. The portal shows the
-        /// compositor's own picker.
+        /// Record through the XDG desktop portal
+        /// (org.freedesktop.portal.ScreenCast) instead of the compositor's own
+        /// protocols; `cli.record.portal` when the flag is not given. The
+        /// picker chooses the source, so `record all --portal` is refused.
         #[arg(long, global = true)]
         portal: bool,
-        /// Refuse the portal, even when the config remembers it.
+        /// Refuse the portal, even when `cli.record.portal` remembers it.
         #[arg(long = "no-portal", global = true, conflicts_with = "portal")]
         no_portal: bool,
     },
 
     /// Keep a rolling window of the screen in memory, and save it on demand.
     #[command(
-        after_help = "A replay is a recording that holds its last seconds in memory instead of \
-writing them to a file: the screen is encoded continuously, the packets go into a ring, and \
-`vshot replay save` copies what the ring holds into an MP4 — a stream copy, no re-encode — so \
-the trigger costs almost nothing and nothing is written until it is asked for. The window \
-`--window` seconds wide is what a save can reach back through.\n\n\
-`replay start` runs the session: it encodes until it is stopped, and serves saves meanwhile. \
-`replay save` asks the running session to write a file, `replay status` prints how much history \
-it holds, and `replay stop` ends it. The control channel is a socket under \
-$XDG_RUNTIME_DIR, so `save` and `stop` need no display and work from a compositor keybinding:\n    \
-bind = SUPER, R, exec, vshot replay start --background\n    \
-bind = SUPER SHIFT, R, exec, vshot replay save\n    \
-bind = SUPER ALT, R, exec, vshot replay stop\n\n\
-The target is what `record` records: `monitor [NAME]` (a bare `replay monitor` means the output \
-you are on), `all`, `region` (--geometry, or dragged out on the frozen desktop), or `window` \
-(the focused one, a name, or `--pick`). The frames come from the same capture backends and go to \
-the same GPU encoder through libavcodec, so a session that can record can replay, and the \
-zero-copy dma-buf path is used wherever `record` uses it.\n\n\
-The encoder runs with a bounded key-frame distance (`--gop` seconds, default 1), so the ring is \
-a fraction of an all-intra stream and every GOP boundary is a place a save can start from. A \
-save starts at the newest key frame at or before `now - seconds`, so it holds at least the \
-seconds asked for and decodes from its first byte; asking for more than the window holds gives \
-everything there is.\n\n\
-`--fps` defaults to 30 for a replay (a recording defaults to 60): a replay is left running for \
-long stretches, and 30 fps halves the encoder's work while motion still looks smooth. \
-`--encoder` picks h264 (default), hevc or av1. `--mic` keeps the microphone in the ring beside \
-the video, the same way `record --mic` records it.\n\n\
-`replay save` writes to `--save-dir` (strftime-expanded, default the videos directory with a \
-timestamped name) unless it is given a path: `vshot replay save /tmp/clip.mp4`. `--background` \
-detaches the session from the terminal, so it outlives the shell that started it.\n\n\
-The config file's `cli.replay` section supplies the defaults: `window`, `encoder`, \
-`encoder-backend`, `fps`, `gop`, `mic`, `follow`, `portal`, `save-dir` and `notify`. A flag \
-always wins over the file — `--no-follow` turns a remembered `follow` list off for one session, \
-as `--no-mic` does a remembered microphone. A remembered `follow` list is read only for a bare \
-`replay start window`, the same rule the recording side uses.\n\n\
-VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid file \
-`replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."
+        after_help = r#"A replay holds its last seconds in memory instead of writing them to a file:
+`replay save` copies what the ring holds into an MP4 -- a stream copy, no
+re-encode -- so the trigger costs almost nothing and nothing is written until it
+is asked for. `--window` seconds is how far a save can reach back.
+
+`replay start` runs the session, `replay save` asks it to write a file,
+`replay status` prints how much history it holds, and `replay stop` ends it. The
+control channel is a socket under $XDG_RUNTIME_DIR, so `save` and `stop` need no
+display and work from a keybinding:
+    bind = SUPER SHIFT, R, exec, vshot replay save
+
+The target is what `record` records, from the same capture backends and the same
+GPU encoder. `--fps` defaults to 30 (a recording defaults to 60), because a
+replay is left running for long stretches.
+
+A save starts at the newest key frame at or before `now - seconds`, so it holds
+at least the seconds asked for; asking for more than the window holds gives
+everything there is. `--background` detaches the session from the terminal.
+
+Config keys: `cli.replay` supplies `window`, `encoder`, `encoder-backend`, `fps`,
+`gop`, `mic`, `follow`, `portal`, `save-dir` and `notify`; a flag always wins, and
+a remembered `follow` list is read only for a bare `replay start window`.
+
+VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid
+file `replay stop` reads, and VSHOT_RECORD_DEBUG=1 traces each frame."#
     )]
     Replay {
         #[command(subcommand)]
         action: ReplayCommandLine,
-        /// Seconds of history to keep in memory; the config's `cli.replay.window`
-        /// when the flag is not given, else 30.
+        /// Seconds of history to keep in memory, 1-3600; the config's
+        /// `cli.replay.window` when the flag is not given, else 30.
         #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=3600))]
         window: Option<u64>,
         /// Frame rate the loop aims for, 1-240; the config's `cli.replay.fps`
         /// when the flag is not given, else 30.
         #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=240))]
         fps: Option<u32>,
-        /// Key-frame distance in seconds (1-10); the config's `cli.replay.gop`
-        /// when the flag is not given, else 1. A smaller value makes a save
-        /// start closer to the requested edge, at the cost of a bigger ring.
+        /// Key-frame distance in seconds (1-10); `cli.replay.gop` when the flag
+        /// is not given, else 1. Smaller values start a save closer to the
+        /// requested edge.
         #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..=10))]
         gop: Option<u64>,
         /// Video codec: h264 (default), hevc or av1; the config's
@@ -511,36 +416,30 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
             value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
         )]
         encoder: Option<String>,
-        /// Hardware encoder: auto (default), vaapi, vulkan or nvenc; the
-        /// config's `cli.replay.encoder-backend` when the flag is not given. As
-        /// on the recording side all three encode on the GPU; VAAPI and Vulkan
-        /// import the dma-buf, while NVENC's frames are carried through the CPU
-        /// because it has no dma-buf import.
+        /// Hardware encoder: auto (default), vaapi, vulkan or nvenc;
+        /// `cli.replay.encoder-backend` when the flag is not given. All encode
+        /// on the GPU.
         #[arg(
             long,
             global = true,
             value_parser = crate::record::avcodec::EncoderBackend::ALL.map(|backend| backend.word())
         )]
         encoder_backend: Option<String>,
-        /// Keep the microphone in the ring beside the video. Without a name
-        /// the session's default source is used; `record mics` lists the ones
-        /// this session has. The config's `cli.replay.mic` is the fallback.
+        /// Keep the microphone in the ring beside the video: a bare `--mic`
+        /// takes the session's default source, and `record mics` lists them.
+        /// Without either flag `cli.replay.mic` decides.
         #[arg(long, global = true, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "")]
         mic: Option<String>,
-        /// Do not keep the microphone, even when the config remembers one.
+        /// Do not keep the microphone, even when `cli.replay.mic` remembers one.
         #[arg(long = "no-mic", global = true, conflicts_with = "mic")]
         no_mic: bool,
-        /// Also keep the recorded window's own application's audio in the ring
-        /// (`replay start window` only), as `record --app-audio` does. It may
-        /// be combined with `--mic`: both are summed into the ring's one track.
+        /// Keep the window's own application audio in the ring
+        /// (`replay start window` only), summed with `--mic` into the one track.
         #[arg(long = "app-audio", global = true)]
         app_audio: bool,
-        /// Follow the focus between windows while replaying one of them, as
-        /// `record --follow` does: give the windows to follow (`--follow
-        /// NAME`, repeated) and the ring moves to whichever of them the focus
-        /// lands on. Only `replay start window` can follow, and a bare
-        /// `replay start window` with no `--follow` follows the windows
-        /// `cli.replay.follow` remembers.
+        /// Follow the focus between windows, as `record --follow` does:
+        /// `--follow NAME`, repeated. Only `replay start window`, never with a
+        /// window NAME or `--pick`; without it, `cli.replay.follow`.
         #[arg(long = "follow", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
         follow: Vec<String>,
         /// Do not follow the focus, even when the config's `cli.replay.follow`
@@ -558,30 +457,28 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
 
     /// Read the text out of a region of the screen.
     #[command(
-        after_help = "Without --geometry the frozen scene is handed to the Qt overlay to frame \
-the text, exactly as `vshot region` does but without the annotation editor: pick a rectangle, \
-press Enter, and its text comes back. The text goes to stdout, or to the clipboard with \
---clipboard. --input reads an image file instead of the screen, which is also how the \
-annotation editor's text tool gets its text.\n\n\
-Recognition runs PaddleOCR's PP-OCR models (the ONNX conversions of them) on ONNX Runtime, on \
-the CPU, in this process. The models are installed under /usr/share/vshot/models and are \
-looked for beside the executable as well, so a source checkout works without installing \
-anything.\n\n\
-To use a GPU, point `ocr.engine` at an external program in \
-$XDG_CONFIG_HOME/vshot/config.json: it is handed a PNG and writes the text on stdout, and \
-vshot never links a GPU runtime itself. See the README's OCR section for the shape of that \
-entry."
+        after_help = r#"Without --geometry the frozen scene is handed to the Qt overlay to frame the
+text, as `vshot region` does but without the annotation editor: pick a rectangle,
+press Enter, and its text comes back -- to stdout, or to the clipboard with
+--clipboard. --input reads an image file instead.
+
+Recognition runs PaddleOCR's PP-OCR models (the ONNX conversions) on ONNX
+Runtime, on the CPU, in this process. The models are installed under
+/usr/share/vshot/models and looked for beside the executable as well.
+
+To use a GPU, point `ocr.engine` at an external program in
+$XDG_CONFIG_HOME/vshot/config.json: it is handed a PNG and writes the text on
+stdout. See the README's OCR section."#
     )]
     Ocr {
         /// Fixed global geometry in `x,y widthxheight` form.
         #[arg(long, conflicts_with = "interactive", allow_hyphen_values = true)]
         geometry: Option<String>,
-        /// Explicitly request pointer-driven selection. This is the default when geometry is omitted.
+        /// Explicitly request pointer-driven selection; the default when geometry is omitted.
         #[arg(long, conflicts_with = "geometry")]
         interactive: bool,
-        /// Read an image from this file instead of capturing the screen. This
-        /// is what the annotation editor's text tool uses: it hands over the
-        /// part of the frame that was framed, and gets the text back.
+        /// Read an image from this file instead of capturing the screen; the
+        /// annotation editor's text tool takes the same route.
         #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "interactive"])]
         input: Option<PathBuf>,
     },
@@ -590,67 +487,76 @@ entry."
 #[derive(Debug, Subcommand)]
 pub enum RecordTargetCommand {
     /// Record one output by name, or the one you are on with `current`.
+    #[command(
+        after_help = r#"A bare `record monitor` means `current`: the output the compositor says you are
+on -- the one under the pointer where it reports that, the focused output
+otherwise. Nothing is frozen while recording, so the frames are live, and the
+pointer never enters vshot: `current` is the compositor's answer, not the seat's."#
+    )]
     Monitor {
-        /// Output name, or `current` for the output the compositor says you
-        /// are on. A bare `record monitor` means `current`.
+        /// Output name; `current` (the default) is the output the compositor
+        /// says you are on.
         #[arg(default_value = "current")]
         name: String,
     },
     /// Record the complete desktop: every output composed at its logical position.
+    #[command(
+        after_help = r#"Every output is composed at its logical position, frame by frame, so a
+multi-monitor desktop becomes one video laid out as the desktop is."#
+    )]
     All,
     /// Record one rectangle of the screen — a region, not a whole output.
     #[command(
-        after_help = "The rectangle is in desktop logical coordinates, in the same `x,y widthxheight` \
-form `vshot region --geometry` takes, and it has to sit inside a single output: no one compositor \
-call copies a region that spans two. Without --geometry the frozen scene is handed to the Qt \
-overlay and the rectangle is dragged out there — the same picker `vshot region` shows, on the \
-live desktop — and nothing is opened or written until a rectangle is confirmed, so a cancelled \
-pick leaves nothing behind.\n\n\
-On a wlroots session the compositor renders just that rectangle into a dma-buf, which goes to \
-the encoder without a copy through the CPU, exactly like `record monitor`; the software path \
-takes over when the session has no linux-dmabuf. `record region` follows the region as it \
-changes, so a window dragged inside the rectangle moves with it — but the rectangle itself \
-stays where it was drawn; moving the area being recorded means stopping and starting again.\n\n\
-`--portal` records one stream the compositor's picker chooses, so with it the rectangle is not \
-this command's own: the portal offers whole screens, and the recording is of the screen that \
-was picked there. Use `record region` without --portal to record a rectangle."
+        after_help = r#"The rectangle is in desktop logical coordinates (`x,y widthxheight`), as
+`vshot region --geometry` takes, and it has to sit inside a single output: no
+compositor call copies a region that spans two. Without --geometry the frozen
+scene is handed to the Qt overlay and the rectangle is dragged out there; nothing
+is opened or written until a rectangle is confirmed.
+
+On a wlroots session the compositor renders just that rectangle into a dma-buf,
+which reaches the encoder without a CPU copy, as `record monitor` does. A window
+dragged inside the rectangle is recorded as it changes, but the rectangle itself
+stays where it was drawn.
+
+`--portal` records one stream the picker chooses, and the portal offers whole
+screens, so with it the rectangle is not this command's own."#
     )]
     Region {
         /// Fixed global geometry in `x,y widthxheight` form; without it the
         /// rectangle is dragged out on the frozen desktop.
         #[arg(long, value_name = "GEOMETRY", allow_hyphen_values = true)]
         geometry: Option<String>,
-        /// Explicitly request pointer-driven selection. This is the default
-        /// when geometry is omitted.
+        /// Explicitly request pointer-driven selection; the default when
+        /// geometry is omitted.
         #[arg(long, conflicts_with = "geometry")]
         interactive: bool,
     },
     /// Record one window's own pixels — not the screen area it covers.
     #[command(
-        after_help = "The compositor copies the window itself, so a window that is covered by \
-another one records whole, and one that is dragged half off the screen still records whole. \
-What is behind the window never appears: this is the window, not the area it sits in.\n\n\
-The window is named by app id or title (the whole name first, else a case-insensitive \
-substring of either), picked with `--pick`, or — with no argument — the focused one. The \
-protocol this needs is `ext_image_copy_capture_v1` with the window as its source; a \
-compositor without it — niri, whose capture support stops at outputs — casts the window \
-through its own screen-cast service (`org.gnome.Mutter.ScreenCast`) instead, which needs no \
-flag and shows no picker. `--follow` is not available on that route, because the service \
-casts the window it was started on.\n\n\
-A window that is resized while recording keeps recording: the new size is fitted into the \
-recording's own canvas (scaled down to fit, centred, letterboxed), because one MP4 holds one \
-frame size — the window was on screen the whole time, so the file is its whole history. A \
-window that is closed ends the recording there: the file is finished properly and says why. A \
-window whose output is off, disabled or disconnected never produces a frame at all, which is \
-reported after a few seconds rather than waited on. With --portal the compositor's own picker \
-chooses the window, so nothing here names it; what --portal decides is that the picker offers \
-windows rather than screens."
+        after_help = r#"The compositor copies the window itself, so a covered window records whole, and
+one dragged half off the screen still records whole; what is behind it never
+appears.
+
+The window is named by app id or title (the whole name first, else a
+case-insensitive substring), picked with `--pick`, or the focused one when no
+argument is given. This needs `ext_image_copy_capture_v1`; niri has no such
+protocol and casts the window through its own screen-cast service
+(`org.gnome.Mutter.ScreenCast`) instead, which needs no flag and shows no picker,
+and `--follow` is not available on that route.
+
+A window resized while recording is fitted into the recording's canvas (scaled
+down, centred, letterboxed), because one MP4 holds one frame size. A window that
+is closed ends the recording there, with the file finished properly; a window
+whose output is off or disconnected never produces a frame, which is reported
+after a few seconds."#
     )]
     Window {
         /// App id or title of the window; the focused window when omitted.
         #[arg(value_name = "NAME")]
         name: Option<String>,
-        /// Pick the window to record by clicking it.
+        /// Pick the window to record by clicking it; a window on a hidden
+        /// workspace can still be recorded, because its own pixels are
+        /// captured.
         #[arg(long)]
         pick: bool,
     },
@@ -674,8 +580,8 @@ pub enum ReplayCommandLine {
         /// `--save-dir`) when omitted.
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
-        /// How many seconds to take from the ring; the whole window when
-        /// omitted.
+        /// How many seconds to take from the ring, 1-3600; the whole window
+        /// when omitted.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
         seconds: Option<u64>,
     },
@@ -690,31 +596,53 @@ pub enum ReplayCommandLine {
 #[derive(Debug, Subcommand)]
 pub enum ReplayTargetCommand {
     /// Replay one output by name, or the one you are on with `current`.
+    #[command(
+        after_help = r#"The choice `record monitor` makes: no name means `current`, the output the
+compositor says you are on; give a name for another output. Nothing is frozen
+during a replay either, so the frames are live."#
+    )]
     Monitor {
-        /// Output name, or `current` for the output the compositor says you
-        /// are on. A bare `replay start monitor` means `current`.
+        /// Output name; `current` (the default) is the output the compositor
+        /// says you are on.
         #[arg(default_value = "current")]
         name: String,
     },
     /// Replay the complete desktop: every output composed at its logical position.
+    #[command(after_help = r#"The composition `vshot all` uses, frame by frame."#)]
     All,
     /// Replay one rectangle of the screen — a region, not a whole output.
+    #[command(
+        after_help = r#"The rectangle is in desktop logical coordinates (`x,y widthxheight`) and has
+to sit inside a single output. Without --geometry the frozen desktop goes to
+the Qt overlay to drag it out there, and nothing is opened or written until a
+rectangle is confirmed. On a wlroots session it takes the same zero-copy
+dma-buf route as `record region`."#
+    )]
     Region {
         /// Fixed global geometry in `x,y widthxheight` form; without it the
         /// rectangle is dragged out on the frozen desktop.
         #[arg(long, value_name = "GEOMETRY", allow_hyphen_values = true)]
         geometry: Option<String>,
-        /// Explicitly request pointer-driven selection. This is the default
-        /// when geometry is omitted.
+        /// Explicitly request pointer-driven selection; the default when
+        /// geometry is omitted.
         #[arg(long, conflicts_with = "geometry")]
         interactive: bool,
     },
     /// Replay one window's own pixels — not the screen area it covers.
+    #[command(
+        after_help = r#"The route `record window` takes: the compositor copies the window itself, so a
+covered or half-off-screen window records whole. The window is named by app id
+or title, picked with `--pick`, or -- with no argument -- the focused one. A
+resize is fitted into the replay's canvas (scaled down, centred, letterboxed),
+because a ring holds one frame size."#
+    )]
     Window {
         /// App id or title of the window; the focused window when omitted.
         #[arg(value_name = "NAME")]
         name: Option<String>,
-        /// Pick the window to replay by clicking it.
+        /// Pick the window to replay by clicking it; a window on a hidden
+        /// workspace can still be recorded, because its own pixels are
+        /// captured.
         #[arg(long)]
         pick: bool,
     },
@@ -726,63 +654,54 @@ pub enum WindowTarget {
     /// where it offers one, otherwise compositor metadata, otherwise pixel
     /// detection on the captured frame.
     #[command(
-        after_help = "The window is taken from the compositor itself where it can draw one: KWin's \
-ScreenShot2 and niri's `screenshot-window` both hand over the window's own pixels, so nothing \
-has to be found in the scene. On niri a translucent window comes out with its alpha, so vshot \
-locates that render on a fresh capture of the window's output and crops the screen there: the \
-output is what the screen showed, background included. A match failure first renders the window \
-again and compares: unchanged content means the render cannot be located at all (nearly invisible, \
-off the output's edge, invisible workspace) and falls back to niri's own translucent picture, while \
-changed content (a video, an animation) means the template went stale and the capture is retried with \
-a fresh render (up to three attempts, render and grab only milliseconds apart). `--no-blend` skips \
-that locating altogether and takes niri's render exactly as handed over — never misplaced, but a \
-translucent window comes out transparent and niri's border (drawn on the tile) is missing. Otherwise the rectangle comes from compositor metadata \
-(Hyprland, Sway), and --pixel skips that and reads the border stroke off the captured frame \
-instead, falling back to background segmentation, which is also what happens when no window \
-list is available at all. Borderless tiling with no gaps or shadows has no pixel signal and is \
-reported as such rather than guessed. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."
+        after_help = r#"The window is taken from the compositor itself where it can draw one: KWin's
+ScreenShot2 and niri's `screenshot-window` hand over the window's own pixels. On
+niri a translucent window comes out with its alpha, so vshot locates that render
+on a fresh capture of the window's output and crops the screen there; a match
+failure re-renders and compares, retrying up to three times when the content
+changed (a video, an animation) and falling back to niri's own translucent
+picture when it did not. Otherwise the rectangle comes from compositor metadata
+(Hyprland, Sway), and --pixel reads the border stroke off the captured frame
+instead, falling back to background segmentation; borderless tiling has no pixel
+signal and is reported as such. VSHOT_PIXEL_DEBUG=1 reports what each stage saw."#
     )]
     Active {
         /// Skip compositor metadata and detect the focused window from the
-        /// captured pixels (border bands, then background segmentation).
-        /// For testing the detector and for compositors without metadata.
+        /// captured pixels (border bands, then background segmentation); for
+        /// compositors without metadata and for testing the detector.
         #[arg(long)]
         pixel: bool,
         /// On niri, take its own window render exactly as it hands it over
-        /// instead of compositing it onto the captured background. A
-        /// translucent window then comes out with its alpha and nothing
-        /// behind it, and niri's border is missing (it is drawn on the tile,
-        /// not the window) — the spare route for when locating the render on
-        /// the screen misbehaves.
+        /// instead of compositing it onto the captured background: a
+        /// translucent window comes out with its alpha and nothing behind it,
+        /// and niri's border is missing. The spare route for when locating the
+        /// render on the screen misbehaves.
         #[arg(long = "no-blend", conflicts_with = "pixel")]
         no_blend: bool,
     },
     /// Pick a window on screen: hover to highlight, click to capture it.
     #[command(
-        after_help = "The live desktop is shown with the candidate windows highlighted, one at a \
-time, and everything else dimmed; a left click captures the highlighted window, Esc or a \
-right-click cancels. The frame is grabbed again after the click, so the captured window is \
-the one visible then, not the one from the hover. Candidates come from the compositor's \
+        after_help = r#"The live desktop is shown with the candidate windows highlighted one at a time
+and everything else dimmed; a left click captures the highlighted window, Esc or
+a right-click cancels. The frame is grabbed again after the click, so the
+captured window is the one visible then. Candidates come from the compositor's
 window list unless --pixel is given.
 
-On niri this is niri's own picker instead: its IPC reports no position for a tiled window, so \
-there is no rectangle to offer the overlay. niri draws a crosshair (no highlight) and the \
-clicked window's own screenshot is captured — which also means no annotation editor afterwards; \
---pixel asks for the overlay and the pixel detection back. A translucent window comes out of \
-niri with its alpha, so vshot locates that render on a fresh capture of the window's output and \
-crops the screen there: the output is what the screen showed, background included. A render \
-that cannot be located at all (nearly invisible, off the output's edge, invisible workspace) falls \
-back to niri's own translucent picture — but changed content (a video, an animation) gets the capture \
-retried with a fresh render, up to three attempts, before the same fallback. `--no-blend` skips \
-that locating altogether and takes niri's render exactly as handed over — never misplaced, but a \
-translucent window comes out transparent and niri's border (drawn on the tile) is missing."
+On niri this is niri's own picker: its IPC reports no position for a tiled
+window, so there is no rectangle to offer the overlay, and niri draws a crosshair
+(no highlight). The clicked window's own screenshot is captured, which also means
+no annotation editor afterwards; --pixel asks for the overlay back. A translucent
+window comes out of niri with its alpha, so vshot locates that render on a fresh
+capture of the window's output and crops the screen there, retrying with a fresh
+render when the content changed, up to three times. `--no-blend` skips that
+locating and takes niri's render as handed over."#
     )]
     Pick {
         /// Skip the compositor's window list and take the candidates from the
-        /// captured pixels (border bands, then background segmentation).
-        /// For compositors without a window-list query and for testing the
-        /// detector; borderless tiling with no gaps or shadows has no pixel
-        /// signal and is reported as such.
+        /// captured pixels (border bands, then background segmentation); for
+        /// compositors without a window-list query and for testing the
+        /// detector. Borderless tiling has no pixel signal and is reported as
+        /// such.
         #[arg(long)]
         pixel: bool,
         /// On niri, take its own window render exactly as it hands it over
