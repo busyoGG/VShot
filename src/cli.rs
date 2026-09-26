@@ -421,13 +421,16 @@ cannot blend)."
             value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
         )]
         encoder: Option<String>,
-        /// Hardware encoder: auto (default; VAAPI where it opens, else NVENC),
-        /// vaapi (AMD/Intel) or nvenc (NVIDIA). The config's
-        /// `cli.record.encoder-backend` when the flag is not given. Both encode
-        /// on the GPU's own media engine (`h264/hevc/av1_vaapi` or `_nvenc`);
-        /// there is no CPU encoder here. NVENC has no dma-buf import, so its
-        /// frames are carried through the CPU — a higher CPU cost than VAAPI's
-        /// zero-copy, with the encode itself still on the GPU.
+        /// Hardware encoder: auto (default; VAAPI where it opens, else Vulkan,
+        /// else NVENC), vaapi (AMD/Intel), vulkan (either vendor, and the only
+        /// zero-copy route on NVIDIA) or nvenc (NVIDIA). The config's
+        /// `cli.record.encoder-backend` when the flag is not given. All three
+        /// encode on the GPU's own media engine
+        /// (`h264/hevc/av1_vaapi`, `_vulkan` or `_nvenc`); there is no CPU
+        /// encoder here. VAAPI and Vulkan import the compositor's dma-buf, so
+        /// no pixels cross the CPU; NVENC has no dma-buf import, so its frames
+        /// are carried through the CPU — a higher CPU cost, with the encode
+        /// itself still on the GPU.
         #[arg(
             long,
             global = true,
@@ -508,10 +511,11 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
             value_parser = crate::record::avcodec::VideoCodec::ALL.map(|codec| codec.word())
         )]
         encoder: Option<String>,
-        /// Hardware encoder: auto (default), vaapi or nvenc; the config's
-        /// `cli.replay.encoder-backend` when the flag is not given. As on the
-        /// recording side both encode on the GPU; NVENC's frames are carried
-        /// through the CPU because it has no dma-buf import.
+        /// Hardware encoder: auto (default), vaapi, vulkan or nvenc; the
+        /// config's `cli.replay.encoder-backend` when the flag is not given. As
+        /// on the recording side all three encode on the GPU; VAAPI and Vulkan
+        /// import the dma-buf, while NVENC's frames are carried through the CPU
+        /// because it has no dma-buf import.
         #[arg(
             long,
             global = true,
@@ -1143,7 +1147,7 @@ impl Cli {
                 Some(word) => {
                     crate::record::avcodec::EncoderBackend::parse(word).ok_or_else(|| {
                         VshotError::InvalidDestination(format!(
-                            "unknown encoder backend `{word}`: pick auto, vaapi or nvenc"
+                            "unknown encoder backend `{word}`: pick auto, vaapi, vulkan or nvenc"
                         ))
                     })?
                 }
@@ -1300,7 +1304,7 @@ impl Cli {
                         Some(word) => crate::record::avcodec::EncoderBackend::parse(word)
                             .ok_or_else(|| {
                                 VshotError::InvalidDestination(format!(
-                                    "unknown encoder backend `{word}`: pick auto, vaapi or nvenc"
+                                    "unknown encoder backend `{word}`: pick auto, vaapi, vulkan or nvenc"
                                 ))
                             })?,
                     };

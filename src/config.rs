@@ -56,8 +56,8 @@ pub struct RecordDefaults {
     /// `hevc` or `av1`.
     pub encoder: Option<String>,
     /// The hardware encoder `--encoder-backend` falls back to: `auto` (the
-    /// built-in default, VAAPI where it opens else NVENC), `vaapi` or
-    /// `nvenc`.
+    /// built-in default, VAAPI where it opens else Vulkan else NVENC),
+    /// `vaapi`, `vulkan` or `nvenc`.
     pub encoder_backend: Option<String>,
     /// The frame rate `--fps` falls back to, 1-240.
     pub fps: Option<u32>,
@@ -94,7 +94,7 @@ pub struct ReplayDefaults {
     /// default), `hevc` or `av1`.
     pub encoder: Option<String>,
     /// The hardware encoder `--encoder-backend` falls back to for a replay:
-    /// `auto` (the default), `vaapi` or `nvenc`.
+    /// `auto` (the default), `vaapi`, `vulkan` or `nvenc`.
     pub encoder_backend: Option<String>,
     /// The frame rate `--fps` falls back to, 1-240.
     pub fps: Option<u32>,

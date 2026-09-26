@@ -399,17 +399,23 @@ vshot record stop                               # 停止（读取 pid 文件发�
   wf-recorder 同一条路线——运行时用 `dlopen` 加载，所以没有 ffmpeg 库的机器上截图照常
   工作，只是 `record` 会说明缺什么。需要 `ffmpeg` 与 `libva`（AMD/Intel 的 VAAPI）。
   码流每帧都是 IDR（全帧内），任意播放器可读，且任何位置都能跳。
-- **编码后端（`--encoder-backend`）**：`auto`（默认）、`vaapi`、`nvenc` 三选一。`auto`
-  先试 VAAPI（AMD/Intel），打不开再试 NVENC（NVIDIA）；写死某一个时只用那个，打不开就
-  明确报错并说明是哪一层失败（例如 `no CUDA device for NVENC`）。两条路的编码器名、
-  像素格式与私有选项各自独立设置，`--encoder h264/hevc/av1` 在两条路上都能选。
-  **两条路都是硬件编码**：跑的是 GPU 自己的媒体引擎（`h264/hevc/av1_vaapi` 或
-  `h264/hevc/av1_nvenc`），vshot 里没有任何 x264/x265 之类的 CPU 编码路径。差别只在
-  **帧怎么送到编码器**：VAAPI 能导入合成器的 dma-buf，全程零拷贝；**NVENC 没有 dma-buf
-  导入**，它的帧要经 CPU 搬一趟（dma-buf 读回内存 → 转 NV12 → 上传显存），所以 NVENC 的
-  CPU 占用略高，编码本身一样在 GPU 上。多显卡机器上 NVENC 默认用第一个 CUDA 设备，
-  `VSHOT_NVENC_DEVICE=<索引>` 换一个。
-  NVIDIA 机器还需要 `ffmpeg` 构建时带 `nvenc`（多数发行版默认带）。
+- **编码后端（`--encoder-backend`）**：`auto`（默认）、`vaapi`、`vulkan`、`nvenc` 四选一。
+  `auto` 按**零拷贝优先**试：VAAPI（AMD/Intel）→ Vulkan → NVENC；写死某一个时只用那个，
+  打不开就明确报错并说明是哪一层失败（例如 `no CUDA device for NVENC`）。四条路的编码器名、
+  像素格式与私有选项各自独立设置，`--encoder h264/hevc/av1` 在每条路上都能选。
+  **每条路都是硬件编码**：跑的是 GPU 自己的媒体引擎（`h264/hevc/av1_vaapi`、`_vulkan` 或
+  `_nvenc`），vshot 里没有任何 x264/x265 之类的 CPU 编码路径。差别只在**帧怎么送到编码器**：
+  VAAPI 与 Vulkan 都能导入合成器的 dma-buf，全程零拷贝；**NVENC 没有 dma-buf 导入**，它的帧
+  要经 CPU 搬一趟（dma-buf 读回内存 → 转 NV12 → 上传显存），所以 NVENC 的 CPU 占用略高，
+  编码本身一样在 GPU 上。**NVIDIA 上要零拷贝就得选 `vulkan`**：那里的 `*_vulkan` 底层就是
+  同一颗 NVENC 硬件单元，而 `*_nvenc` 那条路永远拿不到 dma-buf（ffmpeg 的 CUDA hwcontext
+  只映射 CUDA 内存，没有 DRM PRIME 导入）。多显卡机器上 NVENC 默认用第一个 CUDA 设备，
+  `VSHOT_NVENC_DEVICE=<索引>` 换一个；Vulkan 默认用第一个物理设备，`VSHOT_VULKAN_DEVICE=<索引>`
+  换一个。NVIDIA 机器还需要 `ffmpeg` 构建时带 `nvenc`（多数发行版默认带）。
+- **Vulkan 这条路的取舍**：letterbox 用 `overlay_vulkan` 合成——**没有 `pad_vulkan` 这个滤镜**，
+  所以没有 VAAPI 那样的 pad 兜底，配不出来就明确报错而不是录出错帧。窗口在录制中途被缩放时，
+  重建滤镜链之前会先把编码器抽干：编码器手里还攥着旧链帧池里的帧，池子拆掉再喂新帧就是
+  use-after-free（实测表现是 `avcodec_send_frame` 里 SIGSEGV，重建一次就能复现）。
 - **麦克风（`--mic`）**：把麦克风录进同一个 MP4，编码是 AAC（ffmpeg 自己的编码器，和
   视频同一条 libavcodec 路线）。不带名字用会话的默认输入设备，给名字或节点序号录别的输入
   （`wpctl status` 列得出来；序号比如 `--mic 55` 就是那个 monitor）。麦克风在视频编码器之前
@@ -712,7 +718,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 ### 验证到哪一步了
 
 - **Hyprland**——本机会话就是 Hyprland，也是主要开发与验证环境：截图、选区标注、窗口、长截图、pin 与滚动注入都在这里跑过。
-- **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——CPU 搬运那条路（dma-buf 读回 → 转 NV12 → 上传，编码仍由 NVENC 单元做）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
+- **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。**Vulkan 后端也在本机实测过**（同一张卡，`--encoder-backend vulkan`）：`record monitor` 4K（3840×2160）三种编码器都跑满 60fps 且零拷贝（`shim frame (dmabuf)` 的 map/add 都是 0.0ms）；`record window` 中途缩放实测 24 次重建滤镜链、12 秒完整出片，抽帧验证 letterbox 几何正确（画布 1000×800，内容 2400×1800 被缩到 999×748、上下边距各 26px，与等比居中吻合），还原尺寸后重新铺满画布、没有滞留像素；`replay start window` 的回录链路也走通；故意给错的 `VSHOT_VULKAN_DEVICE` 会干净失败并点名 Vulkan（证明它真的没退回 VAAPI）。**但真实的 NVIDIA 硬件从未跑过**（开发机是 AMD）：`*_vulkan` 在 NVIDIA 上底层就是 NVENC 单元，代码路径与本机相同，实际表现未验证。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——CPU 搬运那条路（dma-buf 读回 → 转 NV12 → 上传，编码仍由 NVENC 单元做）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
 - **逐应用音频**——在 Hyprland 上实测：两个 mpv 分别播 880 Hz / 220 Hz，`record window --app-audio` 录出的文件主频为 880 Hz，隔离正确；无声窗口降级为只录视频。窗口 pid 的来源在**能录窗口**的合成器上都有（Hyprland、niri 由合成器直报，KWin 走 scripting 探针的 `pid` 字段），因此 `--app-audio` 在 Plasma 上也能按 pid 找到应用音频；niri 也报了 pid，所以走 ScreenCast 服务的窗口录制同样能按 pid 找到应用音频（实机未验证隔离）；Sway 与 labwc 没有窗口 pid 来源，会明确拒绝而不是静默退回麦克风。niri 与 KWin 的 pid 路径只有单元测试与无头实测，未在真实音频会话上验证隔离。
 - **麦克风 + 应用音频共存**——在 Hyprland 上实测：一路虚拟麦克风源播 440 Hz、mpv 窗口播 880 Hz，`record window --mic --app-audio` 录出**单条** AAC 音轨，Goertzel 分析在整个时长内同时检出 440 Hz 与 880 Hz，长度与视频一致（8.000s 对 8.000s）。`--follow` 切窗时麦克风那一路**全程不断**（每秒 440 Hz 幅度恒为 0.212），只有应用那一路换到新窗口（880 Hz → 660 Hz）。回录路径（`replay start window --mic --app-audio`）同样含两路。
 - **跟随焦点（`--follow`）**——在 Hyprland 上用两个不同尺寸/音调的 mpv 实测：焦点 A → B → A 得到一个 14.0 s 的文件，宽度始终 900（B 的 600×340 被缩放进 A 的 900×500 画布），音轨按时间窗分析为 880 Hz → 220 Hz → 880 Hz。焦点查询、白名单匹配与"保持在原窗"三类判断都有单元测试；**报不出焦点的合成器未实测**（Hyprland 能报）。
@@ -925,6 +931,7 @@ pin 同样是 layer surface，里面只有图片，所以圆角、身下的阴�
 | `VSHOT_SESSION_DEBUG=1` | 本次会话被判成了哪个合成器、依据是什么 |
 | `VSHOT_LONG_DEBUG_DIR=<dir>` | 长截图落盘每一帧与每次拼接决定 |
 | `VSHOT_NVENC_DEVICE=N` | 指定 NVENC 用第 N 个 CUDA 设备（多显卡机器；默认第一个） |
+| `VSHOT_VULKAN_DEVICE=N` | 指定 Vulkan 编码用第 N 个物理设备（多显卡机器；默认第一个） |
 | `VSHOT_OCR_MODELS=<dir>` | OCR 模型目录，覆盖 `/usr/share/vshot/models` 与可执行文件旁的查找 |
 | `VSHOT_PIN_SOCKET` | pin daemon 监听的 socket 路径 |
 | `VSHOT_PIN_DENSITY=N` | 每张 pin 图的来源密度，等同 `--density` |

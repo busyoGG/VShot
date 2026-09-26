@@ -44,7 +44,7 @@ const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
 const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
                                    QStringLiteral("av1")};
 const QStringList kEncoderBackendNames = {QStringLiteral("auto"), QStringLiteral("vaapi"),
-                                          QStringLiteral("nvenc")};
+                                          QStringLiteral("vulkan"), QStringLiteral("nvenc")};
 
 constexpr int kMaxWidth = 64;
 // The text size is a pixel height, and its range comes from `ui/text_size.hpp`

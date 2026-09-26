@@ -212,18 +212,21 @@ impl fmt::Display for VideoCodec {
 }
 
 /// Which hardware encoder runs the session.  VAAPI is the AMD/Intel one (a
-/// DRM render node, and the only one that can import a compositor dma-buf
-/// without a copy); NVENC is the NVIDIA one (a CUDA device).  `auto` picks
-/// whichever the machine actually has, VAAPI first, so a machine with both —
-/// or a laptop that switches GPUs — records with no flag.
+/// DRM render node); Vulkan is the zero-copy one on either vendor — it is the
+/// only route to an NVIDIA encoder that never reads the frame back to the
+/// CPU; NVENC is the NVIDIA one (a CUDA device, which does read it back).
+/// `auto` picks whichever the machine actually has, VAAPI first and NVENC
+/// last, so a machine with both — or a laptop that switches GPUs — records
+/// with no flag.
 ///
 /// The value passed to the shim is the discriminant; the C side names it
 /// `VSHOT_BACKEND_*`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderBackend {
-    /// Pick VAAPI or NVENC from what the machine has.
+    /// Pick VAAPI, Vulkan or NVENC from what the machine has.
     Auto,
     Vaapi,
+    Vulkan,
     Nvenc,
 }
 
@@ -233,6 +236,7 @@ impl EncoderBackend {
         match self {
             Self::Auto => "auto",
             Self::Vaapi => "vaapi",
+            Self::Vulkan => "vulkan",
             Self::Nvenc => "nvenc",
         }
     }
@@ -242,34 +246,41 @@ impl EncoderBackend {
         match word {
             "auto" => Some(Self::Auto),
             "vaapi" => Some(Self::Vaapi),
+            "vulkan" => Some(Self::Vulkan),
             "nvenc" => Some(Self::Nvenc),
             _ => None,
         }
     }
 
-    /// The shim's own value: `VSHOT_BACKEND_VAAPI` (0) or `VSHOT_BACKEND_NVENC`
-    /// (1).  `Auto` is resolved by [`Self::resolve`] before this is asked, so
-    /// reaching it here means the caller skipped that step; VAAPI is the
-    /// conservative answer.
+    /// The shim's own value: `VSHOT_BACKEND_VAAPI` (0), `VSHOT_BACKEND_NVENC`
+    /// (1) or `VSHOT_BACKEND_VULKAN` (2).  `Auto` is resolved by
+    /// [`Self::resolve`] before this is asked, so reaching it here means the
+    /// caller skipped that step; VAAPI is the conservative answer.
     pub(crate) const fn shim_value(self) -> c_int {
         match self {
             Self::Nvenc => 1,
+            Self::Vulkan => 2,
             _ => 0,
         }
     }
 
     /// The backend a session really runs: `Auto` becomes VAAPI when a VAAPI
-    /// device opens, else NVENC when a CUDA device does, else the requested
-    /// backend so the open failure names the thing the user asked for.
+    /// device opens, else Vulkan when a Vulkan device does, else NVENC when a
+    /// CUDA device does, else the requested backend so the open failure names
+    /// the thing the user asked for.  The zero-copy backends come first —
+    /// NVENC records through system memory, so it is the last resort rather
+    /// than the first choice on a machine that can do better.
     pub fn resolve(self) -> Self {
         match self {
             Self::Auto => {
                 if backend_available(Self::Vaapi) {
                     Self::Vaapi
+                } else if backend_available(Self::Vulkan) {
+                    Self::Vulkan
                 } else if backend_available(Self::Nvenc) {
                     Self::Nvenc
                 } else {
-                    // Neither opened; let the recording report VAAPI's reason,
+                    // None opened; let the recording report VAAPI's reason,
                     // which on a machine with no GPU encoder is the useful one.
                     Self::Vaapi
                 }
@@ -279,7 +290,7 @@ impl EncoderBackend {
     }
 
     /// Every backend, for the help text and the tests.
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Vaapi, Self::Nvenc];
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Vaapi, Self::Vulkan, Self::Nvenc];
 }
 
 impl fmt::Display for EncoderBackend {
@@ -333,8 +344,8 @@ pub(crate) trait VideoSink {
     /// buffer back to system memory and hands the pixels over.
     fn frame_rgba(&mut self, rgba: &[u8], duration_ms: u32) -> Result<()>;
 
-    /// Whether the sink wants dma-buf frames (a VAAPI session) or RGBA ones
-    /// (an NVENC session, which has no dma-buf import).
+    /// Whether the sink wants dma-buf frames (a VAAPI or Vulkan session) or
+    /// RGBA ones (an NVENC session, which has no dma-buf import).
     fn wants_dmabuf(&self) -> bool;
 
     /// Follows a source that was resized mid-session: the new-size frames are
@@ -514,9 +525,11 @@ impl Recorder {
         // NVENC has no way to import a compositor dma-buf (ffmpeg's CUDA
         // hwcontext maps CUDA memory only), so a dma-buf request becomes the
         // software path: the capture side hands over RGBA pixels and the shim
-        // converts and uploads them.  The caller is expected to have skipped
-        // building the zero-copy pool already; this is the second gate, so a
-        // stray fourcc can never reach the filtergraph that cannot use it.
+        // converts and uploads them.  Only NVENC is degraded — VAAPI and
+        // Vulkan both import the buffer on the GPU.  The caller is expected to
+        // have skipped building the zero-copy pool already; this is the second
+        // gate, so a stray fourcc can never reach the filtergraph that cannot
+        // use it.
         let fourcc = match (fourcc, backend.resolve()) {
             (Some(_), EncoderBackend::Nvenc) => None,
             (fourcc, _) => fourcc,
@@ -885,6 +898,7 @@ impl ReplayRecorder {
         }
         // As on the recording side: NVENC records the software path, so a
         // dma-buf request becomes RGBA frames the shim converts and uploads.
+        // VAAPI and Vulkan keep the fourcc and import the buffer.
         let fourcc = match (fourcc, backend.resolve()) {
             (Some(_), EncoderBackend::Nvenc) => None,
             (fourcc, _) => fourcc,
@@ -1183,5 +1197,35 @@ mod tests {
         }
         assert_eq!(VideoCodec::parse("vp9"), None);
         assert_eq!(VideoCodec::parse(""), None);
+    }
+
+    #[test]
+    fn backend_words_round_trip_and_carry_the_shims_values() {
+        assert_eq!(EncoderBackend::ALL.len(), 4);
+        for backend in EncoderBackend::ALL {
+            assert_eq!(
+                EncoderBackend::parse(backend.word()),
+                Some(backend),
+                "{backend}"
+            );
+            // `Auto` is the one that resolves to something else; every named
+            // backend is already what a session runs, and asking the machine
+            // is what `resolve` would do for `Auto`.
+            if backend != EncoderBackend::Auto {
+                assert_eq!(backend.resolve(), backend, "{backend} resolves to itself");
+            }
+        }
+        assert_eq!(
+            EncoderBackend::parse("vulkan"),
+            Some(EncoderBackend::Vulkan)
+        );
+        assert_eq!(EncoderBackend::parse("vp9"), None);
+        assert_eq!(EncoderBackend::parse(""), None);
+        // The discriminants the C side names `VSHOT_BACKEND_*`; `Auto` never
+        // reaches the shim unresolved, so it carries VAAPI's value.
+        assert_eq!(EncoderBackend::Vaapi.shim_value(), 0);
+        assert_eq!(EncoderBackend::Nvenc.shim_value(), 1);
+        assert_eq!(EncoderBackend::Vulkan.shim_value(), 2);
+        assert_eq!(EncoderBackend::Auto.shim_value(), 0);
     }
 }

@@ -24,14 +24,14 @@
 //
 //   * `send_dmabuf` (zero copy): one dma-buf that the compositor has just
 //     rendered into (screencopy with linux-dmabuf buffers, as wf-recorder
-//     captures).  The buffer is wrapped in an AVDRMFrameDescriptor,
-//     mapped to a VAAPI surface with av_hwframe_map — the GPU imports
-//     the buffer, no pixels pass through the CPU — and a filtergraph
-//     (`scale_vaapi=format=nv12`) converts the packed RGB to the NV12
-//     the encoder wants, again on the GPU.  This is the path that makes
-//     4K at 60+ fps possible: the measured software path spends ~40 ms
-//     per 4K frame in the compositor's shm readback and CPU colour
-//     conversion, which caps it near 21 fps.
+//     captures).  The buffer is wrapped in an AVDRMFrameDescriptor, mapped to
+//     a VAAPI or Vulkan frame with av_hwframe_map — the GPU imports the
+//     buffer, no pixels pass through the CPU — and a filtergraph
+//     (`scale_vaapi=format=nv12` / `scale_vulkan=format=nv12`) converts the
+//     packed RGB to the NV12 the encoder wants, again on the GPU.  This is
+//     the path that makes 4K at 60+ fps possible: the measured software path
+//     spends ~40 ms per 4K frame in the compositor's shm readback and CPU
+//     colour conversion, which caps it near 21 fps.
 //
 // The library is loaded with dlopen at runtime: vshot's screenshots must
 // keep working on a machine without ffmpeg libraries, so the dependency
@@ -253,7 +253,7 @@ static void *wrap_gbm_bo(struct gbm_bo *bo, int width, int height, uint64_t *mod
 }
 
 // Allocates one dma-buf of the requested format and size, preferring a
-// linear layout (what screencopy buffers use and what the VAAPI import
+// linear layout (what screencopy buffers use and what the hardware import
 // expects), falling back to a plain renderable allocation.  Outputs the
 // descriptor facts on success.
 void *vshot_gbm_buffer_create(int width, int height, unsigned fourcc, uint64_t *modifier_out,
@@ -341,8 +341,8 @@ void vshot_gbm_buffer_destroy(void *handle) {
     if (!buffer) {
         return;
     }
-    // The mapping cache in the encoder session may still hold a VAAPI
-    // surface imported from this fd; the caller must destroy the encoder
+    // The mapping cache in the encoder session may still hold a hardware
+    // frame imported from this fd; the caller must destroy the encoder
     // first (record.rs does), so closing here is safe.
     if (buffer->fd >= 0) {
         close(buffer->fd);
@@ -389,6 +389,7 @@ typedef struct VshotAvApi {
     int (*open2)(AVCodecContext *ctx, const AVCodec *codec, AVDictionary **options);
     int (*send_frame)(AVCodecContext *ctx, const AVFrame *frame);
     int (*receive_packet)(AVCodecContext *ctx, AVPacket *pkt);
+    void (*flush_buffers)(AVCodecContext *ctx);
     AVPacket *(*packet_alloc)(void);
     void (*packet_free)(AVPacket **pkt);
     void (*packet_unref)(AVPacket *pkt);
@@ -485,7 +486,8 @@ unsigned vshot_av_enc_version(void);
 // A one-shot probe of a hardware backend: can it be opened at all on this
 // machine?  Used by `--encoder-backend auto` to pick one and by the Rust side
 // to fall back to the software path when the GPU's encoder cannot import a
-// compositor buffer.  `backend` is VSHOT_BACKEND_VAAPI or VSHOT_BACKEND_NVENC.
+// compositor buffer.  `backend` is VSHOT_BACKEND_VAAPI, VSHOT_BACKEND_VULKAN
+// or VSHOT_BACKEND_NVENC.
 int vshot_av_enc_backend_probe(int backend, char *err, size_t err_len);
 
 static void *try_open(const char *const *names) {
@@ -557,6 +559,7 @@ static VshotAvApi *load_api(void) {
     NEED(table.open2, codec, "avcodec_open2");
     NEED(table.send_frame, codec, "avcodec_send_frame");
     NEED(table.receive_packet, codec, "avcodec_receive_packet");
+    NEED(table.flush_buffers, codec, "avcodec_flush_buffers");
     NEED(table.packet_alloc, codec, "av_packet_alloc");
     NEED(table.packet_free, codec, "av_packet_free");
     NEED(table.packet_unref, codec, "av_packet_unref");
@@ -652,13 +655,13 @@ static VshotAvApi *load_api(void) {
 
 typedef struct VshotDmabufMap {
     int fd;         // the dma-buf this mapping belongs to (key)
-    AVFrame *frame; // a VAAPI frame mapped from it (READ)
+    AVFrame *frame; // a hardware frame mapped from it (READ)
 } VshotDmabufMap;
 
-// Durations waiting for their packets, for the recorder's timeline.  A VAAPI
-// encoder keeps one or two frames in flight; anything beyond this many means
-// something is deeply wrong, and the queue drops its oldest entry rather than
-// writing out of bounds.
+// Durations waiting for their packets, for the recorder's timeline.  A
+// hardware encoder keeps one or two frames in flight; anything beyond this
+// many means something is deeply wrong, and the queue drops its oldest entry
+// rather than writing out of bounds.
 #define VSHOT_MAX_PENDING 64
 
 // ---------------------------------------------------------------------------
@@ -795,20 +798,25 @@ static int replay_push(VshotReplay *r, AVPacket *src, int is_audio, int is_key, 
     return 0;
 }
 
-// The two hardware encoder backends.  VAAPI is the default on AMD and Intel
-// (a render node), NVENC the NVIDIA one (a CUDA device).  They differ in the
-// hw device type, the frames' pixel format, the encoder name suffix and the
-// private option names — every one of those reads `enc->backend` rather than
-// assuming VAAPI, so a session is one backend end to end.
+// The three hardware encoder backends.  VAAPI is the default on AMD and Intel
+// (a render node), Vulkan the zero-copy one on both (a Vulkan device, and the
+// only route to an NVIDIA encoder that never touches system memory), NVENC the
+// NVIDIA one (a CUDA device, which reads every frame back to the CPU first).
+// They differ in the hw device type, the frames' pixel format, the encoder
+// name suffix and the private option names — every one of those reads
+// `enc->backend` rather than assuming VAAPI, so a session is one backend end
+// to end.
 #define VSHOT_BACKEND_VAAPI 0
 #define VSHOT_BACKEND_NVENC 1
+#define VSHOT_BACKEND_VULKAN 2
 
 struct VshotAvEnc {
     AVBufferRef *device;
     AVBufferRef *frames;    // NV12 pool for the software path
     AVCodecContext *ctx;
-    // Which hardware encoder this session runs: VSHOT_BACKEND_VAAPI or
-    // VSHOT_BACKEND_NVENC.  Chosen once at open time from `--encoder-backend`.
+    // Which hardware encoder this session runs: VSHOT_BACKEND_VAAPI,
+    // VSHOT_BACKEND_VULKAN or VSHOT_BACKEND_NVENC.  Chosen once at open time
+    // from `--encoder-backend`.
     int backend;
     // The software path's letterbox staging: a canvas-sized RGBA buffer the
     // incoming frame is fitted into when the source was resized mid-session.
@@ -1032,19 +1040,67 @@ static void convert_rgba_to_nv12(uint8_t *y_plane, uint8_t *uv_plane, int width,
 }
 
 // The encoder name for a short codec word: "h264" -> "h264_vaapi" on the VAAPI
-// backend, "h264" -> "h264_nvenc" on NVENC.  The caller passes one of the names
-// `vshot record --encoder` accepts.
+// backend, "h264_vulkan" on Vulkan and "h264_nvenc" on NVENC.  The caller
+// passes one of the names `vshot record --encoder` accepts.
 static const char *backend_encoder_name(int backend, const char *codec, char *scratch,
                                         size_t scratch_size) {
-    snprintf(scratch, scratch_size, "%s_%s", codec,
-             backend == VSHOT_BACKEND_NVENC ? "nvenc" : "vaapi");
+    const char *suffix = "vaapi";
+    if (backend == VSHOT_BACKEND_NVENC) {
+        suffix = "nvenc";
+    } else if (backend == VSHOT_BACKEND_VULKAN) {
+        suffix = "vulkan";
+    }
+    snprintf(scratch, scratch_size, "%s_%s", codec, suffix);
     return scratch;
 }
 
-// The pixel format the encoder takes on each backend: a VAAPI surface, or a
-// CUDA device pointer.
+// The pixel format the encoder takes on each backend: a VAAPI surface, a
+// Vulkan image or a CUDA device pointer.
 static enum AVPixelFormat backend_pix_fmt(int backend) {
-    return backend == VSHOT_BACKEND_NVENC ? AV_PIX_FMT_CUDA : AV_PIX_FMT_VAAPI;
+    if (backend == VSHOT_BACKEND_NVENC) {
+        return AV_PIX_FMT_CUDA;
+    }
+    if (backend == VSHOT_BACKEND_VULKAN) {
+        return AV_PIX_FMT_VULKAN;
+    }
+    return AV_PIX_FMT_VAAPI;
+}
+
+// The name the filtergraph's `format`/`pixel_formats` options use for a
+// hardware pixel format, and the VAAPI/Vulkan filter name a chain is built
+// from.  The two backends carry the same filters under different names, so
+// the chain's shape is written once and only the names come from here.
+static const char *backend_filter_name(int backend) {
+    return backend == VSHOT_BACKEND_VULKAN ? "vulkan" : "vaapi";
+}
+
+// The colours the Vulkan chain needs written down on its frames: `scale_vulkan`
+// builds its RGB-to-YUV matrix from the incoming frame's own colourspace and
+// refuses a frame that does not name one, where `scale_vaapi` falls back to a
+// default of its own.  The compositor's buffers are full-range BT.709 — the
+// same properties the encoder is opened with (see `open_encoder`).  Only the
+// Vulkan backend gets them: the VAAPI chain's colours stay exactly as they
+// were.
+static void set_vulkan_colours(VshotAvEnc *enc, AVFrame *frame) {
+    if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        frame->colorspace = AVCOL_SPC_BT709;
+        frame->color_range = AVCOL_RANGE_JPEG;
+    }
+}
+
+// The same colours, declared on a source filter's parameters.  A buffersrc
+// configured without them sees every incoming frame as a property change: it
+// logs "Changing video frame properties on the fly is not supported by all
+// filters" and reconfigures its own output link, which replaces the frame pool
+// the graph's sink hands out.  The encoder holds the pool it was opened with,
+// so a replacement underneath it is a use-after-free — measured as a segfault
+// inside `avcodec_send_frame` the moment a fit chain is rebuilt.  Declaring the
+// colours up front is what keeps the pool the same object for the session.
+static void set_vulkan_colour_params(VshotAvEnc *enc, AVBufferSrcParameters *params) {
+    if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        params->color_space = AVCOL_SPC_BT709;
+        params->color_range = AVCOL_RANGE_JPEG;
+    }
 }
 
 static int open_encoder(VshotAvEnc *enc, int width, int height, const char *codec, int qp,
@@ -1052,12 +1108,21 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     // The hardware device: a render node for VAAPI, a CUDA device for NVENC.
     // NVENC's device is named by index (the ffmpeg CUDA hwcontext counts
     // devices); `VSHOT_NVENC_DEVICE` overrides it for a multi-GPU machine.
+    // Vulkan names its device by index too, through `VSHOT_VULKAN_DEVICE`;
+    // with the variable unset ffmpeg picks the first physical device itself.
     int ret;
     if (enc->backend == VSHOT_BACKEND_NVENC) {
         const char *index = getenv("VSHOT_NVENC_DEVICE");
         ret = api->hwdevice_ctx_create(&enc->device, AV_HWDEVICE_TYPE_CUDA, index, NULL, 0);
         if (ret < 0) {
             set_err(enc, "no CUDA device could be opened for NVENC encoding", ret);
+            return -1;
+        }
+    } else if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        const char *index = getenv("VSHOT_VULKAN_DEVICE");
+        ret = api->hwdevice_ctx_create(&enc->device, AV_HWDEVICE_TYPE_VULKAN, index, NULL, 0);
+        if (ret < 0) {
+            set_err(enc, "no Vulkan device could be opened for encoding", ret);
             return -1;
         }
     } else {
@@ -1124,9 +1189,12 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     // these encoders do not take it — the first recordings had no IDR at all
     // because of that).  NVENC's are `rc=constqp` (an int, so it is set from
     // the enum's numeric value) and the generic `g`, with `forced-idr` so a
-    // key frame is a real IDR.  The key-frame distance itself is carried by
-    // `ctx->gop_size` on both (0 = every frame an I frame), which NVENC reads
-    // through its `g` option and VAAPI through `idr_interval`.
+    // key frame is a real IDR.  Vulkan's are VAAPI's names with a different
+    // type: `rc_mode` is an integer enum there (`cqp` = 1), and a string
+    // would leave the option at its `auto` default.  The key-frame distance
+    // itself is carried by `ctx->gop_size` on all three (0 = every frame an I
+    // frame), which NVENC reads through its `g` option and VAAPI and Vulkan
+    // through `idr_interval`.
     if (enc->backend == VSHOT_BACKEND_NVENC) {
         // NVENC_RC_CONSTQP == 0 in the encoder's own enum; the string is not
         // accepted for an integer AVOption.
@@ -1138,6 +1206,14 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
             return -1;
         }
         api->opt_set_int(enc->ctx, "forced-idr", 1, AV_OPT_SEARCH_CHILDREN);
+    } else if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        if (api->opt_set_int(enc->ctx, "rc_mode", 1, AV_OPT_SEARCH_CHILDREN) < 0 ||
+            api->opt_set_int(enc->ctx, "idr_interval", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
+            snprintf(enc->err, sizeof(enc->err),
+                     "this ffmpeg build's %s encoder does not take the CQP rate-control options",
+                     codec);
+            return -1;
+        }
     } else if (api->opt_set(enc->ctx, "rc_mode", "CQP", AV_OPT_SEARCH_CHILDREN) < 0 ||
                api->opt_set_int(enc->ctx, "idr_interval", 0, AV_OPT_SEARCH_CHILDREN) < 0) {
         snprintf(enc->err, sizeof(enc->err),
@@ -1156,22 +1232,26 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     }
     // Keep the stream simple and seekable: no B frames.  `bf` is a public
     // AVCodecContext option (not private), and AV1 has no B frames and no
-    // such option.
-    if (strcmp(codec, "av1") != 0 && api->opt_set_int(enc->ctx, "bf", 0, 0) < 0) {
+    // such option.  The Vulkan encoders have no `bf` either — they carry
+    // `b_depth`, whose default of 1 already means no B frame — so the call is
+    // skipped there rather than reported as a missing option.
+    if (enc->backend != VSHOT_BACKEND_VULKAN && strcmp(codec, "av1") != 0 &&
+        api->opt_set_int(enc->ctx, "bf", 0, 0) < 0) {
         snprintf(enc->err, sizeof(enc->err),
                  "the %s encoder on this ffmpeg build takes no bf option", codec);
         return -1;
     }
     // How many pictures the encoder keeps in flight.  The default (2) leaves
-    // the zero-copy chain starved at 4K: the filtergraph's `scale_vaapi`
+    // the zero-copy chain starved at 4K: the filtergraph's scale filter
     // blocks on an output surface the encoder has not returned yet, which at
     // 4K costs ~19 ms on a fraction of frames — enough, against a 16.7 ms
     // budget, to make a 4K60 session run at ~58 fps (measured).  A deeper
     // queue lets the conversion run ahead of the encoder, and the stall goes
-    // away.  The option is private to the VAAPI encoders: NVENC has no
-    // `async_depth` (its own knobs are `surfaces` and `delay`), so the call
-    // below fails there and the default stays.  The failure is deliberately
-    // ignored — a build without the option keeps its own default either way.
+    // away.  VAAPI and Vulkan both carry `async_depth` (Vulkan's own range is
+    // 1..64); NVENC has none (its knobs are `surfaces` and `delay`), so the
+    // call below fails there and the default stays.  The failure is
+    // deliberately ignored — a build without the option keeps its own default
+    // either way.
     api->opt_set_int(enc->ctx, "async_depth", 8, AV_OPT_SEARCH_CHILDREN);
     // The colour properties the zero-copy chain carries: the packed RGB
     // the compositor produces is full-range BT.709.  These match the
@@ -1183,9 +1263,9 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     return 0;
 }
 
-// The dma-buf format the buffer came with, as the sw_format the VAAPI
-// frames context must declare.  Only the two packed formats screencopy
-// uses are accepted; anything else is refused by name.
+// The dma-buf format the buffer came with, as the sw_format the frames
+// context must declare.  Only the two packed formats screencopy uses are
+// accepted; anything else is refused by name.
 static int fourcc_to_sw_format(unsigned fourcc) {
     switch (fourcc) {
     case 0x34325241: // DRM_FORMAT_ARGB8888
@@ -1197,10 +1277,12 @@ static int fourcc_to_sw_format(unsigned fourcc) {
     }
 }
 
-// Builds the filtergraph the zero-copy path runs: VAAPI in (the mapped
-// dma-buf surfaces) -> scale_vaapi=format=nv12 -> VAAPI out (what the
-// encoder takes).  The GPU does the colour conversion; no pixels are
-// touched on the CPU.
+// Builds the filtergraph the zero-copy path runs: hardware frames in (the
+// mapped dma-buf surfaces) -> scale=format=nv12 -> hardware frames out (what
+// the encoder takes).  The GPU does the colour conversion; no pixels are
+// touched on the CPU.  VAAPI and Vulkan carry the same filters under
+// different names, so the chain's shape is written once and the names come
+// from `backend_filter_name`.
 //
 // `in_w`/`in_h` are the input frames' size, which is not always the
 // encoder's: `record window` rebuilds this graph when the window is resized
@@ -1209,32 +1291,40 @@ static int fourcc_to_sw_format(unsigned fourcc) {
 // letterboxed — so the encoder's own canvas stays the size it was opened
 // for.  The open-time call passes the encoder's size and no fit box.
 //
-// The letterbox is composed with `overlay_vaapi` over a black plate, and the
-// plate is an input the caller feeds with every frame (see
-// `vshot_av_enc_send_dmabuf`).  `pad_vaapi` would be the two-filter way to
+// The letterbox is composed with the overlay filter over a black plate, and
+// the plate is an input the caller feeds with every frame (see
+// `vshot_av_enc_send_dmabuf`).  The pad filter would be the two-filter way to
 // write those bars, but it only writes where it draws: on radeonsi the
 // padded region keeps whatever the output surface held before, and the
 // surfaces a rebuilt fit chain draws into are exactly the ones the previous
 // chain used — so the bars replay the old size's pixels (measured: a window
-// resized smaller left its old content in the letterbox).  overlay_vaapi
-// rewrites the whole canvas — main first, blended content second — so the
-// bars are the plate's colour by construction, every frame, whatever the
+// resized smaller left its old content in the letterbox).  The overlay
+// filter rewrites the whole canvas — main first, blended content second — so
+// the bars are the plate's colour by construction, every frame, whatever the
 // surface used to hold.
 //
-// The plate itself: a canvas-sized VAAPI pool in the packed format and one
-// black frame in it, uploaded once.  Every capture frame re-sends a
-// reference to it, so the composed canvas has a defined background at every
-// pixel the content does not reach.  The alpha byte is 255 — the plate is
-// the background it is composed over.
+// The plate itself: a canvas-sized pool in the packed format and one black
+// frame in it, uploaded once.  Every capture frame re-sends a reference to
+// it, so the composed canvas has a defined background at every pixel the
+// content does not reach.  The alpha byte is 255 — the plate is the
+// background it is composed over.
+//
+// The pool's packed format has to be the one the content arrives in:
+// overlay_vulkan refuses two inputs whose software formats differ, and it
+// blends an input that carries alpha rather than copying it — which is what
+// the content is scaled to `bgr0` for.  VAAPI's overlay is happy with the
+// alpha-bearing `bgra` the plate has always been.
 static int build_plate(VshotAvEnc *enc, int width, int height) {
+    int packed_format =
+        enc->backend == VSHOT_BACKEND_VULKAN ? AV_PIX_FMT_BGR0 : AV_PIX_FMT_BGRA;
     enc->plate_frames = api->hwframe_ctx_alloc(enc->device);
     if (!enc->plate_frames) {
         snprintf(enc->err, sizeof(enc->err), "could not allocate the plate's frame pool");
         return -1;
     }
     AVHWFramesContext *plate_pool = (AVHWFramesContext *)enc->plate_frames->data;
-    plate_pool->format = AV_PIX_FMT_VAAPI;
-    plate_pool->sw_format = AV_PIX_FMT_BGRA;
+    plate_pool->format = backend_pix_fmt(enc->backend);
+    plate_pool->sw_format = packed_format;
     plate_pool->width = width;
     plate_pool->height = height;
     int ret = api->hwframe_ctx_init(enc->plate_frames);
@@ -1257,7 +1347,10 @@ static int build_plate(VshotAvEnc *enc, int width, int height) {
         api->frame_free(&sw);
         return -1;
     }
-    sw->format = AV_PIX_FMT_BGRA;
+    // The staging frame the plate is uploaded from has to declare the pool's
+    // own software format; the fill below writes the same four bytes either
+    // way, and `bgr0` simply never reads the alpha one.
+    sw->format = packed_format;
     sw->width = width;
     sw->height = height;
     ret = api->frame_get_buffer(sw, 0);
@@ -1283,6 +1376,9 @@ static int build_plate(VshotAvEnc *enc, int width, int height) {
         api->frame_free(&enc->plate);
         return -1;
     }
+    // The composed canvas takes its colour properties from this frame — the
+    // overlay copies the main input's — and the conversion after it needs them.
+    set_vulkan_colours(enc, enc->plate);
     return 0;
 }
 
@@ -1313,11 +1409,27 @@ static void teardown_graph(VshotAvEnc *enc) {
 
 // Builds one chain.  `use_overlay` is only meaningful when fitting: 1 builds
 // the plate + overlay chain, 0 the pad chain (the fallback for drivers whose
-// overlay_vaapi refuses to configure).  On failure the caller tears down
-// whatever was built.
+// overlay filter refuses to configure; VAAPI only, see
+// `open_filtergraph_dmabuf_fit`).  On failure the caller tears down whatever
+// was built.
 static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, int fit_w,
                            int fit_h, int use_overlay) {
     int overlay = use_overlay && fit_w > 0 && fit_h > 0;
+    // The canvas this chain composes into, which is the recording's own canvas
+    // on VAAPI and two pixels larger on Vulkan.  `scale_vulkan` converts
+    // packed RGB to NV12 on the GPU only when *both* output dimensions differ
+    // from the input's: with one of them (or neither) unchanged it hands the
+    // conversion to swscale, which cannot touch a Vulkan frame at all and
+    // fails outright.  Composing two pixels larger makes the conversion filter
+    // scale back down to the recording's canvas, which satisfies it — the cost
+    // is one bilinear resample of the frame, and it is why VAAPI, whose
+    // `scale_vaapi` converts at any size, keeps its exact-size chain.
+    int comp_w = fit_w;
+    int comp_h = fit_h;
+    if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        comp_w += 2;
+        comp_h += 2;
+    }
     if (!api->filter_loaded) {
         snprintf(enc->err, sizeof(enc->err),
                  "libavfilter is not available, so zero-copy recording cannot run "
@@ -1325,10 +1437,11 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
         return -1;
     }
     if (!enc->device) {
-        snprintf(enc->err, sizeof(enc->err), "the VAAPI device is not open");
+        snprintf(enc->err, sizeof(enc->err), "the %s device is not open",
+                 backend_filter_name(enc->backend));
         return -1;
     }
-    // The input pool: VAAPI frames in the buffer's own packed format.
+    // The input pool: hardware frames in the buffer's own packed format.
     // Mapping a dma-buf needs a frames context to map into.
     enc->frames = api->hwframe_ctx_alloc(enc->device);
     if (!enc->frames) {
@@ -1336,7 +1449,7 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
         return -1;
     }
     AVHWFramesContext *frames = (AVHWFramesContext *)enc->frames->data;
-    frames->format = AV_PIX_FMT_VAAPI;
+    frames->format = backend_pix_fmt(enc->backend);
     frames->sw_format = sw_format;
     frames->width = in_w;
     frames->height = in_h;
@@ -1370,6 +1483,7 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
     memset(params, 0, sizeof(*params));
     params->format = AV_PIX_FMT_NONE;
     params->hw_frames_ctx = enc->frames;
+    set_vulkan_colour_params(enc, params);
     ret = api->buffersrc_parameters_set(enc->graph_src, params);
     free(params); // av_free is libc free with the default allocator
     if (ret < 0) {
@@ -1379,18 +1493,19 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
     char config[128];
     snprintf(config, sizeof(config),
              "video_size=%dx%d:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1", in_w, in_h,
-             (int)AV_PIX_FMT_VAAPI);
+             (int)backend_pix_fmt(enc->backend));
     ret = api->filter_init_str(enc->graph_src, config);
     if (ret < 0) {
         set_err(enc, "could not initialise the source filter", ret);
         return -1;
     }
     // The fit chain needs a second input, the black plate the letterbox is
-    // composed over.  It is a canvas-sized VAAPI pool of its own; the plate
-    // frame in it is uploaded once (build_plate) and re-sent with every
-    // capture frame.
+    // composed over.  It is a pool of its own in the backend's hardware
+    // format, the size of the canvas the chain composes into; the plate frame
+    // in it is uploaded once (build_plate) and re-sent with every capture
+    // frame.
     if (overlay) {
-        if (build_plate(enc, fit_w, fit_h) != 0) {
+        if (build_plate(enc, comp_w, comp_h) != 0) {
             return -1;
         }
         enc->graph_plate = api->filter_graph_alloc_filter(enc->graph, source, "Plate");
@@ -1407,6 +1522,7 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
         memset(plate_params, 0, sizeof(*plate_params));
         plate_params->format = AV_PIX_FMT_NONE;
         plate_params->hw_frames_ctx = enc->plate_frames;
+        set_vulkan_colour_params(enc, plate_params);
         ret = api->buffersrc_parameters_set(enc->graph_plate, plate_params);
         free(plate_params);
         if (ret < 0) {
@@ -1414,8 +1530,8 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
             return -1;
         }
         snprintf(config, sizeof(config),
-                 "video_size=%dx%d:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1", fit_w, fit_h,
-                 (int)AV_PIX_FMT_VAAPI);
+                 "video_size=%dx%d:pix_fmt=%d:time_base=1/1000000:pixel_aspect=1/1", comp_w,
+                 comp_h, (int)backend_pix_fmt(enc->backend));
         ret = api->filter_init_str(enc->graph_plate, config);
         if (ret < 0) {
             set_err(enc, "could not initialise the plate source filter", ret);
@@ -1427,7 +1543,8 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
         snprintf(enc->err, sizeof(enc->err), "could not allocate the graph's sink filter");
         return -1;
     }
-    ret = api->opt_set(enc->graph_sink, "pixel_formats", "vaapi", AV_OPT_SEARCH_CHILDREN);
+    ret = api->opt_set(enc->graph_sink, "pixel_formats", backend_filter_name(enc->backend),
+                       AV_OPT_SEARCH_CHILDREN);
     if (ret < 0) {
         set_err(enc, "could not set the sink's pixel formats", ret);
         return -1;
@@ -1469,6 +1586,14 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
     inputs->filter_ctx = enc->graph_sink;
     inputs->pad_idx = 0;
     inputs->next = NULL;
+    // The filter names the chain is written with: the same scale/overlay
+    // filters exist under `_vaapi` and `_vulkan` names, so only the suffix
+    // differs between the two backends.
+    const char *hw = backend_filter_name(enc->backend);
+    char scale[32];
+    char blend[32];
+    snprintf(scale, sizeof(scale), "scale_%s", hw);
+    snprintf(blend, sizeof(blend), "overlay_%s", hw);
     char chain[512];
     if (fit_w > 0 && fit_h > 0) {
         // Fit the new-size frame into the canvas: scaled down when it is
@@ -1477,13 +1602,13 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
         int scaled_w = in_w;
         int scaled_h = in_h;
         if (in_w > fit_w || in_h > fit_h) {
-            double scale = (double)fit_w / (double)in_w;
+            double scale_factor = (double)fit_w / (double)in_w;
             double by_height = (double)fit_h / (double)in_h;
-            if (by_height < scale) {
-                scale = by_height;
+            if (by_height < scale_factor) {
+                scale_factor = by_height;
             }
-            scaled_w = ((int)((double)in_w * scale)) & ~1;
-            scaled_h = ((int)((double)in_h * scale)) & ~1;
+            scaled_w = ((int)((double)in_w * scale_factor)) & ~1;
+            scaled_h = ((int)((double)in_h * scale_factor)) & ~1;
             if (scaled_w < 2) {
                 scaled_w = 2;
             }
@@ -1492,36 +1617,83 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
             }
         }
         if (overlay) {
-            // The scaled frame carries no alpha (`bgr0`): overlay_vaapi
-            // treats an overlay input with an alpha channel as
-            // premultiplied, and a capture buffer's alpha byte is whatever
-            // the compositor left there — zero for a fully occluding window
-            // — which would erase the content from the composed frame.
-            // Dropping the byte keeps the pixels; the plate underneath
-            // supplies the background.
-            snprintf(chain, sizeof(chain),
-                     "[in]scale_vaapi=w=%d:h=%d:format=bgr0[content];"
-                     "[plate]null[bg];"
-                     "[bg][content]overlay_vaapi=x=(main_w-overlay_w)/2:y=(main_h-"
-                     "overlay_h)/2[comp];"
-                     "[comp]scale_vaapi=format=nv12:out_range=full[out]",
-                     scaled_w, scaled_h);
+            // The scaled frame carries no alpha (`bgr0`): the overlay filter
+            // treats an overlay input with an alpha channel as premultiplied,
+            // and a capture buffer's alpha byte is whatever the compositor
+            // left there — zero for a fully occluding window — which would
+            // erase the content from the composed frame.  Dropping the byte
+            // keeps the pixels; the plate underneath supplies the background.
+            //
+            // Vulkan needs the centring written into the chain as numbers:
+            // overlay_vulkan takes plain pixel offsets and has no
+            // `main_w`/`overlay_w` in scope, so they are computed here.  Its
+            // last filter is the conversion, which scales the two-pixel-larger
+            // canvas back down to the recording's own (see `comp_w` above).
+            if (enc->backend == VSHOT_BACKEND_VULKAN) {
+                char content[160];
+                if (scaled_w == in_w && scaled_h == in_h && sw_format != AV_PIX_FMT_BGR0) {
+                    // The content keeps its size, so dropping the alpha is a
+                    // scale of its own — and `scale_vulkan` converts formats
+                    // on the GPU only when both dimensions change, so the
+                    // first filter goes two pixels up and the second comes
+                    // back down to the size the content wants.
+                    snprintf(content, sizeof(content),
+                             "[in]%s=w=%d:h=%d:format=bgr0[c0];[c0]%s=w=%d:h=%d[content];", scale,
+                             scaled_w + 2, scaled_h + 2, scale, scaled_w, scaled_h);
+                } else {
+                    snprintf(content, sizeof(content),
+                             "[in]%s=w=%d:h=%d:format=bgr0[content];", scale, scaled_w, scaled_h);
+                }
+                snprintf(chain, sizeof(chain),
+                         "%s[plate]null[bg];"
+                         "[bg][content]%s=x=%d:y=%d[comp];"
+                         "[comp]%s=w=%d:h=%d:format=nv12:out_range=full[out]",
+                         content, blend, (comp_w - scaled_w) / 2, (comp_h - scaled_h) / 2, scale,
+                         fit_w, fit_h);
+            } else {
+                snprintf(chain, sizeof(chain),
+                         "[in]%s=w=%d:h=%d:format=bgr0[content];"
+                         "[plate]null[bg];"
+                         "[bg][content]%s=x=(main_w-overlay_w)/2:y=(main_h-"
+                         "overlay_h)/2[comp];"
+                         "[comp]%s=format=nv12:out_range=full[out]",
+                         scale, scaled_w, scaled_h, blend, scale);
+            }
         } else {
-            // The fallback composition, for drivers whose overlay_vaapi will
+            // The fallback composition, for drivers whose overlay filter will
             // not configure: scale to fit, then pad the rest of the canvas.
             // The fill lands in the packed surface before the NV12
             // conversion (padding after it would fill the planes with YUV
             // zeros, which a full-range player decodes as dark green), but
-            // pad only writes where it draws — see the note above.
+            // pad only writes where it draws — see the note above.  Only
+            // VAAPI has a pad filter (there is no `pad_vulkan`), so a Vulkan
+            // chain never reaches here; saying so beats letting the parse
+            // fail on a filter name that does not exist.
+            if (enc->backend == VSHOT_BACKEND_VULKAN) {
+                snprintf(enc->err, sizeof(enc->err),
+                         "a Vulkan fit chain needs overlay_vulkan, and this ffmpeg build has "
+                         "no pad_vulkan to fall back to");
+                return -1;
+            }
             const char *packed = sw_format == AV_PIX_FMT_BGRA ? "bgra" : "bgr0";
             snprintf(chain, sizeof(chain),
-                     "[in]scale_vaapi=w=%d:h=%d:format=%s[content];"
+                     "[in]%s=w=%d:h=%d:format=%s[content];"
                      "[content]pad_vaapi=w=%d:h=%d:x=(ow-iw)/2:y=(oh-ih)/2,"
-                     "scale_vaapi=format=nv12:out_range=full[out]",
-                     scaled_w, scaled_h, packed, fit_w, fit_h);
+                     "%s=format=nv12:out_range=full[out]",
+                     scale, scaled_w, scaled_h, packed, fit_w, fit_h, scale);
         }
     } else {
-        snprintf(chain, sizeof(chain), "[in]scale_vaapi=format=nv12:out_range=full[out]");
+        // The open-time chain, where the input pool is the output pool: VAAPI
+        // converts in place, Vulkan goes through the two-pixel step described
+        // at the top of this function first, since its conversion filter has
+        // to see both dimensions change.
+        if (enc->backend == VSHOT_BACKEND_VULKAN) {
+            snprintf(chain, sizeof(chain),
+                     "[in]%s=w=%d:h=%d[c];[c]%s=w=%d:h=%d:format=nv12:out_range=full[out]", scale,
+                     in_w + 2, in_h + 2, scale, in_w, in_h);
+        } else {
+            snprintf(chain, sizeof(chain), "[in]%s=format=nv12:out_range=full[out]", scale);
+        }
     }
     ret = api->filter_graph_parse_ptr(enc->graph, chain, &inputs, &outputs, NULL);
     api->filter_inout_free(&inputs);
@@ -1550,19 +1722,27 @@ static int build_fit_graph(VshotAvEnc *enc, int sw_format, int in_w, int in_h, i
 // letterbox (see above); a driver whose VAAPI video processor cannot blend
 // refuses to configure it — `overlay_vaapi` needs VA_BLEND_GLOBAL_ALPHA —
 // and the pad chain is the one that has always been here, so it is the
-// fallback rather than the only route.
+// fallback rather than the only route.  That fallback is VAAPI-only: there is
+// no `pad_vulkan`, so a Vulkan fit chain that cannot blend has nowhere to go
+// and reports the overlay chain's own failure instead of recording a wrongly
+// composed frame.
 static int open_filtergraph_dmabuf_fit(VshotAvEnc *enc, int sw_format, int in_w, int in_h,
                                        int fit_w, int fit_h) {
     if (fit_w <= 0 || fit_h <= 0) {
         return build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 0);
     }
-    // A test hook for the fallback: the machines this was developed on all
-    // blend, so the pad chain would otherwise never run in a test.
-    if (getenv("VSHOT_RECORD_NO_OVERLAY")) {
-        return build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 0);
+    if (enc->backend != VSHOT_BACKEND_VULKAN) {
+        // A test hook for the fallback: the machines this was developed on all
+        // blend, so the pad chain would otherwise never run in a test.
+        if (getenv("VSHOT_RECORD_NO_OVERLAY")) {
+            return build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 0);
+        }
     }
     if (build_fit_graph(enc, sw_format, in_w, in_h, fit_w, fit_h, 1) == 0) {
         return 0;
+    }
+    if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        return -1;
     }
     if (trace_enabled()) {
         fprintf(stderr,
@@ -1784,7 +1964,7 @@ void vshot_av_enc_destroy(VshotAvEnc *enc) {
 // Fits one source RGBA frame into the encoder's canvas on the CPU: scaled
 // down when it is larger than the canvas, centred at its own size when it is
 // smaller, over a black background.  This is the software path's answer to the
-// dma-buf chain's `scale_vaapi` + letterbox: `record window` can be resized
+// dma-buf chain's scale filter + letterbox: `record window` can be resized
 // mid-recording, one file holds one frame size, so the new frames are fitted
 // into the size the file was opened with.
 //
@@ -1926,9 +2106,9 @@ int vshot_av_enc_send(VshotAvEnc *enc, const uint8_t *rgba) {
     return status;
 }
 
-// Maps one dma-buf to a VAAPI frame, caching by descriptor file descriptor:
-// a buffer whose pixels the compositor has just rewritten is simply fed
-// through the same mapping again.
+// Maps one dma-buf to a hardware frame, caching by descriptor file
+// descriptor: a buffer whose pixels the compositor has just rewritten is
+// simply fed through the same mapping again.
 static void desc_release(void *opaque, uint8_t *data) {
     (void)opaque;
     free(data);
@@ -1985,19 +2165,21 @@ static AVFrame *map_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t mo
     if (!mapped) {
         api->frame_unref(drm);
         api->frame_free(&drm);
-        snprintf(enc->err, sizeof(enc->err), "could not allocate the VAAPI mapping frame");
+        snprintf(enc->err, sizeof(enc->err), "could not allocate the hardware mapping frame");
         return NULL;
     }
-    mapped->format = AV_PIX_FMT_VAAPI;
+    mapped->format = backend_pix_fmt(enc->backend);
     mapped->hw_frames_ctx = api->buffer_ref(enc->frames);
     int ret = api->hwframe_map(mapped, drm, AV_HWFRAME_MAP_READ);
     api->frame_unref(drm);
     api->frame_free(&drm);
     if (ret < 0) {
         api->frame_free(&mapped);
-        set_err(enc, "could not map the dma-buf to a VAAPI surface", ret);
+        set_err(enc, "could not map the dma-buf to a hardware frame", ret);
         return NULL;
     }
+    // What the conversion filter reads to build its RGB-to-YUV matrix.
+    set_vulkan_colours(enc, mapped);
     enc->maps[enc->map_count].fd = fd;
     enc->maps[enc->map_count].frame = mapped;
     enc->map_count++;
@@ -2053,8 +2235,8 @@ int vshot_av_enc_send_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t 
     api->frame_free(&feed);
     // A fit graph has a second input: the black plate its letterbox is
     // composed over.  It needs one reference per output frame — the
-    // framesync behind overlay_vaapi pairs the two by frame — and the same
-    // uploaded plate serves all of them.
+    // framesync behind the overlay filter pairs the two by frame — and the
+    // same uploaded plate serves all of them.
     if (enc->graph_plate && enc->plate) {
         AVFrame *plate = api->frame_alloc();
         if (!plate) {
@@ -2073,8 +2255,8 @@ int vshot_av_enc_send_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t 
         }
     }
     double t_filter_in = trace_enabled() ? now_ms() : 0.0;
-    // The conversion may lag the input by nothing at all (no buffering in
-    // scale_vaapi), but the contract is to drain whatever the graph emits.
+    // The conversion may lag the input by nothing at all (no buffering in the
+    // scale filter), but the contract is to drain whatever the graph emits.
     for (;;) {
         AVFrame *filtered = api->frame_alloc();
         if (!filtered) {
@@ -2164,6 +2346,25 @@ int vshot_av_enc_resize_fit(VshotAvEnc *enc, int in_w, int in_h, unsigned fourcc
         }
     }
     enc->map_count = 0;
+    // The frames the encoder still holds belong to the chain that is about to
+    // go away: it keeps references into that chain's frame pools, and a pool
+    // freed underneath them leaves those frames pointing at Vulkan state that
+    // no longer exists -- measured as a segfault inside `avcodec_send_frame` on
+    // the first frame after a rebuild.  Draining the encoder releases them
+    // first, and the flush that follows puts it back in a state that accepts
+    // frames again.  VAAPI does not need this: its frames carry a surface id
+    // rather than a pool the encoder has to keep alive.
+    if (enc->backend == VSHOT_BACKEND_VULKAN) {
+        int ret = api->send_frame(enc->ctx, NULL);
+        if (ret < 0 && ret != AVERROR_EOF) {
+            set_err(enc, "draining the encoder before a rebuild failed", ret);
+            return -1;
+        }
+        if (drain_packets(enc) != 0) {
+            return -1;
+        }
+        api->flush_buffers(enc->ctx);
+    }
     teardown_graph(enc);
     int sw_format = fourcc_to_sw_format(fourcc);
     if (sw_format < 0) {
@@ -2218,7 +2419,7 @@ int vshot_av_enc_flush(VshotAvEnc *enc) {
         // The filtergraph has to be flushed first: pushing NULL through it
         // is what sends its own tail to the sink.  A fit graph has two
         // inputs — content and plate — and both are ended, or the framesync
-        // behind overlay_vaapi would wait on the one still open.
+        // behind the overlay filter would wait on the one still open.
         int ret = api->buffersrc_add_frame_flags(enc->graph_src, NULL, 0);
         if (ret < 0 && ret != AVERROR_EOF) {
             set_err(enc, "flushing the filtergraph failed", ret);
@@ -2838,8 +3039,9 @@ static VshotRec *rec_start(const char *path, int width, int height, const char *
 }
 
 // Starts a recording: an encoder for `codec` plus the MP4 file at `path`.
-// `backend` is VSHOT_BACKEND_VAAPI (0) or VSHOT_BACKEND_NVENC (1).  Returns
-// NULL with the reason in `vshot_rec_load_error`.
+// `backend` is VSHOT_BACKEND_VAAPI (0), VSHOT_BACKEND_NVENC (1) or
+// VSHOT_BACKEND_VULKAN (2).  Returns NULL with the reason in
+// `vshot_rec_load_error`.
 VshotRec *vshot_rec_start(const char *path, int width, int height, const char *codec, int qp,
                           int backend) {
     return rec_start(path, width, height, codec, qp, 0, 0, 0, 0, backend);
@@ -3061,11 +3263,13 @@ unsigned vshot_rec_version(void) {
 
 // Whether a hardware backend can be opened on this machine at all.  This is
 // what `--encoder-backend auto` asks: it opens the backend's device (a render
-// node, a CUDA device) and looks the encoder up, then closes both.  No frames
-// are encoded, so the probe is cheap and side-effect free.  Returns 0 on
-// success, -1 with `err` filled in otherwise.  It is the same work
-// `open_encoder` does up to the point a device is in hand, so a backend the
-// probe accepts is one a recording will accept too (modulo the encode itself).
+// node, a Vulkan device, a CUDA device) and looks the encoder up, then closes
+// both.  No frames are encoded, so the probe is cheap and side-effect free.
+// Returns 0 on success, -1 with `err` filled in otherwise.  It is the same
+// work `open_encoder` does up to the point a device is in hand, so a backend
+// the probe accepts is one a recording will accept too (modulo the encode
+// itself — for Vulkan the driver's own encode support is only settled when
+// the encoder is opened).
 int vshot_av_enc_backend_probe(int backend, char *err, size_t err_len) {
     if (err != NULL && err_len > 0) {
         err[0] = '\0';
@@ -3088,6 +3292,23 @@ int vshot_av_enc_backend_probe(int backend, char *err, size_t err_len) {
             if (err != NULL && err_len > 0) {
                 snprintf(err, err_len, "no CUDA device for NVENC: %s",
                          text[0] ? text : "the CUDA hwcontext could not be created");
+            }
+            return -1;
+        }
+    } else if (backend == VSHOT_BACKEND_VULKAN) {
+        // The device index, as for NVENC; unset means ffmpeg picks the first
+        // physical device.  A machine whose Vulkan driver has no video encode
+        // extension still creates a device here — that is a property of the
+        // queue families, not of the device — so the encoder lookup below is
+        // what refuses it.
+        const char *index = getenv("VSHOT_VULKAN_DEVICE");
+        ret = api->hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VULKAN, index, NULL, 0);
+        if (ret < 0) {
+            char text[AV_ERROR_MAX_STRING_SIZE] = {0};
+            api->strerror(ret, text, sizeof(text));
+            if (err != NULL && err_len > 0) {
+                snprintf(err, err_len, "no Vulkan device for encoding: %s",
+                         text[0] ? text : "the Vulkan hwcontext could not be created");
             }
             return -1;
         }

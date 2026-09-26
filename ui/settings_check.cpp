@@ -161,8 +161,14 @@ void checkEveryFieldReachesTheFile()
 
     expect(choose(find<QComboBox>(dialog.get(), "recordEncoder"), QStringLiteral("hevc")),
            "the encoder list offers hevc");
-    expect(choose(find<QComboBox>(dialog.get(), "recordEncoderBackend"), QStringLiteral("nvenc")),
+    QComboBox *recordBackend = find<QComboBox>(dialog.get(), "recordEncoderBackend");
+    expect(choose(recordBackend, QStringLiteral("nvenc")),
            "the encoder-backend list offers nvenc");
+    // The zero-copy NVIDIA route has to be offered too; the nvenc choice above
+    // is the one this check goes on to save, so this only asks whether vulkan
+    // is there.
+    expect(recordBackend->findData(QStringLiteral("vulkan")) >= 0,
+           "the encoder-backend list offers vulkan");
     find<QSpinBox>(dialog.get(), "recordFps")->setValue(144);
     find<QLineEdit>(dialog.get(), "recordFollow")->setText(QStringLiteral("game, chat"));
     find<QAbstractButton>(dialog.get(), "recordPortal")->setChecked(true);
@@ -188,8 +194,11 @@ void checkEveryFieldReachesTheFile()
     find<QSpinBox>(dialog.get(), "replayGop")->setValue(3);
     expect(choose(find<QComboBox>(dialog.get(), "replayEncoder"), QStringLiteral("av1")),
            "the replay encoder list offers av1");
-    expect(choose(find<QComboBox>(dialog.get(), "replayEncoderBackend"), QStringLiteral("vaapi")),
+    QComboBox *replayBackend = find<QComboBox>(dialog.get(), "replayEncoderBackend");
+    expect(choose(replayBackend, QStringLiteral("vaapi")),
            "the replay encoder-backend list offers vaapi");
+    expect(replayBackend->findData(QStringLiteral("vulkan")) >= 0,
+           "the replay encoder-backend list offers vulkan");
     find<QSpinBox>(dialog.get(), "replayFps")->setValue(72);
     find<QLineEdit>(dialog.get(), "replayFollow")->setText(QStringLiteral("game"));
     find<QAbstractButton>(dialog.get(), "replayPortal")->setChecked(true);

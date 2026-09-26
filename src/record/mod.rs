@@ -359,8 +359,8 @@ pub struct RecordRequest {
     /// otherwise.
     pub encoder: VideoCodec,
     /// Which hardware encoder runs the session (`--encoder-backend`): VAAPI,
-    /// NVENC, or `auto` to pick whichever the machine has.  VAAPI unless the
-    /// config or the flag says otherwise.
+    /// Vulkan, NVENC, or `auto` to pick whichever the machine has.  VAAPI
+    /// unless the config or the flag says otherwise.
     pub encoder_backend: EncoderBackend,
     /// Take the frames from the XDG desktop portal instead of the
     /// compositor's own protocols (`--portal`).
@@ -663,7 +663,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     // pixel size — the shape the pool is built for.  The probe is one extra
     // capture, before the encoder opens.  NVENC has no dma-buf import at all
     // (ffmpeg's CUDA hwcontext maps CUDA memory only), so it records the
-    // software path and the probe is skipped outright.
+    // software path and the probe is skipped outright; VAAPI and Vulkan both
+    // import the buffer and probe for it.
     let dmabuf_fourcc = if backend == EncoderBackend::Nvenc {
         if debug_enabled() {
             eprintln!(
