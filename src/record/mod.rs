@@ -1310,9 +1310,18 @@ fn record_loop(
                     }
                     eprintln!("vshot: dropping a frame: {error}");
                 }
-                let now = Instant::now();
-                last_frame_at = now;
-                next_frame = now + interval;
+                // The soundtrack keeps up even while the picture does not: the
+                // audio ring holds four seconds (`pipewire_audio`), and a run
+                // of refused frames — a refusal is forgiven for ten seconds —
+                // would overflow it, leaving a file whose audio stops before
+                // its picture does.
+                pump_soundtrack(&mut mic, &mut recorder)?;
+                // A dropped frame is not a hole in the timeline: the interval it
+                // covered belongs to the frame before it, which was still on
+                // screen.  Advancing `last_frame_at` here would cut that time
+                // out of the file, leaving a recording shorter than the time it
+                // ran for.
+                next_frame = Instant::now() + interval;
                 continue;
             }
         };

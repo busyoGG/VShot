@@ -415,7 +415,12 @@ impl Frame<'_> {
 
     /// The pixels, for a frame that came through memory, with the stride its
     /// rows have: a buffer's rows can be padded, so the caller needs both.
-    pub fn memory<'a>(&self) -> Option<Memory<'a>> {
+    ///
+    /// The slice is tied to the frame, not to a lifetime the caller picks:
+    /// the buffer behind it belongs to PipeWire and goes back at the next
+    /// [`Stream::next`], so the pixels cannot outlive the frame that lends
+    /// them.
+    pub fn memory(&self) -> Option<Memory<'_>> {
         if self.raw.kind != KIND_MEMORY || self.raw.data.is_null() {
             return None;
         }

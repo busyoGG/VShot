@@ -192,6 +192,10 @@ pub(super) fn run(request: &RecordRequest, target: &WindowTarget) -> Result<std:
         source,
         mic,
         &interrupted,
+        // A recording is not a replay: a still window stays one long frame,
+        // which is both what was on screen and the cheaper answer.  Its length
+        // is carried by the last frame at the end of the loop.
+        None,
         |_sink| Ok(false),
     );
     let _ = std::fs::remove_file(super::pid_file());
@@ -304,6 +308,15 @@ pub(super) fn open_window_capture(
 /// A still window therefore yields long-duration frames, and the file plays
 /// back at the pace the window actually changed.
 ///
+/// `still` is what a *replay* needs on top of that: its history is measured on
+/// a timeline that only moves when a frame is encoded, so a window that sat
+/// still would freeze the timeline with it and every save would come out short
+/// by the time the window did not change.  Given an interval — the session's
+/// own frame interval — the loop sends the frame the capture is holding again
+/// once that long has passed with nothing new.  `None` — a recording — leaves
+/// the still window as one long frame, whose length the end of the loop
+/// supplies.
+///
 /// The window can also change *size* while the recording runs.  One MP4
 /// holds one frame size, so the recording does not follow the new size; the
 /// encoder is told to fit the new frames into the canvas the file was
@@ -322,6 +335,7 @@ pub(super) fn loop_over<
     source: Name,
     mic: super::pipewire_audio::Soundtrack,
     interrupted: &AtomicBool,
+    still: Option<Duration>,
     mut control: impl FnMut(&mut S) -> Result<bool>,
 ) -> Result<()> {
     let started = Instant::now();
@@ -406,7 +420,18 @@ pub(super) fn loop_over<
             Some(seconds) => Duration::from_secs(seconds).saturating_sub(started.elapsed()),
             None => Duration::from_secs(u64::MAX / 2),
         };
-        let wait = POLL_WINDOW.min(remaining.max(Duration::from_millis(1)));
+        // How long this wait may last.  A recording waits out the whole poll
+        // window: a compositor that holds its copy sends nothing either way,
+        // and a still window is one long frame.  A replay cuts the wait short
+        // at its own frame interval, because that is when it repeats the frame
+        // it holds if nothing new has arrived — which is what keeps the ring's
+        // timeline in step with the clock, and a key-frame distance counted in
+        // frames equal to the seconds it was asked for.
+        let pace = match still {
+            Some(interval) => interval.min(POLL_WINDOW),
+            None => POLL_WINDOW,
+        };
+        let wait = pace.min(remaining.max(Duration::from_millis(1)));
         // Whether *the loop* has delivered a frame yet.  The first frame
         // covers the time from the start of the recording to its arrival, so
         // it is the one frame whose duration is measured from `started`; every
@@ -427,6 +452,42 @@ pub(super) fn loop_over<
                         started.elapsed().as_secs_f64()
                     );
                 }
+                // The soundtrack keeps up even while the picture does not: the
+                // audio ring holds four seconds (`pipewire_audio`), so a window
+                // that sends nothing for longer would lose the sound of the
+                // whole still stretch.
+                super::pump_soundtrack(&mut mic, recorder)?;
+                // A compositor may hold its copy until the window's content
+                // changes (`window_copy`), so a still window answers Idle here
+                // instead of sending a frame.  A recording leaves it at that:
+                // the still window is one long frame, and the end of the loop
+                // gives it its length.  A replay cannot — its ring's timeline
+                // only moves when a frame is encoded, so the seconds the window
+                // sat still would be missing from every save.  Sending the
+                // frame the capture still holds again carries that timeline to
+                // now, exactly as the screen-cast loop does for its own.
+                let Some(interval) = still else { continue };
+                let now = Instant::now();
+                if !delivered_any || now.saturating_duration_since(last_frame_at) < interval {
+                    continue;
+                }
+                let Some(frame) = capture.last_frame() else {
+                    continue;
+                };
+                let duration_ms =
+                    super::cast::cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, now);
+                encode_window_frame(capture, recorder, &frame, duration_ms)?;
+                if debug_enabled() {
+                    encoded += 1;
+                    eprintln!(
+                        "vshot: frame {encoded}: the compositor sent nothing, so the last frame \
+                         was repeated to carry {duration_ms}ms of the timeline"
+                    );
+                }
+                // The pace is not advanced here: the next iteration's own wait
+                // is what times the next repeat, so a still window is repeated
+                // once per frame interval rather than once per interval *plus*
+                // a wait for a frame that never comes.
                 continue;
             }
             Ok(Capture::Interrupted) => break,
@@ -451,6 +512,9 @@ pub(super) fn loop_over<
                     "vshot: the window was resized to {width}x{height}; fitting it into the \
                      recording's {canvas_width}x{canvas_height} canvas",
                 );
+                // The picture is what a resize moves, not the sound: the audio
+                // of the moment the rebuild took is still the recording's.
+                super::pump_soundtrack(&mut mic, recorder)?;
                 continue;
             }
             // The compositor refused a frame whose buffer no longer matched
@@ -476,6 +540,12 @@ pub(super) fn loop_over<
                          ({consecutive_retries}/60)"
                     );
                 }
+                // The soundtrack keeps up through the retries: they come back
+                // before any frame wait could have run, and a resize animation
+                // can refuse a good number of frames in a row — long enough
+                // for the four-second audio ring to overflow behind a picture
+                // that is not moving.
+                super::pump_soundtrack(&mut mic, recorder)?;
                 // The retry comes back before any frame wait could have run
                 // (the refusal is immediate), so the pace has to come from
                 // here or this would spin on a compositor that is between
@@ -504,6 +574,9 @@ pub(super) fn loop_over<
                     )));
                 }
                 eprintln!("vshot: dropping a frame: {error}");
+                // A run of dropped frames is a picture that is not moving,
+                // which is exactly when the audio ring behind it fills up.
+                super::pump_soundtrack(&mut mic, recorder)?;
                 continue;
             }
         };
@@ -515,14 +588,8 @@ pub(super) fn loop_over<
             last_frame_at = started;
         }
         delivered_any = true;
-        let duration_ms = {
-            covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;
-            last_frame_at = now;
-            let due_ms = covered_us / 1000;
-            let step = due_ms.saturating_sub(timeline_ms);
-            timeline_ms = timeline_ms.max(due_ms);
-            u32::try_from(step).unwrap_or(1).max(1)
-        };
+        let duration_ms =
+            super::cast::cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, now);
         let encode_started = Instant::now();
         encode_window_frame(capture, recorder, &frame, duration_ms)?;
         // The soundtrack for the interval this frame covered.

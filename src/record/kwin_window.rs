@@ -418,9 +418,15 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
                     if !refusals.refused(&explanation) {
                         return Err(VshotError::ScreenshotDenied(explanation));
                     }
-                    let now = Instant::now();
-                    last_frame_at = now;
-                    next_frame_at = now + interval;
+                    // The soundtrack keeps up even while the picture does not:
+                    // a refusal is forgiven for ten seconds, and the audio ring
+                    // behind the loop holds four, so a run of them would leave
+                    // the file's audio behind its picture.
+                    super::pump_soundtrack(mic, recorder)?;
+                    // A refused or failed frame is not a hole in the timeline:
+                    // the interval it covered belongs to the frame before it,
+                    // which was still on screen (see `cast::cover`).
+                    next_frame_at = Instant::now() + interval;
                     continue;
                 }
                 Err(error) => {
@@ -431,9 +437,13 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
                         )));
                     }
                     eprintln!("vshot: dropping a frame: {error}");
-                    let now = Instant::now();
-                    last_frame_at = now;
-                    next_frame_at = now + interval;
+                    // A run of dropped frames is a picture that is not moving,
+                    // which is exactly when the audio ring behind it fills up.
+                    super::pump_soundtrack(mic, recorder)?;
+                    // A refused or failed frame is not a hole in the timeline:
+                    // the interval it covered belongs to the frame before it,
+                    // which was still on screen (see `cast::cover`).
+                    next_frame_at = Instant::now() + interval;
                     continue;
                 }
             },

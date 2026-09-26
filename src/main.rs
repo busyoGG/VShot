@@ -100,14 +100,29 @@ fn run() -> Result<()> {
                     request,
                     background,
                 } => {
+                    // The portal's own frame loop is not wired to the ring, so
+                    // a replay cannot use it.  Refused here rather than inside
+                    // `run`, because the background path never reaches `run`
+                    // in this process: the session is a child, and a sentence
+                    // written to its stderr goes nowhere.
+                    if request.portal {
+                        return Err(VshotError::Recording(
+                            "replay does not support the portal yet: the portal's own frame loop \
+                             is not wired to the ring. Record through the portal instead (`vshot \
+                             record ... --portal`)"
+                                .into(),
+                        ));
+                    }
                     if background {
                         return replay_background(&request);
                     }
                     record::replay::run(&request)
                 }
-                cli::ReplayAction::Save { path, seconds } => {
-                    record::replay_save(path, seconds).map(|_| ())
-                }
+                cli::ReplayAction::Save {
+                    path,
+                    seconds,
+                    save_dir,
+                } => record::replay_save(path, seconds, save_dir).map(|_| ()),
                 cli::ReplayAction::Status => record::replay_status(),
                 cli::ReplayAction::Stop => record::replay_stop(),
             };
@@ -471,22 +486,35 @@ fn replay_background(request: &record::ReplayRequest) -> Result<()> {
     args.push(request.encoder.word().into());
     args.push("--encoder-backend".into());
     args.push(request.encoder_backend.word().into());
+    args.push("--gop".into());
+    args.push(request.gop_secs.to_string().into());
     if request.cursor {
         args.push("--cursor".into());
     }
+    // The microphone: `--no-mic` when the request has none, so a remembered
+    // `cli.replay.mic` cannot open a microphone in a session the user asked to
+    // be silent.  Without it the child reads the config and turns one on.
     match &request.mic {
         Some(record::MicChoice::Default) => args.push("--mic".into()),
         Some(record::MicChoice::Device(name)) => {
             args.push("--mic".into());
             args.push(name.clone().into());
         }
-        None => {}
+        None => args.push("--no-mic".into()),
     }
     if request.app_audio {
         args.push("--app-audio".into());
     }
-    if request.portal {
-        args.push("--portal".into());
+    // The windows a `--follow` replay moves between.  An empty list is said
+    // out loud for the same reason as the microphone: otherwise the config's
+    // `cli.replay.follow` re-arms a list the user turned off.
+    if request.follow.is_empty() {
+        args.push("--no-follow".into());
+    } else {
+        for name in &request.follow {
+            args.push("--follow".into());
+            args.push(name.clone().into());
+        }
     }
     if let Some(dir) = &request.save_dir {
         args.push("--save-dir".into());

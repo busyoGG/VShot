@@ -17,7 +17,9 @@
 //! * **The frames are damage-driven.**  A cast produces a frame when what it
 //!   is casting changes and nothing at all when it does not, so the loop waits
 //!   for frames rather than sampling them; a still screen becomes a
-//!   long-duration frame, which is exactly what was on screen.
+//!   long-duration frame, which is exactly what was on screen.  A replay asks
+//!   for something else there — see `still` in [`loop_over`] — because its
+//!   history is measured on a timeline that has to keep moving with the clock.
 //!
 //! * **There are two frame shapes.**  A dma-buf frame goes to the GPU encoder
 //!   without a copy; a memory frame is converted on the CPU.  Which one the
@@ -116,6 +118,18 @@ impl Shape {
 /// The frame rate is not here: `--fps` is the rate *asked of the compositor*
 /// when the stream is opened, and what actually arrives is damage-driven, so
 /// the loop paces itself off the arrivals instead.
+///
+/// `still` is the one thing a *replay* cannot leave at that.  Its history is
+/// measured on a timeline that only moves when a frame is encoded, so a window
+/// that sits still would freeze the timeline with it: the seconds it sat still
+/// would be missing from every save, and a save for the last thirty seconds
+/// would come out shorter than thirty.  Given an interval — the session's own
+/// frame interval — the loop repeats the frame it is holding once that long has
+/// passed with nothing new, which carries the timeline to now and keeps a
+/// key-frame distance counted in frames equal to the seconds it was asked for.
+/// `None` — a recording — leaves the still screen as one long frame, which is
+/// both what was on screen and the cheaper answer: a recording's length comes
+/// from its last frame, so nothing is lost by not repeating it.
 #[allow(clippy::too_many_arguments)] // the stream's whole shape
 pub(super) fn loop_over<S: VideoSink + AudioSink>(
     stream: &mut pipewire::Stream,
@@ -126,6 +140,7 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
     mic: &mut super::pipewire_audio::Soundtrack,
     interrupted: &AtomicBool,
     fit_on_resize: bool,
+    still: Option<Duration>,
     mut control: impl FnMut(&mut S) -> Result<bool>,
 ) -> Result<()> {
     // The clock the recording's own length is measured against: the first
@@ -167,11 +182,67 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
             )));
         }
 
-        let frame = match stream.next(POLL) {
+        // How long this wait for a frame may last.  A recording waits out the
+        // whole poll window: its frames are damage-driven, and a still screen
+        // is a frame that keeps its length.  A replay cuts the wait short at
+        // the moment the still frame falls due, so the ring's timeline follows
+        // the clock instead of lagging behind it by up to one poll.
+        let wait = match still {
+            Some(interval) if started.is_some() => interval
+                .saturating_sub(now.saturating_duration_since(last_frame_at))
+                .clamp(Duration::from_millis(1), POLL),
+            _ => POLL,
+        };
+
+        let frame = match stream.next(wait) {
             Ok(Some(frame)) => frame,
             // A screen cast is damage-driven: no frame in the window is the
             // normal state of a screen nothing has happened on, not a failure.
-            Ok(None) => continue,
+            Ok(None) => {
+                // The soundtrack keeps up even while the picture does not: a
+                // screen cast's audio arrives on a stream of its own, and the
+                // ring behind it holds four seconds (`pipewire_audio`).  A cast
+                // that sends no frame for longer than that would lose the sound
+                // of the whole still stretch, leaving a file whose audio is
+                // seconds shorter than its picture.
+                super::pump_soundtrack(mic, sink)?;
+                let Some(interval) = still else { continue };
+                if started.is_none() {
+                    continue;
+                }
+                let now = Instant::now();
+                if now.saturating_duration_since(last_frame_at) < interval {
+                    continue;
+                }
+                // Send the frame the client is still holding a second time.
+                // A wait that found nothing is exactly what says nothing has
+                // replaced it, so its pixels are still there and still the
+                // ones on screen: `vshot_pw_next` only takes a buffer back
+                // once the frame replacing it has arrived.  That is what
+                // carries the ring's timeline to now, so the seconds a window
+                // sat still are in the history a save can reach.
+                let duration_ms = cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, now);
+                match (&tail_dmabuf, &tail_software) {
+                    (Some(dmabuf), _) => sink.frame_dmabuf(
+                        dmabuf.fd,
+                        dmabuf.fourcc,
+                        dmabuf.modifier,
+                        dmabuf.offset,
+                        dmabuf.stride,
+                        duration_ms,
+                    )?,
+                    (None, Some(frame)) => sink.frame_rgba(frame.pixels(), duration_ms)?,
+                    (None, None) => {}
+                }
+                if debug_enabled() {
+                    encoded += 1;
+                    eprintln!(
+                        "vshot: frame {encoded}: the cast sent nothing, so the last frame was \
+                         repeated to carry {duration_ms}ms of the timeline"
+                    );
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         let now = Instant::now();
@@ -216,12 +287,7 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
         // screen, which is the interval between the two arrivals — the same
         // accounting the screen and window loops use, so a cast recording
         // plays back on the same clock as the others.
-        covered_us += now.saturating_duration_since(last_frame_at).as_micros() as u64;
-        last_frame_at = now;
-        let due_ms = covered_us / 1000;
-        let step = due_ms.saturating_sub(timeline_ms);
-        timeline_ms = timeline_ms.max(due_ms);
-        let duration_ms = u32::try_from(step).unwrap_or(1).max(1);
+        let duration_ms = cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, now);
 
         let encode_started = Instant::now();
         match shape {
@@ -307,6 +373,31 @@ pub(super) fn loop_over<S: VideoSink + AudioSink>(
         }
     }
     Ok(())
+}
+
+/// How long the frame about to be sent was on screen: the time since the frame
+/// before it, on a timeline that is the sum of those intervals rather than a
+/// nominal rate times a count.  Every loop that encodes frames accounts for
+/// time this way, so they all play back on the same clock — and a still
+/// screen's long frame gets its true length rather than a nominal one.
+///
+/// `last_frame_at` is the moment the previous frame's pixels were taken.  A
+/// loop that *drops* a frame leaves it alone, so the interval the drop covered
+/// is carried by the frame before it; advancing it there would cut that time
+/// out of the file.  The window loop shares this, which is why it is here
+/// rather than private to one loop.
+pub(super) fn cover(
+    covered_us: &mut u64,
+    timeline_ms: &mut u64,
+    last_frame_at: &mut Instant,
+    now: Instant,
+) -> u32 {
+    *covered_us += now.saturating_duration_since(*last_frame_at).as_micros() as u64;
+    *last_frame_at = now;
+    let due_ms = *covered_us / 1000;
+    let step = due_ms.saturating_sub(*timeline_ms);
+    *timeline_ms = (*timeline_ms).max(due_ms);
+    u32::try_from(step).unwrap_or(1).max(1)
 }
 
 /// The DRM name for the byte order a `SPA_VIDEO_FORMAT_*` stands for, which is
@@ -508,5 +599,38 @@ mod tests {
         assert_eq!(Shape::of(&memory), Shape::Software);
         assert_eq!(Shape::Dmabuf.word(), "dma-buf");
         assert_eq!(Shape::Software.word(), "memory");
+    }
+
+    /// A frame's length is the time since the one before it, and the timeline
+    /// is the sum of those lengths rather than a nominal rate times a count.
+    /// A still screen's long frame and a replay's repeated frame are both
+    /// measured here, so a save of the last N seconds comes out N long.
+    #[test]
+    fn a_frames_length_is_the_time_since_the_one_before_it() {
+        let mut covered_us = 0u64;
+        let mut timeline_ms = 0u64;
+        let start = Instant::now();
+        let mut last_frame_at = start;
+
+        // Two arrivals 33 ms apart: the second carries the first's 33 ms.
+        let at = start + Duration::from_millis(33);
+        assert_eq!(
+            cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, at),
+            33
+        );
+        // A ten-second gap is one long frame, not ten seconds of timeline that
+        // never happened: this is the still window a replay repeats its frame
+        // through, a quarter of a second at a time.
+        let at = start + Duration::from_millis(10_033);
+        assert_eq!(
+            cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, at),
+            10_000
+        );
+        // A frame sent with no time having passed — the same instant twice —
+        // still gets a length, because a zero-length sample is not a frame.
+        assert_eq!(
+            cover(&mut covered_us, &mut timeline_ms, &mut last_frame_at, at),
+            1
+        );
     }
 }

@@ -361,7 +361,12 @@ static void vshot_pwa_on_process(void *data)
 	if (frames > pw->ring_frames)
 		frames = pw->ring_frames;
 	available = vshot_pwa_queued(pw);
-	room = pw->ring_frames - available;
+	/* One frame of the ring is always left empty: `head == tail` is how the
+	 * reader says "nothing to read", so a write that filled the ring
+	 * completely would make the whole ring — every sample in it — look empty
+	 * instead of dropping the oldest.  The writable span is one frame short of
+	 * the ring, which is a millisecond of audio at any rate worth recording. */
+	room = pw->ring_frames - 1 - available;
 	if (frames > room) {
 		/* The caller has not read for a while.  The oldest samples go:
 		 * the recording follows the wall clock, so the newest audio is
@@ -370,7 +375,7 @@ static void vshot_pwa_on_process(void *data)
 		if (drop > available)
 			drop = available;
 		pw->tail = (pw->tail + drop) % pw->ring_frames;
-		room = pw->ring_frames - vshot_pwa_queued(pw);
+		room = pw->ring_frames - 1 - vshot_pwa_queued(pw);
 	}
 	if (frames > room)
 		frames = room;

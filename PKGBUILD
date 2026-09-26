@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 pkgname=vshot
 pkgver=0.1.3
-pkgrel=3
+pkgrel=4
 pkgdesc='Strict-freeze Wayland screenshot CLI with Qt interactive overlay and pin server'
 url='https://github.com/busyoGG/VShot'
 arch=('x86_64')

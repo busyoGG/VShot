@@ -2114,6 +2114,27 @@ static void desc_release(void *opaque, uint8_t *data) {
     free(data);
 }
 
+// Drops every cached dma-buf mapping.
+//
+// The cache is keyed on the descriptor number, and a number identifies a
+// buffer only inside the capture session that allocated it.  A session that
+// moves — a `--follow` switch, a pool rebuilt after a resize — frees the old
+// buffers and hands out numbers of its own, and the kernel re-uses the numbers
+// it just freed.  A re-used number answered from this cache is the *old*
+// mapping: the previous window's pixels, or a dma-buf that no longer exists.
+// The mappings also count against `VSHOT_MAX_MAPS`, which a session that
+// switched windows a few times would otherwise exhaust.
+static void drop_map_cache(VshotAvEnc *enc) {
+    for (int i = 0; i < enc->map_count; i++) {
+        if (enc->maps[i].frame) {
+            api->frame_unref(enc->maps[i].frame);
+            api->frame_free(&enc->maps[i].frame);
+        }
+        enc->maps[i].fd = -1;
+    }
+    enc->map_count = 0;
+}
+
 static AVFrame *map_dmabuf(VshotAvEnc *enc, int fd, unsigned fourcc, uint64_t modifier,
                            int offset, int stride) {
     for (int i = 0; i < enc->map_count; i++) {
@@ -2334,18 +2355,19 @@ int vshot_av_enc_resize_fit(VshotAvEnc *enc, int in_w, int in_h, unsigned fourcc
         fourcc = enc->fourcc;
     }
     if (in_w == enc->in_w && in_h == enc->in_h && fourcc == enc->fourcc) {
+        // The shape is unchanged, so the graph and the canvas stay — but the
+        // call still means the capture side has moved, because a `--follow`
+        // switch to a window of the same size retargets the session without
+        // rebuilding anything on this side.  The mappings are what identifies a
+        // buffer, and the session that owns those descriptors is gone, so they
+        // go with it.  A redundant call costs a handful of re-imports.
+        drop_map_cache(enc);
         return 0;
     }
     // The old chain goes first: the graph holds the input pool referenced by
     // the mappings, and both are replaced together.  The plate and its pool
     // belong to the chain too — the rebuilt graph builds its own.
-    for (int i = 0; i < enc->map_count; i++) {
-        if (enc->maps[i].frame) {
-            api->frame_unref(enc->maps[i].frame);
-            api->frame_free(&enc->maps[i].frame);
-        }
-    }
-    enc->map_count = 0;
+    drop_map_cache(enc);
     // The frames the encoder still holds belong to the chain that is about to
     // go away: it keeps references into that chain's frame pools, and a pool
     // freed underneath them leaves those frames pointing at Vulkan state that
@@ -2781,6 +2803,12 @@ static int vshot_audio_enc_pump(VshotAudioEnc *audio, VshotRec *rec, int flush) 
         if (take < frame_size && !flush) {
             break;
         }
+        // The frame is reused for every packet of the recording, so the
+        // buffers the previous pass allocated have to go back first:
+        // `av_frame_get_buffer` on a frame that still holds them leaks them
+        // (its own documentation says so), which at 1024 frames of stereo
+        // float per packet is 8 KiB per packet — 23 MB a minute at 48 kHz.
+        api->frame_unref(audio->frame);
         // `av_frame_get_buffer` allocates from the frame's own description:
         // the format, the sample count and the channel layout must be set
         // *before* the call, or it cannot size the planes (which it answers

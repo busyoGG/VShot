@@ -155,13 +155,17 @@ fn running_pid() -> Option<i32> {
 enum ReplayCommand {
     /// Write the last `seconds` of the ring (all of it when `seconds` is
     /// absent or zero) to `path`, or the session's own default when absent.
+    /// `save_dir` is `replay save --save-dir`: the directory the session names
+    /// the file in when the request carries no path of its own.
     Save {
         #[serde(default)]
         path: Option<PathBuf>,
         #[serde(default)]
         seconds: Option<u64>,
+        #[serde(default)]
+        save_dir: Option<PathBuf>,
     },
-    /// How much history the ring holds, and where a default save would land.
+    /// How much history the ring holds, and how many saves it has served.
     Status,
     /// End the session.
     Stop,
@@ -224,9 +228,18 @@ fn send_command(command: &ReplayCommand) -> Result<ReplayReply> {
 }
 
 /// `vshot replay save`: asks the running session to write its history to a
-/// file and reports where it went.
-pub fn save(path: Option<PathBuf>, seconds: Option<u64>) -> Result<PathBuf> {
-    match send_command(&ReplayCommand::Save { path, seconds })? {
+/// file and reports where it went.  `save_dir` is `--save-dir`, which names
+/// the directory for this one save when no path is given.
+pub fn save(
+    path: Option<PathBuf>,
+    seconds: Option<u64>,
+    save_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    match send_command(&ReplayCommand::Save {
+        path,
+        seconds,
+        save_dir,
+    })? {
         ReplayReply::Saved { path, seconds } => {
             eprintln!("vshot: saved {seconds:.1}s into {}", path.display());
             Ok(path)
@@ -284,16 +297,40 @@ pub fn stop() -> Result<()> {
     ))
 }
 
+/// Expands the `%`-conversions in a template the way the rest of vshot does,
+/// and answers the text unchanged when it holds a `%` that is not one.
+///
+/// `chrono`'s own formatting panics on a stray `%`, and a filename is not a
+/// place to find that out: `--save-dir /tmp/50%off` is a directory someone can
+/// have, and it has to stay one.
+fn expand_strftime(template: &str) -> String {
+    use chrono::format::{Item, StrftimeItems};
+
+    let items: Vec<Item<'_>> = StrftimeItems::new(template).collect();
+    if items.iter().any(|item| matches!(item, Item::Error)) {
+        return template.to_owned();
+    }
+    chrono::Local::now()
+        .format_with_items(items.into_iter())
+        .to_string()
+}
+
 /// The save path for a request: the session's own default when the control
 /// line names none.  The directory is made when vshot chose it (the videos
 /// directory), an error of the user's when they named a missing one.
+///
+/// Only the names vshot builds itself are templates: `--save-dir` and the
+/// timestamped default are documented as strftime-expanded, and a PATH the
+/// user typed is used exactly as given.  Expanding a typed path would rewrite
+/// `a%m.mp4` into `a09.mp4` without saying so, and the path is the user's to
+/// name.
 fn resolve_save_path(
     requested: Option<&Path>,
     save_dir: Option<&Path>,
     label: &str,
 ) -> Result<PathBuf> {
-    let (raw, owned_default) = match requested {
-        Some(path) => (path.to_string_lossy().to_string(), false),
+    let (path, owned_default) = match requested {
+        Some(path) => (path.to_path_buf(), false),
         None => {
             let base = match save_dir {
                 Some(dir) => dir.to_path_buf(),
@@ -306,11 +343,11 @@ fn resolve_save_path(
                 })?,
             };
             let name = format!("{label}-%Y%m%d-%H%M%S.mp4");
-            (base.join(name).to_string_lossy().to_string(), true)
+            let expanded = expand_strftime(&base.join(name).to_string_lossy());
+            (PathBuf::from(expanded), true)
         }
     };
-    let expanded = chrono::Local::now().format(&raw).to_string();
-    let mut path = PathBuf::from(expanded);
+    let mut path = path;
     if path.extension().and_then(|ext| ext.to_str()) != Some("mp4") {
         path.set_extension("mp4");
     }
@@ -337,18 +374,15 @@ fn resolve_save_path(
 /// Runs a replay session to completion.  This is `vshot replay start`: it owns
 /// the ring, the pid file and the control socket, and returns when the session
 /// is stopped.
+///
+/// The portal is refused before this point, by the caller: a detached session
+/// is a child process whose stderr goes nowhere, so the refusal has to come
+/// from the process the user is watching.
 pub fn run(request: &ReplayRequest) -> Result<()> {
     if let Some(pid) = running_pid() {
         return Err(VshotError::Recording(format!(
             "a replay is already running (pid {pid}); stop it with `vshot replay stop` first"
         )));
-    }
-    if request.portal {
-        return Err(VshotError::Recording(
-            "replay does not support the portal yet: the portal's own frame loop is not wired to \
-             the ring. Record through the portal instead (`vshot record ... --portal`)"
-                .into(),
-        ));
     }
     if request.window == 0 {
         return Err(VshotError::Recording(
@@ -560,6 +594,11 @@ fn window_session(
         name,
         mic,
         interrupted,
+        // The compositor holds its copy until the window's content changes, so
+        // a still window answers Idle rather than sending frames.  Repeating
+        // the frame the capture holds keeps the ring's timeline in step with
+        // the clock, which is what makes a save of the last N seconds N long.
+        Some(request.frame_interval()),
         |sink| {
             // The control socket is polled at every frame boundary, so a save
             // is served with the ring consistent and the loop keeps running.
@@ -758,6 +797,14 @@ fn screencast_window_session(
         // A window that is resized keeps being kept: the ring holds one
         // canvas, and the new frames are fitted into it.
         true,
+        // The cast of a window sends nothing while the window sits still, and
+        // this replay's history is measured on a timeline that only moves when
+        // a frame is encoded.  Repeating the held frame at the session's own
+        // frame rate is what keeps that timeline in step with the clock — and
+        // what keeps `--gop` meaning what it says: a key-frame distance in
+        // *frames* only comes to the seconds it was asked for if the frames
+        // keep arriving at the rate the session was opened with.
+        Some(request.frame_interval()),
         move |sink| {
             // The compositor saying the cast is over ends the session: a
             // window that was closed stops the frames without an error.
@@ -862,9 +909,18 @@ fn session_loop(
                     }
                     eprintln!("vshot: dropping a frame: {error}");
                 }
-                let now = Instant::now();
-                last_frame_at = now;
-                next_frame = now + interval;
+                // The soundtrack keeps up even while the picture does not: the
+                // audio ring holds four seconds (`pipewire_audio`), and a run
+                // of refused frames — a refusal is forgiven for ten seconds —
+                // would overflow it and leave the ring's audio behind the
+                // picture it belongs to.
+                super::pump_soundtrack(mic, recorder)?;
+                // A dropped frame is not a hole in the timeline: the interval it
+                // covered belongs to the frame before it, which was still on
+                // screen.  Advancing `last_frame_at` here would cut that time
+                // out of the ring, making a save shorter than the history it
+                // was asked for.
+                next_frame = Instant::now() + interval;
                 continue;
             }
         };
@@ -948,8 +1004,18 @@ fn handle_control(
         }
     };
     match command {
-        ReplayCommand::Save { path, seconds } => {
-            let reply = match do_save(recorder, request, path.as_deref(), seconds) {
+        ReplayCommand::Save {
+            path,
+            seconds,
+            save_dir,
+        } => {
+            let reply = match do_save(
+                recorder,
+                request,
+                path.as_deref(),
+                save_dir.as_deref(),
+                seconds,
+            ) {
                 Ok((path, seconds)) => ReplayReply::Saved { path, seconds },
                 Err(error) => ReplayReply::Error {
                     // The client relays this sentence verbatim, so the
@@ -1003,9 +1069,14 @@ fn do_save(
     recorder: &mut ReplayRecorder,
     request: &ReplayRequest,
     requested_path: Option<&Path>,
+    requested_dir: Option<&Path>,
     seconds: Option<u64>,
 ) -> Result<(PathBuf, f64)> {
-    let path = resolve_save_path(requested_path, request.save_dir.as_deref(), "replay")?;
+    // The directory the request itself carries (`replay save --save-dir`) wins
+    // over the session's: the file is named here, so a directory the caller
+    // gave for this one save is the one that applies to it.
+    let save_dir = requested_dir.or(request.save_dir.as_deref());
+    let path = resolve_save_path(requested_path, save_dir, "replay")?;
     // No `--seconds` means the user's window, not the whole ring: the ring
     // holds one key-frame interval more than the window on purpose, and that
     // slack is not what a bare `replay save` asked for.
@@ -1080,6 +1151,19 @@ mod tests {
         let command = ReplayCommand::Save {
             path: Some(PathBuf::from("/tmp/a.mp4")),
             seconds: Some(10),
+            save_dir: None,
+        };
+        let text = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReplayCommand>(&text).unwrap(),
+            command
+        );
+        // A bare `replay save --save-dir DIR` travels as no path and a
+        // directory; the session is what names the file.
+        let command = ReplayCommand::Save {
+            path: None,
+            seconds: None,
+            save_dir: Some(PathBuf::from("/tmp/clips")),
         };
         let text = serde_json::to_string(&command).unwrap();
         assert_eq!(
@@ -1098,5 +1182,34 @@ mod tests {
     fn a_save_path_gains_an_mp4_suffix() {
         let path = resolve_save_path(Some(Path::new("/tmp/replay-now")), None, "replay").unwrap();
         assert_eq!(path.extension().unwrap(), "mp4");
+    }
+
+    #[test]
+    fn a_save_path_the_user_typed_is_used_verbatim() {
+        // A path the user named is not a template.  Expanding it would turn
+        // `a%m.mp4` into `a09.mp4` without saying so, and a stray `%` used to
+        // be worse than a rename: `chrono` answers one with a panic, which
+        // takes the session — and the history in its ring — down with it.
+        for typed in ["/tmp/a%m.mp4", "/tmp/50%off.mp4"] {
+            let path = resolve_save_path(Some(Path::new(typed)), None, "replay").unwrap();
+            assert_eq!(path, PathBuf::from(typed));
+        }
+    }
+
+    #[test]
+    fn the_names_vshot_builds_are_expanded() {
+        let expanded = expand_strftime("/tmp/clips-%Y/replay-%Y%m%d-%H%M%S.mp4");
+        assert!(!expanded.contains('%'), "{expanded}");
+        assert!(expanded.starts_with("/tmp/clips-2"), "{expanded}");
+        assert!(expanded.ends_with(".mp4"), "{expanded}");
+    }
+
+    #[test]
+    fn a_stray_percent_in_a_template_is_kept_rather_than_panicking() {
+        // `--save-dir /tmp/50%off` is a directory someone can have, and it has
+        // to stay one rather than panic the session.
+        assert_eq!(expand_strftime("/tmp/50%off"), "/tmp/50%off");
+        assert_eq!(expand_strftime("/tmp/a%"), "/tmp/a%");
+        assert_eq!(expand_strftime("%Y%%%"), "%Y%%%");
     }
 }

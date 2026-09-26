@@ -65,6 +65,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/format.h>
@@ -507,6 +508,12 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 	struct timespec deadline;
 	bool locked = false;
 	bool done;
+	/* Whether `fd` has been handed to the core.  From that point on the
+	 * connection owns it and `vshot_pw_close` is what releases it; before it,
+	 * a failure has to close the descriptor here or it is gone for the life of
+	 * the process — and the portal retries a failed open, so a session that
+	 * fails early would lose one per attempt. */
+	bool fd_given = false;
 	VshotPw *pw;
 
 	if (err != NULL && err_len > 0)
@@ -529,6 +536,8 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 	pw = (VshotPw *)calloc(1, sizeof(*pw));
 	if (pw == NULL) {
 		vshot_pw_error_out(err, err_len, "out of memory for the PipeWire client");
+		if (fd >= 0)
+			close(fd);
 		return NULL;
 	}
 	pw->api = api;
@@ -564,10 +573,12 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 	 * screen-cast service names a node on the session's daemon, so the client
 	 * connects to that daemon itself — the negative descriptor is what asks
 	 * for that. */
-	if (fd >= 0)
+	if (fd >= 0) {
+		fd_given = true;
 		pw->core = api->context_connect_fd(pw->context, fd, NULL, 0);
-	else
+	} else {
 		pw->core = api->context_connect(pw->context, NULL, 0);
+	}
 	if (pw->core == NULL) {
 		vshot_pw_error_out(err, err_len,
 				   "the screen cast's PipeWire connection could not be used: %s",
@@ -670,6 +681,11 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 fail:
 	if (locked)
 		api->thread_loop_unlock(pw->loop);
+	/* A descriptor that never reached the core is closed by nothing below:
+	 * `vshot_pw_close` destroys the stream, the core, the context and the
+	 * loop, and none of those owns a descriptor it was never handed. */
+	if (fd >= 0 && !fd_given)
+		close(fd);
 	if (err != NULL && err_len > 0 && err[0] == '\0')
 		snprintf(err, (size_t)err_len, "the screen-cast stream could not be set up");
 	vshot_pw_close(pw);

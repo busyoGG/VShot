@@ -209,6 +209,10 @@ pub(super) fn run_window(request: &RecordRequest, target: &WindowTarget) -> Resu
         // into the canvas the file was opened with, because the window was on
         // screen the whole time.
         true,
+        // A recording is not a replay: a still window stays one long frame,
+        // which is both what was on screen and the cheaper answer.  Its length
+        // is carried by the last frame at the end of the loop.
+        None,
         // The one thing to serve at a frame boundary here: the compositor
         // saying the cast is over, which is what a window being closed looks
         // like from this side — no more frames, and no error either.

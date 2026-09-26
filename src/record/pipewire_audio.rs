@@ -522,8 +522,9 @@ impl Soundtrack {
 
     /// Replaces the application stream — the `--follow` switch's new window's
     /// own audio — leaving the microphone untouched.  An error is returned
-    /// when the new stream does not share the mix's shape; the caller reports
-    /// it and keeps the stream it had.
+    /// when the new stream does not share the mix's shape, or when the
+    /// recording has no audio track to put it in (it was opened without a
+    /// soundtrack); the caller reports it and keeps the stream it had.
     ///
     /// The outgoing stream is drained into `recorder` first, *paired with the
     /// microphone*: during the round trip that opens the new stream the loop
@@ -539,6 +540,20 @@ impl Soundtrack {
         app: Option<Mic>,
         recorder: &mut impl crate::record::avcodec::AudioSink,
     ) -> Result<()> {
+        // A session that started with no audio at all has no audio track in its
+        // file — the muxer wrote the stream list when it was opened — so a
+        // stream that only turns up at the first `--follow` switch cannot be
+        // added to it.  Refused rather than kept: `pump` follows `format`, so
+        // a stream taken here would be armed and never read, which is a
+        // recording that looks like it has audio and has none.
+        if app.is_some() && self.format.is_none() {
+            return Err(VshotError::Recording(
+                "this recording has no audio track: it was opened without a soundtrack, because \
+                 the first window's application was not playing anything at the time. `--mic` \
+                 keeps a track open for the whole session"
+                    .into(),
+            ));
+        }
         if let (Some(format), Some(new)) = (self.format, &app) {
             if new.format != format {
                 return Err(VshotError::Recording(format!(

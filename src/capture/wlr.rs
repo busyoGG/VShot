@@ -46,7 +46,18 @@ impl CaptureBuffer {
     where
         State: Dispatch<wl_shm_pool::WlShmPool, ()> + Dispatch<wl_buffer::WlBuffer, ()> + 'static,
     {
-        if !matches!(format, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888) {
+        // The four 32-bit layouts a compositor may hand over: the `…rgb…` names
+        // are BGRA in memory and the `…bgr…` ones RGBA, while the fourth byte
+        // is alpha in the `A…` forms and padding in the `X…` ones.  wlroots
+        // with the pixman renderer — a headless or software-rendered session —
+        // offers XBGR8888, which is why the `…bgr…` pair is here at all.
+        if !matches!(
+            format,
+            wl_shm::Format::Argb8888
+                | wl_shm::Format::Xrgb8888
+                | wl_shm::Format::Abgr8888
+                | wl_shm::Format::Xbgr8888
+        ) {
             return Err(VshotError::UnsupportedOutput(format!(
                 "wlr-screencopy returned unsupported wl_shm format {format:?}"
             )));
@@ -133,7 +144,13 @@ fn convert_shm_pixels(
     format: wl_shm::Format,
     y_invert: bool,
 ) -> Result<Frame> {
-    if !matches!(format, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888) {
+    if !matches!(
+        format,
+        wl_shm::Format::Argb8888
+            | wl_shm::Format::Xrgb8888
+            | wl_shm::Format::Abgr8888
+            | wl_shm::Format::Xbgr8888
+    ) {
         return Err(VshotError::UnsupportedOutput(format!(
             "unsupported wl_shm format {format:?}"
         )));
@@ -163,14 +180,19 @@ fn convert_shm_pixels(
         .and_then(|area| area.checked_mul(4))
         .ok_or_else(|| VshotError::WaylandProtocol("capture frame is too large".into()))?;
     let mut pixels = vec![0u8; pixel_count];
-    // The pixel format is BGRA in memory and vshot works in RGBA — the same
-    // four bytes with the red and blue ends swapped.  Swapping them as whole
-    // 32-bit words instead of one byte at a time is what lets the loop go
-    // several times faster: it moves the same pixels with a fraction of the
-    // memory traffic, which matters because this runs once per grabbed frame.
-    let alpha = match format {
-        wl_shm::Format::Argb8888 => None,
-        wl_shm::Format::Xrgb8888 => Some(0xFF00_0000),
+    // What the bytes mean.  The `…rgb…` names are BGRA in memory and vshot
+    // works in RGBA — the same four bytes with the red and blue ends swapped —
+    // while the `…bgr…` names are already RGBA.  The fourth byte is alpha in
+    // the `A…` forms and padding in the `X…` ones, and padding has to be
+    // written out opaque.  Swapping as whole 32-bit words instead of one byte
+    // at a time is what lets the loop go several times faster: it moves the
+    // same pixels with a fraction of the memory traffic, which matters because
+    // this runs once per grabbed frame.
+    let (swap, alpha) = match format {
+        wl_shm::Format::Argb8888 => (true, None),
+        wl_shm::Format::Xrgb8888 => (true, Some(0xFF00_0000)),
+        wl_shm::Format::Abgr8888 => (false, None),
+        wl_shm::Format::Xbgr8888 => (false, Some(0xFF00_0000)),
         _ => unreachable!("unsupported format was rejected above"),
     };
     let row_bytes = width * 4;
@@ -186,11 +208,13 @@ fn convert_shm_pixels(
             .zip(source_row.chunks_exact(4))
         {
             let word = u32::from_le_bytes([source[0], source[1], source[2], source[3]]);
-            let swapped = (word & 0x0000_00FF) << 16
-                | (word & 0x00FF_0000) >> 16
-                | (word & 0xFF00_FF00)
-                | alpha.unwrap_or(word & 0xFF00_0000);
-            destination.copy_from_slice(&swapped.to_le_bytes());
+            let ordered = if swap {
+                (word & 0x0000_00FF) << 16 | (word & 0x00FF_0000) >> 16 | (word & 0xFF00_FF00)
+            } else {
+                word
+            };
+            let pixel = alpha.map_or(ordered, |opaque| ordered | opaque);
+            destination.copy_from_slice(&pixel.to_le_bytes());
         }
     }
     Frame::new(Size::new(width as u32, height as u32), pixels)
@@ -1066,6 +1090,32 @@ mod tests {
         assert_eq!(
             frame.pixel(crate::geometry::Point::new(0, 0)),
             Some([10, 20, 30, 77])
+        );
+    }
+
+    /// The `…bgr…` layouts are already RGBA in memory, so only the padding has
+    /// to be made opaque.  wlroots with the pixman renderer — a headless or
+    /// software-rendered session — hands over XBGR8888, and reading it as the
+    /// BGRA of the `…rgb…` names would swap every red and blue in the frame.
+    #[test]
+    fn converts_xbgr_without_swapping_the_colour_bytes() {
+        let map = vec![1, 2, 3, 99];
+        let frame = convert_shm_pixels(&map, 1, 1, 4, wl_shm::Format::Xbgr8888, false).unwrap();
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(0, 0)),
+            Some([1, 2, 3, 255])
+        );
+    }
+
+    /// ABGR8888 keeps its alpha, and its byte order, the way ARGB8888 keeps
+    /// them with the colour bytes swapped.
+    #[test]
+    fn converts_abgr_alpha_without_swapping_the_colour_bytes() {
+        let map = vec![1, 2, 3, 77];
+        let frame = convert_shm_pixels(&map, 1, 1, 4, wl_shm::Format::Abgr8888, false).unwrap();
+        assert_eq!(
+            frame.pixel(crate::geometry::Point::new(0, 0)),
+            Some([1, 2, 3, 77])
         );
     }
 }

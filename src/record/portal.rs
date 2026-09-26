@@ -289,6 +289,10 @@ fn record(
         // reconfiguration is a different screen rather than a resize to
         // follow: the recording ends there.
         false,
+        // A recording is not a replay: a still screen stays one long frame,
+        // which is both what was on screen and the cheaper answer.  Its length
+        // is carried by the last frame at the end of the loop.
+        None,
         // A portal recording has nothing to serve at a frame boundary: the
         // control socket belongs to a replay, which does not take this route.
         |_sink| Ok(false),

@@ -886,6 +886,10 @@ pub enum ReplayAction {
     Save {
         path: Option<PathBuf>,
         seconds: Option<u64>,
+        /// The directory the session names the file in when `path` is absent,
+        /// from `--save-dir`; the session's own remembered directory when
+        /// this is `None`.
+        save_dir: Option<PathBuf>,
     },
     /// `replay status`: print how much history the session holds.
     Status,
@@ -909,6 +913,34 @@ pub enum OcrSource {
 pub enum OcrDestination {
     Stdout,
     Clipboard,
+}
+
+/// Refuses the options that only shape a session when one of the one-line
+/// control shapes (`replay save`, `status`, `stop`) is given them.
+///
+/// Those three send a request to a session that is already running, so there
+/// is nowhere to put a rate, a codec, a microphone or a follow list — and
+/// accepting one silently would read as if it had been applied.  `options`
+/// carries the name of each such option with whether the user actually gave
+/// it, so only the ones that were typed are named.
+fn refuse_session_options(shape: &str, options: &[(&str, bool)]) -> Result<()> {
+    let named: Vec<&str> = options
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    Err(VshotError::InvalidDestination(format!(
+        "{shape} does not take {}: {} a session, and only `replay start` starts one",
+        named.join(", "),
+        if named.len() == 1 {
+            "it shapes"
+        } else {
+            "they shape"
+        }
+    )))
 }
 
 /// The parser, with the help output in the language `VSHOT_LANG` (or the
@@ -1209,6 +1241,28 @@ impl Cli {
                     "--clipboard and --pin do not apply to the replay subcommand".into(),
                 ));
             }
+            // The options that only shape a session, with which of them the
+            // user actually gave: the three one-line control shapes ask a
+            // session that is already running and cannot apply any of them.
+            let session_options: [(&str, bool); 11] = [
+                ("--window", window.is_some()),
+                ("--fps", fps.is_some()),
+                ("--gop", gop.is_some()),
+                ("--encoder", encoder.is_some()),
+                ("--encoder-backend", encoder_backend.is_some()),
+                ("--mic", mic.is_some()),
+                ("--no-mic", *no_mic),
+                ("--app-audio", *app_audio),
+                ("--follow", !follow.is_empty()),
+                ("--no-follow", *no_follow),
+                // `--save-dir` is the one session option a save can use — the
+                // path is resolved by the session, so the directory travels
+                // with the request — and it is the last entry so a save can
+                // leave it out of the list it refuses.
+                ("--save-dir", save_dir.is_some()),
+            ];
+            // A save keeps `--save-dir`; the other two have no use for it.
+            let for_save = &session_options[..session_options.len() - 1];
             return match action {
                 ReplayCommandLine::Save { path, seconds } => {
                     if self.output.is_some() || *background {
@@ -1217,9 +1271,11 @@ impl Cli {
                                 .into(),
                         ));
                     }
+                    refuse_session_options("`replay save`", for_save)?;
                     Ok(Action::Replay(ReplayAction::Save {
                         path: path.clone(),
                         seconds: *seconds,
+                        save_dir: save_dir.clone(),
                     }))
                 }
                 ReplayCommandLine::Status => {
@@ -1228,6 +1284,7 @@ impl Cli {
                             "`replay status` takes no options".into(),
                         ));
                     }
+                    refuse_session_options("`replay status`", &session_options)?;
                     Ok(Action::Replay(ReplayAction::Status))
                 }
                 ReplayCommandLine::Stop => {
@@ -1236,6 +1293,7 @@ impl Cli {
                             "`replay stop` takes no options".into(),
                         ));
                     }
+                    refuse_session_options("`replay stop`", &session_options)?;
                     Ok(Action::Replay(ReplayAction::Stop))
                 }
                 ReplayCommandLine::Start { target } => {
@@ -2059,6 +2117,44 @@ mod tests {
         .is_err());
         // They are options like any other: `record stop` refuses them too.
         assert!(Cli::try_parse_action_from(["vshot", "record", "stop", "--no-follow"]).is_err());
+    }
+
+    /// The one-line replay control shapes ask a session that is already
+    /// running, so a rate, a codec or a microphone given to one of them has
+    /// nowhere to go.  Refused, because accepting one silently reads as if it
+    /// had been applied.
+    #[test]
+    fn a_control_line_refuses_the_options_that_shape_a_session() {
+        for shape in [vec!["status"], vec!["stop"]] {
+            let mut args = vec!["vshot", "replay"];
+            args.extend(shape.iter().copied());
+            args.extend(["--fps", "60"]);
+            let error = Cli::try_parse_action_from(args).unwrap_err();
+            assert!(error.to_string().contains("--fps"), "{error}");
+        }
+        // `--save-dir` is the one such option a save can use — the session
+        // resolves the path, so the directory travels with the request — and
+        // the two shapes that cannot are the ones that refuse it.
+        let Action::Replay(ReplayAction::Save { save_dir, .. }) =
+            Cli::try_parse_action_from(["vshot", "replay", "save", "--save-dir", "/tmp/clips"])
+                .unwrap()
+        else {
+            panic!("`replay save --save-dir` is a save");
+        };
+        assert_eq!(save_dir, Some(std::path::PathBuf::from("/tmp/clips")));
+        let error =
+            Cli::try_parse_action_from(["vshot", "replay", "stop", "--save-dir", "/tmp/clips"])
+                .unwrap_err();
+        assert!(error.to_string().contains("--save-dir"), "{error}");
+        // A control line with nothing on it is still fine.
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "replay", "status"]).unwrap(),
+            Action::Replay(ReplayAction::Status)
+        );
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "replay", "stop"]).unwrap(),
+            Action::Replay(ReplayAction::Stop)
+        );
     }
 
     #[test]
