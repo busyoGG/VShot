@@ -2,15 +2,19 @@
 // Copyright (C) 2026 VShot contributors
 
 /*
- * The portal's PipeWire stream, as a C client.
+ * A screen cast's PipeWire stream, as a C client.
  *
- * The XDG portal does not hand frames over itself.  `OpenPipeWireRemote`
- * returns a file descriptor to the compositor's PipeWire connection, and the
- * frames come from a node on it, so a recording that goes through the portal
- * needs a PipeWire client: connect to that node, agree on a video format, and
- * read the buffers the compositor renders into.  That work is C — libpipewire
- * is a C library whose callbacks arrive on its own loop thread — and this file
- * is that client, wrapped in an API small enough for Rust to call.
+ * A screen cast does not hand frames over directly: it names a PipeWire node
+ * and the frames come from it, so anything recording one needs a PipeWire
+ * client — connect to that node, agree on a video format, and read the buffers
+ * the compositor renders into.  The XDG portal names the node in its `Start`
+ * answer and hands over a descriptor to the connection it lives on
+ * (`OpenPipeWireRemote`); the compositor's own screen-cast service
+ * (`org.gnome.Mutter.ScreenCast`) names it in a signal, and the node is on the
+ * session's PipeWire daemon, so the client connects to that daemon itself.
+ * That work is C — libpipewire is a C library whose callbacks arrive on its own
+ * loop thread — and this file is that client, wrapped in an API small enough
+ * for Rust to call.
  *
  * Four things shape it:
  *
@@ -517,7 +521,7 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 	 * with a sentence instead. */
 	if (fd >= 0 && fcntl(fd, F_GETFD) < 0) {
 		vshot_pw_error_out(err, err_len,
-				   "the portal's PipeWire file descriptor (%d) is not open: %s", fd,
+				   "the screen cast's PipeWire file descriptor (%d) is not open: %s", fd,
 				   strerror(errno));
 		return NULL;
 	}
@@ -533,7 +537,7 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 
 	api->init(NULL, NULL);
 
-	pw->loop = api->thread_loop_new("vshot-portal", NULL);
+	pw->loop = api->thread_loop_new("vshot-cast", NULL);
 	if (pw->loop == NULL) {
 		vshot_pw_error_out(err, err_len, "the PipeWire thread loop could not be created");
 		goto fail;
@@ -543,7 +547,7 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 	locked = true;
 
 	/* The properties say what this stream is for; a session that has rules
-	 * for screen casting (the portal's own, or a policy daemon's) reads
+	 * for screen casting (a portal's own, or a policy daemon's) reads
 	 * them. */
 	properties = api->properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
 					 PW_KEY_MEDIA_ROLE, "Screen", NULL);
@@ -554,15 +558,19 @@ VshotPw *vshot_pw_open(int fd, uint32_t node_id, int allow_dmabuf, int fps, int 
 		goto fail;
 	}
 
-	/* The portal hands over a connection to the compositor's own PipeWire
-	 * instance, which is what `fd` is. */
+	/* Two ways to reach the node, and the caller says which by the descriptor
+	 * it passes.  The portal hands over a connection to the compositor's own
+	 * PipeWire instance, which is what `fd` is; the compositor's own
+	 * screen-cast service names a node on the session's daemon, so the client
+	 * connects to that daemon itself — the negative descriptor is what asks
+	 * for that. */
 	if (fd >= 0)
 		pw->core = api->context_connect_fd(pw->context, fd, NULL, 0);
 	else
 		pw->core = api->context_connect(pw->context, NULL, 0);
 	if (pw->core == NULL) {
 		vshot_pw_error_out(err, err_len,
-				   "the portal's PipeWire connection could not be used: %s",
+				   "the screen cast's PipeWire connection could not be used: %s",
 				   strerror(errno));
 		goto fail;
 	}
@@ -775,20 +783,28 @@ void vshot_pw_close(VshotPw *pw)
 	if (pw->loop != NULL && pw->loop_started)
 		pw->api->thread_loop_stop(pw->loop);
 
+	/* The buffers the caller still holds are **not** handed back here, and
+	 * that is deliberate.  Handing one back means `pw_stream_queue_buffer`
+	 * with a `pw_buffer` the stream's pool owns — and by the time a screen
+	 * cast ends, that pool is often already gone: the compositor stopped the
+	 * cast, the window it was casting closed, the node was removed.  The
+	 * pointer is stale then, and writing through it is a segfault (measured,
+	 * twice: once when this client stopped the cast itself, once when the
+	 * window closed under it).  No state tells the two cases apart — a
+	 * stream whose node was removed still reports itself as streaming.
+	 *
+	 * Nothing is lost by skipping it: the stream is destroyed a few lines
+	 * below, and PipeWire returns whatever it still owns to the node then.
+	 * The hand-back matters while a cast is *running* — the caller returns
+	 * each frame as the next one is taken, which is what keeps the
+	 * compositor supplied — and that is `vshot_pw_next`'s job, not this
+	 * one's. */
 	pthread_mutex_lock(&pw->lock);
 	pw->failed = true;
 	pw->ended = true;
-	vshot_pw_wake(pw);
-	pthread_mutex_unlock(&pw->lock);
-
-	/* Buffers the caller still holds go back before the stream goes away,
-	 * so the compositor is not left short of them.  The loop is stopped by
-	 * now, so nothing else touches the stream. */
-	pthread_mutex_lock(&pw->lock);
-	vshot_pw_recycle_locked(pw, pw->held);
-	vshot_pw_recycle_locked(pw, pw->slot);
 	pw->held = NULL;
 	pw->slot = NULL;
+	vshot_pw_wake(pw);
 	pthread_mutex_unlock(&pw->lock);
 
 	if (pw->stream != NULL)
@@ -843,7 +859,7 @@ static const struct vshot_pw_api *vshot_pw_api_load(char *error, size_t error_le
 			const char *reason = dlerror();
 
 			snprintf(vshot_pw_api_error, sizeof(vshot_pw_api_error),
-				 "libpipewire is not installed, and the portal's screen cast travels "
+				 "libpipewire is not installed, and a screen cast travels "
 				 "over libpipewire: %s",
 				 reason != NULL ? reason : "the shared object could not be opened");
 			gave_up = true;
@@ -867,7 +883,7 @@ static const struct vshot_pw_api *vshot_pw_api_load(char *error, size_t error_le
 		if (symbol == NULL) {                                                              \
 			snprintf(vshot_pw_api_error, sizeof(vshot_pw_api_error),                    \
 				 "libpipewire is installed but `%s` is missing, so it is too old "  \
-				 "for the portal's screen cast",                                    \
+				 "for a screen cast",                                               \
 				 symbol_name);                                                       \
 			pthread_mutex_unlock(&vshot_pw_api_lock);                                  \
 			if (error != NULL && error_len > 0)                                        \

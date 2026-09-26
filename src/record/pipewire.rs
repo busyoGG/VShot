@@ -1,24 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
-//! The Rust side of the portal's PipeWire client (`pipewire_client.c`).
+//! The Rust side of the PipeWire client every screen-cast route uses
+//! (`pipewire_client.c`).
 //!
-//! The XDG portal does not hand frames over itself: `OpenPipeWireRemote`
-//! returns a file descriptor to the compositor's PipeWire connection, and the
-//! frames come from a node on it.  Connecting to that node and turning its
-//! buffers into something the encoder can take is C's job — libpipewire is a
-//! C library with C callbacks, and the frame arrives on a PipeWire thread,
-//! which is exactly the shape a C shim carries well.  [`Stream`] is the RAII
-//! wrapper around it.
+//! A screen cast hands over a PipeWire node rather than pixels.  The XDG
+//! portal names it in its `Start` answer and hands over a descriptor to the
+//! connection it lives on (`OpenPipeWireRemote`); the compositor's own
+//! screen-cast service names it in a signal, and the node is on the session's
+//! PipeWire daemon, so the client connects to that daemon itself.  Either way
+//! the frames come from a node, and connecting to it and turning its buffers
+//! into something the encoder can take is C's job — libpipewire is a C library
+//! with C callbacks, and the frame arrives on a PipeWire thread, which is
+//! exactly the shape a C shim carries well.  [`Stream`] is the RAII wrapper
+//! around it.
 //!
 //! Two things about the C boundary shape this module:
 //!
 //! * **libpipewire is `dlopen`ed by the shim, not linked.**  The headers are a
 //!   build-time dependency (the C file cannot be compiled without them), the
-//!   library is not: a machine without it still builds, and the portal route
-//!   says what is missing when it is asked for.  When the headers were missing
-//!   at build time too, the whole client is compiled out and the stub below
-//!   answers for it.
+//!   library is not: a machine without it still builds, and both screen-cast
+//!   routes say what is missing when they are asked for.  When the headers
+//!   were missing at build time too, the whole client is compiled out and the
+//!   stub below answers for it.
 //!
 //! * **A frame is borrowed, not owned.**  The pixels live in a buffer the
 //!   compositor owns and PipeWire recycles; handing out an owned copy of the
@@ -128,8 +132,8 @@ mod binding {
 }
 
 /// The same entry points, for a build that had no libpipewire headers: every
-/// one of them answers "there is no client", so the portal route fails with a
-/// sentence naming the package instead of with a link error at build time.
+/// one of them answers "there is no client", so a screen-cast route fails with
+/// a sentence naming the package instead of with a link error at build time.
 #[cfg(not(vshot_pipewire))]
 mod binding {
     use super::{c_char, c_int, RawFrame, VshotPw};
@@ -137,8 +141,8 @@ mod binding {
     /// The message every entry point answers with; a `&'static` string so the
     /// pointer it hands out stays valid.
     const MESSAGE: &[u8] =
-        b"this build was made without libpipewire's headers, so the XDG portal's \
-screen-cast stream cannot be read; install libpipewire and rebuild\n\0";
+        b"this build was made without libpipewire's headers, so a screen-cast stream cannot be \
+read; install libpipewire and rebuild\n\0";
 
     fn message() -> *const c_char {
         MESSAGE.as_ptr().cast::<c_char>()
@@ -196,8 +200,8 @@ screen-cast stream cannot be read; install libpipewire and rebuild\n\0";
     pub(super) unsafe fn vshot_pw_close(pw: *mut VshotPw) {}
 }
 
-/// Whether the portal's frames can be read at all: libpipewire present at run
-/// time, and the client compiled in.
+/// Whether a screen cast's frames can be read at all: libpipewire present at
+/// run time, and the client compiled in.
 pub fn available() -> bool {
     unsafe { binding::vshot_pw_available() != 0 }
 }
@@ -240,7 +244,7 @@ pub struct Dmabuf {
     pub stride: i32,
 }
 
-/// A connected PipeWire stream, reading the node the portal's `Start` named.
+/// A connected PipeWire stream, reading the node the cast named.
 ///
 /// One frame is in hand at a time: [`Stream::next`] returns a frame that
 /// borrows the stream, and the buffer goes back to PipeWire on the following
@@ -291,7 +295,7 @@ impl Stream {
         };
         if handle.is_null() {
             return Err(VshotError::Recording(format!(
-                "could not read the portal's screen-cast stream: {}",
+                "could not read the screen-cast stream: {}",
                 take(buffer.as_ptr())
             )));
         }
@@ -313,7 +317,7 @@ impl Stream {
         };
         if code != 0 {
             return Err(VshotError::Recording(format!(
-                "the portal's screen-cast stream has no shape yet: {}",
+                "the screen-cast stream has no shape yet: {}",
                 self.error()
             )));
         }
@@ -321,7 +325,7 @@ impl Stream {
             (Ok(width), Ok(height)) => (width, height),
             _ => {
                 return Err(VshotError::Recording(format!(
-                    "the portal offered a frame of {width}x{height}, which is not a size"
+                    "the screen cast offered a frame of {width}x{height}, which is not a size"
                 )))
             }
         };
@@ -349,7 +353,7 @@ impl Stream {
             })),
             1 => Ok(None),
             _ => Err(VshotError::Recording(format!(
-                "the portal's screen-cast stream ended: {}",
+                "the screen-cast stream ended: {}",
                 self.error()
             ))),
         }

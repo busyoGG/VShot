@@ -255,6 +255,19 @@ impl WindowCapture {
     /// Connects and binds the protocols window capture needs.  A compositor
     /// without them is reported here, before any recording file is created.
     pub fn connect() -> Result<Self> {
+        let capture = Self::connect_listing()?;
+        capture.require_capture()?;
+        Ok(capture)
+    }
+
+    /// Connects and binds the toplevel list alone, for a caller that only
+    /// needs to name windows.
+    ///
+    /// The compositor's own screen-cast service (`record::screencast`) takes a
+    /// window id rather than a protocol handle, and the id is the toplevel's
+    /// identifier — so that route needs the list without the capture
+    /// protocols, on a compositor where they do not exist.
+    pub fn connect_listing() -> Result<Self> {
         let connection = Connection::connect_to_env()
             .map_err(|error| VshotError::WaylandConnection(error.to_string()))?;
         let mut event_queue = connection.new_event_queue::<CopyState>();
@@ -267,27 +280,46 @@ impl WindowCapture {
         event_queue
             .roundtrip(&mut state)
             .map_err(|error| VshotError::WaylandProtocol(error.to_string()))?;
+        Ok(Self { event_queue, state })
+    }
+
+    /// Whether the protocols a capture session needs were bound.  This is the
+    /// question the recording dispatch asks before it picks a route: a
+    /// compositor that answers "no" is served by its own screen-cast service
+    /// instead, where it has one.
+    pub fn has_capture(&self) -> bool {
+        self.state.list.is_some()
+            && self.state.source_manager.is_some()
+            && self.state.manager.is_some()
+    }
+
+    /// Whether the protocols a capture session needs were bound, with the
+    /// missing one named when they were not.
+    fn require_capture(&self) -> Result<()> {
         for missing in [
-            (state.list.is_none(), "ext_foreign_toplevel_list_v1"),
+            (self.state.list.is_none(), "ext_foreign_toplevel_list_v1"),
             (
-                state.source_manager.is_none(),
+                self.state.source_manager.is_none(),
                 "ext_foreign_toplevel_image_capture_source_manager_v1",
             ),
-            (state.manager.is_none(), "ext_image_copy_capture_manager_v1"),
+            (
+                self.state.manager.is_none(),
+                "ext_image_copy_capture_manager_v1",
+            ),
         ] {
             if missing.0 {
                 return Err(VshotError::Recording(format!(
                     "this compositor does not offer window capture (`{}`); record a screen instead \
-                     (`vshot record monitor`, or `vshot record all`), or ask the compositor's own \
-                     picker through the portal (`vshot record window --portal`)",
+                     (`vshot record monitor`, or `vshot record all`), or record through the \
+                     compositor's own screen-cast service if it has one",
                     missing.1
                 )));
             }
         }
-        if state.dmabuf.is_none() {
+        if self.state.dmabuf.is_none() {
             return Err(VshotError::MissingCapability("zwp_linux_dmabuf_v1".into()));
         }
-        Ok(Self { event_queue, state })
+        Ok(())
     }
 
     /// Every mapped window the compositor lists.  The list is enumerated on the

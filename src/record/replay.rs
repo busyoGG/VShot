@@ -467,8 +467,9 @@ fn screen_session(
 ///
 /// Which loop depends on what the session speaks, exactly as on the recording
 /// side: the wlroots route copies the window through
-/// `ext_image_copy_capture_v1`, while a Plasma session has no such protocol
-/// and copies it through KWin's own `ScreenShot2.CaptureWindow`.
+/// `ext_image_copy_capture_v1`, a Plasma session has no such protocol and
+/// copies it through KWin's own `ScreenShot2.CaptureWindow`, and a compositor
+/// with neither — niri — casts it through its own screen-cast service.
 fn window_session(
     request: &ReplayRequest,
     target: &super::WindowTarget,
@@ -479,6 +480,11 @@ fn window_session(
         == crate::capture::active_output::Session::KWin
     {
         return kwin_window_session(request, target, listener, interrupted);
+    }
+    // The same fallback a window *recording* takes, because it is the same
+    // frame source; only the sink differs — a ring instead of a file.
+    if !super::window_capture_supported() && super::screencast::available() {
+        return screencast_window_session(request, target, listener, interrupted);
     }
     use super::avcodec::VideoSink;
     let (mut capture, shape, name) = super::window::open_window_capture(target)?;
@@ -664,6 +670,115 @@ fn kwin_window_session(
             }
         },
     )
+}
+
+/// The screen-cast window replay session: the compositor's own cast of one
+/// window, encoded into the ring.  The twin of [`window_session`] for a
+/// compositor that speaks neither `ext_image_copy_capture_v1` nor KWin's
+/// `ScreenShot2` — niri, whose capture support stops at outputs and whose
+/// window pixels come from the screen-cast service its portal drives.  The
+/// cast, the loop and the per-frame control socket are the ones a window
+/// *recording* on that service uses; only the sink differs.
+fn screencast_window_session(
+    request: &ReplayRequest,
+    target: &super::WindowTarget,
+    listener: &UnixListener,
+    interrupted: &AtomicBool,
+) -> Result<()> {
+    use super::avcodec::VideoSink;
+    let backend = request.encoder_backend.resolve();
+    let mut window = super::screencast::WindowCast::open(
+        target,
+        request.cursor,
+        request.fps,
+        super::screencast::allow_dmabuf(backend),
+    )?;
+    let geometry = window.geometry;
+    let shape = super::cast::Shape::of(&geometry);
+    let fourcc = super::cast::fourcc_for(geometry.spa_format)?;
+
+    // `--mic` and `--app-audio` are independent and may both be given: the
+    // microphone is the room, the window's own application audio is the
+    // window's sound, and the ring keeps both summed into its one track.
+    let app_audio = if request.app_audio {
+        super::open_app_audio(&window.name)?
+    } else {
+        None
+    };
+    let mic = super::open_soundtrack_with(request.mic.as_ref(), app_audio)?;
+    let mic_format = mic.format();
+    let gop_frames = request.gop_frames();
+    let retention = request
+        .window
+        .saturating_add(request.gop_secs.clamp(1, MAX_GOP));
+    let mut recorder = ReplayRecorder::start(
+        geometry.width,
+        geometry.height,
+        request.encoder,
+        // The ring keeps dma-bufs only where the cast produced them and the
+        // backend can import them; a memory cast is RGBA, exactly as on the
+        // recording side.
+        match shape {
+            super::cast::Shape::Dmabuf => Some(fourcc),
+            super::cast::Shape::Software => None,
+        },
+        mic_format,
+        retention,
+        gop_frames,
+        request.fps,
+        backend,
+    )?;
+    if debug_enabled() {
+        eprintln!(
+            "vshot: window replay {}x{} at {} fps with {} ({}) through libavcodec {}, keeping \
+             {}s in memory (GOP {} frames)",
+            geometry.width,
+            geometry.height,
+            request.fps,
+            request.encoder.word(),
+            backend.word(),
+            super::avcodec::libavcodec_version(),
+            request.window,
+            gop_frames
+        );
+    }
+    let _ = VideoSink::canvas(&recorder);
+    let mut mic = mic;
+    mic.arm();
+    let ended = window.ended_flag();
+    let outcome = super::cast::loop_over(
+        &mut window.stream,
+        &mut recorder,
+        // A replay has no `--duration`: it runs until it is stopped.
+        None,
+        shape,
+        geometry,
+        &mut mic,
+        interrupted,
+        // A window that is resized keeps being kept: the ring holds one
+        // canvas, and the new frames are fitted into it.
+        true,
+        move |sink| {
+            // The compositor saying the cast is over ends the session: a
+            // window that was closed stops the frames without an error.
+            if ended.load(Ordering::Relaxed) {
+                eprintln!(
+                    "vshot: the replay ended: the compositor stopped casting the window; it may \
+                     have been closed"
+                );
+                return Ok(true);
+            }
+            // The control socket is polled at every frame boundary, so a save
+            // is served with the ring consistent and the loop keeps running.
+            if let Some(stream) = accept_control(listener) {
+                handle_control(stream, sink, request)
+            } else {
+                Ok(false)
+            }
+        },
+    );
+    window.stop();
+    outcome
 }
 
 /// Binds the control socket, replacing a stale one (a socket left by a session

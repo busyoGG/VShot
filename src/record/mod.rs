@@ -74,11 +74,13 @@ use crate::wayland::WaylandSession;
 use self::avcodec::{EncoderBackend, Recorder, VideoCodec};
 
 pub mod avcodec;
+mod cast;
 mod kwin_window;
 mod pipewire;
 mod pipewire_audio;
 mod portal;
 pub(crate) mod replay;
+mod screencast;
 mod window;
 
 pub use replay::{
@@ -579,6 +581,18 @@ fn compose(
     SceneSnapshot::from_outputs(std::mem::take(&mut scratch.outputs))
 }
 
+/// Whether this session's compositor offers the wlroots window-capture
+/// protocols.
+///
+/// A session that cannot even be asked — no Wayland connection at all —
+/// answers "no", and whichever route runs next reports the real reason.
+fn window_capture_supported() -> bool {
+    match crate::capture::window_copy::WindowCapture::connect_listing() {
+        Ok(capture) => capture.has_capture(),
+        Err(_) => false,
+    }
+}
+
 /// Runs a recording to completion (a stop signal, `--duration`, or an
 /// error).  Returns the file that was written.
 pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
@@ -602,10 +616,18 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     // `ext_image_copy_capture_v1` over an `ext_foreign_toplevel_handle_v1`
     // source, and a Plasma session speaks neither — it records a window through
     // KWin's own `ScreenShot2.CaptureWindow`, aimed at the window's `QUuid`.
+    // A compositor with neither — niri, whose capture support stops at outputs
+    // — casts the window through its own screen-cast service, aimed at the
+    // window id the toplevel list gives.  That last one is a fallback rather
+    // than a mode: it records the window the command named, exactly as the
+    // wlroots route does, so there is nothing for the user to choose.
     if let RecordTarget::Window(target) = &request.target {
         let session = crate::capture::active_output::Session::detect();
         if session == crate::capture::active_output::Session::KWin {
             return kwin_window::run(request, target);
+        }
+        if !window_capture_supported() && screencast::available() {
+            return screencast::run_window(request, target);
         }
         return window::run(request, target);
     }

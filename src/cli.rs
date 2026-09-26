@@ -626,7 +626,10 @@ What is behind the window never appears: this is the window, not the area it sit
 The window is named by app id or title (the whole name first, else a case-insensitive \
 substring of either), picked with `--pick`, or — with no argument — the focused one. The \
 protocol this needs is `ext_image_copy_capture_v1` with the window as its source; a \
-compositor without it is told to record a screen instead.\n\n\
+compositor without it — niri, whose capture support stops at outputs — casts the window \
+through its own screen-cast service (`org.gnome.Mutter.ScreenCast`) instead, which needs no \
+flag and shows no picker. `--follow` is not available on that route, because the service \
+casts the window it was started on.\n\n\
 A window that is resized while recording keeps recording: the new size is fitted into the \
 recording's own canvas (scaled down to fit, centred, letterboxed), because one MP4 holds one \
 frame size — the window was on screen the whole time, so the file is its whole history. A \
