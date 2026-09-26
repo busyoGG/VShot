@@ -375,8 +375,9 @@ vshot record stop                               # 停止（读取 pid 文件发�
   vshot 按新约束重建捕获缓冲池，并把新尺寸的画面**等比缩放适配进录制自己的画布**
   （比画布大就缩小，小就原尺寸居中，两侧加黑边），所以一条 MP4 的帧尺寸从第一包到 trailer
   始终不变，而文件是窗口完整的历史。适配在 VAAPI（dma-buf）路上由 GPU 的 `scale_vaapi`
-  滤镜链完成；在 NVENC 的软件路上由 CPU 做同样的等比缩放（录制本来就是那条路唯一的兼容
-  选择）。窗口被**关闭**则在那里结束——文件正常收尾（trailer 完整），stderr 说明原因。
+  滤镜链完成；在 NVENC 那条路上由 CPU 做同样的等比缩放（那条路本来就要把帧搬过 CPU，编码仍在
+  GPU 的 NVENC 单元上）。窗口被**关闭**则在那里结束——文件正常收尾（trailer 完整），stderr
+  说明原因。
   窗口所在输出如果**关着/禁用/断开**，永远不会有帧送过来，这种情况几秒后会报错而不是一直等。
   实测：一扇浮窗在录制中被依次拉到 500×400、900×700、320×240，逐次被适配进开录时的画布，
   文件尺寸始终不变、帧数与时长相符、录制不中断。
@@ -402,9 +403,12 @@ vshot record stop                               # 停止（读取 pid 文件发�
   先试 VAAPI（AMD/Intel），打不开再试 NVENC（NVIDIA）；写死某一个时只用那个，打不开就
   明确报错并说明是哪一层失败（例如 `no CUDA device for NVENC`）。两条路的编码器名、
   像素格式与私有选项各自独立设置，`--encoder h264/hevc/av1` 在两条路上都能选。
-  **NVENC 没有 dma-buf 导入**，所以它走**软件路径**：帧在 CPU 上转成 NV12 再上传，
-  零拷贝只在 VAAPI 上可用，NVENC 的 CPU 占用因此略高（编码本身仍在 GPU 上）。多显卡
-  机器上 NVENC 默认用第一个 CUDA 设备，`VSHOT_NVENC_DEVICE=<索引>` 换一个。
+  **两条路都是硬件编码**：跑的是 GPU 自己的媒体引擎（`h264/hevc/av1_vaapi` 或
+  `h264/hevc/av1_nvenc`），vshot 里没有任何 x264/x265 之类的 CPU 编码路径。差别只在
+  **帧怎么送到编码器**：VAAPI 能导入合成器的 dma-buf，全程零拷贝；**NVENC 没有 dma-buf
+  导入**，它的帧要经 CPU 搬一趟（dma-buf 读回内存 → 转 NV12 → 上传显存），所以 NVENC 的
+  CPU 占用略高，编码本身一样在 GPU 上。多显卡机器上 NVENC 默认用第一个 CUDA 设备，
+  `VSHOT_NVENC_DEVICE=<索引>` 换一个。
   NVIDIA 机器还需要 `ffmpeg` 构建时带 `nvenc`（多数发行版默认带）。
 - **麦克风（`--mic`）**：把麦克风录进同一个 MP4，编码是 AAC（ffmpeg 自己的编码器，和
   视频同一条 libavcodec 路线）。不带名字用会话的默认输入设备，给名字或节点序号录别的输入
@@ -708,7 +712,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 ### 验证到哪一步了
 
 - **Hyprland**——本机会话就是 Hyprland，也是主要开发与验证环境：截图、选区标注、窗口、长截图、pin 与滚动注入都在这里跑过。
-- **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——软件路径（CPU 转 NV12 再上传）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
+- **录屏编码后端**——本机（7900 XT）是 VAAPI：零拷贝 dma-buf、h264/hevc/av1、`--fps`、窗口中途缩放、portal 与回录都在这条路上实测过。NVENC 的**选路与失败路径**已验证（`--encoder-backend nvenc` 在无 NVIDIA 的机器上干净失败，消息带具体原因如 `no CUDA device for NVENC`），但**真实的 NVENC 编码从未在 NVIDIA 硬件上跑过**——CPU 搬运那条路（dma-buf 读回 → 转 NV12 → 上传，编码仍由 NVENC 单元做）与其中的窗口缩放适配是按代码审查实现的，没有现场数据。
 - **逐应用音频**——在 Hyprland 上实测：两个 mpv 分别播 880 Hz / 220 Hz，`record window --app-audio` 录出的文件主频为 880 Hz，隔离正确；无声窗口降级为只录视频。窗口 pid 的来源在**能录窗口**的合成器上都有（Hyprland、niri 由合成器直报，KWin 走 scripting 探针的 `pid` 字段），因此 `--app-audio` 在 Plasma 上也能按 pid 找到应用音频；niri 也报了 pid，所以走 ScreenCast 服务的窗口录制同样能按 pid 找到应用音频（实机未验证隔离）；Sway 与 labwc 没有窗口 pid 来源，会明确拒绝而不是静默退回麦克风。niri 与 KWin 的 pid 路径只有单元测试与无头实测，未在真实音频会话上验证隔离。
 - **麦克风 + 应用音频共存**——在 Hyprland 上实测：一路虚拟麦克风源播 440 Hz、mpv 窗口播 880 Hz，`record window --mic --app-audio` 录出**单条** AAC 音轨，Goertzel 分析在整个时长内同时检出 440 Hz 与 880 Hz，长度与视频一致（8.000s 对 8.000s）。`--follow` 切窗时麦克风那一路**全程不断**（每秒 440 Hz 幅度恒为 0.212），只有应用那一路换到新窗口（880 Hz → 660 Hz）。回录路径（`replay start window --mic --app-audio`）同样含两路。
 - **跟随焦点（`--follow`）**——在 Hyprland 上用两个不同尺寸/音调的 mpv 实测：焦点 A → B → A 得到一个 14.0 s 的文件，宽度始终 900（B 的 600×340 被缩放进 A 的 900×500 画布），音轨按时间窗分析为 880 Hz → 220 Hz → 880 Hz。焦点查询、白名单匹配与"保持在原窗"三类判断都有单元测试；**报不出焦点的合成器未实测**（Hyprland 能报）。

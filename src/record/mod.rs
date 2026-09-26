@@ -667,8 +667,8 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     let dmabuf_fourcc = if backend == EncoderBackend::Nvenc {
         if debug_enabled() {
             eprintln!(
-                "vshot: the NVENC backend records the software path (no dma-buf import); \
-                 reading frames back through system memory"
+                "vshot: the NVENC backend has no dma-buf import; reading frames back through \
+                 system memory (the encode itself is still on the GPU)"
             );
         }
         None

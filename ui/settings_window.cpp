@@ -1403,7 +1403,7 @@ private:
         recordEncoderBackendBox_->setMinimumWidth(200);
         selectChoice(recordEncoderBackendBox_, config_.cli.recordEncoderBackend);
         addRow(recording, uiTr("Hardware encoder"),
-               uiTr("auto tries VAAPI then NVENC; NVENC records the software path"),
+               uiTr("auto tries VAAPI then NVENC; both encode on the GPU (NVENC copies frames via the CPU)"),
                recordEncoderBackendBox_, false);
 
         recordFpsSpin_ = optionalSpin(recording, kDefaultRecordFps, 240, uiTr(" fps"));
@@ -1510,7 +1510,7 @@ private:
         replayEncoderBackendBox_->setMinimumWidth(200);
         selectChoice(replayEncoderBackendBox_, config_.cli.replayEncoderBackend);
         addRow(replay, uiTr("Hardware encoder"),
-               uiTr("auto tries VAAPI then NVENC; NVENC records the software path"),
+               uiTr("auto tries VAAPI then NVENC; both encode on the GPU (NVENC copies frames via the CPU)"),
                replayEncoderBackendBox_, false);
 
         replayFpsSpin_ = optionalSpin(replay, kDefaultReplayFps, 240, uiTr(" fps"));

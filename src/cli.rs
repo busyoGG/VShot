@@ -423,9 +423,11 @@ cannot blend)."
         encoder: Option<String>,
         /// Hardware encoder: auto (default; VAAPI where it opens, else NVENC),
         /// vaapi (AMD/Intel) or nvenc (NVIDIA). The config's
-        /// `cli.record.encoder-backend` when the flag is not given. NVENC has
-        /// no dma-buf import, so it records the software path — expect a
-        /// higher CPU cost, and zero-copy where VAAPI is available.
+        /// `cli.record.encoder-backend` when the flag is not given. Both encode
+        /// on the GPU's own media engine (`h264/hevc/av1_vaapi` or `_nvenc`);
+        /// there is no CPU encoder here. NVENC has no dma-buf import, so its
+        /// frames are carried through the CPU — a higher CPU cost than VAAPI's
+        /// zero-copy, with the encode itself still on the GPU.
         #[arg(
             long,
             global = true,
@@ -508,7 +510,8 @@ VSHOT_REPLAY_SOCKET overrides the control socket, VSHOT_REPLAY_PIDFILE the pid f
         encoder: Option<String>,
         /// Hardware encoder: auto (default), vaapi or nvenc; the config's
         /// `cli.replay.encoder-backend` when the flag is not given. As on the
-        /// recording side, NVENC records the software path.
+        /// recording side both encode on the GPU; NVENC's frames are carried
+        /// through the CPU because it has no dma-buf import.
         #[arg(
             long,
             global = true,

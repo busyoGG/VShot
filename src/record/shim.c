@@ -1168,10 +1168,10 @@ static int open_encoder(VshotAvEnc *enc, int width, int height, const char *code
     // 4K costs ~19 ms on a fraction of frames — enough, against a 16.7 ms
     // budget, to make a 4K60 session run at ~58 fps (measured).  A deeper
     // queue lets the conversion run ahead of the encoder, and the stall goes
-    // away.  The option is private to the VAAPI encoders; NVENC's equivalent
-    // is `async_depth` too (it bounds how many frames the encoder accepts
-    // before it makes the caller wait), and a build without it keeps the
-    // default.
+    // away.  The option is private to the VAAPI encoders: NVENC has no
+    // `async_depth` (its own knobs are `surfaces` and `delay`), so the call
+    // below fails there and the default stays.  The failure is deliberately
+    // ignored — a build without the option keeps its own default either way.
     api->opt_set_int(enc->ctx, "async_depth", 8, AV_OPT_SEARCH_CHILDREN);
     // The colour properties the zero-copy chain carries: the packed RGB
     // the compositor produces is full-range BT.709.  These match the
