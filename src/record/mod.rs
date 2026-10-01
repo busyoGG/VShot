@@ -766,34 +766,15 @@ pub fn run(request: &RecordRequest) -> Result<std::path::PathBuf> {
     report_outcome(outcome, &path)
 }
 
-/// The output path, with its directory made when vshot chose it and an error
-/// of ours when the user's own directory is missing.  Shared by every
-/// recording shape.
+/// The output path, with its directory made when it is missing.
+///
+/// A recording's path is a strftime pattern either way — the videos directory
+/// vshot picks, or one the user named — and a pattern routinely names a
+/// directory that does not exist yet (`Screenshots/%Y%m/`).  Both are made here,
+/// so naming a directory costs no `mkdir` of your own.
 fn prepare_output_path(request: &RecordRequest) -> Result<std::path::PathBuf> {
     let path = resolve_output_path(request.output.as_deref())?;
-    // The default videos directory is vshot's own choice, so it gets made if
-    // it is missing — `~/.config/user-dirs.dirs` can name one that no desktop
-    // has created yet.  A path the user named is theirs: a missing directory
-    // there is a mistake worth an error of our own rather than the muxer's
-    // bare "No such file or directory".
-    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(directory) if request.output.is_none() => {
-            std::fs::create_dir_all(directory).map_err(|source| {
-                VshotError::Recording(format!(
-                    "could not create the videos directory {}: {source}",
-                    directory.display()
-                ))
-            })?;
-        }
-        Some(directory) if !directory.is_dir() => {
-            return Err(VshotError::Recording(format!(
-                "the directory {} does not exist (create it, or drop --output to record into the \
-                 videos directory)",
-                directory.display()
-            )));
-        }
-        _ => {}
-    }
+    crate::output::create_parent_directories(&path)?;
     Ok(path)
 }
 

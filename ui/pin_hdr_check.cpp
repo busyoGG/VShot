@@ -235,9 +235,11 @@ int main(int argc, char **argv)
     bare.borderWidth = 0;
     surface.setStyle(bare);
 
-    // Three pins of the same grey: two HDR captures with an SDR pin between
-    // them, so "the tag is on the pin under the pointer" cannot pass by being
-    // "the tag is on the first pin" or "on every pin".
+    // Three pins of the same grey.  The marker belongs to a pin's *own* state
+    // -- it is an HDR capture whatever surface is showing it -- and what this
+    // checks is which pin under the pointer carries it and in what ink.  Which
+    // pins the helper has taken the pixels of is a separate question, and it is
+    // the subject of the two paint checks below.
     const QImage grey = solid(160, 100, QColor(kPinLevel, kPinLevel, kPinLevel));
     const QRect hdrRect = QRect(base + QPoint(20, 20), grey.size());
     const QRect sdrRect = QRect(base + QPoint(20, 150), grey.size());
@@ -246,7 +248,7 @@ int main(int argc, char **argv)
     first.id = 1;
     first.image = grey;
     first.origin = hdrRect.topLeft();
-    first.hdr = true;
+    first.capturedHdr = true;
     vshot::PinSurface::Item plain;
     plain.id = 2;
     plain.image = grey;
@@ -255,8 +257,14 @@ int main(int argc, char **argv)
     second.id = 3;
     second.image = grey;
     second.origin = otherRect.topLeft();
-    second.hdr = true;
+    second.capturedHdr = true;
+    // The helper has the output: every pin's picture, shadow and rim are drawn
+    // on its own surface below this one, so this surface paints no image at all
+    // -- only the chrome, which is what these checks are about.
     surface.setHdrPixels(true);
+    for (vshot::PinSurface::Item *item : {&first, &plain, &second}) {
+        item->hdr = true;
+    }
     surface.setPins({first, plain, second});
 
     const auto local = [&base](const QRect &global) { return global.translated(-base); };
@@ -279,16 +287,17 @@ int main(int argc, char **argv)
     expectNothing("no pointer: nothing is painted over any pin", idle, localFirst);
     expectNothing("no pointer: the SDR pin is bare too", idle, localPlain);
     expectNothing("no pointer: the second HDR pin is bare", idle, localSecond);
-    // The rectangles the tag is looked for in, and the reason a tag standing
-    // alone over transparency is the right thing to see: an HDR pin's pixels
-    // belong to the helper's surface below this one, so this surface paints
-    // nothing there at all, while an SDR pin's own image is what the tag has to
-    // be readable over.
-    expectPixel("the SDR pin's corner is its own image", idle, localPlain.topLeft(), kPinLevel,
-                kPinLevel, kPinLevel, 255);
+    // With the helper holding the output, *no* pin's pixels are this surface's
+    // to draw: the picture, the shadow and the rim all travel together on the
+    // helper's own surface below this one, which is the only way the stack can
+    // keep one order -- a layer's surfaces are stacked in map order and there is
+    // no request to restack them.  So every pin's rect is transparent here, HDR
+    // and SDR alike, and the tag is what the check has to look for.
+    expectTransparent("an HDR pin's pixels are left to the helper", idle, localFirst.topLeft());
+    expectTransparent("an SDR pin's pixels are left to the helper too", idle,
+                      localPlain.topLeft());
     expectTransparent("just outside a pin there is nothing", idle,
                       localPlain.topLeft() - QPoint(1, 1));
-    expectTransparent("an HDR pin's pixels are left to the helper", idle, localFirst.topLeft());
 
     hover(surface, onFirst, globalOnFirst);
     const QImage onHdr = paint(surface);
@@ -322,17 +331,19 @@ int main(int argc, char **argv)
     expectNothing("pointer gone: the tag is gone with it", away, localFirst);
     expectNothing("pointer gone: nothing is left anywhere", away, localSecond);
 
-    // The other half of the answer: an output the helper could not describe
-    // shows the SDR copy, and the tag says so -- it is still an HDR capture, so
-    // it is still tagged, but in the muted ink.
+    // The other half of the answer: an output the helper could not describe has
+    // no copy of the stack at all, so this surface paints every pin -- and the
+    // tag on an HDR capture says so by its muted ink.
     surface.setHdrPixels(false);
     hover(surface, onFirst, globalOnFirst);
     const QImage fallback = paint(surface);
     leave(QStringLiteral("06-fallback.png"), fallback);
     expectTag("SDR output: the tag is up but muted", fallback, localFirst, kFallbackInk);
-    expectNothing("SDR output: the SDR pin stays bare", fallback, localPlain);
-    // No helper took the pixels, so this surface drew the SDR copy itself --
-    // which is what the muted ink is saying, seen in the pixels.
+    // Every pin's own image is back, the SDR one included: on an output the
+    // helper never described, `hdr` on the item means nothing and this surface is
+    // the only copy of the picture there is.
+    expectPixel("SDR output: the SDR pin's own copy is painted", fallback, localPlain.topLeft(),
+                kPinLevel, kPinLevel, kPinLevel, 255);
     expectPixel("SDR output: the HDR pin's own copy is painted", fallback, localSecond.topLeft(),
                 kPinLevel, kPinLevel, kPinLevel, 255);
 

@@ -173,9 +173,75 @@ impl BezierFill {
 /// brush.  Level 2 matches the historical fixed 12px block.
 pub const DEFAULT_MOSAIC_STRENGTH: u32 = 2;
 
-/// Device-pixel mosaic block size for `strength` at the given output scale.
-pub fn mosaic_block_size(strength: u32, scale: u32) -> u32 {
-    let base = 12u32.saturating_mul(scale).max(1);
+/// Device pixels per logical pixel of the surface annotations are drawn on.
+///
+/// A capture is annotated on an output's own frame, whose density is a whole
+/// number: one device pixel per logical pixel at scale 1, two at scale 2, and
+/// so on.  A pin is annotated on an image that has been zoomed, and a zoomed
+/// image is not a whole number of device pixels per logical pixel — a 160-pixel
+/// pin shown at 176 logical pixels covers 0.909 of a device pixel each, so
+/// rounding that to 1 drew every mark at the wrong size and in the wrong place,
+/// and the editor's session was refused outright because its pixel dimensions
+/// no longer matched the rect and the scale it declared.
+///
+/// The factor is therefore kept as it is rather than rounded to a whole number.
+/// Every whole density still maps through unchanged — the arithmetic below is
+/// exact for them — so a capture's rendering is untouched.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scale {
+    device: f64,
+}
+
+impl Scale {
+    /// The scale of a surface with `device` device pixels per logical pixel.
+    pub fn whole(device: u32) -> Self {
+        Self {
+            device: f64::from(device.max(1)),
+        }
+    }
+
+    /// The scale an image `pixels` device pixels wide is shown at in `logical`
+    /// logical pixels: a pin editor's zoom.
+    ///
+    /// Zero on either side falls back to 1, so a session that describes nothing
+    /// draws at its own size rather than dividing by zero.
+    pub fn ratio(pixels: u32, logical: u32) -> Self {
+        if pixels == 0 || logical == 0 {
+            return Self::whole(1);
+        }
+        Self {
+            device: f64::from(pixels) / f64::from(logical),
+        }
+    }
+
+    pub fn factor(self) -> f64 {
+        self.device
+    }
+
+    /// A length in logical pixels, in device pixels.  Exact for whole scales,
+    /// so an unzoomed capture maps through unchanged.
+    pub fn length(self, logical: u32) -> u32 {
+        let scaled = f64::from(logical) * self.device;
+        if !scaled.is_finite() || scaled < 1.0 {
+            return 1;
+        }
+        (scaled.round() as i64).clamp(1, i64::from(u32::MAX)) as u32
+    }
+
+    /// A signed coordinate difference in logical pixels, in device pixels,
+    /// rounded to the nearest one.
+    pub fn offset(self, logical: i64) -> i64 {
+        let scaled = logical as f64 * self.device;
+        if !scaled.is_finite() {
+            return 0;
+        }
+        scaled.round() as i64
+    }
+}
+
+/// Device-pixel mosaic block size for `strength` at the given scale.
+pub fn mosaic_block_size(strength: u32, scale: Scale) -> u32 {
+    let base = 12u32.saturating_mul(scale.length(1)).max(1);
     match strength {
         1 => (base / 2).max(4),
         3 => base.saturating_mul(2),
@@ -774,181 +840,19 @@ pub fn crop_operation(frame: &Frame, rect: Rect) -> Result<ImageDocument> {
         .apply(ImageDocument::new(frame.clone()))
 }
 
-/// Converts helper annotations from global (scene) logical coordinates into
-/// `selection`-local device pixels and folds them into one pipeline. Shared
-/// by the capture flow and by pin editing, which renders annotations on top
-/// of a pinned image instead of a frozen scene.
-///
-/// `scale` is the frame's density — device pixels per logical pixel of the
-/// pixels being annotated.  `bitmap_scale` is the density the helper rasterized
-/// its text bitmaps at, which is the scene's scale for a capture and the pin's
-/// own for pin editing; text is resampled when the two differ.
-pub fn pipeline_for_annotations(
-    annotations: Vec<crate::wayland::input::Annotation>,
-    selection: Rect,
-    scale: u32,
-    bitmap_scale: u32,
-) -> Result<EditPipeline> {
-    use crate::wayland::input::Annotation;
-
-    let mut pipeline = EditPipeline::new();
-    for annotation in annotations {
-        let color = annotation.color();
-        let logical_width = annotation.width();
-        let width = device_width(logical_width, scale)?;
-        let dash = annotation.dash();
-        let head = annotation.head();
-        let arrow_style = annotation.arrow_style();
-        let strength = annotation.strength();
-        // A wave's amplitude and wavelength travel as logical pixels; zero means
-        // "derive them from the stroke width". A pen's fill mode says which
-        // parts of the path get painted.
-        let amplitude = annotation.amplitude();
-        let wavelength = annotation.wavelength();
-        let fill = annotation.fill();
-        match annotation {
-            Annotation::Shape {
-                tool, rect, mask, ..
-            } => {
-                let rect = local_rect(rect, selection, scale)?;
-                match tool {
-                    crate::wayland::input::EditorTool::Rectangle => {
-                        pipeline = pipeline.rectangle_stroke(rect, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Ellipse => {
-                        pipeline = pipeline.ellipse_stroke(rect, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Mosaic
-                    | crate::wayland::input::EditorTool::Blur => {
-                        let block = mosaic_block_size(strength, scale);
-                        pipeline = match mask {
-                            ShapeMask::Rect => pipeline.mosaic(rect, block),
-                            ShapeMask::Ellipse => pipeline.mosaic_ellipse(rect, block),
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            Annotation::Stroke {
-                tool,
-                points,
-                closed,
-                ..
-            } => {
-                let points = points
-                    .into_iter()
-                    .map(|point| local_point(point, selection, scale))
-                    .collect::<Result<Vec<_>>>()?;
-                match tool {
-                    crate::wayland::input::EditorTool::Arrow if points.len() >= 2 => {
-                        pipeline = pipeline.arrow_with_style(
-                            points[0],
-                            *points.last().ok_or_else(|| {
-                                VshotError::Selection("arrow has no endpoint".into())
-                            })?,
-                            color,
-                            width,
-                            dash,
-                            head,
-                            arrow_style,
-                        );
-                    }
-                    crate::wayland::input::EditorTool::Wave if points.len() >= 2 => {
-                        // An explicit amplitude or wavelength is a logical-pixel
-                        // value from the helper; zero falls back to the derived
-                        // formula.  Either way the floors of the derivation
-                        // apply to the logical width and the density scales the
-                        // result, matching the Qt preview exactly.
-                        pipeline = pipeline.wave(
-                            points[0],
-                            *points.last().ok_or_else(|| {
-                                VshotError::Selection("wave has no endpoint".into())
-                            })?,
-                            color,
-                            width,
-                            wave_size(amplitude, logical_width, scale, wave_amplitude),
-                            wave_size(wavelength, logical_width, scale, wave_wavelength),
-                        );
-                    }
-                    crate::wayland::input::EditorTool::Bezier => {
-                        // The wire interleaves an anchor and its out-handle, so
-                        // a well-formed path always has an even number of
-                        // points. An odd count means a truncated pair; erroring
-                        // out is better than silently dropping the last point
-                        // or inventing a handle for it.
-                        if points.len() % 2 != 0 {
-                            return Err(VshotError::Selection(
-                                "bezier stroke must contain an even number of points".into(),
-                            ));
-                        }
-                        pipeline = pipeline.bezier(points, closed, fill, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Pen
-                    | crate::wayland::input::EditorTool::Draw
-                    | crate::wayland::input::EditorTool::Line => {
-                        pipeline = pipeline.freehand(points, color, width, dash);
-                    }
-                    crate::wayland::input::EditorTool::Mosaic
-                    | crate::wayland::input::EditorTool::Blur => {
-                        // Freehand mosaic smears discs along the path; the
-                        // strength level scales the smear radius.
-                        let radius = mosaic_brush_radius(strength, width);
-                        pipeline = pipeline.mosaic_brush(points, radius);
-                    }
-                    _ => {}
-                }
-            }
-            Annotation::Image { rect, pixels } => {
-                // Both the destination rect and the image itself are in
-                // logical pixels of the scene the helper drew on; the frame is
-                // in device pixels of the output the selection came from, so
-                // both go through the same scale the other annotations use.
-                let rect = local_rect(rect, selection, scale)?;
-                pipeline = pipeline.blit_scaled(rect, pixels.clone());
-            }
-            Annotation::Text {
-                origin,
-                text,
-                scale: text_scale,
-                bitmap,
-                ..
-            } => {
-                let origin = local_point(origin, selection, scale)?;
-                pipeline = match bitmap {
-                    // Helper-rendered with the user-selected font: composite
-                    // the bitmap, brought to this frame's density if the
-                    // selection came from a lower-density output than the one
-                    // the helper drew it for.
-                    Some(bitmap) => pipeline.blit(origin, bitmap.resampled(bitmap_scale, scale)),
-                    None => {
-                        pipeline.text(origin, text, color, text_scale.saturating_mul(scale).max(1))
-                    }
-                };
-            }
-        }
-    }
-    Ok(pipeline)
-}
-
 /// Peak deviation of a wave stroke from its centre line, in device pixels.
 ///
 /// The floor of `max(width * 2, 4)` is applied to the *logical* width and the
 /// result is then scaled, which is exactly what the Qt preview does; scaling
 /// first and flooring afterwards would flatten the wave at high densities.
-fn wave_amplitude(logical_width: u32, scale: u32) -> u32 {
-    logical_width
-        .saturating_mul(2)
-        .max(4)
-        .saturating_mul(scale.max(1))
+fn wave_amplitude(logical_width: u32, scale: Scale) -> u32 {
+    scale.length(logical_width.saturating_mul(2).max(4))
 }
 
 /// One full period of a wave stroke along its line, in device pixels. Like
 /// [`wave_amplitude`], `max(width * 6, 18)` is applied in logical pixels first.
-fn wave_wavelength(logical_width: u32, scale: u32) -> u32 {
-    logical_width
-        .saturating_mul(6)
-        .max(18)
-        .saturating_mul(scale.max(1))
+fn wave_wavelength(logical_width: u32, scale: Scale) -> u32 {
+    scale.length(logical_width.saturating_mul(6).max(18))
 }
 
 /// Resolves one wave dimension from the helper's logical-pixel value.
@@ -956,52 +860,43 @@ fn wave_wavelength(logical_width: u32, scale: u32) -> u32 {
 /// `explicit` is what the user typed, clamped by the parser to `1..=4096`; a
 /// zero means the helper sent nothing, so `derive` computes it from the logical
 /// stroke width.  An explicit value is a logical-pixel length like the derived
-/// one, so it goes through the same saturating multiply by the density.
-fn wave_size(explicit: u32, logical_width: u32, scale: u32, derive: fn(u32, u32) -> u32) -> u32 {
+/// one, so it goes through the same scaling by the density.
+fn wave_size(
+    explicit: u32,
+    logical_width: u32,
+    scale: Scale,
+    derive: fn(u32, Scale) -> u32,
+) -> u32 {
     if explicit == 0 {
         derive(logical_width, scale)
     } else {
-        explicit.saturating_mul(scale.max(1))
+        scale.length(explicit)
     }
 }
 
 /// Converts an annotation stroke width from logical pixels to device pixels.
-fn device_width(logical_width: u32, scale: u32) -> Result<u32> {
-    let width = logical_width
-        .max(1)
-        .checked_mul(scale)
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation width overflows".into()))?;
-    Ok(width.clamp(1, 4096))
+fn device_width(logical_width: u32, scale: Scale) -> u32 {
+    scale.length(logical_width.max(1)).clamp(1, 4096)
 }
 
-fn local_point(point: Point, selection: Rect, scale: u32) -> Result<Point> {
-    let x = (i64::from(point.x) - i64::from(selection.left()))
-        .checked_mul(i64::from(scale))
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation x overflows".into()))?;
-    let y = (i64::from(point.y) - i64::from(selection.top()))
-        .checked_mul(i64::from(scale))
-        .ok_or_else(|| VshotError::InvalidGeometry("annotation y overflows".into()))?;
+fn local_point(point: Point, selection: Rect, scale: Scale) -> Result<Point> {
+    let x = i64::from(point.x) - i64::from(selection.left());
+    let y = i64::from(point.y) - i64::from(selection.top());
     Ok(Point::new(
-        i32::try_from(x)
+        i32::try_from(scale.offset(x))
             .map_err(|_| VshotError::InvalidGeometry("annotation x is out of range".into()))?,
-        i32::try_from(y)
+        i32::try_from(scale.offset(y))
             .map_err(|_| VshotError::InvalidGeometry("annotation y is out of range".into()))?,
     ))
 }
 
-fn local_rect(rect: Rect, selection: Rect, scale: u32) -> Result<Rect> {
+fn local_rect(rect: Rect, selection: Rect, scale: Scale) -> Result<Rect> {
     let origin = local_point(rect.origin, selection, scale)?;
     Ok(Rect::new(
         origin.x,
         origin.y,
-        rect.size
-            .width
-            .checked_mul(scale)
-            .ok_or_else(|| VshotError::InvalidGeometry("annotation width overflows".into()))?,
-        rect.size
-            .height
-            .checked_mul(scale)
-            .ok_or_else(|| VshotError::InvalidGeometry("annotation height overflows".into()))?,
+        scale.length(rect.size.width),
+        scale.length(rect.size.height),
     ))
 }
 
@@ -1141,10 +1036,10 @@ mod tests {
 
     #[test]
     fn mosaic_strength_scales_block_size_and_smear_radius() {
-        assert_eq!(mosaic_block_size(2, 1), 12);
-        assert_eq!(mosaic_block_size(1, 1), 6);
-        assert_eq!(mosaic_block_size(1, 2), 12);
-        assert_eq!(mosaic_block_size(3, 2), 48);
+        assert_eq!(mosaic_block_size(2, Scale::whole(1)), 12);
+        assert_eq!(mosaic_block_size(1, Scale::whole(1)), 6);
+        assert_eq!(mosaic_block_size(1, Scale::whole(2)), 12);
+        assert_eq!(mosaic_block_size(3, Scale::whole(2)), 48);
         assert_eq!(mosaic_brush_radius(2, 8), 4);
         assert_eq!(mosaic_brush_radius(1, 8), 2);
         assert_eq!(mosaic_brush_radius(3, 8), 8);
@@ -1152,232 +1047,15 @@ mod tests {
     }
 
     #[test]
-    fn a_pasted_image_is_scaled_to_its_rect_and_composited_there() {
-        let bitmap = TextBitmap {
-            width: 2,
-            height: 2,
-            pixels: vec![
-                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
-            ],
-        };
-        // The helper works in logical pixels of the scene it drew on; the frame
-        // is in device pixels of that scene, so an image annotation goes
-        // through the same conversion the other annotations do.
-        let pipeline = pipeline_for_annotations(
-            vec![crate::wayland::input::Annotation::Image {
-                rect: Rect::new(2, 3, 4, 5),
-                pixels: bitmap.clone(),
-            }],
-            Rect::new(0, 0, 20, 20),
-            2,
-            2,
-        )
-        .unwrap();
-        assert_eq!(
-            pipeline.operations(),
-            [EditOperation::BlitScaled {
-                rect: Rect::new(4, 6, 8, 10),
-                bitmap,
-            }]
-        );
-
-        let frame = Frame::solid(Size::new(20, 20), [0, 0, 0, 255]).unwrap();
-        let document = pipeline
-            .apply(ImageDocument::new(frame))
-            .unwrap()
-            .into_frame();
-        // The source quadrants fill the destination, and nothing outside it is
-        // touched.
-        assert_eq!(
-            document.pixel(Point::new(4, 6)),
-            Some([255, 0, 0, 255]),
-            "top-left quadrant"
-        );
-        assert_eq!(
-            document.pixel(Point::new(11, 6)),
-            Some([0, 255, 0, 255]),
-            "top-right quadrant"
-        );
-        assert_eq!(
-            document.pixel(Point::new(11, 15)),
-            Some([255, 255, 0, 255]),
-            "bottom-right quadrant"
-        );
-        assert_eq!(document.pixel(Point::new(3, 6)), Some([0, 0, 0, 255]));
-        assert_eq!(document.pixel(Point::new(12, 6)), Some([0, 0, 0, 255]));
-    }
-
-    #[test]
-    fn a_wave_annotation_becomes_a_wave_operation() {
-        // A logical width of 1 gives `amplitude = max(2, 4) = 4` and
-        // `wavelength = max(6, 18) = 18`, both then scaled by 2; the endpoints
-        // shift into the selection's device pixels and the width doubles.
-        let pipeline = pipeline_for_annotations(
-            vec![crate::wayland::input::Annotation::stroke(
-                crate::wayland::input::EditorTool::Wave,
-                vec![Point::new(2, 3), Point::new(8, 3)],
-            )],
-            Rect::new(0, 0, 20, 20),
-            2,
-            2,
-        )
-        .unwrap();
-        assert_eq!(
-            pipeline.operations(),
-            [EditOperation::Wave {
-                start: Point::new(4, 6),
-                end: Point::new(16, 6),
-                color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
-                width: 2,
-                amplitude: 8,
-                wavelength: 36,
-            }]
-        );
-    }
-
-    #[test]
-    fn a_bezier_annotation_becomes_a_bezier_operation() {
-        // The interleaved points shift into the selection's device pixels and
-        // the width doubles; the closed flag and the fill mode ride along.
-        let pipeline = pipeline_for_annotations(
-            vec![crate::wayland::input::Annotation::Stroke {
-                tool: crate::wayland::input::EditorTool::Bezier,
-                points: vec![
-                    Point::new(2, 3),
-                    Point::new(4, 3),
-                    Point::new(8, 3),
-                    Point::new(10, 3),
-                ],
-                color: [10, 20, 30, 200],
-                width: 2,
-                dash: LineDash::Solid,
-                head: 1,
-                arrow_style: ArrowStyle::Open,
-                strength: DEFAULT_MOSAIC_STRENGTH,
-                closed: true,
-                amplitude: 0,
-                wavelength: 0,
-                fill: BezierFill::Both,
-            }],
-            Rect::new(0, 0, 20, 20),
-            2,
-            2,
-        )
-        .unwrap();
-        assert_eq!(
-            pipeline.operations(),
-            [EditOperation::Bezier {
-                points: vec![
-                    Point::new(4, 6),
-                    Point::new(8, 6),
-                    Point::new(16, 6),
-                    Point::new(20, 6),
-                ],
-                closed: true,
-                fill: BezierFill::Both,
-                color: [10, 20, 30, 200],
-                width: 4,
-                dash: LineDash::Solid,
-            }]
-        );
-    }
-
-    #[test]
-    fn a_bezier_with_an_odd_point_count_is_rejected() {
-        // The wire pairs each anchor with its out-handle; an odd count is a
-        // truncated pair and must error rather than be silently repaired.
-        let annotation = crate::wayland::input::Annotation::Stroke {
-            tool: crate::wayland::input::EditorTool::Bezier,
-            points: vec![Point::new(2, 3), Point::new(4, 3), Point::new(8, 3)],
-            color: [255, 64, 64, 255],
-            width: 1,
-            dash: LineDash::Solid,
-            head: 1,
-            arrow_style: ArrowStyle::Open,
-            strength: DEFAULT_MOSAIC_STRENGTH,
-            closed: false,
-            amplitude: 0,
-            wavelength: 0,
-            fill: BezierFill::Both,
-        };
-        let result = pipeline_for_annotations(vec![annotation], Rect::new(0, 0, 20, 20), 1, 1);
-        assert!(matches!(result, Err(VshotError::Selection(_))));
-    }
-
-    #[test]
     fn wave_amplitude_and_wavelength_floor_in_logical_pixels() {
         // The floors bind before scaling: a logical width of 1 is amplified to
         // 4 / 18, not to 1 / 6, and only then multiplied by the density.
-        assert_eq!(wave_amplitude(1, 1), 4);
-        assert_eq!(wave_wavelength(1, 1), 18);
-        assert_eq!(wave_amplitude(1, 3), 12);
-        assert_eq!(wave_wavelength(1, 3), 54);
+        assert_eq!(wave_amplitude(1, Scale::whole(1)), 4);
+        assert_eq!(wave_wavelength(1, Scale::whole(1)), 18);
+        assert_eq!(wave_amplitude(1, Scale::whole(3)), 12);
+        assert_eq!(wave_wavelength(1, Scale::whole(3)), 54);
         // Above the floor the wave just follows the width.
-        assert_eq!(wave_amplitude(3, 2), 12);
-        assert_eq!(wave_wavelength(3, 2), 36);
-    }
-
-    #[test]
-    fn explicit_wave_sizes_override_the_derived_ones() {
-        // A logical width of 1 would derive 4 / 18 here, but the helper's
-        // explicit values win.  They are logical pixels too, so the density
-        // scales them exactly as it scales the derived ones.
-        let annotation = crate::wayland::input::Annotation::Stroke {
-            tool: crate::wayland::input::EditorTool::Wave,
-            points: vec![Point::new(2, 3), Point::new(8, 3)],
-            color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
-            width: 1,
-            dash: LineDash::Solid,
-            head: 1,
-            arrow_style: ArrowStyle::Open,
-            strength: DEFAULT_MOSAIC_STRENGTH,
-            closed: false,
-            amplitude: 7,
-            wavelength: 30,
-            fill: BezierFill::Both,
-        };
-        let pipeline =
-            pipeline_for_annotations(vec![annotation], Rect::new(0, 0, 20, 20), 2, 2).unwrap();
-        assert_eq!(
-            pipeline.operations(),
-            [EditOperation::Wave {
-                start: Point::new(4, 6),
-                end: Point::new(16, 6),
-                color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
-                width: 2,
-                amplitude: 14,
-                wavelength: 60,
-            }]
-        );
-
-        // Zero on either one falls back to the derived formula, so the helper
-        // can leave a key out without changing the shape.
-        let derived = crate::wayland::input::Annotation::Stroke {
-            tool: crate::wayland::input::EditorTool::Wave,
-            points: vec![Point::new(2, 3), Point::new(8, 3)],
-            color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
-            width: 1,
-            dash: LineDash::Solid,
-            head: 1,
-            arrow_style: ArrowStyle::Open,
-            strength: DEFAULT_MOSAIC_STRENGTH,
-            closed: false,
-            amplitude: 0,
-            wavelength: 30,
-            fill: BezierFill::Both,
-        };
-        let pipeline =
-            pipeline_for_annotations(vec![derived], Rect::new(0, 0, 20, 20), 2, 2).unwrap();
-        assert_eq!(
-            pipeline.operations(),
-            [EditOperation::Wave {
-                start: Point::new(4, 6),
-                end: Point::new(16, 6),
-                color: crate::wayland::input::DEFAULT_ANNOTATION_COLOR,
-                width: 2,
-                amplitude: 8,
-                wavelength: 60,
-            }]
-        );
+        assert_eq!(wave_amplitude(3, Scale::whole(2)), 12);
+        assert_eq!(wave_wavelength(3, Scale::whole(2)), 36);
     }
 }

@@ -82,12 +82,13 @@ int vshot_fp16_draw_image(vshot_fp16 *ctx, uint64_t image_id, int x, int y, int 
                           int radius);
 /// Draws the stroke around a pin.  `colour` is the encoded colour the buffer
 /// wants: a PQ code, three floats, since only the caller knows what one stands
-/// for here.
+/// for here.  `alpha` is the stroke's own opacity, 0..1 -- a rim the user set
+/// to a transparent colour paints nothing, exactly as the Qt side's pen does.
 int vshot_fp16_draw_rim(vshot_fp16 *ctx, int x, int y, int width, int height, int radius,
-                        int thickness, float red, float green, float blue);
+                        int thickness, float red, float green, float blue, float alpha);
 
-/// Copies the region that changed into `slot` and leaves it ready to attach.
-/// Answers 0, or -1 when that slot has nothing in it.
+/// Copies a rectangle of the compose texture into `slot` and leaves it ready to
+/// attach.  Answers 0, or -1 when that slot has nothing in it.
 int vshot_fp16_present(vshot_fp16 *ctx, int slot, int x, int y, int width, int height);
 
 #ifdef __cplusplus

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, VshotError};
 use crate::geometry::Size;
-use crate::model::hdr::{Primaries, Transfer};
+use crate::model::hdr::Transfer;
 use crate::model::HdrFrame;
 use crate::output::HdrHalf;
 use crate::qt_overlay::helper_program;
@@ -59,6 +59,32 @@ pub(crate) enum PinCommand {
         /// images have no such place and leave this out.
         #[serde(skip_serializing_if = "Option::is_none")]
         at: Option<WirePoint>,
+        /// The marks the pinned pixels carry, in the shape the editor reports
+        /// them, when the pin came out of an editing session that had any.
+        /// The daemon keeps them so the pin can be opened for editing again
+        /// with the user's marks still on it: they are the marks as data, which
+        /// the flattened pixels no longer are.  Absent for a pin made from a
+        /// file, the clipboard or a capture nothing was drawn on.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<serde_json::Value>,
+        /// The capture `path` was flattened from, before any mark was drawn on
+        /// it: the pristine picture the marks belong to.  Only sent beside
+        /// `annotations`, and it is what makes the marks editable a second
+        /// time -- an editor handed the flattened pixels and the marks would
+        /// draw every one of them again on top of its own baked copy, which is
+        /// the duplicate the user sees.  The daemon shows `path` and edits
+        /// `base`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base: Option<PathBuf>,
+        /// Ask for the reply to wait until the pin is really on the screen
+        /// rather than merely applied.  Only a client that is about to stop
+        /// drawing asks for it: the pin editor unmaps its own surface as soon
+        /// as it has the answer, and without this it would do that over a
+        /// picture the compositor has not drawn yet, which the user sees as the
+        /// marks vanishing for a moment.  Absent means "answer as soon as the
+        /// change is applied", which is what every other caller wants.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        ack: bool,
     },
     #[serde(rename = "add-clipboard")]
     AddClipboard {
@@ -85,6 +111,16 @@ pub(crate) enum PinCommand {
         /// SDR editor sends neither and becomes an ordinary SDR pin.
         #[serde(skip_serializing_if = "Option::is_none")]
         hdr: Option<PathBuf>,
+        /// The marks the new pixels carry, in the shape the editor reports
+        /// them.  The daemon keeps them so the pin can be opened for editing
+        /// again: they are the marks as data, which the flattened pixels above
+        /// no longer are.  Absent on a plain move, which replaces nothing.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<serde_json::Value>,
+        /// Ask for the reply to wait until the new pixels are on the screen;
+        /// see `Add::ack`.  The pin editor's own handoff uses it.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        ack: bool,
     },
     Toggle,
     Show,
@@ -306,6 +342,11 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
             output,
             output_name: output_name.clone(),
             at: None,
+            annotations: None,
+            base: None,
+            // Nothing is drawing this pin, so there is no handoff to make
+            // seamless and nothing to wait for.
+            ack: false,
         })?;
     }
     if clipboard {
@@ -469,25 +510,37 @@ fn read_reply(stream: &mut UnixStream) -> Result<PinReply> {
 
 /// The HDR half of a capture as a pin travels: PQ-encoded words at the frame's
 /// own device size, the exact shape a ten-bit surface buffer takes, with the
-/// light a code of `1.0` stands for.  The white travels with the pixels because
-/// a PQ code alone does not say what light it means, and both the surface
-/// helper and the pin editor have to read it back.
+/// light a code of `1.0` stands for and the gamut the codes are written in.  The
+/// white travels with the pixels because a PQ code alone does not say what light
+/// it means, and both the surface helper and the pin editor have to read it
+/// back; the gamut travels with them for the same reason, because a PQ signal is
+/// relative to the primaries it is written against and a wide-gamut capture read
+/// as BT.2020 shifts every colour.
 pub(crate) struct PqPin {
     pub words: Vec<u32>,
     pub width: u32,
     pub height: u32,
     pub reference_nits: f32,
+    /// The primaries the codes are in: the output's own, which is also the
+    /// description the surface carries.  [`crate::model::hdr::Primaries::Bt2020`]
+    /// only when the output really was BT.2020.
+    pub primaries: crate::model::hdr::Primaries,
 }
 
 impl PqPin {
     /// The file body the surface helper reads: the magic, the size, the white,
-    /// and the words in little-endian order.
+    /// the gamut's six chromaticity coordinates as the protocol's millionth-unit
+    /// integers, and the words in little-endian order.
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(20 + self.words.len() * 4);
-        bytes.extend_from_slice(b"VSHTPQ01");
+        let mut bytes = Vec::with_capacity(44 + self.words.len() * 4);
+        bytes.extend_from_slice(b"VSHTPQ02");
         bytes.extend_from_slice(&self.width.to_le_bytes());
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(&self.reference_nits.to_le_bytes());
+        for (x, y) in self.primaries.chromaticities() {
+            bytes.extend_from_slice(&((x * 1_000_000.0).round() as i32).to_le_bytes());
+            bytes.extend_from_slice(&((y * 1_000_000.0).round() as i32).to_le_bytes());
+        }
         for word in &self.words {
             bytes.extend_from_slice(&word.to_le_bytes());
         }
@@ -495,17 +548,98 @@ impl PqPin {
     }
 }
 
+/// The pin half of a region session's handoff: the editor has finished drawing
+/// and the capture it was drawing on has to be on the screen before it stops,
+/// or the marks blink out between the editor's surface and the pin's.
+///
+/// Called from inside the helper dialogue, on the editor's release, which is
+/// the only moment the editor is both still up and done drawing -- the pixels
+/// it rendered reach this side as an argument rather than through the
+/// dialogue's own return, which happens after the helper is gone.  `rendered`
+/// is the editor's render, which is the SDR result outright: Qt is the only
+/// annotation renderer, so there is nothing left to rasterize here.  The HDR
+/// half is marked from the marks it sent beside it, because an opaque flattened
+/// picture cannot be composited onto HDR -- it would replace the light instead
+/// of marking it.
+///
+/// A session that did not ask to pin, or a cancelled one, pins nothing: the
+/// answer is a release, not a pin, and the CLI's own path then does whatever
+/// the command line asked for.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hand_off_region_pin(
+    // The capture as it was before the editor drew on it, which the daemon
+    // keeps as the picture the marks belong to: a second edit then opens on the
+    // user's marks instead of on the pixels they were flattened into.
+    base: &crate::model::Frame,
+    hdr: Option<&HdrHalf>,
+    density: u32,
+    rect: crate::geometry::Rect,
+    rendered: &crate::qt_overlay::RenderedCapture,
+    marks: Option<&serde_json::Value>,
+    tone_map: crate::model::hdr::ToneMapOptions,
+) -> Result<()> {
+    // The editor reports the pin image's rect as the selection and the pin
+    // lands back where the capture came from, exactly as a fixed-region pin
+    // does.
+    let at = Some(rect.origin);
+    let sdr = &rendered.composite;
+    let marked = match hdr {
+        Some(HdrHalf {
+            frame,
+            reference_nits,
+        }) => {
+            let mut marked = frame.clone();
+            marked.composite_srgb_layer(&rendered.marks)?;
+            marked
+                .carries_hdr(tone_map.hdr)
+                .then_some((marked, *reference_nits))
+        }
+        None => None,
+    };
+    let pq = marked.map(|(frame, reference_nits)| PqPin {
+        words: frame.to_rgb10_pq_in(frame.primaries(), reference_nits),
+        width: frame.size().width,
+        height: frame.size().height,
+        reference_nits,
+        primaries: frame.primaries(),
+    });
+    pin_png(
+        &sdr.to_png()?,
+        density,
+        at,
+        pq.as_ref(),
+        marks,
+        // The pin destination reads the base only when there are marks to
+        // carry it for, and a session that drew nothing has none.
+        match marks {
+            Some(_) => Some(base.to_png()?),
+            None => None,
+        }
+        .as_deref(),
+        true,
+    )
+}
+
 /// Pins an in-memory capture.  `at` is the global logical top-left of the
 /// content the capture came from, when it came from the desktop at all: the pin
 /// lands back exactly there, which is what makes pinning a window over itself
 /// seamless.  `None` (a composed or synthetic image) lets the daemon place it.
 /// `hdr` is the capture's HDR half, when the content really is HDR; the daemon
-/// takes it and shows the pin on a surface of its own.
+/// takes it and shows the pin on a surface of its own.  `marks` is what the
+/// editing session drew, when there was one, so the pin opens for a second edit
+/// on the user's marks instead of on the flattened pixels.  `handoff` asks the
+/// daemon to answer only once the pin is on the screen: it is set when an
+/// editing session is still drawing this capture and is about to stop.
 pub(crate) fn pin_png(
     png: &[u8],
     density: u32,
     at: Option<crate::geometry::Point>,
     hdr: Option<&PqPin>,
+    marks: Option<&serde_json::Value>,
+    // The same capture before the marks were drawn on it.  Only sent when
+    // `marks` is, and only a capture that came out of an editor has one.
+    base_png: Option<&[u8]>,
+    handoff: bool,
 ) -> Result<()> {
     let directory = tempfile::Builder::new()
         .prefix("vshot-pin-")
@@ -515,6 +649,12 @@ pub(crate) fn pin_png(
             VshotError::Pin(format!("failed to create pin temp directory: {error}"))
         })?;
     let path = write_private_file(directory.path(), "capture.png", png)?;
+    // The pristine picture the marks were drawn on, when there are marks.  It
+    // travels as its own file because the daemon loads it later, per edit.
+    let base_path = match (marks, base_png) {
+        (Some(_), Some(base)) => Some(write_private_file(directory.path(), "base.png", base)?),
+        _ => None,
+    };
     // The helper reads this file by path, so it has to be a file and not a pipe:
     // the daemon copies it before this directory goes.
     let hdr_path = match hdr {
@@ -535,10 +675,22 @@ pub(crate) fn pin_png(
         output,
         output_name,
         at: at.map(WirePoint::from),
+        annotations: marks.cloned(),
+        base: base_path.clone(),
+        // A capture pinned with the marks still drawn over it on the screen: the
+        // editor's surface is about to go, and the reply is what tells it that
+        // it may.  So it waits for the pin to be on the screen rather than for
+        // the daemon to have applied it, and the marks do not blink out between
+        // the two.  Without a session there is nothing drawing them, so nothing
+        // to wait for.
+        ack: handoff,
     });
     // The daemon has copied the pixels by the time it replied; the temp files
     // are ours to remove even when the reply said no.
     remove_pin_temp(&path);
+    if let Some(base_path) = &base_path {
+        remove_pin_temp(base_path);
+    }
     if let Some(hdr_path) = &hdr_path {
         remove_pin_temp(hdr_path);
     }
@@ -597,6 +749,12 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         .get("bounds")
         .ok_or_else(|| VshotError::Pin("pin-edit session has no bounds".into()))?;
     let window = parse_json_rect(window)?;
+    // The desktop the editor's keyboard-cursor walk expresses a pointer move
+    // in.  The daemon stamps it because the session's own bounds are the pin,
+    // which is not the screen; a session without one leaves the pointer
+    // unmoved, which is the same outcome as a compositor with no injection
+    // backend.
+    let desktop = session.get("desktop").map(parse_json_rect).transpose()?;
     let id = session
         .get("id")
         .and_then(serde_json::Value::as_u64)
@@ -652,7 +810,28 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         None => None,
     };
 
-    let scale = pin_edit_scale(frame.size().width, window.size.width);
+    // The marks the daemon holds, exactly as the editor last reported them, so
+    // a second edit opens on them.  Read as JSON rather than re-parsed into
+    // `Annotation`s: this side has no use for them beyond handing them back, and
+    // re-spelling them would be a second place for the wire shape to drift.
+    let marks = session.get("annotations").cloned();
+
+    // The ratio between the pin's pixels and the rect it is shown in: the pin
+    // editor's virtual output declares it as its scale, so the session's pixel
+    // dimensions and its logical size agree exactly, and the editor's own
+    // marks are drawn at the size the image is really shown at. A zoomed pin is
+    // not a whole number of device pixels per logical pixel, which is why the
+    // ratio is carried as it is rather than rounded: rounding a 1.1x zoom to 1
+    // drew every mark at the wrong size and in the wrong place.
+    let scale = crate::edit::Scale::ratio(frame.size().width, window.size.width);
+    // How wide the daemon draws this pin's border. The rim is centred on the
+    // image's edge, so half of it stands outside the image, and the editor has
+    // to know that band to treat a drag on the rim as a drag on the pin. Absent
+    // from a session an older daemon wrote, which means no border.
+    let border_width = session
+        .get("border_width")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
     let (_editor_dir, editor_session) =
         crate::qt_overlay::write_pin_edit_session(&crate::qt_overlay::PinEditSpec {
             frame: &frame,
@@ -662,52 +841,122 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
             socket: Path::new(&socket_path),
             pin_id: id,
             action,
+            annotations: marks.as_ref(),
+            border_width,
+            desktop,
         })?;
-    let output = crate::qt_overlay::run_session(&editor_session)?;
-    let Some((selection, annotations)) = crate::qt_overlay::parse_edit_result(output, window)?
-    else {
+    let mut hdr_half = hdr_half;
+    // The handoff: everything from the editor's result to the daemon's answer
+    // happens here, inside the dialogue, because the editor is holding the
+    // picture up on the screen until it is told the pin has it.  The move
+    // carries `ack`, so the daemon answers only once its own frame is
+    // presented, and that answer is what the editor waits for.
+    let mut released = false;
+    let mut handoff_error: Option<VshotError> = None;
+    let output = {
+        let mut handoff = |result: &[u8],
+                           composite: Option<&crate::qt_overlay::RenderedCapture>|
+         -> Result<String> {
+            released = true;
+            if let Err(error) =
+                apply_edit_result(result, composite, window, id, hdr_half.take(), &directory)
+            {
+                // The editor is still told to stop: it has drawn everything it
+                // is going to draw and the session is over either way.  The
+                // failure travels to the caller below.
+                handoff_error = Some(error);
+            }
+            Ok("{}".to_string())
+        };
+        crate::qt_overlay::run_session(&editor_session, &frame, &mut handoff)?
+    };
+    if let Some(error) = handoff_error {
+        return Err(error);
+    }
+    if released {
+        return Ok(());
+    }
+    // The editor never asked to be let go: it wrote its result and exited,
+    // which is a cancelled edit, or a helper that does not know the release.
+    // Nothing was handed over while it was up, so the result is applied here
+    // instead -- and a cancelled one applies nothing.
+    apply_edit_result(
+        &output.json,
+        output.composite.as_ref(),
+        window,
+        id,
+        hdr_half,
+        &directory,
+    )
+}
+
+/// The second half of one pin edit: the editor's result becomes the pin's new
+/// pixels, and the daemon is told where they go.
+///
+/// Split out because it is called from the editor's release rather than after
+/// the dialogue: the editor keeps drawing until this has landed, so it has to
+/// happen while the helper is still running.  `half` is the pin's pristine HDR
+/// capture, when it has one; it is consumed, because the marked HDR half
+/// replaces it.
+fn apply_edit_result(
+    result: &[u8],
+    composite: Option<&crate::qt_overlay::RenderedCapture>,
+    window: crate::geometry::Rect,
+    id: u64,
+    half: Option<HdrHalf>,
+    directory: &Path,
+) -> Result<()> {
+    let Some(edited) = crate::qt_overlay::parse_edit_result(result.to_vec(), window)? else {
         // Cancelled. The editor moved the live pin while the user was
         // dragging, and that move stands: cancelling drops the annotations,
         // it does not undo where the user put the image. The pixels were
         // never replaced, so the pin keeps its original content.
         return Ok(());
     };
+    let selection = edited.selection;
 
     // The editor reports the pin image's rect as the selection: the user may
-    // have dragged the image to a new spot. Render the annotations over the
-    // pin's own pixels and land the pin exactly there. The editor works in
-    // screen-logical pixels; the ratio computed above maps them onto the pin's
-    // device pixels — and it is also the scale the editor rasterized its text
-    // bitmaps at, since that is the only scale its single output declares.
-    let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, scale, scale)?;
-    // An HDR pin is annotated in HDR and its SDR half is vshot's own tone map of
-    // the same marks, exactly as a fresh capture with a Pin button is; an SDR pin
+    // have dragged the image to a new spot. The pixels it hands back are the
+    // whole answer for the SDR half -- Qt is the only renderer, so what the user
+    // was looking at is what lands -- and the marks travel beside them for the
+    // HDR half, which an opaque flattened picture cannot be composited onto.
+    let annotations = edited.marks;
+
+    // An HDR pin is annotated in HDR: the marks composite onto the HDR half in
+    // linear light, exactly as a fresh capture with a Pin button is.  An SDR pin
     // keeps the plain path it always had.
-    let (png, hdr_path) = match hdr_half {
-        Some(half) => {
+    let (png, hdr_path) = match (half, composite) {
+        (Some(half), Some(rendered)) => {
             let reference_nits = if half.reference_nits.is_finite() && half.reference_nits > 0.0 {
                 half.reference_nits
             } else {
                 crate::model::hdr::REFERENCE_WHITE_NITS
             };
-            let annotated = pipeline.apply_to_hdr(half.frame)?;
-            let png = annotated.tone_map_to_srgb()?.to_png()?;
+            let mut annotated = half.frame;
+            annotated.composite_srgb_layer(&rendered.marks)?;
+            let png = rendered.composite.to_png()?;
             let pq = PqPin {
-                words: annotated.to_rgb10_pq(reference_nits),
+                words: annotated.to_rgb10_pq_in(annotated.primaries(), reference_nits),
                 width: annotated.size().width,
                 height: annotated.size().height,
                 reference_nits,
+                primaries: annotated.primaries(),
             };
-            let rendered = write_private_file(&directory, "pin-edited.pq", &pq.encode())?;
+            let rendered = write_private_file(directory, "pin-edited.pq", &pq.encode())?;
             (png, Some(rendered))
         }
-        None => {
-            let edited = pipeline.apply(crate::model::ImageDocument::new(frame))?;
-            (edited.frame().to_png()?, None)
+        (_, Some(rendered)) => (rendered.composite.to_png()?, None),
+        // The editor rendered nothing, which only happens when its own render
+        // failed: it would have reported the failure through its status, so
+        // there is nothing to replace the pin's pixels with.
+        (_, None) => {
+            return Err(VshotError::Pin(
+                "the pin editor returned no rendered image".into(),
+            ))
         }
     };
 
-    let rendered_path = write_private_file(&directory, "pin-edited.png", &png)?;
+    let rendered_path = write_private_file(directory, "pin-edited.png", &png)?;
 
     let reply = execute(PinCommand::Move {
         id,
@@ -715,6 +964,12 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
         y: selection.origin.y,
         path: Some(rendered_path.clone()),
         hdr: hdr_path.clone(),
+        annotations: Some(annotations),
+        // The editor is still drawing the marks the daemon is being handed, and
+        // it stops as soon as this answers.  Waiting for the pin's own frame is
+        // what makes the two pictures one: the compositor has drawn the pin
+        // before the editor takes its copy away.
+        ack: true,
     });
     let _ = std::fs::remove_file(&rendered_path);
     if let Some(hdr_path) = &hdr_path {
@@ -724,7 +979,8 @@ pub(crate) fn apply_edit(session_path: &Path) -> Result<()> {
 }
 
 /// Decodes one pin HDR file back to linear light: the same header the surface
-/// helper reads, PQ over BT.2020, and the white the file names as its own.
+/// helper reads, PQ over the gamut the file names, and the white the file names
+/// as its own.
 fn decode_pq_half(path: &Path) -> Result<HdrHalf> {
     let image = crate::pin_hdr::read_pq_file(path)?;
     Ok(HdrHalf {
@@ -732,24 +988,16 @@ fn decode_pq_half(path: &Path) -> Result<HdrHalf> {
             &image.words,
             Size::new(image.width, image.height),
             Transfer::Pq,
-            Primaries::Bt2020,
+            // The gamut the codes were written against, not a fixed BT.2020: a
+            // pin taken from a P3-like output decodes to the light it holds
+            // only when it is read back in that output's own primaries.
+            image.primaries,
             // The words carry real alpha bits, the way a surface buffer does.
             true,
             image.reference_nits,
         )?,
         reference_nits: image.reference_nits,
     })
-}
-
-/// Device pixels per logical pixel for a pin-edit round trip: the pin's
-/// native width divided by its on-screen (logical) width. Plain pins and
-/// captures are 1:1 logical; text cards render at the output's pixel
-/// density (2x on HiDPI outputs). The renderer supports 1..=4.
-fn pin_edit_scale(frame_width: u32, window_width: u32) -> u32 {
-    if window_width == 0 {
-        return 1;
-    }
-    (frame_width / window_width).clamp(1, 4)
 }
 
 fn parse_json_rect(value: &serde_json::Value) -> Result<crate::geometry::Rect> {
@@ -774,6 +1022,7 @@ fn parse_json_rect(value: &serde_json::Value) -> Result<crate::geometry::Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::hdr::Primaries;
 
     #[test]
     fn socket_path_names_the_uid_socket_and_honours_override() {
@@ -804,6 +1053,50 @@ mod tests {
         assert!(!keep_daemon_stderr());
     }
 
+    // A pin made from an annotated capture carries the marks and the picture
+    // they were drawn on, or the pin can only ever be edited once: a second
+    // edit would be handed the flattening and draw every mark again on top of
+    // its own baked copy.
+    #[test]
+    fn a_pin_carries_the_marks_and_the_base_they_were_drawn_on() {
+        let marks = serde_json::json!([
+            {"kind": "shape", "tool": "rect", "rect": {"x": 4, "y": 6, "width": 20, "height": 10}}
+        ]);
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
+            density: Some(2),
+            output: None,
+            output_name: None,
+            at: None,
+            annotations: Some(marks.clone()),
+            base: Some(PathBuf::from("/tmp/base.png")),
+            ack: false,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["annotations"], marks);
+        assert_eq!(value["base"], "/tmp/base.png");
+
+        // A capture nothing was drawn on carries neither, so the daemon opens
+        // it blank rather than on a base that is not there.
+        let encoded = serde_json::to_vec(&PinCommand::Add {
+            path: PathBuf::from("/tmp/x.png"),
+            hdr: None,
+            density: None,
+            output: None,
+            output_name: None,
+            at: None,
+            annotations: None,
+            base: None,
+            ack: false,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(value.get("annotations").is_none(), "{value}");
+        assert!(value.get("base").is_none(), "{value}");
+    }
+
     #[test]
     fn add_command_encodes_the_wire_shape() {
         let encoded = serde_json::to_vec(&PinCommand::Add {
@@ -813,6 +1106,9 @@ mod tests {
             output: None,
             output_name: None,
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -833,6 +1129,9 @@ mod tests {
             ))),
             output_name: Some("DP-2".into()),
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -849,6 +1148,9 @@ mod tests {
             output: None,
             output_name: Some("DP-2".into()),
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -878,15 +1180,25 @@ mod tests {
     }
 
     #[test]
-    fn pin_edit_scale_follows_the_display_density() {
-        assert_eq!(pin_edit_scale(160, 160), 1);
-        assert_eq!(pin_edit_scale(320, 160), 2);
-        assert_eq!(pin_edit_scale(1120, 560), 2);
-        // Zoomed-in pins (screen rect larger than the image) stay at 1x.
-        assert_eq!(pin_edit_scale(80, 160), 1);
-        // Degenerate window falls back to 1x; density is capped at 4.
-        assert_eq!(pin_edit_scale(320, 0), 1);
-        assert_eq!(pin_edit_scale(4000, 500), 4);
+    fn the_pin_edit_scale_is_the_ratio_the_image_is_shown_at() {
+        use crate::edit::Scale;
+        // A plain pin, and a text card rendered at an output's density: whole
+        // numbers of device pixels per logical pixel, exactly as before.
+        assert_eq!(Scale::ratio(160, 160).factor(), 1.0);
+        assert_eq!(Scale::ratio(320, 160).factor(), 2.0);
+        assert_eq!(Scale::ratio(1120, 560).factor(), 2.0);
+        // A zoomed pin: the window is not a whole multiple of the image, and
+        // truncating the ratio to 1 is what made the editor refuse the session.
+        // The ratio is carried as it is, so the session's pixel dimensions and
+        // its logical size agree and the marks land where they were drawn.
+        assert!((Scale::ratio(160, 176).factor() - 0.909_09).abs() < 1e-4);
+        // Zoomed out: fewer device pixels than logical ones, which no whole
+        // number can express at all.
+        assert_eq!(Scale::ratio(160, 320).factor(), 0.5);
+        assert!((Scale::ratio(160, 144).factor() - 1.111_11).abs() < 1e-4);
+        // Degenerate window falls back to 1 rather than dividing by zero.
+        assert_eq!(Scale::ratio(320, 0).factor(), 1.0);
+        assert_eq!(Scale::ratio(0, 160).factor(), 1.0);
     }
 
     #[test]
@@ -943,6 +1255,9 @@ mod tests {
             output: None,
             output_name: None,
             at: Some(WirePoint { x: 100, y: 240 }),
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -960,6 +1275,9 @@ mod tests {
             output: None,
             output_name: None,
             at: None,
+            annotations: None,
+            base: None,
+            ack: false,
         })
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -981,6 +1299,7 @@ mod tests {
             width: 2,
             height: 1,
             reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
+            primaries: Primaries::Bt2020,
         };
         let directory = tempfile::tempdir().unwrap();
         let path = write_private_file(directory.path(), "x.pq", &pin.encode()).unwrap();
@@ -990,6 +1309,7 @@ mod tests {
             image.reference_nits,
             crate::model::hdr::REFERENCE_WHITE_NITS
         );
+        assert_eq!(image.primaries, Primaries::Bt2020);
         assert_eq!(image.words, pin.words);
         // And the words decode back to the light they were encoded from: SDR
         // white stays white, and the bright pixel stays well above it.

@@ -11,6 +11,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 memmap2 = "0.9.11"
+# The HDR half's default format.  `image`'s AVIF encoder cannot carry one: it
+# always writes eight bits (`AvifEncoder::new_with_speed_quality` hardcodes
+# `BitDepth::Eight`), and the colour description comes from `ravif`, which
+# hardcodes sRGB / BT.709 whatever the pixels are.  `rav1e` writes the AV1
+# payload and `avif-serialize` the container, so both the sequence header and
+# the `colr` box can say BT.2020 PQ.  See `src/model/avif.rs`.
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
+avif-serialize = "0.8.9"
 # OCR, for `vshot ocr` and the editor's text tool. `oar-ocr` runs PaddleOCR's
 # own PP-OCR models (converted to ONNX) on ONNX Runtime, and the ONNX Runtime
 # it links against is the system one rather than a downloaded copy, so the
@@ -61,6 +69,15 @@ zbus = "5.19.0"
 [build-dependencies]
 # Compiles src/record/shim.c, the libavcodec encoder boundary.
 cc = "1.2"
+
+[features]
+# `rav1e`'s hand-written x86 SIMD, which needs `nasm` on PATH at build time.
+# Off by default so a build without nasm still works; worth turning on for a
+# package, because it is most of the time an AVIF of a 4K capture takes.
+#
+#     cargo build --release --features avif-asm
+#
+avif-asm = ["rav1e/asm"]
 
 [profile.release]
 lto = "thin"

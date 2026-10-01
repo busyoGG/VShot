@@ -9,7 +9,8 @@ use crate::error::{Result, VshotError};
 use crate::geometry::{parse_geometry, Rect};
 use crate::inject::Prefer;
 use crate::longshot::LongShotOptions;
-use crate::model::PngCompression;
+use crate::model::{HdrDecision, PngCompression, ToneMap, ToneMapOptions};
+use crate::output::HdrFormat;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,6 +41,8 @@ Destination (every capture above goes to exactly one)
 Shared modifiers
   -c, --cursor        draw the compositor cursor into the capture
   --png-compression   none|fastest|fast (default)|balanced|high, lossless
+  --hdr-format        avif (default)|hdr, the file beside the PNG when the
+                      capture carries HDR content
 
 Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) through
 wlr-screencopy; KWin/Plasma through org.kde.KWin.ScreenShot2, granted only to a
@@ -102,6 +105,43 @@ pub struct Cli {
     /// all lossless. `--pin` writes nothing to disk.
     #[arg(long = "png-compression", global = true, value_name = "LEVEL")]
     pub png_compression: Option<String>,
+    /// Format of the HDR file written beside the PNG when the capture carries
+    /// HDR content: `avif` (the default) or `hdr` (Radiance RGBE). `avif` is
+    /// ten-bit BT.2020 PQ and states its colour in the file, but is lossy;
+    /// `hdr` is the light exactly as captured, in the output's own primaries.
+    /// Neither affects a capture without HDR content.
+    #[arg(long = "hdr-format", global = true, value_name = "FORMAT")]
+    pub hdr_format: Option<String>,
+    /// How the SDR PNG of an HDR capture is mapped down from the HDR light:
+    /// `auto` (the default) reads the white level from the frame, so an SDR
+    /// capture comes out exactly as it looked and only a frame with highlights
+    /// moves white down to make room for them; `fixed` always uses
+    /// `--tone-map-white`; `normalize` scales the light so the frame's own
+    /// brightest point lands on white, which keeps the highlights ordered but
+    /// flattens their separation. Ignored by a capture with no HDR content.
+    #[arg(long = "tone-map", global = true, value_name = "MODE")]
+    pub tone_map: Option<String>,
+    /// Where SDR white lands in the SDR copy, as a fraction of the output
+    /// range: 0.5 to 0.95, default 0.8. Everything above it is the room left
+    /// for light brighter than white, so a lower value keeps more highlight
+    /// separation at the cost of dimming the rest of the picture. Used by
+    /// `--tone-map fixed` and `auto`.
+    #[arg(long = "tone-map-white", global = true, value_name = "LEVEL")]
+    pub tone_map_white: Option<f32>,
+    /// Whether a capture on an HDR output is judged to hold HDR content by how
+    /// much of it is brighter than SDR white, rather than by whether any single
+    /// pixel is. A ten-bit PQ buffer puts ordinary SDR white a few codes either
+    /// side of the boundary, so a plain desktop has thousands of pixels just
+    /// over it and the one-pixel test reads that as HDR content. Off restores
+    /// that test; see `--hdr-area-ratio` for what "on" means.
+    #[arg(long = "hdr-area-test", global = true, value_name = "BOOL")]
+    pub hdr_area_test: Option<bool>,
+    /// The share of the capture that has to be brighter than SDR white for it
+    /// to count as HDR content, when `--hdr-area-test` is on: 0 to 1, default
+    /// 0.0005. Zero means every capture on an HDR output counts, with no region
+    /// test at all. Ignored when the area test is off.
+    #[arg(long = "hdr-area-ratio", global = true, value_name = "SHARE")]
+    pub hdr_area_ratio: Option<f32>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -905,6 +945,11 @@ pub struct Request {
     pub destination: Destination,
     pub cursor: bool,
     pub compression: PngCompression,
+    /// How the HDR half is written when the capture carries HDR content.
+    pub hdr_format: HdrFormat,
+    /// How the SDR half is mapped down from that HDR content: which behaviour,
+    /// and where SDR white lands for the two that take a level.
+    pub tone_map: ToneMapOptions,
 }
 
 /// What `vshot` was asked to do.  Only the capture arm touches the Wayland
@@ -1756,6 +1801,38 @@ impl Cli {
             Some(name) => PngCompression::parse(name)?,
             None => crate::config::compression_default().unwrap_or_default(),
         };
+        let hdr_format = match self.hdr_format.as_deref() {
+            Some(name) => HdrFormat::parse(name)?,
+            None => crate::config::hdr_format_default().unwrap_or_default(),
+        };
+        // The flag wins, then the config file, then the built-in default.  A
+        // white level outside the range the map accepts is clamped rather than
+        // refused: it is a number the user meant, and the map has a defined
+        // answer for it.
+        let tone_map = match self.tone_map.as_deref() {
+            Some(name) => ToneMap::parse(name).ok_or_else(|| {
+                VshotError::InvalidDestination(format!(
+                    "unknown --tone-map `{name}`; expected one of {}",
+                    ToneMap::NAMES.join(", ")
+                ))
+            })?,
+            None => crate::config::tone_map_default().unwrap_or_default(),
+        };
+        let tone_map_white = self
+            .tone_map_white
+            .or_else(crate::config::tone_map_white_default)
+            .map_or_else(
+                || ToneMapOptions::default().white,
+                ToneMapOptions::clamp_white,
+            );
+        let hdr_area_test = self
+            .hdr_area_test
+            .or_else(crate::config::hdr_area_test_default)
+            .unwrap_or_else(|| HdrDecision::default().ratio > 0.0);
+        let hdr_area_ratio = self
+            .hdr_area_ratio
+            .or_else(crate::config::hdr_area_ratio_default)
+            .map_or_else(|| HdrDecision::default().ratio, HdrDecision::clamp_ratio);
         let destination = match (self.output, self.clipboard, self.pin) {
             (Some(path), false, false) if path.as_os_str() == "-" => Destination::Stdout,
             (Some(path), false, false) => Destination::File(path),
@@ -1875,6 +1952,12 @@ impl Cli {
             destination,
             cursor: self.cursor,
             compression,
+            hdr_format,
+            tone_map: ToneMapOptions {
+                mode: tone_map,
+                white: tone_map_white,
+                hdr: HdrDecision::from_config(hdr_area_test, hdr_area_ratio),
+            },
         })
     }
 
@@ -1924,6 +2007,83 @@ mod tests {
     fn requires_destination() {
         let error = Cli::try_parse_from(["vshot", "all"]).unwrap_err();
         assert!(error.to_string().contains("no output destination"));
+    }
+
+    /// The tone-map flags.  What the config file remembers is covered in
+    /// `config.rs`, which is where the reading of it lives; this is the flags
+    /// and the precedence they take part in.
+    ///
+    /// It deliberately touches no environment variable: the tests in this
+    /// binary run in one process, and pointing `XDG_CONFIG_HOME` at a scratch
+    /// directory here would have every other test read it too.
+    #[test]
+    fn the_tone_map_flags_parse_and_are_clamped() {
+        // Both defaults, with nothing given.
+        let request = Cli::try_parse_from(["vshot", "monitor", "--output", "-"]).unwrap();
+        assert_eq!(request.tone_map.mode, ToneMap::Auto);
+        assert!((request.tone_map.white - ToneMapOptions::default().white).abs() < 1e-6);
+
+        // The mode, by each of its names.
+        for mode in [ToneMap::Auto, ToneMap::Fixed, ToneMap::Normalize] {
+            let request = Cli::try_parse_from([
+                "vshot",
+                "monitor",
+                "--output",
+                "-",
+                "--tone-map",
+                mode.name(),
+            ])
+            .unwrap();
+            assert_eq!(request.tone_map.mode, mode);
+        }
+
+        // The level, which is a fraction of the range and is clamped into the
+        // span the map accepts rather than refused: it is a number the user
+        // meant, and the map has a defined answer for it.
+        let request = Cli::try_parse_from([
+            "vshot",
+            "monitor",
+            "--output",
+            "-",
+            "--tone-map-white",
+            "0.75",
+        ])
+        .unwrap();
+        assert!((request.tone_map.white - 0.75).abs() < 1e-6);
+        for (given, expected) in [
+            ("0.2", ToneMapOptions::MIN_WHITE),
+            ("4", ToneMapOptions::MAX_WHITE),
+        ] {
+            let request = Cli::try_parse_from([
+                "vshot",
+                "monitor",
+                "--output",
+                "-",
+                "--tone-map-white",
+                given,
+            ])
+            .unwrap();
+            assert!(
+                (request.tone_map.white - expected).abs() < 1e-6,
+                "{given} was not clamped to {expected}"
+            );
+        }
+
+        // A mode name the parser does not know is a typo, and the message names
+        // both the typo and the names that would have worked.
+        let error = Cli::try_parse_from([
+            "vshot",
+            "monitor",
+            "--output",
+            "-",
+            "--tone-map",
+            "soft-knee",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("soft-knee"), "{error}");
+        for name in ToneMap::NAMES {
+            assert!(error.to_string().contains(name), "{error} omits {name}");
+        }
     }
 
     #[test]
@@ -2436,6 +2596,8 @@ mod tests {
                 destination: Destination::Clipboard,
                 cursor: false,
                 compression: PngCompression::Fast,
+                hdr_format: HdrFormat::default(),
+                tone_map: ToneMapOptions::default(),
             })
         );
         let action =

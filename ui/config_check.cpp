@@ -20,6 +20,7 @@
 // Built only with `-DVSHOT_BUILD_CHECKS=ON`.
 
 #include "config.hpp"
+#include "shortcuts.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -28,9 +29,11 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeySequence>
 #include <QString>
 #include <QTemporaryDir>
 
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -103,6 +106,11 @@ double numberAt(const QJsonObject &object, const char *path)
     return valueAt(object, path).toDouble();
 }
 
+bool booleanAt(const QJsonObject &object, const char *path)
+{
+    return valueAt(object, path).toBool();
+}
+
 /// Whether a `/`-separated path exists at all, which is how "the section was
 /// pruned rather than left empty" is told apart from "it is there but empty".
 bool containsAt(const QJsonObject &object, const char *path)
@@ -130,10 +138,10 @@ void checkDefaultsWhenTheFileIsMissing()
     std::printf("--- a missing file is the built-in defaults ------------------------\n");
     QFile::remove(configPath());
     const vshot::Config config = vshot::loadConfig();
-    expect(config.editor.tool == QStringLiteral("select"),
-           "the editor tool falls back to select", config.editor.tool);
+    expect(config.editor.tool.isEmpty(),
+           "the editor opens with no tool armed", config.editor.tool);
     expect(config.editor.selectMode == QStringLiteral("precise"),
-           "the Select tool needs the press on the mark unless the file says otherwise",
+           "a press has to land on the mark unless the file says otherwise",
            config.editor.selectMode);
     expect(config.editor.color == QColor(255, 64, 64, 255), "the color falls back to #ff4040ff",
            config.editor.color.name(QColor::HexArgb));
@@ -178,7 +186,7 @@ void checkUnknownKeysAreIgnored()
     expect(config.cli.pngCompression == QStringLiteral("high"),
            "a known key beside an unknown one still reads", config.cli.pngCompression);
     expect(config.cli.longNotches == 3, "a known nested key still reads");
-    expect(config.editor.tool == QStringLiteral("select"),
+    expect(config.editor.tool.isEmpty(),
            "the absent editor section is still the defaults");
 }
 
@@ -191,8 +199,8 @@ void checkBadValuesFallBackFieldByField()
         "cli": {"png-compression": "slowest", "monitor": "DP-3"}
     })"));
     const vshot::Config config = vshot::loadConfig();
-    expect(config.editor.tool == QStringLiteral("select"),
-           "an unknown tool name falls back", config.editor.tool);
+    expect(config.editor.tool.isEmpty(),
+           "an unknown tool name falls back to nothing armed", config.editor.tool);
     expect(config.editor.selectMode == QStringLiteral("precise"),
            "an unknown select mode falls back", config.editor.selectMode);
     expect(config.editor.width == 64, "an out-of-range width is clamped", QString::number(config.editor.width));
@@ -200,6 +208,143 @@ void checkBadValuesFallBackFieldByField()
     expect(config.editor.color == QColor(255, 64, 64, 255), "an unparseable color falls back");
     expect(config.cli.pngCompression.isEmpty(), "an unknown compression name falls back");
     expect(config.cli.monitor == QStringLiteral("DP-3"), "a good monitor name survives");
+}
+
+// A config file written before the Select tool went away names it, and the state
+// it named is the one the editor still opens in: nothing armed.  Reading the
+// name as a typo would quietly move the user onto the first tool in the list.
+void checkTheRetiredSelectToolStillMeansNothingArmed()
+{
+    std::printf("--- the retired select tool still means nothing armed ---------------\n");
+    writeConfig(QStringLiteral(R"({"editor": {"tool": "select"}})"));
+    expect(vshot::loadConfig().editor.tool.isEmpty(),
+           "a config naming the retired Select tool opens unarmed",
+           vshot::loadConfig().editor.tool);
+}
+
+void checkTheHdrFormatRoundTripsAndIsCleared()
+{
+    std::printf("--- the HDR format is remembered and can be cleared ----------------\n");
+    // The HDR half's format, on the same terms as the compression level: an
+    // absent key or an empty value means "let the built-in default stand", and
+    // only a name this build knows is read at all.
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-format": "hdr", "future": 1}})"));
+    expect(vshot::loadConfig().cli.hdrFormat == QStringLiteral("hdr"),
+           "a known HDR format name is read", vshot::loadConfig().cli.hdrFormat);
+
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-format": "webp", "future": 1}})"));
+    expect(vshot::loadConfig().cli.hdrFormat.isEmpty(),
+           "an unknown HDR format name falls back to the built-in default");
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.hdrFormat = QStringLiteral("avif");
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(textAt(root, "cli/hdr-format") == QStringLiteral("avif"),
+           "the chosen HDR format was written", textAt(root, "cli/hdr-format"));
+    expect(numberAt(root, "cli/future") == 1, "an unknown key beside it is still kept");
+
+    config.cli.hdrFormat.clear();
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(textAt(root, "cli/hdr-format").isEmpty() && !containsAt(root, "cli/hdr-format"),
+           "clearing it removes the key rather than writing an empty one");
+}
+
+void checkTheToneMapRoundTripsAndIsCleared()
+{
+    std::printf("--- the tone map is remembered and can be cleared ------------------\n");
+    // The map down to SDR, on the same terms as the format above: an absent key
+    // means "let the built-in default stand", and only a name this build knows
+    // is read at all.
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map": "normalize", "tone-map-white": 0.72}})"));
+    expect(vshot::loadConfig().cli.toneMap == QStringLiteral("normalize"),
+           "a known tone-map name is read", vshot::loadConfig().cli.toneMap);
+    expect(std::abs(vshot::loadConfig().cli.toneMapWhite - 0.72) < 1e-6,
+           "the white level is read", QString::number(vshot::loadConfig().cli.toneMapWhite));
+
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map": "soft-knee"}})"));
+    expect(vshot::loadConfig().cli.toneMap.isEmpty(),
+           "an unknown tone-map name falls back to the built-in default");
+
+    // A level outside the span the map accepts is clamped rather than dropped:
+    // it is a number the user meant, and the map has a defined answer for it.
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map-white": 0.2}})"));
+    expect(std::abs(vshot::loadConfig().cli.toneMapWhite - vshot::kMinToneMapWhite) < 1e-6,
+           "a level below the span is clamped up",
+           QString::number(vshot::loadConfig().cli.toneMapWhite));
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map-white": 4}})"));
+    expect(std::abs(vshot::loadConfig().cli.toneMapWhite - vshot::kMaxToneMapWhite) < 1e-6,
+           "a level above the span is clamped down",
+           QString::number(vshot::loadConfig().cli.toneMapWhite));
+    writeConfig(QStringLiteral(R"({"cli": {"tone-map-white": "high"}})"));
+    expect(vshot::loadConfig().cli.toneMapWhite == 0.0,
+           "a level that is not a number falls back to the built-in default");
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.toneMap = QStringLiteral("fixed");
+    config.cli.toneMapWhite = 0.72;
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(textAt(root, "cli/tone-map") == QStringLiteral("fixed"),
+           "the chosen tone map was written", textAt(root, "cli/tone-map"));
+    expect(numberAt(root, "cli/tone-map-white") > 0.71 &&
+               numberAt(root, "cli/tone-map-white") < 0.73,
+           "the white level was written", QString::number(numberAt(root, "cli/tone-map-white")));
+
+    // Zero is how the settings window says "the built-in default stands", so it
+    // must not be written: a level of zero is not one the map would ever use.
+    config.cli.toneMapWhite = 0.0;
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/tone-map-white"),
+           "a white level of zero writes no key rather than a zero");
+
+    config.cli.toneMap.clear();
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/tone-map"),
+           "clearing the tone map removes the key rather than writing an empty one");
+}
+
+void checkTheHdrAreaTestRoundTripsAndKeepsItsZero()
+{
+    std::printf("--- the HDR area test is remembered and its zero survives ----------\n");
+    // The test is on when the file says nothing, so an absent key and a `true`
+    // are the same thing, and only "off" needs a key of its own.
+    writeConfig(QStringLiteral(R"({"cli": {}})"));
+    expect(vshot::loadConfig().cli.hdrAreaTest, "the area test is on when the file says nothing");
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-area-test": false}})"));
+    expect(!vshot::loadConfig().cli.hdrAreaTest, "an area test switched off is read");
+
+    // A ratio of zero is the state that means "every capture of an HDR output
+    // is HDR content", so it is a value and not an absent key -- the one place
+    // in this section where zero is meaningful.  A file that says nothing has to
+    // read back as *not* zero, which is what the negative sentinel is for.
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-area-ratio": 0}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrAreaRatio) < 1e-9,
+           "a ratio of zero is read as zero",
+           QString::number(vshot::loadConfig().cli.hdrAreaRatio));
+    writeConfig(QStringLiteral(R"({"cli": {}})"));
+    expect(vshot::loadConfig().cli.hdrAreaRatio < 0.0,
+           "an absent ratio reads as the sentinel, not as zero");
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-area-ratio": 2}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrAreaRatio - 1.0) < 1e-9,
+           "a ratio past a whole frame is clamped",
+           QString::number(vshot::loadConfig().cli.hdrAreaRatio));
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.hdrAreaTest = false;
+    config.cli.hdrAreaRatio = 0.0;
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(booleanAt(root, "cli/hdr-area-test") == false, "the switch being off was written");
+    expect(containsAt(root, "cli/hdr-area-ratio") && numberAt(root, "cli/hdr-area-ratio") == 0.0,
+           "a ratio of zero was written rather than dropped",
+           QString::number(numberAt(root, "cli/hdr-area-ratio")));
+
+    // The switch being on is the default and needs no key, and a ratio nobody
+    // chose is the sentinel and needs none either.
+    config.cli.hdrAreaTest = true;
+    config.cli.hdrAreaRatio = -1.0;
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/hdr-area-test"),
+           "an area test left on writes no key rather than a true");
+    expect(!containsAt(root, "cli/hdr-area-ratio"), "an unset ratio writes no key");
 }
 
 void checkEditorSaveKeepsTheCliSection()
@@ -637,6 +782,20 @@ void checkRoundTripOfEveryField()
         expect(vshot::loadConfig().cli.pngCompression == value,
                "the settings window's compression names all load back", value);
     }
+    for (const QString &value : vshot::hdrFormatNames()) {
+        vshot::Config probe = written;
+        probe.cli.hdrFormat = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.hdrFormat == value,
+               "the settings window's HDR format names all load back", value);
+    }
+    for (const QString &value : vshot::toneMapNames()) {
+        vshot::Config probe = written;
+        probe.cli.toneMap = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.toneMap == value,
+               "the settings window's tone-map names all load back", value);
+    }
     for (const QString &value : vshot::toolNames()) {
         vshot::Config probe = written;
         probe.editor.tool = value;
@@ -751,6 +910,210 @@ void checkTheLegacyTextSizeIsMigrated()
            QString::number(vshot::loadConfig().editor.textSize));
 }
 
+// The editor's key bindings are the one part of the config file a user is
+// likely to edit by hand and the one part whose mistakes are invisible: a
+// binding that does not parse reads as "the default", so a typo costs the user
+// the key they asked for and gives them back one they did not. What is checked
+// here is that a binding the file spells is the one the editor reads, that
+// clearing one is not the same as never having set it, and that a save leaves
+// everything else in the file alone.
+void checkTheShortcutDefaultsAreReachable()
+{
+    std::printf("--- every default binding is reachable -----------------------------\n");
+    QFile::remove(configPath());
+    const vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    // One press per action, built the way a key event carries it. The point is
+    // not that the spelling round-trips -- it is that the key a user presses
+    // for an action is the one the editor hears, which is a different claim
+    // from "the string came back unchanged".
+    struct Probe {
+        vshot::ShortcutAction action;
+        int modifiers;
+        int key;
+    };
+    const Probe probes[] = {
+        {vshot::ShortcutAction::Confirm, 0, Qt::Key_Return},
+        {vshot::ShortcutAction::Confirm, 0, Qt::Key_Enter},
+        {vshot::ShortcutAction::Cancel, 0, Qt::Key_Escape},
+        {vshot::ShortcutAction::Undo, Qt::ControlModifier, Qt::Key_Z},
+        {vshot::ShortcutAction::Redo, Qt::ControlModifier, Qt::Key_Y},
+        {vshot::ShortcutAction::Redo, Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_Z},
+        {vshot::ShortcutAction::Copy, Qt::ControlModifier, Qt::Key_S},
+        {vshot::ShortcutAction::CopyText, Qt::ControlModifier, Qt::Key_C},
+        {vshot::ShortcutAction::Paste, Qt::ControlModifier, Qt::Key_V},
+        {vshot::ShortcutAction::SelectAll, Qt::ControlModifier, Qt::Key_A},
+        {vshot::ShortcutAction::SelectNone, Qt::ControlModifier, Qt::Key_D},
+        {vshot::ShortcutAction::NextMark, 0, Qt::Key_Tab},
+        // Shift+Tab arrives as Key_Backtab with Shift still set, which is the
+        // whole reason this one is worth checking rather than assuming.
+        {vshot::ShortcutAction::PreviousMark, Qt::ShiftModifier, Qt::Key_Backtab},
+        {vshot::ShortcutAction::PreviousMark, Qt::ControlModifier | Qt::ShiftModifier,
+         Qt::Key_Backtab},
+        {vshot::ShortcutAction::Delete, 0, Qt::Key_Delete},
+        {vshot::ShortcutAction::Delete, 0, Qt::Key_Backspace},
+        {vshot::ShortcutAction::CopyColor, 0, Qt::Key_C},
+        {vshot::ShortcutAction::AdoptColor, 0, Qt::Key_V},
+        {vshot::ShortcutAction::ShowMagnifier, 0, Qt::Key_M},
+        {vshot::ShortcutAction::CursorLeft, 0, Qt::Key_Left},
+        {vshot::ShortcutAction::CursorLeft, 0, Qt::Key_A},
+        {vshot::ShortcutAction::CursorRight, 0, Qt::Key_D},
+        {vshot::ShortcutAction::CursorUp, 0, Qt::Key_W},
+        {vshot::ShortcutAction::CursorDown, 0, Qt::Key_S},
+    };
+    for (const Probe &probe : probes) {
+        const QKeySequence pressed(
+            static_cast<int>(static_cast<int>(probe.modifiers) | static_cast<int>(probe.key)));
+        expect(keys.matches(probe.action, pressed),
+               "the default binding hears the key it is bound to",
+               QStringLiteral("%1 <- %2").arg(vshot::shortcutBinding(probe.action).id,
+                                              pressed.toString()));
+    }
+    // The two held modifiers are read from the state of the keyboard rather
+    // than from a key press, and Qt will not parse a lone "Alt" -- so they get
+    // their own reader and their own check.  There used to be a third, the
+    // drag-selection modifier, but the drag it gated is the middle button's
+    // now: a button cannot be read from the keyboard's state at all, so there
+    // is nothing left here for it to be.
+    expect(keys.held(vshot::ShortcutAction::PreserveAspect, Qt::AltModifier),
+           "the aspect-ratio modifier is read while it is held");
+    expect(keys.held(vshot::ShortcutAction::CoarseStep, Qt::ShiftModifier),
+           "the coarse step modifier is read while it is held");
+    // A modifier that is *not* the one an action wants must not count as held:
+    // Ctrl+Alt is a Ctrl drag to the compositor, not an Alt-resize.
+    expect(!keys.held(vshot::ShortcutAction::PreserveAspect, Qt::ControlModifier),
+           "a modifier that is not the bound one does not count as held");
+    expect(keys.held(vshot::ShortcutAction::PreserveAspect,
+                     Qt::ControlModifier | Qt::AltModifier),
+           "the bound modifier still counts when another is down beside it");
+}
+
+void checkAnUnrelatedKeyIsNotABinding()
+{
+    std::printf("--- a key that is bound to nothing hears nothing -------------------\n");
+    QFile::remove(configPath());
+    const vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    // Ctrl+F is bound to nothing. It has to stay that way, or every unbound key
+    // would fire some action's default.
+    const QKeySequence find(static_cast<int>(Qt::ControlModifier | Qt::Key_F));
+    bool any = false;
+    for (int index = 0; index < static_cast<int>(vshot::ShortcutAction::kActionCount); ++index) {
+        any = any || keys.matches(static_cast<vshot::ShortcutAction>(index), find);
+    }
+    expect(!any, "Ctrl+F is bound to nothing and fires nothing", find.toString());
+
+    // And the modifiers alone -- a key event's bits without a key behind them.
+    const QKeySequence ctrlOnly(static_cast<int>(Qt::ControlModifier));
+    bool anyModifier = false;
+    for (int index = 0; index < static_cast<int>(vshot::ShortcutAction::kActionCount); ++index) {
+        anyModifier = anyModifier
+            || keys.matches(static_cast<vshot::ShortcutAction>(index), ctrlOnly);
+    }
+    expect(!anyModifier, "pressing a modifier on its own fires nothing");
+}
+
+void checkAReboundKeyIsTheOneHeard()
+{
+    std::printf("--- a rebound binding is the one the editor hears ------------------\n");
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": "Ctrl+K", "undo": "F2"}})"));
+    const vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    const auto pressed = [](int modifiers, int key) {
+        return QKeySequence(static_cast<int>(modifiers | key));
+    };
+    expect(keys.matches(vshot::ShortcutAction::Copy,
+                        pressed(Qt::ControlModifier, Qt::Key_K)),
+           "the new key for copy is heard", keys.textFor(vshot::ShortcutAction::Copy));
+    expect(!keys.matches(vshot::ShortcutAction::Copy,
+                         pressed(Qt::ControlModifier, Qt::Key_S)),
+           "the key it replaced is not heard any more");
+    expect(keys.matches(vshot::ShortcutAction::Undo, pressed(0, Qt::Key_F2)),
+           "a plain letter can be bound on its own", keys.textFor(vshot::ShortcutAction::Undo));
+    // Everything the file did not mention keeps its default.
+    expect(keys.matches(vshot::ShortcutAction::Redo,
+                        pressed(Qt::ControlModifier, Qt::Key_Y)),
+           "an action the file does not name keeps its default");
+
+    // A binding that does not parse is not "unbind" -- it is a typo, and the
+    // user is better off with the default than with nothing.
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": "Ctrl+Thumbprint"}})"));
+    const vshot::ShortcutPreferences typo = vshot::loadShortcutPreferences();
+    expect(typo.matches(vshot::ShortcutAction::Copy,
+                        pressed(Qt::ControlModifier, Qt::Key_S)),
+           "an unreadable binding falls back to the default rather than to nothing");
+
+    // A value of the wrong type is the same story.
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": 7}})"));
+    const vshot::ShortcutPreferences wrong = vshot::loadShortcutPreferences();
+    expect(wrong.matches(vshot::ShortcutAction::Copy,
+                         pressed(Qt::ControlModifier, Qt::Key_S)),
+           "a binding that is not a string falls back to the default");
+
+    // An action this build has never heard of is simply not read; it must not
+    // disturb the ones beside it.
+    writeConfig(QStringLiteral(R"({"shortcuts": {"future-action": "Ctrl+S", "copy": "Ctrl+K"}})"));
+    const vshot::ShortcutPreferences future = vshot::loadShortcutPreferences();
+    expect(future.matches(vshot::ShortcutAction::Copy,
+                          pressed(Qt::ControlModifier, Qt::Key_K)),
+           "an unknown action's key does not shadow a known one's");
+}
+
+void checkClearingABindingIsNotTheSameAsDefaulting()
+{
+    std::printf("--- clearing a binding leaves the action with no key ---------------\n");
+    // The one pair of states the file has to keep apart: an absent key means
+    // "the default stands", an empty one means "the user wants no key".
+    writeConfig(QStringLiteral(R"({"shortcuts": {"copy": ""}})"));
+    const vshot::ShortcutPreferences cleared = vshot::loadShortcutPreferences();
+    expect(!cleared.hasKeys(vshot::ShortcutAction::Copy) && !cleared.matches(
+               vshot::ShortcutAction::Copy,
+               QKeySequence(static_cast<int>(Qt::ControlModifier | Qt::Key_S))),
+           "an empty binding is no key at all, not the default back again");
+    expect(cleared.matches(vshot::ShortcutAction::Undo,
+                           QKeySequence(static_cast<int>(Qt::ControlModifier | Qt::Key_Z))),
+           "clearing one action leaves every other one alone");
+
+    // And it survives a round trip: the empty string has to be written, because
+    // omitting the key would read back as the default.
+    const QJsonObject root = afterSave([&] { vshot::saveShortcutPreferences(cleared); });
+    expect(containsAt(root, "shortcuts/copy") && textAt(root, "shortcuts/copy").isEmpty(),
+           "a cleared binding is written as an empty string, not omitted");
+    const vshot::ShortcutPreferences again = vshot::loadShortcutPreferences();
+    expect(!again.hasKeys(vshot::ShortcutAction::Copy), "it reads back as still cleared");
+}
+
+void checkTheShortcutsSaveKeepsTheRestOfTheFile()
+{
+    std::printf("--- saving the shortcuts keeps everything else ---------------------\n");
+    writeConfig(QStringLiteral(R"({
+        "editor": {"tool": "arrow", "color": "#00ff00"},
+        "cli": {"png-compression": "high"},
+        "shortcuts": {"copy": "Ctrl+K", "an-action-of-the-future": "Ctrl+J"},
+        "some-future-section": {"keep": true}
+    })"));
+    vshot::ShortcutPreferences keys = vshot::loadShortcutPreferences();
+    keys.setText(vshot::ShortcutAction::Undo, QStringLiteral("Ctrl+Backspace"));
+    const QJsonObject root = afterSave([&] { vshot::saveShortcutPreferences(keys); });
+
+    expect(textAt(root, "editor/tool") == QStringLiteral("arrow"),
+           "the editor's style is still there", textAt(root, "editor/tool"));
+    expect(textAt(root, "cli/png-compression") == QStringLiteral("high"),
+           "the CLI defaults are still there");
+    expect(containsAt(root, "some-future-section/keep"), "an unknown section is kept whole");
+    expect(textAt(root, "shortcuts/copy") == QStringLiteral("Ctrl+K"),
+           "a binding the save did not touch is still there", textAt(root, "shortcuts/copy"));
+    expect(textAt(root, "shortcuts/undo") == QStringLiteral("Ctrl+Backspace"),
+           "the rebound key was written", textAt(root, "shortcuts/undo"));
+    expect(textAt(root, "shortcuts/an-action-of-the-future") == QStringLiteral("Ctrl+J"),
+           "an action this build does not know is left in the file");
+
+    // A binding put back to its default disappears from the file again: writing
+    // twenty-two lines the user never asked for is not what a save is for.
+    keys.setText(vshot::ShortcutAction::Undo, QStringLiteral("Ctrl+Z"));
+    const QJsonObject back = afterSave([&] { vshot::saveShortcutPreferences(keys); });
+    expect(!containsAt(root, "shortcuts/select-all"), "a default binding is not written");
+    expect(!containsAt(back, "shortcuts/undo"),
+           "a binding put back to its default is removed from the file");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -773,6 +1136,10 @@ int main(int argc, char **argv)
     checkDefaultsWhenTheFileIsMissing();
     checkUnknownKeysAreIgnored();
     checkBadValuesFallBackFieldByField();
+    checkTheRetiredSelectToolStillMeansNothingArmed();
+    checkTheHdrFormatRoundTripsAndIsCleared();
+    checkTheToneMapRoundTripsAndIsCleared();
+    checkTheHdrAreaTestRoundTripsAndKeepsItsZero();
     checkColorsUseTheCssSpelling();
     checkTheLegacyTextSizeIsMigrated();
     checkEditorSaveKeepsTheCliSection();
@@ -781,6 +1148,11 @@ int main(int argc, char **argv)
     checkClearingAValueRemovesIt();
     checkTheLookNumbersKeepTheLargestValueTheyAreOffered();
     checkRoundTripOfEveryField();
+    checkTheShortcutDefaultsAreReachable();
+    checkAnUnrelatedKeyIsNotABinding();
+    checkAReboundKeyIsTheOneHeard();
+    checkClearingABindingIsNotTheSameAsDefaulting();
+    checkTheShortcutsSaveKeepsTheRestOfTheFile();
 
     std::printf("--- result ---------------------------------------------------------\n");
     std::printf("%s (%d failure(s))\n", failures == 0 ? "ALL PASS" : "FAILURES", failures);

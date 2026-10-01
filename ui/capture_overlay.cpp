@@ -2,7 +2,10 @@
 // Copyright (C) 2026 VShot contributors
 
 #include "capture_overlay.hpp"
+
+#include "pixel_fd.hpp"
 #include "config.hpp"
+#include "shortcuts.hpp"
 #include "i18n.hpp"
 #include "text_size.hpp"
 
@@ -10,6 +13,7 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QBuffer>
 #include <QCloseEvent>
 #include <QConicalGradient>
 #include <QCoreApplication>
@@ -72,6 +76,22 @@ namespace vshot {
 namespace {
 
 constexpr int kHandleRadius = 6;
+// How many pixels one cursor step covers while the step modifier is held. One
+// pixel is the point of walking the cursor at all -- a corner the mouse cannot
+// land on exactly -- and ten is the coarse half of the same trip.
+constexpr int kCoarseCursorStep = 10;
+// Whether `key` is one of the four arrow keys.  A cursor step is either a nudge
+// of the selected mark or a walk of the cursor, and which one it is hangs on
+// the key that was pressed rather than on which action it reached: an arrow
+// nudges a mark when there is one, a letter always walks.
+bool pressedArrow(int key)
+{
+    return key == Qt::Key_Left || key == Qt::Key_Right || key == Qt::Key_Up
+        || key == Qt::Key_Down;
+}
+// How far outside a mark's bounds the pointer still counts as being on its
+// border rather than on the canvas beyond it.
+constexpr int kBorderGrab = 3;
 constexpr int kMinimumSelection = 5;
 // Widest window label the picker's size pill shows before eliding it.
 constexpr int kPickerLabelWidth = 360;
@@ -85,6 +105,34 @@ constexpr int kCandidateRefreshIntervalMs = 150;
 // seeing an event, and the highlight must not keep describing what used to be
 // there.  Only the picker's lifetime pays for this.
 constexpr int kCandidateRefreshPollMs = 300;
+// How often a walk of the keyboard cursor may ask the CLI to move the real
+// pointer.  Every request is a pipe write, a process round trip and a
+// compositor call, and a held key repeats far faster than that; the editor's
+// own cursor still moves on every repeat, so this is only how far the arrow on
+// the screen lags behind the loupe.  Short enough that a few taps look
+// immediate.
+constexpr int kPointerWarpIntervalMs = 40;
+// How long after a keyboard walk a pointer motion is still read as the echo of
+// that walk rather than as the user taking the pointer back.  VShot moves the
+// pointer by asking the compositor, and the compositor reports the result as an
+// ordinary motion event -- which arrives after the step that asked for it, so a
+// handler that treated it as "the user moved the mouse" would end the magnifier
+// flash the step had just raised, every step, and the loupe would blink.  The
+// distance test below is what separates the two in practice; this is the window
+// it is applied in, and it has to be wider than the warp throttle so a step
+// held back by it is still recognised when it finally goes out.
+constexpr qint64 kPointerWarpEchoMs = 250;
+// How many pin moves may be written before the daemon answers the first.  More
+// than one keeps it from idling between replies; the position is absolute and
+// only the newest matters, so the queue never needs to be long.
+constexpr int kPinMovesInFlight = 3;
+// How long the editor keeps drawing after it has asked to be let go.  The CLI
+// holds its answer until the daemon says the picture the editor is drawing is
+// on the screen, and the daemon has its own deadline for a surface that never
+// draws one; this is the backstop for the CLI itself being gone, which has
+// nothing to answer with.  Comfortably past the daemon's own wait, so it never
+// cuts a real handoff short.
+constexpr int kHandoffWaitMs = 600;
 constexpr int kMaxUndoSteps = 100;
 constexpr int kLoupeRadius = 7;
 constexpr int kLoupeZoom = 8;
@@ -160,14 +208,25 @@ QRectF localRect(const OutputSession &output, const LogicalRect &rect, const QSi
                   static_cast<double>(rect.height) * sy);
 }
 
+// Device pixels per logical pixel of an output, as the number it is. A real
+// output's density is a whole number, but the pin editor's virtual output
+// carries the zoom its image is shown at, which is not -- a 160-pixel pin
+// across 176 logical pixels is 0.909 -- so it is never narrowed to an int
+// before it is used. Narrowing it to 1 is what drew a zoomed pin's marks at
+// the wrong size and in the wrong place.
+double outputScale(const OutputSession &output)
+{
+    return output.scale > 0.0 ? output.scale : 1.0;
+}
+
 QRect sourceRect(const OutputSession &output, const LogicalRect &rect)
 {
-    const std::int64_t x = (static_cast<std::int64_t>(rect.x) - output.geometry.x) * output.scale;
-    const std::int64_t y = (static_cast<std::int64_t>(rect.y) - output.geometry.y) * output.scale;
-    const std::int64_t width = static_cast<std::int64_t>(rect.width) * output.scale;
-    const std::int64_t height = static_cast<std::int64_t>(rect.height) * output.scale;
-    return QRect(static_cast<int>(x), static_cast<int>(y), static_cast<int>(width),
-                 static_cast<int>(height));
+    const double scale = outputScale(output);
+    const double x = (static_cast<double>(rect.x) - output.geometry.x) * scale;
+    const double y = (static_cast<double>(rect.y) - output.geometry.y) * scale;
+    return QRect(static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
+                 static_cast<int>(std::lround(static_cast<double>(rect.width) * scale)),
+                 static_cast<int>(std::lround(static_cast<double>(rect.height) * scale)));
 }
 
 // The exact inverse of `sourceRect`: a rect in one output's captured device
@@ -178,7 +237,7 @@ QRect sourceRect(const OutputSession &output, const LogicalRect &rect)
 // box, so a rect that was mapped out and back comes home.
 LogicalRect logicalFromSource(const OutputSession &output, const QRect &rect)
 {
-    const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+    const double scale = outputScale(output);
     const double x = static_cast<double>(output.geometry.x) + static_cast<double>(rect.x()) / scale;
     const double y = static_cast<double>(output.geometry.y) + static_cast<double>(rect.y()) / scale;
     const double width = static_cast<double>(rect.width()) / scale;
@@ -189,6 +248,53 @@ LogicalRect logicalFromSource(const OutputSession &output, const QRect &rect)
     result.width = static_cast<std::uint32_t>(std::max(0L, std::lround(width)));
     result.height = static_cast<std::uint32_t>(std::max(0L, std::lround(height)));
     return result;
+}
+
+// The top-left pixel of anything actually drawn in `image`.
+QPoint firstInk(const QImage &image)
+{
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (qAlpha(image.pixel(x, y)) != 0) {
+                return QPoint(x, y);
+            }
+        }
+    }
+    return QPoint();
+}
+
+// How far inside a line edit its own glyphs start, measured against where the
+// overlay draws the very same glyphs for the committed label.  The editor is a
+// QLineEdit and whatever its style bakes into the content rect shifts the text
+// a pixel or two; the committed label is drawn at the mark's origin with
+// AlignLeft|AlignTop.  The difference is a constant for a given font and style,
+// so a one-glyph probe in both places measures it exactly -- subtracting the
+// two puts the editor's text where the label will land instead of where the
+// style happens to put it.
+QPoint lineEditGlyphInset(QLineEdit *editor)
+{
+    const QFont font = editor->font();
+    const QSize size = editor->size();
+    const qreal ratio = editor->devicePixelRatioF() > 0 ? editor->devicePixelRatioF() : 1.0;
+
+    QImage reference(size, QImage::Format_ARGB32_Premultiplied);
+    reference.fill(Qt::transparent);
+    {
+        QPainter painter(&reference);
+        painter.setFont(font);
+        painter.setPen(Qt::white);
+        painter.drawText(QRect(QPoint(0, 0), size), Qt::AlignLeft | Qt::AlignTop,
+                         QStringLiteral("H"));
+    }
+
+    QImage probe(size, QImage::Format_ARGB32_Premultiplied);
+    probe.fill(Qt::transparent);
+    editor->render(&probe);
+
+    const QPoint want = firstInk(reference);
+    const QPoint got = firstInk(probe);
+    return QPoint(static_cast<int>(std::lround((got.x() - want.x()) / ratio)),
+                  static_cast<int>(std::lround((got.y() - want.y()) / ratio)));
 }
 
 QPointF localPoint(const OutputSession &output, const Point &point, const QSize &size)
@@ -204,22 +310,45 @@ QPointF localPoint(const OutputSession &output, const Point &point, const QSize 
                    (static_cast<double>(point.y) - surface.y) * sy);
 }
 
-// Two pi, spelled out rather than read from a platform's `M_PI`: the wave the
-// preview draws and the one the Rust renderer bakes into the PNG have to be the
-// same curve, and the constant is the one place that could silently differ.
+// The fixed device-pixel crop the magnifier shows, centred on the cursor's own
+// pixel.  Near a frame edge the window would run off the image; the pixels that
+// do not exist are borrowed from the nearest edge instead of being dropped, so
+// the cursor's pixel stays at the centre of the loupe and the circle is filled
+// edge to edge.  Dropping them is what left the loupe showing the frame under
+// it near the screen's borders.
+QImage loupeCrop(const QImage &image, int centerX, int centerY)
+{
+    constexpr int span = 2 * kLoupeRadius + 1;
+    QImage crop(span, span, QImage::Format_ARGB32);
+    if (crop.isNull()) {
+        return crop;
+    }
+    for (int row = 0; row < span; ++row) {
+        const int sourceY = std::clamp(centerY - kLoupeRadius + row, 0, image.height() - 1);
+        for (int column = 0; column < span; ++column) {
+            const int sourceX = std::clamp(centerX - kLoupeRadius + column, 0, image.width() - 1);
+            crop.setPixel(column, row, image.pixel(sourceX, sourceY));
+        }
+    }
+    return crop;
+}
+
+// Two pi, spelled out rather than read from a platform's `M_PI`: the wave's
+// shape must not depend on which libm the build landed on, and the constant is
+// the one place that could silently differ.
 constexpr double kTau = 6.283185307179586476925286766559;
 
-// Samples the sine wave along the segment `start`..`end` as a polyline, exactly
-// as the Rust renderer's `wave_polyline` does, so a wave drawn here and the
-// same wave baked into the final PNG agree line for line.
+// Samples the sine wave along the segment `start`..`end` as a polyline.  This
+// is the only wave there is -- the preview and the committed mark both come
+// from here -- so a wave looks the same live as it does once it is down.
 //
 // `start` and `end` are overlay-local logical pixels.  `widthLogical` is the
 // annotation's width in logical pixels; the amplitude and the wavelength are
 // its `max(width * 2, 4)` and `max(width * 6, 18)`, in logical pixels, so the
 // shape does not depend on the output's scale.  `scale` is that output's device
 // scale and sets only the sampling distance: one sample per *device* pixel
-// means a step of `1 / scale` logical pixels, which is what the Rust side's
-// `n = ceil(length_device) + 1` produces.
+// means a step of `1 / scale` logical pixels, so a wave's polyline is as fine
+// as the screen it is drawn on and no finer.
 //
 // The phase finishes on a whole number of cycles -- `cycles = max(1, round(L /
 // wavelength))`, with the wavelength actually used being `L / cycles` -- so both
@@ -380,7 +509,8 @@ void paintBezierInk(QPainter *painter, const QVector<QPointF> &at, bool closed, 
     const bool wantStroke = !wantFill || fill == QStringLiteral("both");
     const QPainterPath path = bezierPathAt(at, closed);
     if (wantFill) {
-        // Fill first and stroke second, the order the Rust renderer bakes in.
+        // Fill first and stroke second, so the outline is not tinted by the
+        // translucent fill it sits on.
         // The fill is the stroke's own colour at half its alpha, floored: that
         // is what "a translucent fill under a solid outline" means for a colour
         // the user picked an opacity for.
@@ -483,16 +613,17 @@ QString toolName(Tool tool)
         return QStringLiteral("number");
     case Tool::Picker:
         return QStringLiteral("picker");
-    case Tool::Select:
-        return QStringLiteral("select");
     }
     return QStringLiteral("pen");
 }
 
 /// The inverse of [`toolName`], for a name that came out of the config file.
-/// An unrecognized name is a typo in a file the user can edit, so it falls
-/// back to the tool a session has always started with.
-Tool toolForName(const QString &name)
+/// An unrecognized name is a typo in a file the user can edit, and "select" is
+/// the name the old Select tool was remembered under -- still the default in
+/// every config file written before that tool went away.  Neither names a tool
+/// there is anything to arm, so both come back empty and the session stays
+/// unarmed, which is the state that tool used to be.
+std::optional<Tool> toolForName(const QString &name)
 {
     if (name == QStringLiteral("rectangle")) {
         return Tool::Rectangle;
@@ -521,7 +652,10 @@ Tool toolForName(const QString &name)
     if (name == QStringLiteral("text")) {
         return Tool::Text;
     }
-    return Tool::Select;
+    if (name == QStringLiteral("number")) {
+        return Tool::Number;
+    }
+    return std::nullopt;
 }
 
 QFont textFont(const QString &family, int pixelSize)
@@ -547,21 +681,6 @@ QSize textMetrics(const Annotation &annotation)
         width = std::max(width, metrics.horizontalAdvance(line));
     }
     return QSize(width, std::max(1, static_cast<int>(lines.size()) * metrics.lineSpacing()));
-}
-
-// A numbered badge's diameter is a value of its own, set by the number tool's
-// size control: floored at 18 logical pixels so the count stays legible, and
-// capped at 96 so it does not paint a billboard.  It used to be six pen widths
-// across, which tied a badge's size to the width slider and left no way to size
-// one without restyling every stroke.  The standalone annotate surface spells
-// the same two numbers out for itself: the two files share no code on purpose,
-// and this is the price of that.
-constexpr int kNumberMinDiameter = 18;
-constexpr int kNumberMaxDiameter = 96;
-
-int numberDiameter(std::uint32_t size)
-{
-    return std::clamp(static_cast<int>(size), kNumberMinDiameter, kNumberMaxDiameter);
 }
 
 // The glyphs are a touch over half the badge, bold, so that a two-digit count
@@ -596,9 +715,8 @@ QColor numberOnInk(const QColor &ink)
 constexpr qreal kNumberHaloWidth = 2.0;
 
 // The one place a numbered badge is turned into ink.  The overlay's live
-// preview, its cached per-mark raster and the bitmap the renderer is handed all
-// draw through here, so the four styles cannot drift apart between them -- and
-// the bitmap the Rust side composites is exactly what the user saw.
+// preview, its cached per-mark raster and the layer handed to the CLI all draw
+// through here, so the four styles cannot drift apart between them.
 void paintNumberBadge(QPainter &painter, const QRectF &box, const QString &text, NumberStyle style,
                       const QColor &color)
 {
@@ -672,8 +790,9 @@ QString numberStyleName(NumberStyle style)
     return QString();
 }
 
-// The tag the four number-style segments carry.  It never leaves this file: the
-// segment row is a Qt-side control and nothing about it is serialized.
+// The tag the four number-style segments carry, and the name the style travels
+// under in the marks document: a badge that comes back from a re-edit has to be
+// the same shape it went out as.
 QString numberStyleValue(NumberStyle style)
 {
     switch (style) {
@@ -689,6 +808,37 @@ QString numberStyleValue(NumberStyle style)
     return QStringLiteral("plain");
 }
 
+// Whether an annotation is the number tool's badge rather than a typed label.
+// Both are text annotations and differ only in the one name, which is what
+// keeps every reader that does not care about badges from having to know.
+bool isNumberAnnotation(const Annotation &annotation)
+{
+    return annotation.kind == Annotation::Kind::Text &&
+        annotation.tool == QStringLiteral("number");
+}
+
+// The point a badge is centred on, recovered from its own box.
+Point numberCenter(const Annotation &annotation)
+{
+    return Point{annotation.rect.x + static_cast<std::int32_t>(annotation.rect.width / 2),
+                 annotation.rect.y + static_cast<std::int32_t>(annotation.rect.height / 2)};
+}
+
+} // namespace
+
+// A numbered badge's diameter is a value of its own, set by the number tool's
+// size control: floored at 18 logical pixels so the count stays legible, and
+// capped at 96 so it does not paint a billboard.  It used to be six pen widths
+// across, which tied a badge's size to the width slider and left no way to size
+// one without restyling every stroke.  The standalone annotate surface spells
+// the same two numbers out for itself: the two files share no code on purpose,
+// and this is the price of that.
+int numberDiameter(std::uint32_t size)
+{
+    return std::clamp(static_cast<int>(size), kNumberMinDiameter, kNumberMaxDiameter);
+}
+
+// The four looks, read from the tag the wire carries.
 NumberStyle numberStyleForName(const QString &value)
 {
     if (value == QStringLiteral("ring")) {
@@ -701,22 +851,6 @@ NumberStyle numberStyleForName(const QString &value)
         return NumberStyle::Plain;
     }
     return NumberStyle::FilledCircle;
-}
-
-// Whether an annotation is the number tool's badge rather than a typed label.
-// Both travel as text annotations with a bitmap, and the difference is the one
-// name -- which is exactly why the renderer never has to know about it.
-bool isNumberAnnotation(const Annotation &annotation)
-{
-    return annotation.kind == Annotation::Kind::Text &&
-        annotation.tool == QStringLiteral("number");
-}
-
-// The point a badge is centred on, recovered from its own box.
-Point numberCenter(const Annotation &annotation)
-{
-    return Point{annotation.rect.x + static_cast<std::int32_t>(annotation.rect.width / 2),
-                 annotation.rect.y + static_cast<std::int32_t>(annotation.rect.height / 2)};
 }
 
 // Lays a badge's box out around `center` for the diameter it currently carries.
@@ -732,12 +866,14 @@ void layoutNumberBox(Annotation &annotation, Point center)
     annotation.origin = origin;
     annotation.rect = LogicalRect{origin.x, origin.y, static_cast<std::uint32_t>(diameter),
                                   static_cast<std::uint32_t>(diameter)};
-    // The legacy glyph multiple the protocol derives from this is only ever read
-    // by the renderer's no-bitmap fallback, so the count it means is the badge's
-    // own diameter: the fallback then draws glyphs about as tall as the bitmap
-    // the helper ships, rather than a label at some unrelated size.
+    // The glyph multiple the wire carries is only read by a reader that has to
+    // draw the badge itself, so the count it means is the badge's own diameter:
+    // such a reader then draws glyphs about as tall as the badge, rather than a
+    // label at some unrelated size.
     annotation.textPixels = static_cast<std::uint32_t>(diameter);
 }
+
+namespace {
 
 // The logical rect an annotation occupies, whatever its kind.  Shared by the
 // hit test, the drag clamps and the render cache so all three agree on what a
@@ -847,12 +983,6 @@ QIcon toolbarIcon(Tool tool, const QColor &color = QColor(230, 225, 229),
     painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
     switch (tool) {
-    case Tool::Select:
-        painter.setBrush(color);
-        painter.drawPolygon(QPolygonF{QPointF(5, 3), QPointF(18, 14), QPointF(12, 15),
-                                      QPointF(9, 21), QPointF(6, 19), QPointF(9, 14),
-                                      QPointF(5, 3)});
-        break;
     case Tool::Rectangle:
         painter.drawRoundedRect(QRectF(4, 5, 16, 14), 2, 2);
         break;
@@ -1093,11 +1223,6 @@ QIcon pinIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRati
 // room its text needs.
 constexpr int kInfoPillGap = 8;
 
-// The eyedropper's readout carries the colour itself: a chip of it at the
-// pill's left edge, and this much room between the chip and the hex.
-constexpr qreal kColorChip = 12.0;
-constexpr qreal kColorChipGap = 6.0;
-
 QSizeF pillSize(const QString &text)
 {
     const QFontMetrics metrics(pillFont());
@@ -1105,11 +1230,8 @@ QSizeF pillSize(const QString &text)
 }
 
 // Draws a dark rounded label (dimensions, pixel coordinates) in `pill`, pulled
-// back inside `bounds` when it would hang over an edge.  A valid `chip` puts
-// that colour at the pill's left edge with the text beside it, which is how the
-// eyedropper reads a pixel out: the colour itself, then its hex.
-void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, const QRectF &bounds,
-                 const QColor &chip = QColor())
+// back inside `bounds` when it would hang over an edge.
+void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, const QRectF &bounds)
 {
     const qreal x = std::clamp(pill.left(), bounds.left() + 2.0,
                                std::max(bounds.left() + 2.0, bounds.right() - pill.width() - 2.0));
@@ -1123,40 +1245,7 @@ void drawPillBox(QPainter *painter, const QRectF &pill, const QString &text, con
     painter->setPen(QPen(QColor(120, 120, 120), 1.0));
     painter->drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter->setPen(Qt::white);
-    if (!chip.isValid()) {
-        painter->drawText(box, Qt::AlignCenter, text);
-        return;
-    }
-    const QRectF swatch(box.left() + 4.0, box.center().y() - kColorChip / 2.0, kColorChip,
-                        kColorChip);
-    // A picked colour keeps the tool's opacity, so a translucent one is shown
-    // over a checkerboard rather than as a dimmer version of itself.
-    if (chip.alpha() < 255) {
-        const QSizeF half(kColorChip / 2.0, kColorChip / 2.0);
-        painter->save();
-        painter->setClipRect(swatch);
-        painter->fillRect(swatch, QColor(0x6f, 0x76, 0x80));
-        painter->fillRect(QRectF(swatch.topLeft(), half), QColor(0x9a, 0xa3, 0xae));
-        painter->fillRect(QRectF(swatch.center(), half), QColor(0x9a, 0xa3, 0xae));
-        painter->restore();
-    }
-    painter->setPen(Qt::NoPen);
-    painter->setBrush(chip);
-    painter->drawRoundedRect(swatch, 2, 2);
-    painter->setBrush(Qt::NoBrush);
-    painter->setPen(QPen(QColor(120, 120, 120), 1.0));
-    painter->drawRoundedRect(swatch.adjusted(0.5, 0.5, -0.5, -0.5), 2, 2);
-    painter->setPen(Qt::white);
-    painter->drawText(QRectF(swatch.right() + kColorChipGap, box.top(),
-                             box.right() - swatch.right() - kColorChipGap - 4.0, box.height()),
-                      Qt::AlignVCenter | Qt::AlignLeft, text);
-}
-
-// The room the eyedropper's readout needs: the hex, and the chip beside it.
-QSizeF colorPillSize(const QString &text)
-{
-    const QSizeF size = pillSize(text);
-    return QSizeF(size.width() + kColorChip + kColorChipGap, size.height());
+    painter->drawText(box, Qt::AlignCenter, text);
 }
 
 // Draws a dark rounded label anchored at `anchor` inside `bounds`; flips above
@@ -1171,22 +1260,6 @@ void drawInfoPill(QPainter *painter, const QPointF &anchor, const QString &text,
     }
     drawPillBox(painter, QRectF(anchor.x() - size.width() / 2.0, y, size.width(), size.height()),
                 text, bounds);
-}
-
-// The loupe's readout while the eyedropper is up: the pixel under the crosshair
-// as a chip with its hex beside it, anchored where the coordinates go.  A pair
-// of numbers says nothing about what a click would take; this says all of it.
-void drawColorPill(QPainter *painter, const QPointF &anchor, const QColor &color,
-                   const QRectF &bounds)
-{
-    const QString text = color.name();
-    const QSizeF size = colorPillSize(text);
-    qreal y = anchor.y() + 10.0;
-    if (y + size.height() > bounds.bottom()) {
-        y = anchor.y() - size.height() - 10.0;
-    }
-    drawPillBox(painter, QRectF(anchor.x() - size.width() / 2.0, y, size.width(), size.height()),
-                text, bounds, color);
 }
 
 // Draws the size pill of a capture selection, which hangs *outside* the region
@@ -1234,9 +1307,11 @@ void drawSelectionPill(QPainter *painter, const QPointF &corner, const QRectF &r
 
 // Mosaic strength levels: block size in device pixels for a given output
 // scale (P1 fine, P2 standard, P3 coarse) — mirrors edit::mosaic_block_size.
-int mosaicBlockForStrength(std::uint32_t strength, int scale)
+// The scale is the ratio it is, not a whole number: a zoomed pin's is 0.909,
+// and rounding that to 1 would pixelate at a different block than the renderer.
+int mosaicBlockForStrength(std::uint32_t strength, double scale)
 {
-    const int base = std::max(1, 12 * scale);
+    const int base = std::max(1, static_cast<int>(std::lround(12.0 * scale)));
     switch (strength) {
     case 1:
         return std::max(4, base / 2);
@@ -1261,9 +1336,8 @@ int brushRadiusForStrength(std::uint32_t strength, int radius)
     }
 }
 
-// Builds the pen for an annotation, translating the wire line style into a
-// dash pattern that approximates the Rust renderer (dashes of 3w with 2w gaps,
-// width-wide dots with 2w gaps, in device pixels).
+// Builds the pen for an annotation, translating the wire line style into a dash
+// pattern in device pixels: dashes of 3w with 2w gaps, dots of w with 2w gaps.
 QPen penForAnnotation(const Annotation &annotation)
 {
     const bool solid = annotation.dash == QStringLiteral("solid");
@@ -1278,33 +1352,17 @@ QPen penForAnnotation(const Annotation &annotation)
     return pen;
 }
 
-// The pen a wave is drawn with: always solid, whatever the style says.  The
-// Rust renderer's wave operation carries no dash -- it samples a solid sine --
-// so a dashed wave here would preview one thing and bake another.
+// The pen a wave is drawn with: always solid, whatever the style says.  A wave
+// is a sampled sine and has no dash to carry, so offering one would put a
+// control on the toolbar that changes nothing.
 QPen wavePen(const Annotation &annotation)
 {
     return QPen(annotation.color, static_cast<double>(annotation.width), Qt::SolidLine,
                 Qt::RoundCap, Qt::RoundJoin);
 }
 
-// Dashed rectangles are drawn along the stroke band centerline in the final
-// renderer, so the preview walks the same inset path instead of drawRect.
-QPolygonF insetRectPolygon(const QRectF &rect, double width)
-{
-    const double inset = std::max(0.0, (width - 1.0) / 2.0);
-    const double outer = std::max(0.0, width / 2.0);
-    const double left = rect.left() + inset;
-    const double top = rect.top() + inset;
-    const double right = std::max(left + 0.5, rect.right() - outer);
-    const double bottom = std::max(top + 0.5, rect.bottom() - outer);
-    QPolygonF polygon;
-    polygon << QPointF(left, top) << QPointF(right, top) << QPointF(right, bottom)
-            << QPointF(left, bottom) << QPointF(left, top);
-    return polygon;
-}
-
-// Computes the average color of one device-pixel block, mirroring the Rust
-// block averaging (4x4 subsampling, round-half-up per channel).
+// Computes the average color of one device-pixel block: a 4x4 subsample of the
+// block, rounded half up per channel.
 QColor averageBlockColor(const uchar *bits, qsizetype bytesPerLine,
                          int x, int y, int width, int height)
 {
@@ -1381,14 +1439,17 @@ bool fillRectDirect(QPainter *painter, const QRectF &logical, const QColor &colo
 }
 
 void fillLogicalBlock(QPainter *painter, const OutputSession &output, const LogicalRect &bounds,
-                      const QSize &size, const QRect &source, int scale, int x, int y, int width,
+                      const QSize &size, const QRect &source, double scale, int x, int y, int width,
                       int height, const QColor &color)
 {
+    // The block is in device pixels and the rect is logical, so the division is
+    // the ratio it is: a zoomed pin's scale is 0.909, and a block mapped back
+    // through a rounded 1 would land on the wrong part of the picture.
     LogicalRect blockLogical;
-    blockLogical.x = bounds.x + static_cast<std::int32_t>((x - source.x()) / scale);
-    blockLogical.y = bounds.y + static_cast<std::int32_t>((y - source.y()) / scale);
-    blockLogical.width = static_cast<std::uint32_t>(width / scale);
-    blockLogical.height = static_cast<std::uint32_t>(height / scale);
+    blockLogical.x = bounds.x + static_cast<std::int32_t>(std::lround((x - source.x()) / scale));
+    blockLogical.y = bounds.y + static_cast<std::int32_t>(std::lround((y - source.y()) / scale));
+    blockLogical.width = static_cast<std::uint32_t>(std::lround(width / scale));
+    blockLogical.height = static_cast<std::uint32_t>(std::lround(height / scale));
     const QRectF logical = localRect(output, blockLogical, size);
     if (fillRectDirect(painter, logical, color)) {
         return;
@@ -1396,9 +1457,9 @@ void fillLogicalBlock(QPainter *painter, const OutputSession &output, const Logi
     painter->fillRect(logical, color);
 }
 
-// Renders a real pixelation mosaic over the annotation bounds, matching the
-// Rust renderer: blocks of 12 * scale device pixels averaged independently and
-// aligned to the bounds origin.  `mask` picks a rectangular or elliptical area;
+// Renders a real pixelation mosaic over the annotation bounds: blocks of
+// 12 * scale device pixels averaged independently and aligned to the bounds
+// origin.  `mask` picks a rectangular or elliptical area;
 // ellipse boundary blocks are averaged and filled per pixel so the edge stays
 // as smooth as the final render.
 void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
@@ -1414,12 +1475,13 @@ void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
     if (clipped.isEmpty()) {
         return;
     }
-    const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
+    const double scale = outputScale(output);
     const int block = mosaicBlockForStrength(strength, scale);
     const uchar *bits = image.constBits();
     const qsizetype bytesPerLine = image.bytesPerLine();
     const bool ellipse = mask == QStringLiteral("ellipse");
-    // Mirrors the Rust integer midline ellipse (center = left + size/2).
+    // An integer midline ellipse: the centre is `left + size/2`, which is what
+    // keeps an odd-sized rect's ellipse on the pixel the user drew around.
     const std::int64_t left = source.x();
     const std::int64_t top = source.y();
     const std::int64_t rectWidth = source.width();
@@ -1486,7 +1548,7 @@ void drawMosaicAnnotation(QPainter *painter, const OutputSession &output,
                         continue;
                     }
                     fillLogicalBlock(painter, output, bounds, size, source, scale, x + xx,
-                                     y + yy, scale, scale, average);
+                                     y + yy, 1, 1, average);
                 }
             }
         }
@@ -1590,8 +1652,7 @@ void drawMosaicBrush(QPainter *painter, const OutputSession &output, const QVect
     if (output.image.isNull() || points.isEmpty()) {
         return;
     }
-    const std::uint32_t scaleValue = output.scale > 0 ? output.scale : 1;
-    const double scale = static_cast<double>(scaleValue);
+    const double scale = outputScale(output);
     const int baseRadius = std::clamp(static_cast<int>(widthLogical * scale / 2.0), 1, 512);
     const int radius = std::clamp(brushRadiusForStrength(strength, baseRadius), 1, 512);
     // The same spacing the live preview uses (`paintLiveStroke`), so a previewed
@@ -2149,12 +2210,24 @@ public:
 
     void setOpener(QWidget *opener) { opener_ = opener; }
 
+    // Told when the picker opens and closes so the pin editor can widen its
+    // input region over it: the popup reaches past the toolbar's own rect, and
+    // a region that stopped at the toolbar would paint the picker but send its
+    // clicks to the desktop behind.
+    void setVisibilityCallback(std::function<void()> callback)
+    {
+        visibilityChanged_ = std::move(callback);
+    }
+
     void openAt(const QColor &color, const QPoint &topLeft)
     {
         setHsvFrom(color);
         move(topLeft);
         show();
         raise();
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
     QColor pickedColor() const
@@ -2207,6 +2280,9 @@ protected:
         if (QCoreApplication *application = QCoreApplication::instance()) {
             application->removeEventFilter(this);
         }
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
     // Click-outside dismissal: any press that lands outside the popup (and on
@@ -2224,6 +2300,7 @@ protected:
     }
 
 private:
+    std::function<void()> visibilityChanged_;
     void setHsvFrom(const QColor &color)
     {
         float hue = -1.0f;
@@ -2362,6 +2439,13 @@ public:
 
     void setOpener(QWidget *opener) { opener_ = opener; }
 
+    // Told when the picker opens and closes so the pin editor can widen its
+    // input region over it; see the colour picker's own.
+    void setVisibilityCallback(std::function<void()> callback)
+    {
+        visibilityChanged_ = std::move(callback);
+    }
+
     void openAt(const QString &currentFamily, const QPoint &topLeft)
     {
         const QString family = currentFamily.isEmpty() ? QApplication::font().family() : currentFamily;
@@ -2376,6 +2460,9 @@ public:
         move(topLeft);
         show();
         raise();
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
 protected:
@@ -2416,6 +2503,9 @@ protected:
         if (QCoreApplication *application = QCoreApplication::instance()) {
             application->removeEventFilter(this);
         }
+        if (visibilityChanged_) {
+            visibilityChanged_();
+        }
     }
 
     bool eventFilter(QObject *watched, QEvent *event) override
@@ -2433,6 +2523,7 @@ protected:
 private:
     QListWidget *list_ = nullptr;
     std::function<void(const QString &)> apply_;
+    std::function<void()> visibilityChanged_;
     QWidget *opener_ = nullptr;
 };
 
@@ -2576,6 +2667,37 @@ bool runWlCopy(const QString &text)
     return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
 }
 
+// The same, for pixels.  `wl-copy --type image/png` reads the encoding from the
+// bytes themselves, so nothing has to be declared beyond the type, and the
+// result is an image a paste target can take rather than a file it has to be
+// told about.
+bool runWlCopyImage(const QImage &image)
+{
+    constexpr int kTimeoutMs = 5000;
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+        return false;
+    }
+    buffer.close();
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-copy"));
+    process.setArguments({QStringLiteral("--type"), QStringLiteral("image/png")});
+    process.start();
+    if (!process.waitForStarted(kTimeoutMs)) {
+        return false;
+    }
+    process.write(bytes);
+    process.closeWriteChannel();
+    const bool finished = process.waitForFinished(kTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(kTimeoutMs);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
 // The image encodings worth asking for, best first; any other `image/*` the
 // clipboard offers is taken after these.
 constexpr const char *kClipboardImageTypes[] = {
@@ -2703,6 +2825,10 @@ struct OverlayController::Gesture {
     Point current;
     LogicalRect origin;
     int handle = 0;
+    // Alt was down when the handle was grabbed.  It is read once, at the press:
+    // a resize that changed its mind halfway through would jump, and the key is
+    // held for the whole drag in practice anyway.
+    bool preserveAspect = false;
     QVector<Point> points;
     // The in-progress freehand stroke, rasterized incrementally.  Re-stroking
     // the whole path on every paint is O(points) each time -- quadratic over a
@@ -2849,7 +2975,6 @@ public:
         commandColumn->addLayout(firstRow);
         commandColumn->addLayout(secondRow);
         cardLayout->addLayout(commandColumn);
-        addTool(Tool::Select);
         addTool(Tool::Rectangle);
         addTool(Tool::Ellipse);
         addTool(Tool::Arrow);
@@ -2864,7 +2989,7 @@ public:
         // reads the pixel under the click and hands the colour to the tool it was
         // armed from, which is where the pick leaves the session.
         addTool(Tool::Picker);
-        // The twelve are in, so their one size can be measured from their own
+        // The eleven are in, so their one size can be measured from their own
         // labels; the actions that follow are built at it, which is why this
         // stands between the last tool and the first action.
         sizeToolButtons();
@@ -3047,18 +3172,23 @@ public:
         endsGrid->setVerticalSpacing(2);
         endsGrid->setHorizontalSpacing(kEndsSpacing);
         undo_ = makeToolButton(uiTr("Undo"), historyIcon(false, QColor(QStringLiteral("#dfe4ec"))),
-                               uiTr("Undo last change (Ctrl+Z)"), QStringLiteral("undoButton"));
+                               controller_->shortcutHint(ShortcutAction::Undo,
+                                                         uiTr("Undo last change")),
+                               QStringLiteral("undoButton"));
         connect(undo_, &QToolButton::clicked, [controller = controller_] { controller->undo(); });
         redo_ = makeToolButton(uiTr("Redo"), historyIcon(true, QColor(QStringLiteral("#dfe4ec"))),
-                               uiTr("Redo last change (Ctrl+Y)"), QStringLiteral("redoButton"));
+                               controller_->shortcutHint(ShortcutAction::Redo,
+                                                         uiTr("Redo last change")),
+                               QStringLiteral("redoButton"));
         connect(redo_, &QToolButton::clicked, [controller = controller_] { controller->redo(); });
         auto *ok = addActionButton(uiTr("OK"));
         ok->setObjectName(QStringLiteral("confirmButton"));
-        ok->setToolTip(uiTr("Confirm capture (Enter)"));
+        ok->setToolTip(controller_->shortcutHint(ShortcutAction::Confirm, uiTr("Confirm capture")));
         connect(ok, &QPushButton::clicked, [controller = controller_] { controller->confirm(); });
         auto *cancel = addActionButton(uiTr("Cancel"));
         cancel->setObjectName(QStringLiteral("cancelButton"));
-        cancel->setToolTip(uiTr("Discard capture (Esc)"));
+        cancel->setToolTip(controller_->shortcutHint(ShortcutAction::Cancel,
+                                                     uiTr("Discard capture")));
         connect(cancel, &QPushButton::clicked, [controller = controller_] { controller->cancel(); });
         // The width of the whole block: the wider of the two ends' own hints,
         // which the style already sizes to its label plus the padding the rule
@@ -3494,11 +3624,32 @@ public:
             controller->setCurrentFont(family);
         }, parent);
         fontPopup_->setOpener(fontButton_);
+        // An open picker is part of the chrome the pin editor has to keep
+        // clickable, and it reaches past the toolbar's own rect.
+        const auto popupVisibility = [controller = controller_] { controller->scheduleInputMask(); };
+        pickerPopup_->setVisibilityCallback(popupVisibility);
+        fontPopup_->setVisibilityCallback(popupVisibility);
         // The tooltips are drawn by the panel itself, not by Qt (see
         // `HoverTip`), so every event in this process is filtered to catch the
         // hover and turn it into one.
         qApp->installEventFilter(this);
         syncState();
+    }
+
+    // The windows this panel owns that are not part of its own rect: the two
+    // pickers, which are parented to the overlay so they can reach past the
+    // panel's clipped box.  The pin editor's input region has to include them
+    // or an open picker would be painted but not clickable.
+    QVector<QWidget *> popups() const
+    {
+        QVector<QWidget *> result;
+        for (QWidget *popup : {static_cast<QWidget *>(pickerPopup_),
+                               static_cast<QWidget *>(fontPopup_)}) {
+            if (popup != nullptr) {
+                result.push_back(popup);
+            }
+        }
+        return result;
     }
 
     void syncState()
@@ -3509,11 +3660,13 @@ public:
         // itself stays enabled and shows the mode is up.
         const bool textMode = controller_->textMode_;
         for (int index = 0; index < toolButtons_.size(); ++index) {
-            setToolButtonActive(toolButtons_.at(index), tools_.at(index),
-                                tools_.at(index) == controller_->tool_, ratio);
+            // An unarmed session lights no tool: the row says nothing is
+            // selected, which is exactly the state a fresh capture starts in.
+            const bool active = controller_->tool_.has_value() &&
+                tools_.at(index) == *controller_->tool_;
+            setToolButtonActive(toolButtons_.at(index), tools_.at(index), active, ratio);
             toolButtons_.at(index)->setEnabled(!textMode);
-        }
-        if (textButton_ != nullptr) {
+        }        if (textButton_ != nullptr) {
             setButtonActive(textButton_, textMode);
         }
         if (longButton_ != nullptr) {
@@ -3553,9 +3706,9 @@ public:
         // Every tool that paints a stroked shape: the rectangle and ellipse
         // outlines, the arrow, the pen, the two segment tools and the bezier
         // pen.  They share the colour and width controls; the dash is only
-        // meaningful to the tools the Rust renderer walks with a dashes
-        // pattern -- the wave is sampled as a solid sine and a bezier path is
-        // stroked whole, so neither is offered a dash control.
+        // meaningful to the tools that carry a dash pattern -- the wave is
+        // sampled as a solid sine and a bezier path is stroked whole, so
+        // neither is offered a dash control.
         const bool stroke = shape || target == QStringLiteral("arrow") ||
             target == QStringLiteral("pen") || target == QStringLiteral("line") ||
             target == QStringLiteral("wave") || target == QStringLiteral("bezier");
@@ -3965,6 +4118,9 @@ protected:
             const int y = std::clamp(local.y(), 0,
                                      std::max(0, parentWidget()->height() - height()));
             move(x, y);
+            // The panel is the pin editor's chrome, so its input region travels
+            // with it as it is dragged.
+            controller_->scheduleInputMask();
             event->accept();
             return;
         }
@@ -4279,8 +4435,6 @@ private:
     static QString toolLabel(Tool tool)
     {
         switch (tool) {
-        case Tool::Select:
-            return uiTr("Select");
         case Tool::Rectangle:
             return uiTr("Rect");
         case Tool::Ellipse:
@@ -4316,7 +4470,7 @@ private:
         button->setText(label);
         button->setIcon(toolbarIcon(tool, QColor(230, 225, 229), devicePixelRatioF()));
         button->setIconSize(QSize(20, 20));
-        // No size of its own: the twelve of them are sized together once the
+        // No size of its own: the eleven of them are sized together once the
         // last one is in, by `sizeToolButtons`.  A button fixed here would
         // report that fixed width back from `sizeHint`, which is the one number
         // that pass has to read.
@@ -4324,7 +4478,7 @@ private:
         button->setFocusPolicy(Qt::NoFocus);
         button->setToolTip(toolTipForTool(tool));
         button->setAccessibleName(uiTr("Tool: %1").arg(label));
-        // The tool it selects, so a check can tell the twelve drawing tools from
+        // The tool it selects, so a check can tell the eleven drawing tools from
         // the actions laid out among them -- the two kinds of button are drawn
         // the same way and the rows no longer separate them.  Empty on every
         // other button on the card.
@@ -4336,17 +4490,13 @@ private:
         tools_.push_back(tool);
         toolButtons_.push_back(button);
         connect(button, &QToolButton::clicked, [controller = controller_, tool] {
-            controller->chooseTool(tool);
+            controller->toggleTool(tool);
         });
     }
 
     static QString toolTipForTool(Tool tool)
     {
         switch (tool) {
-        case Tool::Select:
-            return uiTr(
-                "Adjust selection; click an annotation to select, drag to move, "
-                "handles to resize, double-click text to re-edit");
         case Tool::Rectangle:
             return uiTr("Draw a rectangular annotation");
         case Tool::Ellipse:
@@ -4405,12 +4555,12 @@ private:
         return widest;
     }
 
-    // One size for all twelve drawing tools, taken from what each label and icon
+    // One size for all eleven drawing tools, taken from what each label and icon
     // actually asks the style for rather than from a number picked by hand.
     //
     // The hand-picked number was 48x46, chosen when the labels were the widest
     // thing in the row; measured against the labels of both languages it stood
-    // about a tenth more than any of them needed, and the twelve buttons put
+    // about a tenth more than any of them needed, and the eleven buttons put
     // that slack on the panel's width and height together.  Reading the size
     // back from the style is also what keeps a wider font -- the desktop's own,
     // which the toolbar is drawn in -- from eliding a label.
@@ -4698,14 +4848,17 @@ private:
     Finished finished_;
 };
 
-OverlayController::OverlayController(Session session)
-    : session_(std::move(session))
+OverlayController::OverlayController(Session session, QObject *parent)
+    : QObject(parent)
+    , session_(std::move(session))
     , gesture_(new Gesture)
 {
     // Whether the toolbar offers the scrolling-capture action.  Read from
     // `session_` rather than the parameter: the parameter has already been
     // moved from by the time this body runs.
     longAllowed_ = session_.longAllowed;
+    // A trace of the drag's round trip, for measuring where the latency is.
+    pinDebug_ = qEnvironmentVariableIsSet("VSHOT_PIN_DEBUG");
     // Window picking is driven by the session's candidate list instead of a
     // free-hand drag: the pointer highlights a candidate and a click takes it.
     if (session_.mode == QStringLiteral("window-pick")) {
@@ -4720,8 +4873,9 @@ OverlayController::OverlayController(Session session)
     // No toolbar is ever shown, so the flag that draws one is never set for it.
     translateMode_ = session_.mode == QStringLiteral("translate");
     resultPath_ = session_.resultPath;
-    // The style the user last left the editor in.
+    // The style the user last left the editor in, and the keys they bound.
     const EditorPreferences preferences = loadEditorPreferences();
+    shortcuts_ = loadShortcutPreferences();
     currentFont_ = preferences.font;
     textSize_ = preferences.textSize;
     currentDash_ = preferences.dash;
@@ -4737,9 +4891,9 @@ OverlayController::OverlayController(Session session)
     // they start from the editor's defaults, with the wave derived from the
     // remembered width so a wide default still draws a proportionate wave.
     const Tool everyTool[] = {
-        Tool::Select,  Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Line,
-        Tool::Wave,    Tool::Bezier,    Tool::Pen,     Tool::Text,  Tool::Number,
-        Tool::Mosaic,  Tool::Picker,
+        Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Line, Tool::Wave,
+        Tool::Bezier,    Tool::Pen,     Tool::Text,  Tool::Number, Tool::Mosaic,
+        Tool::Picker,
     };
     for (const Tool entry : everyTool) {
         ToolStyle style;
@@ -4749,22 +4903,27 @@ OverlayController::OverlayController(Session session)
         style.wavelength = std::max(6u * preferences.width, 18u);
         toolStyles_.insert(toolName(entry), style);
     }
-    // The remembered tool is restored only where a tool is already meaningful:
-    // a session that starts in editing state -- one that arrives with its
-    // selection made (`beginPresetEdit`, the window picker's follow-up) and the
-    // pin editor, whose whole image is preselected in `beginPinEdit`.  A fresh
-    // region session must open on Select no matter what the file says -- its
-    // first step is dragging the rectangle, and opening on Text means the first
-    // click starts a label instead, which reads as "region capture is broken".
-    // Scrolling capture (`selectOnly_`) and picking (`pickMode_`) have their
-    // own reasons to stay on Select either way.
+    // The remembered tool is restored where a tool is already meaningful, and
+    // *not* at the open of a session whose first gesture is the frame itself.
+    //
+    // A session that arrives with its selection made -- the window picker's
+    // follow-up (`beginPresetEdit`) and the pin editor, whose whole image is
+    // preselected in `beginPinEdit` -- has nothing left to frame, so it opens
+    // on the user's tool.  A fresh region session does not: its first step is
+    // dragging the rectangle, and arming a tool there would make that first
+    // click start a mark instead, which reads as "region capture is broken".
+    // Nor does it arm one when the frame is done.  The frame is a frame, and
+    // the tool the config remembers is a default for a *new* mark, not a
+    // decision the session gets to make for the user: opening armed meant the
+    // first click inside a fresh region inked instead of letting the user
+    // adjust the frame they had just drawn.  Region stays unarmed until a tool
+    // is picked, and an unarmed drag re-frames.  Scrolling capture
+    // (`selectOnly_`) and picking (`pickMode_`) stay unarmed either way: they
+    // have no annotation step for a tool to belong to.
     const bool startsInEdit =
         session_.selection.has_value() || session_.mode == QStringLiteral("pin-edit");
-    if (startsInEdit && !selectOnly_ && !pickMode_) {
-        const Tool remembered = toolForName(preferences.tool);
-        if (remembered != Tool::Select) {
-            tool_ = remembered;
-        }
+    if (!selectOnly_ && !pickMode_ && !translateMode_ && startsInEdit) {
+        tool_ = toolForName(preferences.tool);
     }
 }
 
@@ -4772,11 +4931,21 @@ OverlayController::~OverlayController()
 {
     removeTextEditor();
     delete toolbar_;
+    toolbar_ = nullptr;
     delete gesture_;
     // Explicit rather than parented: the controller is not a QObject.
     delete pinSocket_;
     delete candidateReader_;
     delete candidateTimer_;
+    delete inputMaskTimer_;
+    delete pointerWarpTimer_;
+    // The overlays are the caller's to delete (see `main`), so they are not
+    // owned here -- but they must stop painting through a controller that is
+    // gone.  Detach them, which hides them too.
+    for (CaptureOverlay *overlay : overlays_) {
+        overlay->detachController();
+    }
+    overlays_.clear();
 }
 
 int OverlayController::outputCount() const
@@ -4847,6 +5016,11 @@ Point OverlayController::clampPoint(Point point) const
 // around the surrounding canvas.
 const LogicalRect &OverlayController::annotationLimits() const
 {
+    if (pinEdit_ && marksOrigin_.has_value()) {
+        // Use the confirmed position: marks are constrained to where the FP16
+        // image actually is, not where the cursor is asking it to go next.
+        return *marksOrigin_;
+    }
     if (pinEdit_ && selection_.has_value()) {
         return *selection_;
     }
@@ -4941,7 +5115,8 @@ LogicalRect OverlayController::moveSelection(LogicalRect origin, Point anchor, P
     return rectFromEdges(x, y, x + origin.width, y + origin.height);
 }
 
-LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, Point current) const
+LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, Point current,
+                                              bool preserveAspect) const
 {
     // Region capture resizes the selection inside the frozen scene; in the pin
     // editor the same helper resizes a mark inside the image (which may have
@@ -4955,8 +5130,50 @@ LogicalRect OverlayController::resizeSelection(LogicalRect origin, int handle, P
     std::int64_t top = origin.y;
     std::int64_t rightEdge = origin.right();
     std::int64_t bottomEdge = origin.bottom();
-    const std::int64_t x = current.x;
-    const std::int64_t y = current.y;
+    std::int64_t x = current.x;
+    std::int64_t y = current.y;
+    if (preserveAspect && handle != 0 && handle != 9) {
+        // Alt: the corner the pointer is not on stays put and the other follows
+        // the pointer, but pulled onto the box's own diagonal so the two edges
+        // keep the ratio they started with.  The corner that is dragged is the
+        // one the handle names, so it is the one that has to be derived.
+        const bool movesLeft = handle == 1 || handle == 7 || handle == 8;
+        const bool movesRight = handle == 3 || handle == 4 || handle == 5;
+        const bool movesTop = handle == 1 || handle == 2 || handle == 3;
+        const bool movesBottom = handle == 5 || handle == 6 || handle == 7;
+        const double ratio = static_cast<double>(origin.width) /
+            static_cast<double>(std::max<std::int64_t>(1, origin.height));
+        // Which way the pointer went, measured from the corner that is anchored.
+        const std::int64_t anchorX = movesLeft ? origin.right() : origin.x;
+        const std::int64_t anchorY = movesTop ? origin.bottom() : origin.y;
+        double width = static_cast<double>(std::abs(x - anchorX));
+        double height = static_cast<double>(std::abs(y - anchorY));
+        // The wider travel wins, so the box tracks whichever axis the pointer is
+        // actually pushing on instead of collapsing when one of them stalls.
+        if (width < height * ratio) {
+            width = height * ratio;
+        } else {
+            height = width / ratio;
+        }
+        const std::int64_t limitX = movesLeft ? anchorX - boundsLeft
+                                              : boundsRight - anchorX;
+        const std::int64_t limitY = movesTop ? anchorY - boundsTop
+                                             : boundsBottom - anchorY;
+        width = std::min(width, static_cast<double>(std::max<std::int64_t>(0, limitX)));
+        height = std::min(height, static_cast<double>(std::max<std::int64_t>(0, limitY)));
+        // Both edges are taken from the same clamped pair, so the ratio survives
+        // the limits rather than being applied before them.
+        const std::int64_t edgeX = movesLeft ? anchorX - static_cast<std::int64_t>(width)
+                                             : anchorX + static_cast<std::int64_t>(width);
+        const std::int64_t edgeY = movesTop ? anchorY - static_cast<std::int64_t>(height)
+                                            : anchorY + static_cast<std::int64_t>(height);
+        if (movesLeft || movesRight) {
+            x = edgeX;
+        }
+        if (movesTop || movesBottom) {
+            y = edgeY;
+        }
+    }
     switch (handle) {
     case 1:
         left = std::clamp<std::int64_t>(x, boundsLeft, rightEdge - 1);
@@ -5141,6 +5358,100 @@ void OverlayController::enableCandidateRefresh()
     candidateTimer_->start();
 }
 
+void OverlayController::enablePointerWarp()
+{
+    pointerWarpEnabled_ = true;
+}
+
+/// One request to the CLI, on the pipe the session path arrived on: a single
+/// JSON object and a newline, which is the shape the CLI reads.  Nothing is
+/// written unless the session said there is a CLI to read it -- a helper run by
+/// hand, or by a check, has a pipe nobody is on the other end of, and a request
+/// written into it would sit there until the pipe filled.
+bool OverlayController::writeCliRequest(const QByteArray &request)
+{
+    if (std::fwrite(request.constData(), 1, static_cast<std::size_t>(request.size()), stdout) !=
+        static_cast<std::size_t>(request.size())) {
+        return false;
+    }
+    return std::fflush(stdout) == 0;
+}
+
+/// Asks the CLI to put the real pointer at `point`, in global logical pixels.
+///
+/// The keyboard walks a cursor of the editor's own, which is enough for
+/// everything the editor draws -- the loupe reads it, a press uses it -- but it
+/// is not the pointer the compositor paints on the screen.  The user aiming at
+/// a pixel with a key needs to *see* where it went, and only the compositor can
+/// move what it draws, so the walk asks.  The CLI owns the injection backends
+/// (the compositor's virtual-pointer protocol, the portal, `/dev/uinput`) and
+/// the desktop geometry the request is expressed in, and the helper does not.
+///
+/// Throttled, and *coalescing* rather than dropping: a held key repeats far
+/// faster than a round trip through another process and a compositor, and
+/// throwing the later steps away would leave the pointer short of where the
+/// walk ended -- tap right five times quickly and the arrow moves one pixel.
+/// So a step inside the interval is remembered and sent when the interval is
+/// up, and only the newest one, because the position is absolute.
+void OverlayController::requestPointerWarp(Point point)
+{
+    if (!pointerWarpEnabled_ || finished_ || cancelled_) {
+        return;
+    }
+    if (pointerWarpClock_.isValid() && pointerWarpClock_.elapsed() < kPointerWarpIntervalMs) {
+        pointerWarpPending_ = point;
+        if (pointerWarpTimer_ == nullptr) {
+            pointerWarpTimer_ = new QTimer();
+            pointerWarpTimer_->setSingleShot(true);
+            QObject::connect(pointerWarpTimer_, &QTimer::timeout, pointerWarpTimer_, [this] {
+                if (!pointerWarpPending_.has_value()) {
+                    return;
+                }
+                const Point pending = *pointerWarpPending_;
+                pointerWarpPending_.reset();
+                requestPointerWarp(pending);
+            });
+        }
+        pointerWarpTimer_->start(kPointerWarpIntervalMs);
+        return;
+    }
+    pointerWarpClock_.restart();
+    // What the compositor is about to report back, so the motion it makes of
+    // this request is not mistaken for the user moving the mouse; see
+    // `isPointerWarpEcho`.
+    pointerWarpTarget_ = point;
+    const QByteArray request =
+        QByteArrayLiteral("{\"request\":\"pointer\",\"x\":")
+        + QByteArray::number(point.x) + QByteArrayLiteral(",\"y\":")
+        + QByteArray::number(point.y) + QByteArrayLiteral("}\n");
+    writeCliRequest(request);
+}
+
+/// Whether a motion event at `point` is the compositor reporting the pointer
+/// position VShot itself asked for, rather than the user moving the mouse.
+///
+/// The keyboard walks a cursor of its own and asks the CLI to put the real
+/// pointer there; the compositor then reports the moved pointer as an ordinary
+/// motion, which reaches this surface after the step that asked for it.  Read
+/// as a mouse move it would end the magnifier flash the step had just raised --
+/// so the loupe would blink on every step of a walk, and whether it survived
+/// the last one would depend on whether the echo happened to arrive before or
+/// after the step.
+///
+/// The test is the distance.  A warp puts the pointer exactly where the walk
+/// put its cursor, so the echo lands on `pointerWarpTarget_` to the pixel; a
+/// hand on the mouse covers a pixel or more, and a hand that covers none has
+/// not moved anything.  The window bounds how long that stays true, since a
+/// user who moves the pointer back onto the same pixel later means it.
+bool OverlayController::isPointerWarpEcho(Point point) const
+{
+    if (!pointerWarpTarget_.has_value() || !pointerWarpClock_.isValid() ||
+        pointerWarpClock_.elapsed() > kPointerWarpEchoMs) {
+        return false;
+    }
+    return pointerWarpTarget_->x == point.x && pointerWarpTarget_->y == point.y;
+}
+
 void OverlayController::requestCandidateRefresh()
 {
     if (!candidateRefreshEnabled_ || candidateRefreshPending_ || finished_ || cancelled_) {
@@ -5151,11 +5462,9 @@ void OverlayController::requestCandidateRefresh()
     }
     candidateClock_.restart();
     const QByteArray request = QByteArrayLiteral("{\"request\":\"candidates\"}\n");
-    if (std::fwrite(request.constData(), 1, static_cast<std::size_t>(request.size()), stdout) !=
-        static_cast<std::size_t>(request.size())) {
+    if (!writeCliRequest(request)) {
         return;
     }
-    std::fflush(stdout);
     candidateRefreshPending_ = true;
 }
 
@@ -5257,7 +5566,7 @@ void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
     updateAll();
 }
 
-void OverlayController::beginSelectionGesture(Point point)
+void OverlayController::beginSelectionGesture(Point point, bool preserveAspect)
 {
     const int handle = hitHandle(point);
     if (selection_.has_value() && handle != 0 && handle != 9) {
@@ -5265,16 +5574,27 @@ void OverlayController::beginSelectionGesture(Point point)
         gesture_->current = point;
         gesture_->origin = *selection_;
         gesture_->handle = handle;
+        gesture_->preserveAspect = preserveAspect;
         gesture_->type = Gesture::Type::Resizing;
-    } else if (selection_.has_value() && handle == 9) {
-        gesture_->anchor = point;
-        gesture_->current = point;
-        gesture_->origin = *selection_;
-        gesture_->handle = handle;
-        gesture_->type = Gesture::Type::Moving;
     } else {
+        // A press that landed on no handle draws a new frame.  The body of the
+        // selection is deliberately not a target here: dragging it is Ctrl's,
+        // which is what keeps an ordinary press meaning "frame this instead".
         startSelection(point);
     }
+}
+
+void OverlayController::beginSelectionMove(Point point)
+{
+    if (!selection_.has_value()) {
+        startSelection(point);
+        return;
+    }
+    gesture_->anchor = point;
+    gesture_->current = point;
+    gesture_->origin = *selection_;
+    gesture_->handle = 9;
+    gesture_->type = Gesture::Type::Moving;
 }
 
 void OverlayController::startSelection(Point point)
@@ -5370,7 +5690,10 @@ void OverlayController::finishDrawing(Point point)
 {
     updateDrawing(point);
     const QVector<Point> points = gesture_->points;
-    const Tool drawingTool = tool_;
+    // A stroke can only be committed by a tool that is armed: the press that
+    // started it checked, and nothing disarms mid-gesture, so the empty case is
+    // unreachable rather than a state to draw from.
+    const Tool drawingTool = *tool_;
     gesture_->type = Gesture::Type::None;
     gesture_->points.clear();
     gesture_->liveRaster = QImage();
@@ -5522,6 +5845,10 @@ void OverlayController::mutateAnnotations(QVector<Annotation> next)
     if (selectedAnnotation_ >= annotations_.size()) {
         selectedAnnotation_ = -1;
     }
+    // An edit is not the keyboard's walk any more: the run of nudges ends here,
+    // and the selection is no longer "all of them" unless the caller says so.
+    nudgeBase_.reset();
+    allSelected_ = false;
     updateAll();
 }
 
@@ -5535,6 +5862,42 @@ bool OverlayController::canDrawAt(Point point) const
     const LogicalRect &limits = annotationLimits();
     return point.x >= limits.x && point.x < limits.right() &&
            point.y >= limits.y && point.y < limits.bottom();
+}
+
+// The band the pin's own border occupies, as the image grown by half the
+// stroke's width. `PinSurface` centres the stroke on the image's edge, so that
+// is exactly how far outside the image it reaches; with no border the band is
+// the image itself and nothing more.
+LogicalRect OverlayController::pinBorderBand() const
+{
+    const LogicalRect &image = annotationLimits();
+    const std::uint32_t half = session_.pinBorderWidth / 2;
+    if (half == 0) {
+        return image;
+    }
+    return LogicalRect{image.x - static_cast<std::int32_t>(half),
+                       image.y - static_cast<std::int32_t>(half), image.width + 2 * half,
+                       image.height + 2 * half};
+}
+
+bool OverlayController::insidePinImage(Point point) const
+{
+    if (!pinEdit_) {
+        return canDrawAt(point);
+    }
+    const LogicalRect &image = annotationLimits();
+    return point.x >= image.x && point.x < image.right() &&
+           point.y >= image.y && point.y < image.bottom();
+}
+
+bool OverlayController::onPinBorder(Point point) const
+{
+    if (!pinEdit_ || insidePinImage(point)) {
+        return false;
+    }
+    const LogicalRect band = pinBorderBand();
+    return point.x >= band.x && point.x < band.right() &&
+           point.y >= band.y && point.y < band.bottom();
 }
 
 void OverlayController::placeNumber(Point point)
@@ -5672,24 +6035,49 @@ void OverlayController::startTextEditor(CaptureOverlay *overlay, int index, Poin
     textEdit_->setText(initial);
     QFont editorFont = textFont(textEditFont_, std::max(1, static_cast<int>(textEditPixels_)));
     textEdit_->setFont(editorFont);
-    textEdit_->setStyleSheet(
-        QStringLiteral("QLineEdit { color: %1; background: rgba(0, 0, 0, 140); "
-                       "border: 1px solid #888; padding: 0 3px; }")
-            .arg(editColor.name()));
+    // The editor carries no frame and no padding, so its glyphs start exactly at
+    // its own top-left.  A framed, padded box would draw the text a few pixels
+    // in from the corner and the label would jump the moment the editor was
+    // accepted; this way the corner is the label's origin and nothing moves.
+    textEdit_->setFrame(false);
+    textEdit_->setTextMargins(0, 0, 0, 0);
+    const QString editorSheet =
+        QStringLiteral("QLineEdit { color: %1; border: none; padding: 0; background: %2; }")
+            .arg(editColor.name(), QStringLiteral("rgba(0, 0, 0, 140)"));
+    const QString probeSheet =
+        QStringLiteral("QLineEdit { color: %1; border: none; padding: 0; background: transparent; }")
+            .arg(editColor.name());
+    textEdit_->setStyleSheet(editorSheet);
     const QPointF local = owner->localFromGlobal(origin);
-    const int width = std::min(360, std::max(160, owner->width() - 16));
-    // Hug the mirrored glyph height instead of QLineEdit's roomy default
-    // frame: the box only needs the text plus a small breathing margin.
-    const int height = std::max(20, QFontMetrics(editorFont).height() + 6);
-    const int x = std::clamp(static_cast<int>(std::round(local.x())), 4, std::max(4, owner->width() - width - 4));
-    const int y = std::clamp(static_cast<int>(std::round(local.y())), 4, std::max(4, owner->height() - height - 4));
+    const QFontMetrics editorMetrics(editorFont);
+    // As tall as its own glyphs, so the vertical centring QLineEdit applies is
+    // a no-op and the text's ascent sits on the widget's top edge; as wide as
+    // the room left of the origin, so the corner stays where the label is drawn
+    // rather than being clamped away from it.
+    const int x = static_cast<int>(std::round(local.x()));
+    const int y = static_cast<int>(std::round(local.y()));
+    const int height = std::max(1, editorMetrics.height());
+    const int width = std::clamp(owner->width() - x - 4, 40, 360);
     textEdit_->setGeometry(x, y, width, height);
     textEdit_->show();
     textEdit_->raise();
     textEdit_->setFocus(Qt::OtherFocusReason);
+    // Measure where the style actually puts the glyphs (a frame, a margin) and
+    // pull the box back by exactly that, so the label lands where it was typed.
+    // The probe is painted on a transparent background so only its ink is read.
+    textEdit_->setStyleSheet(probeSheet);
+    textEdit_->setText(QStringLiteral("H"));
+    const QPoint inset = lineEditGlyphInset(textEdit_);
+    textEdit_->setStyleSheet(editorSheet);
+    textEdit_->setText(initial);
+    textEdit_->setGeometry(x - inset.x(), y - inset.y(), width, height);
     if (!initial.isEmpty()) {
         textEdit_->selectAll();
     }
+    // The editor is chrome like the toolbar: the surface has to take clicks on
+    // it, or the user could see the box they are typing into but not click in
+    // it.
+    scheduleInputMask();
     updateAll();
 }
 
@@ -5707,6 +6095,7 @@ void OverlayController::finishText(bool accept)
     textEdit_->deleteLater();
     textEdit_ = nullptr;
     textEditPixels_ = 0;
+    scheduleInputMask();
     if (accept && !value.isEmpty()) {
         Annotation annotation;
         annotation.kind = Annotation::Kind::Text;
@@ -5780,6 +6169,7 @@ void OverlayController::showToolbar()
     toolbar_->raise();
     toolbar_->syncState();
     updateToolbarGeometry();
+    scheduleInputMask();
 }
 
 // The output that currently hosts the selection (by its center point).
@@ -5833,6 +6223,7 @@ void OverlayController::settlePanelAtGlobal(QPoint topLeft)
     const int x = std::clamp(local.x(), 0, std::max(0, target->width() - toolbar_->width()));
     const int y = std::clamp(local.y(), 0, std::max(0, target->height() - toolbar_->height()));
     toolbar_->move(x, y);
+    scheduleInputMask();
 }
 
 void OverlayController::hideToolbar()
@@ -5841,6 +6232,7 @@ void OverlayController::hideToolbar()
     if (toolbar_ != nullptr) {
         toolbar_->hide();
     }
+    scheduleInputMask();
 }
 
 void OverlayController::updateToolbarGeometry()
@@ -5870,7 +6262,13 @@ void OverlayController::updateToolbarGeometry()
     // the display -- it doubles back over the selection instead, so showing or
     // hiding it never nudges the buttons.
     const OutputSession &output = owner->output();
-    const QRectF localSelection = localRect(output, *selection_, owner->size());
+    // Anchor to the same rect the marks and the image are drawn against: in the
+    // pin editor that is the daemon-confirmed image rect, not the optimistic
+    // cursor target, so the bar tracks the picture rather than running ahead of
+    // it mid-drag.
+    const LogicalRect &anchor =
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : *selection_;
+    const QRectF localSelection = localRect(output, anchor, owner->size());
     const QRect anchorSelection = localSelection.toRect();
     const int width = toolbar_->width();
     const int height = toolbar_->height();
@@ -5919,13 +6317,21 @@ void OverlayController::updateToolbarGeometry()
     toolbarAnchorBelow_ = below;
     toolbarAnchorValid_ = true;
     toolbar_->setGeometry(x, y, width, height);
+    // The panel moved, so the strip of the surface that takes input moved with
+    // it.
+    scheduleInputMask();
 }
 
 int OverlayController::sceneScale() const
 {
+    // The density the helper rasterized its bitmaps at: the highest one any
+    // output declares.  A pin-edit session's single output carries the pin's
+    // zoom rather than a density, and its text is composited from the helper's
+    // own bitmap, so the whole-number part is what the bitmap was drawn at --
+    // a zoom below 1 is one bitmap pixel per logical pixel, which is 1.
     int scale = 1;
     for (const OutputSession &output : session_.outputs) {
-        scale = std::max(scale, static_cast<int>(output.scale));
+        scale = std::max(scale, static_cast<int>(std::lround(outputScale(output))));
     }
     return scale;
 }
@@ -5946,7 +6352,83 @@ void OverlayController::updateAll()
     // A full repaint erases whatever the narrow ones left, so the rect they were
     // tracking stops being the record of what is on the surface.
     hasLastTouch_ = false;
+    // The hover frame is not drawn by a full repaint, and the mark it named may
+    // not even be there any more -- a delete, an undo, a tool change all land
+    // here.  Forgetting it means the next motion re-derives it against whatever
+    // the mark list is now, rather than framing a stale index.
+    markHovered_ = -1;
     repaintEverything();
+}
+
+void OverlayController::scheduleInputMask()
+{
+    if (!pinEdit_) {
+        return;
+    }
+    if (inputMaskTimer_ == nullptr) {
+        // Parentless and deleted explicitly, like the controller's other timers:
+        // the controller is not a QObject, so there is no parent to hang it on.
+        inputMaskTimer_ = new QTimer();
+        inputMaskTimer_->setSingleShot(true);
+        inputMaskTimer_->setInterval(0);
+        QObject::connect(inputMaskTimer_, &QTimer::timeout, inputMaskTimer_, [this] {
+            applyPinEditInputMask();
+        });
+    }
+    // Applied now as well as on the timer.  The first call is the one that has
+    // to be in force before the event loop runs -- the surface is born taking
+    // the whole output -- and every later one is cheap, because a mask that has
+    // not changed is not re-sent.
+    applyPinEditInputMask();
+    inputMaskTimer_->start();
+}
+
+// The editor's surface covers the whole output so the toolbar has somewhere to
+// sit beside the image, but the editor only owns the chrome it draws: the
+// pinned image, the band its border occupies, the toolbar and anything open
+// over them.  Everything else on the screen belongs to the desktop underneath,
+// and an input region that said otherwise is what made a click far from the pin
+// land on the editor instead of on the window behind it.
+void OverlayController::applyPinEditInputMask()
+{
+    if (!pinEdit_ || overlays_.isEmpty()) {
+        return;
+    }
+    // The band is where the daemon last confirmed the image to be, not where
+    // the session put it: a pin that has been dragged since would otherwise
+    // leave its input region behind at the old spot.
+    const LogicalRect band = pinBorderBand();
+    QRegion mask;
+    for (CaptureOverlay *overlay : overlays_) {
+        // `pinBorderBand` already falls back to the image when the session named
+        // no border, so this is the whole of what the pin occupies.
+        const LogicalRect &visible = band;
+        if (visible.width == 0 || visible.height == 0) {
+            continue;
+        }
+        mask += localRect(overlay->output(), visible, overlay->size()).toAlignedRect();
+        // The toolbar and its popups are children of the overlay, so their own
+        // geometry is already in overlay coordinates.
+        const auto addWidget = [&mask, overlay](const QWidget *widget) {
+            if (widget == nullptr || !widget->isVisible() || widget->parentWidget() != overlay) {
+                return;
+            }
+            mask += QRegion(widget->geometry());
+        };
+        addWidget(toolbar_);
+        addWidget(textEdit_);
+        if (toolbar_ != nullptr) {
+            for (const QWidget *popup : toolbar_->popups()) {
+                addWidget(popup);
+            }
+        }
+        // No mask was asked for: leave the surface whole rather than cutting
+        // the editor down to nothing and making it unreachable.
+        if (mask.isEmpty()) {
+            continue;
+        }
+        overlay->setInputMask(mask);
+    }
 }
 
 // How far outside a mark's own rect its pixels can reach.  The answer lives in
@@ -5995,14 +6477,20 @@ LogicalRect growBy(LogicalRect rect, int margin)
 // by half its width; the mosaic brush stamps a block whose radius comes from the
 // strength and can be far wider than the cursor.  `paintLiveStroke` builds its
 // own padding out of the same two numbers, so the two move together.
-double liveStrokeMargin(bool brush, int widthLogical, int scale, std::uint32_t strength)
+double liveStrokeMargin(bool brush, int widthLogical, double scale, std::uint32_t strength)
 {
     if (!brush) {
         return widthLogical / 2.0 + 2.0;
     }
+    // The ratio is a real number, not a whole one: a zoomed pin shows 160
+    // pixels across 176 logical ones, so a scale rounded to a whole number
+    // would be zero here and the division below would be by zero.
+    const double ratio = scale > 0.0 ? scale : 1.0;
     const double deviceRadius = std::clamp(
-        brushRadiusForStrength(strength, std::clamp(widthLogical * scale / 2, 1, 512)), 1, 512);
-    return deviceRadius / scale + 2.0;
+        brushRadiusForStrength(
+            strength, std::clamp(static_cast<int>(widthLogical * ratio / 2), 1, 512)),
+        1, 512);
+    return deviceRadius / ratio + 2.0;
 }
 
 /// How far a wave's pixels reach from the line its two points describe.
@@ -6027,15 +6515,24 @@ constexpr int kInfoPillSlack = 64;
 } // namespace
 
 // The magnifier the editor follows the pointer with while a gesture is dragging
-// something, plus the coordinate pill that hangs under it.  The loupe sits a
-// little past the pointer and flips to the other side near an edge, so the box
-// is the pointer plus the whole reach on every side: half a diameter in x, and
-// enough in y for the pill below the circle.
+// something, plus the coordinate and colour pills that hang off it.  The loupe
+// sits a little past the pointer and flips to the other side near an edge, so
+// the box is the pointer plus the whole reach on every side: half a diameter in
+// x, and enough in y for both pills stacked below the circle.
 LogicalRect OverlayController::pointerTouch() const
 {
+    return pointerTouchAt(pointer_);
+}
+
+// The same box around an arbitrary point.  The magnifier follows the pointer
+// while the right button is held, so a step has to be able to name the rect the
+// *previous* position's loupe covered -- which is not `pointer_` by the time
+// the step asks, because the pointer has already moved.
+LogicalRect OverlayController::pointerTouchAt(Point point) const
+{
     constexpr int kReachX = kLoupeDiameter + kLoupeMargin;
-    constexpr int kReachY = kLoupeDiameter + kInfoPillSlack + kLoupeMargin;
-    return LogicalRect{pointer_.x - kReachX, pointer_.y - kReachY, 2 * kReachX, 2 * kReachY};
+    constexpr int kReachY = kLoupeDiameter + 2 * kInfoPillSlack + kLoupeMargin;
+    return LogicalRect{point.x - kReachX, point.y - kReachY, 2 * kReachX, 2 * kReachY};
 }
 
 LogicalRect OverlayController::selectionTouch() const
@@ -6090,16 +6587,18 @@ LogicalRect OverlayController::drawingTouch(int pointsBefore) const
     }
     // The preview is stamped on the output the stroke started on, and that
     // output's scale is what turns the device-space brush radius back into
-    // logical pixels.
-    int scale = 1;
+    // logical pixels.  It is the ratio itself, not a rounded one: the pin
+    // editor's output is zoomed, and rounding 0.909 to a whole number is zero.
+    double scale = 1.0;
     for (CaptureOverlay *overlay : overlays_) {
         if (overlay->outputIndex() == gesture_->liveOutput) {
-            scale = static_cast<int>(overlay->output().scale > 0 ? overlay->output().scale : 1);
+            scale = outputScale(overlay->output());
             break;
         }
     }
     const bool brush = tool_ == Tool::Mosaic;
-    const ToolStyle &style = toolStyle(toolName(tool_));
+    const QString liveTool = tool_.has_value() ? toolName(*tool_) : QStringLiteral("pen");
+    const ToolStyle &style = toolStyle(liveTool);
     // A wave is the one two-point tool whose pixels leave the box its endpoints
     // describe, so it is measured by its own reach rather than by the half-width
     // margin every other straight tool fits inside.
@@ -6107,6 +6606,9 @@ LogicalRect OverlayController::drawingTouch(int pointsBefore) const
         ? waveReach(style.amplitude, style.width)
         : liveStrokeMargin(brush, std::max(1, static_cast<int>(style.width)), scale,
                            mosaicStrength_);
+    // The magnifier follows every drawing drag, and it travels with the pointer:
+    // it is drawn a whole diameter away from the cursor, so a rect that only
+    // covered the ink would leave the circle it moved away from on screen.
     return growBy(touched, static_cast<int>(std::ceil(reach)) + kSelectionChrome);
 }
 
@@ -6165,6 +6667,11 @@ bool OverlayController::drawsGrowingStroke() const
     // Only an opaque pen stroke can be baked a segment at a time: a translucent
     // one has to be composited as a whole, and the mosaic brush stamps blocks
     // the committed mark rebuilds from the source.
+    // The live raster is only ever built for a stroke being drawn, so an
+    // unarmed session -- which cannot draw -- never asks this.
+    if (!tool_.has_value()) {
+        return false;
+    }
     return (tool_ == Tool::Pen && toolStyle(QStringLiteral("pen")).color.alpha() == 255) ||
            (tool_ == Tool::Mosaic && mosaicShape_ == QStringLiteral("brush"));
 }
@@ -6192,7 +6699,12 @@ void OverlayController::updateTouch(const LogicalRect &touched)
     hasLastTouch_ = true;
     for (CaptureOverlay *overlay : overlays_) {
         LogicalRect visible;
-        if (!intersection(region, overlay->output().geometry, &visible)) {
+        // The overlay drawable is the whole surface, not the output geometry: in
+        // the pin editor the image (and the marks pinned to it) can be dragged
+        // away from the rect the session recorded, and the magnifier and chrome
+        // are clipped to the image's *current* place.  Clipping the damage to
+        // the stale geometry would leave their pixels on the canvas.
+        if (!intersection(region, surfaceOf(overlay->output()), &visible)) {
             continue;
         }
         // One pixel of slack: a mark's rounded or antialiased edge can spill
@@ -6214,10 +6726,43 @@ QRect OverlayController::lastInteractiveUpdate() const
     return lastTouchLocal_;
 }
 
+QString OverlayController::shortcutText(ShortcutAction action) const
+{
+    // Nothing for a binding the user cleared: a tooltip that named a key the
+    // editor will not act on would be a lie the settings page itself told.
+    return shortcuts_.hasKeys(action) ? shortcuts_.textFor(action) : QString();
+}
+
+QString OverlayController::shortcutHint(ShortcutAction action, const QString &label) const
+{
+    const QString keys = shortcutText(action);
+    return keys.isEmpty() ? label : QStringLiteral("%1 (%2)").arg(label, keys);
+}
+
+// Repaints the overlays' part of `region`, nothing else.  Unlike `updateTouch`
+// this leaves the "last touch" bookkeeping alone: it exists for damage that is
+// not a gesture step (the pin editor's daemon confirmation), which must not
+// clobber the rect a gesture's next step unions against.
+void OverlayController::invalidateLogicalRegion(const LogicalRect &region)
+{
+    if (region.width == 0 || region.height == 0) {
+        return;
+    }
+    for (CaptureOverlay *overlay : overlays_) {
+        LogicalRect visible;
+        if (!intersection(region, surfaceOf(overlay->output()), &visible)) {
+            continue;
+        }
+        const QRect local =
+            localRect(overlay->output(), visible, overlay->size()).toAlignedRect().adjusted(
+                -1, -1, 1, 1);
+        overlay->update(local);
+    }
+}
+
 void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
                               Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     if (finished_ || cancelled_) {
         return;
     }
@@ -6225,7 +6770,77 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
     // arrived (a grab lost mid-drag); this press replaces it either way.
     looseDrag_.reset();
     if (button == Qt::RightButton) {
-        cancel();
+        // The right button is the magnifier's, not a cancel: it is the button
+        // the user holds while aiming at a pixel.  Escape is the cancel, and
+        // always was the one the overlay's own text offered.
+        magnifierHeld_ = true;
+        endMagnifierFlash();
+        pointer_ = globalPoint(overlay, local);
+        pointerOutput_ = overlay->outputIndex();
+        lastMagnifierPointer_ = pointer_;
+        updateAll();
+        return;
+    }
+    if (button == Qt::MiddleButton) {
+        // The middle button is the drag's: it moves a framed region by its body
+        // or slides the pin's image under the marks.  It is a button rather than
+        // a held modifier because the gesture is a *drag* -- the state has to be
+        // on for as long as the pointer travels -- and a modifier made the user
+        // hold a key down through the whole move while the left button did the
+        // work.  A middle drag on a mark's rim still picks the mark up, exactly
+        // as a left one does: the rim is a deliberate target on its own, and
+        // taking it away under this button would make the one affordance the
+        // pointer promises there the one that does not work.
+        const Point grab = globalPoint(overlay, local);
+        if (selection_.has_value() && editing_) {
+            const int annotationHandle =
+                selectedAnnotation_ >= 0 ? annotationHandleAt(grab) : 0;
+            const int hit = annotationHitAt(grab);
+            if (annotationHandle != 0) {
+                beginAnnotationDrag(grab, true,
+                                    shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                    static_cast<int>(modifiers)));
+                updateAll();
+                return;
+            }
+            if (hit >= 0 && annotationBorderOf(hit, grab) != 0) {
+                selectAnnotation(hit);
+                beginAnnotationDrag(grab, false);
+                updateAll();
+                return;
+            }
+            // The mark the pick-up modifier has already put under the pointer
+            // is the one this press takes, wherever it lands -- the same
+            // promise the left button makes, and the reason the mark follows a
+            // drag that started nowhere near it.  Asking the selection's body
+            // first would swallow that: the body covers nearly the whole
+            // picture, so almost every loose drag starts inside it.
+            if (looseSelect_ && selectedAnnotation_ >= 0 && !pinEdit_) {
+                looseDrag_ = grab;
+                updateAll();
+                return;
+            }
+            // The eight resize handles are the region selection's: the CLI
+            // refuses any size change to a pin, so a pin has only its body to
+            // drag.  Handle 9 is that body, and it is the one that matters
+            // here.
+            const int handle = hitHandle(grab);
+            if (!pinEdit_ && handle != 0 && handle != 9) {
+                // A handle is the one thing that stretches, and a middle press
+                // on it means the same as a left one.
+                selectAnnotation(-1);
+                beginSelectionGesture(grab, shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                            static_cast<int>(modifiers)));
+                updateAll();
+                return;
+            }
+            if (handle == 9) {
+                selectAnnotation(-1);
+                beginSelectionMove(grab);
+                updateAll();
+                return;
+            }
+        }
         return;
     }
     if (button != Qt::LeftButton) {
@@ -6288,26 +6903,167 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         }
         return;
     }
-    if (pinEdit_ && !canDrawAt(point)) {
-        // Outside the pinned image the surface is bare canvas: only the Select
-        // tool reacts, and only by dropping the current annotation selection.
-        if (tool_ == Tool::Select) {
+    // The membership tests below are asked of the *unclamped* point:
+    // `globalPoint` folds a point outside the image onto its nearest edge, so
+    // asking it would answer "on the image" for every point on the surrounding
+    // canvas -- which is what made a click out there drag the pin.
+    const Point raw = unclampedGlobalPoint(overlay, local);
+    if (pinEdit_ && !insidePinImage(raw)) {
+        // Outside the image itself.  The pin's own border is still the pin --
+        // the daemon draws it centred on the image's edge, and the user aiming
+        // at the rim means to move the pin, not to paint on the canvas -- so a
+        // press there starts the same move a press on the image does.  It takes
+        // no ink, because the mark would be drawn outside the picture and the
+        // renderer clips it away.
+        if (onPinBorder(raw) && selection_.has_value()) {
+            // The rim is the pin too, and a press on it is the same "this one"
+            // as a press on the picture: ask for the pin back on top.
+            requestPinRaise();
             selectAnnotation(-1);
+            // Anchored on the raw point, not the clamped one: a press on
+            // the border lands outside the image, and clamping it to the
+            // edge would swallow the first pixels of the drag.
+            gesture_->anchor = raw;
+            gesture_->current = raw;
+            gesture_->origin = *selection_;
+            gesture_->handle = 9;
+            gesture_->type = Gesture::Type::Moving;
             updateAll();
+            return;
         }
+        // The bare canvas: it drops the current annotation selection and lets
+        // the press go.  A mark is not drawn out here -- there is no image for
+        // it to sit on.
+        selectAnnotation(-1);
+        updateAll();
         return;
     }
-    if (tool_ == Tool::Text) {
+    if (pinEdit_) {
+        // A press on the image is the user saying which pin they mean, and while
+        // an edit is open the pin under the pointer is the one being annotated.
+        // The click cannot reach the pin's own surface to raise it the ordinary
+        // way -- the editor's layer surface covers the output and holds the
+        // keyboard -- so the editor asks the daemon instead.  Asked here, before
+        // anything decides what the press *does*, because that is what a click
+        // on a pin means in every other state: it comes to the front.
+        requestPinRaise();
+    }
+    // A press on a mark picks it up whatever tool is armed, and so does a press
+    // on the selected mark's own handles.  That is what makes the marks
+    // adjustable without a tool of their own: the drawing tools keep drawing,
+    // and the one thing a press does before it draws is ask whether it landed
+    // on something already there.
+    //
+    // A mark's *body* is the exception.  Picking a mark up there and drawing on
+    // it are the same gesture, and the tool the user armed is the one that has
+    // to win: a pen that could not start a stroke on top of an existing mark
+    // would be a pen that stops working wherever the picture is busiest.  So
+    // the body answers to the pick-up modifier instead -- held while the press
+    // is made, and only for the press -- which leaves the armed tool alone:
+    // entering the state is not a tool change, so letting the modifier go puts
+    // the user back exactly where they were.
+    //
+    // The handles are not gated on it.  They are small, deliberate targets that
+    // can only mean one thing, and the user who aims at a mark's rim means to
+    // stretch it whether or not a modifier is down.  Neither is the rim itself:
+    // see below.
+    const bool picksMarkUp = pickingMarks(static_cast<int>(modifiers));
+    {
+        const int annotationHandle = selectedAnnotation_ >= 0 ? annotationHandleAt(point) : 0;
+        const int hit = annotationHitAt(point);
+        // The rim of a mark the pointer is *not* on yet still counts as a hit
+        // even with a tool armed, so that a mark can be picked up and moved
+        // without the tool being put down first.  The body is the case that
+        // cannot: there the armed tool and the pick-up are the same gesture, and
+        // the tool is the one the user chose.  A rim has no such reading -- it
+        // is a deliberate target on an outline, not a place to start a stroke.
+        const int border = annotationBorderOf(hit, point);
+        const int annotationIndex =
+            (!tool_.has_value() || picksMarkUp || border != 0) ? hit : -1;
+        if (annotationHandle != 0) {
+            // A handle, which is the one thing that stretches: the whole of a
+            // mark's edge moves it, and the eight small targets resize it.
+            beginAnnotationDrag(point, true, shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                            static_cast<int>(modifiers)));
+            updateAll();
+            return;
+        }
+        if (annotationIndex >= 0) {
+            selectAnnotation(annotationIndex);
+            beginAnnotationDrag(point, false);
+            updateAll();
+            return;
+        }
+    }
+    // The capture selection's own border and handles.  They are not gated on
+    // the middle button: they are small, deliberate targets that can only mean
+    // one thing, and the user who aims at the rim of the selection means to
+    // resize it.  The *body* of the selection is the middle button's, and is
+    // handled below.
+    if (!pinEdit_ && selection_.has_value() && editing_) {
+        const int handle = hitHandle(point);
+        if (handle != 0 && handle != 9) {
+            selectAnnotation(-1);
+            beginSelectionGesture(point, shortcuts_.held(ShortcutAction::PreserveAspect,
+                                                         static_cast<int>(modifiers)));
+            updateAll();
+            return;
+        }
+    }
+    if (!tool_.has_value()) {
+        // Nothing armed: the selection is adjusted, not drawn on.  The middle
+        // button drags its body; a plain drag starts a new frame over it, which
+        // is the one thing a bare drag has always meant on a capture.
+        //
+        // Loose mode is asked first, and is the one press that does not need
+        // the middle button: a mark the user has just selected follows a drag
+        // from anywhere, and "anywhere" includes the inside of the selection --
+        // asking the selection's body first would swallow every loose drag that
+        // started there, which is nearly all of them.
+        if (looseSelect_ && selectedAnnotation_ >= 0 && !pinEdit_) {
+            // Loose mode: the selected mark follows a drag from anywhere, so
+            // this press is held back rather than acted on -- until it moves it
+            // is still a click, and a click that lands on nothing lets the mark
+            // go.
+            looseDrag_ = point;
+            updateAll();
+            return;
+        }
+        if (pinEdit_) {
+            // Empty image surface: the middle button is what starts the move,
+            // the same as it is for a region selection's body.  Without it the
+            // press lets go of the current selection and does nothing else --
+            // the pin editor's image is not reframed by a drag (the CLI refuses
+            // a size change), so a bare press there has nothing to mean, and the
+            // pointer does not promise one either.
+            selectAnnotation(-1);
+        } else {
+            // A bare drag on the canvas starts a new frame over the old one.
+            // That is what an unarmed drag has always meant on a capture, and
+            // it is the whole point of a region session opening with no tool
+            // armed: the user who has just framed a region and wants a
+            // different one draws it, rather than having to find the toolbar
+            // first.  `startSelection` clears the old frame and puts the
+            // overlay back into the framing state, so the drag that follows is
+            // the same drag that made the first one.
+            selectAnnotation(-1);
+            startSelection(point);
+        }
+        updateAll();
+        return;
+    }
+    const Tool armed = *tool_;
+    if (armed == Tool::Text) {
         beginText(overlay, point);
         return;
     }
-    if (tool_ == Tool::Number) {
+    if (armed == Tool::Number) {
         // One click, one badge.  Nothing waits for a release: the tool has no
         // drag to preview, so the press is the whole gesture.
         placeNumber(point);
         return;
     }
-    if (tool_ == Tool::Picker) {
+    if (armed == Tool::Picker) {
         // One click takes one pixel, for the same reason: there is no drag to
         // preview.  The style row already points at the tool the picker was
         // armed from, and the pick hands the session back to it -- a colour is
@@ -6317,7 +7073,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         }
         return;
     }
-    if (tool_ == Tool::Bezier) {
+    if (armed == Tool::Bezier) {
         if (!canDrawAt(point)) {
             return;
         }
@@ -6347,46 +7103,7 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         updateAll();
         return;
     }
-    if (tool_ == Tool::Select) {
-        // Annotation handles and annotations take precedence over the outer
-        // capture selection, so every existing mark remains adjustable.
-        const int annotationHandle =
-            selectedAnnotation_ >= 0 ? annotationHandleAt(point) : 0;
-        const int annotationIndex = annotationHitAt(point);
-        if (annotationHandle != 0) {
-            beginAnnotationDrag(point, true);
-        } else if (annotationIndex >= 0) {
-            selectAnnotation(annotationIndex);
-            beginAnnotationDrag(point, false);
-        } else if (looseSelect_ && selectedAnnotation_ >= 0) {
-            // Loose mode: the selected mark follows a drag from anywhere, so
-            // this press is held back rather than acted on -- until it moves it
-            // is still a click, and a click that lands on nothing lets the mark
-            // go.  A capture handle is the one exception: it is a small,
-            // deliberate target, and dropping the mark is the price of using
-            // it.
-            const int handle = pinEdit_ ? 0 : hitHandle(point);
-            if (handle != 0 && handle != 9) {
-                selectAnnotation(-1);
-                beginSelectionGesture(point);
-            } else {
-                looseDrag_ = point;
-            }
-        } else if (pinEdit_) {
-            // Empty image surface: drop the current annotation selection and
-            // start dragging the image itself (which carries its annotations).
-            selectAnnotation(-1);
-            if (selection_.has_value()) {
-                gesture_->anchor = point;
-                gesture_->current = point;
-                gesture_->origin = *selection_;
-                gesture_->handle = 9;
-                gesture_->type = Gesture::Type::Moving;
-            }
-        } else {
-            beginSelectionGesture(point);
-        }
-    } else {
+    {
         if (!canDrawAt(point)) {
             return;
         }
@@ -6401,13 +7118,50 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
 void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButtons buttons,
                              Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     if (finished_ || cancelled_) {
         return;
     }
     const Point point = globalPoint(overlay, local);
     pointer_ = point;
     pointerOutput_ = overlay->outputIndex();
+    lastModifiers_ = static_cast<int>(modifiers);
+    // A real pointer motion takes the cursor back from the keyboard, and the
+    // magnifier a key press put up has nothing left to point at -- but the
+    // motion VShot's own warp makes is not the user moving anything, and
+    // treating it as one would end the flash on the step that raised it.  See
+    // `isPointerWarpEcho`; the echo is left to the walk that asked for it.
+    if (!isPointerWarpEcho(point)) {
+        keyboardCursor_.reset();
+        endMagnifierFlash();
+    }
+    if (magnifierHeld_) {
+        // The magnifier the right button holds is a colour picker, and a picker
+        // is aimed *by* moving: it follows the pointer for as long as the
+        // button is down, so what the pill says is always the pixel under the
+        // cursor rather than the one the button went down on.  It is also the
+        // one step that has to repaint without a gesture: no drag is under way,
+        // so nothing else here would ask for the frame to be redrawn.
+        //
+        // No test on which buttons are down: the motion event that carries a
+        // held button names it in `buttons`, so the right button is still
+        // reported on every step of the very drag it is holding, and asking for
+        // `NoButton` here -- as this once did -- made the whole step a no-op.
+        // The loupe stayed where the button went down and the pill read the
+        // pixel that was under the cursor when it did.
+        const LogicalRect previous = pointerTouchAt(lastMagnifierPointer_);
+        lastMagnifierPointer_ = point;
+        updateTouch(uniteLogical(previous, pointerTouchAt(point)));
+        // ...but the loupe is a *second* reading of the same motion, not a
+        // replacement for it.  The right button is how the user aims at a pixel
+        // while a gesture is already under way -- a rectangle being drawn, a
+        // pin being dragged -- and returning here swallowed every step of that
+        // gesture: the preview froze at the point the button went down and only
+        // moved again once it was released.  Only a step with no gesture to
+        // serve ends here.
+        if (gesture_->type == Gesture::Type::None) {
+            return;
+        }
+    }
     if (textMode_) {
         // The mode has the pointer to itself: no candidate hover, no gesture.
         // A drag widens the range to the character nearest the pointer, which
@@ -6471,7 +7225,10 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         }
         return;
     }
-    const bool insideImage = canDrawAt(point);
+    const Point raw = unclampedGlobalPoint(overlay, local);
+    // The pin's border counts as the pin for the pointer's own sake: aiming at
+    // the rim is aiming at the image, so the cursor says "drag me" there too.
+    const bool insideImage = insidePinImage(raw) || onPinBorder(raw);
     if (pinEdit_ && !insideImage && buttons == Qt::NoButton &&
         gesture_->type == Gesture::Type::None) {
         // Bare canvas around the pin image: the toolbar lives there, so the
@@ -6497,21 +7254,81 @@ void OverlayController::move(CaptureOverlay *overlay, const QPointF &local, Qt::
         }
     } else if (pinEdit_) {
         // Inside the image the pointer announces the drag that moves it;
-        // anywhere else with a drawing tool it is the crosshair.
-        overlay->setCursor(insideImage ? Qt::SizeAllCursor : Qt::ArrowCursor);
-    } else if (tool_ == Tool::Select && selection_.has_value() && editing_) {
-        // Handles map to resize arrows; anywhere else inside the selection
-        // (hitHandle returns 9) means the selection itself can be dragged.
-        overlay->setCursor(cursorForHandle(hitHandle(point)));
+        // anywhere else with a drawing tool it is the crosshair.  A mark's own
+        // rim answers first, exactly as it does on the canvas: a press there
+        // picks the mark up rather than starting a stroke, so the pointer has to
+        // say so -- otherwise the one target that stays live with a tool armed
+        // is the one the cursor lies about.
+        const int border = insideImage ? annotationBorderAt(point) : 0;
+        if (border != 0) {
+            overlay->setCursor(Qt::SizeAllCursor);
+        } else if (insideImage && pickingMarks(static_cast<int>(modifiers))
+                   && annotationHitAt(point) >= 0) {
+            overlay->setCursor(Qt::SizeAllCursor);
+        } else {
+            // The bare image says "drag me" only while the middle button is
+            // down, exactly as the region selection's body does: that button is
+            // the only way the drag can start, so without it the pointer is
+            // promising a drag the press will not make.
+            const bool drags = (buttons & Qt::MiddleButton) != 0;
+            overlay->setCursor(insideImage && drags ? Qt::SizeAllCursor : Qt::ArrowCursor);
+        }
+        // The hover frame and the pick-up selection follow the pointer in here
+        // too.  The pin editor opens on marks already on the canvas -- that is
+        // the whole point of a re-edit -- so leaving this out made the one
+        // session with marks to pick up the one session where picking them up
+        // did nothing.
+        if (insideImage) {
+            refreshMarkHover();
+        }
+    } else {
+        // The selection's chrome is live whatever is armed, so the pointer says
+        // what each part of it does.  Its handles map to their resize arrows;
+        // its body says "drag me" only while the middle button is down, because
+        // that is the only way it can be dragged -- without it the press draws
+        // a new frame instead, and a move cursor there would be a promise the
+        // editor does not keep.
+        const int handle = selection_.has_value() && editing_ ? hitHandle(point) : 0;
+        if (handle != 0) {
+            const bool drags = (buttons & Qt::MiddleButton) != 0;
+            overlay->setCursor(handle == 9 ? (drags ? Qt::SizeAllCursor : Qt::CrossCursor)
+                                           : cursorForHandle(handle));
+        } else {
+            // Not the selection: a mark's own rim answers next.  It is live on
+            // its own -- a press there picks the mark up and drags it, with
+            // nothing held and nothing armed -- so the pointer says "drag me"
+            // rather than promising the stroke the press will not make.  The
+            // handles are the mark's own and are drawn only once it is selected,
+            // so before that the rim is all there is to aim at.
+            const int border = annotationBorderAt(point);
+            if (border != 0) {
+                overlay->setCursor(Qt::SizeAllCursor);
+            } else if (pickingMarks(static_cast<int>(modifiers))
+                       && annotationHitAt(point) >= 0) {
+                overlay->setCursor(Qt::SizeAllCursor);
+            } else {
+                overlay->setCursor(Qt::CrossCursor);
+            }
+        }
+        // The mark the pick-up modifier has put under the pointer wears a frame
+        // of its own, which is the feedback that the press would take it and not
+        // draw.  Repainted only where it changed: the whole point of it is that
+        // it appears and disappears as the pointer crosses a mark, and a full
+        // repaint per motion would make hovering cost what drawing costs.
+        refreshMarkHover();
     }
     if (gesture_->type == Gesture::Type::Selecting) {
         updateSelection(point);
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Moving) {
-        applySelectionMove(gesture_->origin, gesture_->anchor, point);
+        // The raw point again: a pin drag may have started on the border, and
+        // clamping the motion would hold the pin still until the pointer had
+        // travelled all the way onto the image.
+        applySelectionMove(gesture_->origin, gesture_->anchor, pinEdit_ ? raw : point);
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::Resizing) {
-        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point));
+        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point),
+                                     gesture_->preserveAspect);
         updateTouch(selectionTouch());
     } else if (gesture_->type == Gesture::Type::MovingAnnotation ||
                gesture_->type == Gesture::Type::ResizingAnnotation) {
@@ -6536,7 +7353,33 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
                                 Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(modifiers);
-    if (finished_ || cancelled_ || button != Qt::LeftButton) {
+    if (finished_ || cancelled_) {
+        return;
+    }
+    if (button == Qt::RightButton) {
+        // Letting the right button go puts the magnifier away; the gesture it
+        // was held over is untouched, which is the whole point of the button
+        // being the magnifier's rather than a cancel.
+        if (magnifierHeld_) {
+            magnifierHeld_ = false;
+            updateAll();
+        }
+        return;
+    }
+    if (button == Qt::MiddleButton) {
+        // The middle button owns the two drags that move rather than draw, and
+        // both of them are started and finished by the left button's own code
+        // paths -- the gesture is the same gesture either way, only the button
+        // that began it differs.  So the release is the ordinary one, and the
+        // left button's guard below is simply not applied to it.  A loose drag
+        // is the exception: it is a press held back until it travels, so it is
+        // still a click while the button is down and has to reach the code
+        // below that lets the mark go.
+        if (!looseDrag_.has_value() && gesture_->type != Gesture::Type::Moving &&
+            gesture_->type != Gesture::Type::MovingAnnotation) {
+            return;
+        }
+    } else if (button != Qt::LeftButton) {
         return;
     }
     if (textMode_) {
@@ -6554,18 +7397,31 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         return;
     }
     const Point point = globalPoint(overlay, local);
+    // The keyboard walks the cursor while a stroke is in progress, and the
+    // button is still down for the whole of it -- so the release arrives at
+    // wherever the mouse was when the press was made, which is the anchor.  The
+    // far end is the cursor's, not the release's: taking the release's position
+    // would throw away every step the keys just made.
+    const Point end = (gesture_->type == Gesture::Type::Drawing ||
+                       gesture_->type == Gesture::Type::Bezier)
+        ? gesture_->current
+        : point;
     switch (gesture_->type) {
     case Gesture::Type::Selecting:
         toolbarOutput_ = overlay->outputIndex();
         finishSelection(point);
         break;
     case Gesture::Type::Moving:
-        applySelectionMove(gesture_->origin, gesture_->anchor, point);
+        // The raw point, to match `move()`: a pin drag that started on the
+        // border would otherwise land a few pixels short of the pointer.
+        applySelectionMove(gesture_->origin, gesture_->anchor,
+                           pinEdit_ ? unclampedGlobalPoint(overlay, local) : point);
         gesture_->type = Gesture::Type::None;
         showToolbar();
         break;
     case Gesture::Type::Resizing:
-        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point));
+        selection_ = resizeSelection(gesture_->origin, gesture_->handle, clampPoint(point),
+                                     gesture_->preserveAspect);
         gesture_->type = Gesture::Type::None;
         showToolbar();
         break;
@@ -6574,13 +7430,13 @@ void OverlayController::release(CaptureOverlay *overlay, const QPointF &local,
         finishAnnotationDrag(overlay, point);
         break;
     case Gesture::Type::Drawing:
-        finishDrawing(point);
+        finishDrawing(end);
         break;
     case Gesture::Type::Bezier:
         // A release only ends the handle drag that followed the last press.  The
         // path itself is not finished until it is closed or double-clicked, so
         // the gesture stays in progress and the preview stays on screen.
-        updateBezier(point, false);
+        updateBezier(end, false);
         break;
     case Gesture::Type::None:
         break;
@@ -6640,7 +7496,27 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
 void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(overlay);
-    if (key == Qt::Key_Escape) {
+    // Shift itself arrives here as a key with no keycode of its own, and it is
+    // the pick-up modifier: holding it is what puts the hover frame on the mark
+    // under the pointer, so the frame has to follow the modifier and not only
+    // the pointer.  The stored bits are updated before anything acts on them so
+    // that the whole of this press sees one state.
+    const int bits = static_cast<int>(modifiers);
+    if (bits != lastModifiers_) {
+        lastModifiers_ = bits;
+        refreshMarkHover();
+    }
+    const QKeySequence pressed(
+        static_cast<int>(static_cast<int>(modifiers) | static_cast<int>(key)));
+    // Everything below looks a key up in the binding table rather than
+    // comparing it against a hard-coded `Qt::Key_`, so a binding the user has
+    // changed in the settings is the one honoured here.  The pressed key is
+    // built once and asked about; `ShortcutPreferences::matches` is the only
+    // place that knows how a stored sequence and a pressed one are compared.
+    const auto is = [this, &pressed](ShortcutAction action) {
+        return shortcuts_.matches(action, pressed);
+    };
+    if (is(ShortcutAction::Cancel)) {
         if (translateMode_) {
             // The translation goes first, back to the framing it replaced; a
             // second Escape is the cancel the framing has.
@@ -6670,7 +7546,7 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         }
         return;
     }
-    if (key == Qt::Key_Return || key == Qt::Key_Enter) {
+    if (is(ShortcutAction::Confirm)) {
         if (translateMode_) {
             // Enter keeps its two stages: it translates a frame nothing has
             // translated yet -- the drag that drew it normally has, so this is
@@ -6702,46 +7578,156 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
     if (translateMode_) {
         // Only the copy and the step back reach the translate overlay; every
         // other key is swallowed so nothing moves the frame under it.
-        if ((modifiers & Qt::ControlModifier) && key == Qt::Key_C && translated_) {
+        if (is(ShortcutAction::CopyText) && translated_) {
             writeClipboard(translatedText_);
         }
         return;
     }
     if (textMode_) {
-        // The mode owns the keys: Ctrl+C copies the range and Ctrl+A selects
-        // it all, and every other key is swallowed so the arrow keys cannot
-        // move the capture's selection out from under the text.
-        if (modifiers & Qt::ControlModifier) {
-            if (key == Qt::Key_C) {
-                copyTextSelection();
-            } else if (key == Qt::Key_A) {
-                textSelectAll();
-            }
+        // The mode owns the keys: copying the range and selecting it all are
+        // the two it answers, and every other key is swallowed so the arrow
+        // keys cannot move the capture's selection out from under the text.
+        if (is(ShortcutAction::CopyText)) {
+            copyTextSelection();
+        } else if (is(ShortcutAction::SelectAll)) {
+            textSelectAll();
         }
         return;
     }
-    if (modifiers & Qt::ControlModifier) {
-        if (key == Qt::Key_Z && !(modifiers & Qt::ShiftModifier)) {
-            undo();
-        } else if (key == Qt::Key_Z || key == Qt::Key_Y) {
-            redo();
-        } else if (key == Qt::Key_V) {
-            // Paste is the one action here that can fail for a reason the user
-            // needs told: an empty clipboard, or `wl-paste` missing. There is
-            // no status line on a frozen overlay, so the message goes to stderr
-            // where the CLI's own diagnostics already land.
-            QString error;
-            if (!pasteFromClipboard(&error)) {
-                std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
-                std::fflush(stderr);
-            }
+    if (is(ShortcutAction::Undo)) {
+        undo();
+        return;
+    }
+    if (is(ShortcutAction::Redo)) {
+        redo();
+        return;
+    }
+    if (is(ShortcutAction::Paste)) {
+        // Paste is the one action here that can fail for a reason the user
+        // needs told: an empty clipboard, or `wl-paste` missing. There is
+        // no status line on a frozen overlay, so the message goes to stderr
+        // where the CLI's own diagnostics already land.
+        QString error;
+        if (!pasteFromClipboard(&error)) {
+            std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+            std::fflush(stderr);
         }
         return;
     }
-    if ((key == Qt::Key_Delete || key == Qt::Key_Backspace) &&
-        gesture_->type == Gesture::Type::None && selectedAnnotation_ >= 0) {
+    if (is(ShortcutAction::Copy)) {
+        // Copy the capture with its marks, through the same composite the
+        // Copy button makes.
+        copyToClipboard();
+        return;
+    }
+    if (is(ShortcutAction::SelectAll)) {
+        // Every mark, so a style or a delete reaches all of them at once.
+        selectAllAnnotations();
+        return;
+    }
+    if (is(ShortcutAction::SelectNone)) {
+        selectAnnotation(-1);
+        return;
+    }
+    if (is(ShortcutAction::NextMark) || is(ShortcutAction::PreviousMark)) {
+        // Tab and Shift+Tab walk the marks; Ctrl+Tab does the same, so a run
+        // of them can be walked in either direction without Shift.
+        const int step = is(ShortcutAction::PreviousMark) ? -1 : 1;
+        cycleAnnotationFocus(step);
+        return;
+    }
+    if (colorPickerVisible()) {
+        // The picker owns its two colour keys while it is up: the user is
+        // looking at a pixel through it, and those are the two things to do
+        // with one.  They are bound only here so the letters stay free for the
+        // keyboard cursor below when no picker is up.  Neither is a letter the
+        // cursor walk wants -- `C` and `V` are not among the WASD keys -- and
+        // that matters most here: the picker is up while the right button is
+        // held, which is the one moment the pointer is still being moved, so
+        // the cursor keys have to keep working underneath it.
+        if (is(ShortcutAction::CopyColor)) {
+            copyColorUnderCursor();
+            return;
+        }
+        if (is(ShortcutAction::AdoptColor)) {
+            adoptColorUnderCursor();
+            return;
+        }
+    }
+    if (is(ShortcutAction::ShowMagnifier)) {
+        // The magnifier on demand: the same two seconds a cursor step gives
+        // the user, asked for directly.  A cursor step is what usually raises
+        // it, and a step ends by repainting -- so `flashMagnifier` on its own
+        // here set the flag and left the frame alone, and the key looked dead
+        // until something else happened to redraw.
+        flashMagnifier();
+        updateAll();
+        return;
+    }
+    if (is(ShortcutAction::Delete) && gesture_->type == Gesture::Type::None
+        && selectedAnnotation_ >= 0) {
         deleteSelectedAnnotation();
         return;
+    }
+    if (gesture_->type == Gesture::Type::None || gesture_->type == Gesture::Type::Selecting ||
+        gesture_->type == Gesture::Type::Drawing || gesture_->type == Gesture::Type::Bezier) {
+        // Walking the cursor with the keyboard.  The point of it is to pick a
+        // spot the mouse cannot reach exactly -- the corner of a region, the
+        // end of an arrow -- and a step of one pixel is what makes that worth
+        // doing; the step modifier takes ten at a time for the coarse part of
+        // the trip.
+        //
+        // The arrow keys nudge the mark the keyboard has selected, when there
+        // is one, and walk the cursor when there is not -- which is the state
+        // framing is in.  WASD always walks the cursor, so the two are both
+        // reachable without letting go of a mark.  Which of the two a key is
+        // comes from the binding: an arrow is a nudge, a letter is a walk.
+        // The step modifier is read as part of the step's *size*, so it is not
+        // part of the key the step is bound to: Shift+Left is "left, ten
+        // pixels", not a key of its own.  Every comparison below therefore
+        // matches with those bits taken out of both sides.
+        //
+        // A stroke in progress is walked too.  Its press chose the start and
+        // its release will choose the end, so the button is held for the whole
+        // of it -- and that is precisely when the mouse cannot place the end
+        // exactly, which is what the walk is for.  The step moves the *live*
+        // gesture rather than the committed marks: the anchor the press set
+        // stays where it is and the far end follows, which is the same edit the
+        // pointer would have made, made a pixel at a time.
+        const int coarse = shortcuts_.held(ShortcutAction::CoarseStep, static_cast<int>(modifiers))
+            ? static_cast<int>(Qt::ShiftModifier)
+            : 0;
+        const int step = coarse != 0 ? kCoarseCursorStep : 1;
+        const auto steps = [this, &pressed, coarse](ShortcutAction action) {
+            return shortcuts_.matches(action, pressed, coarse);
+        };
+        int dx = 0;
+        int dy = 0;
+        bool nudge = false;
+        if (steps(ShortcutAction::CursorLeft)) {
+            dx = -step;
+            nudge = pressedArrow(key);
+        } else if (steps(ShortcutAction::CursorRight)) {
+            dx = step;
+            nudge = pressedArrow(key);
+        } else if (steps(ShortcutAction::CursorUp)) {
+            dy = -step;
+            nudge = pressedArrow(key);
+        } else if (steps(ShortcutAction::CursorDown)) {
+            dy = step;
+            nudge = pressedArrow(key);
+        }
+        if (dx != 0 || dy != 0) {
+            if (gesture_->type == Gesture::Type::Drawing ||
+                gesture_->type == Gesture::Type::Bezier) {
+                walkLiveGesture(dx, dy);
+            } else if (nudge && selectedAnnotation_ >= 0) {
+                nudgeSelectedAnnotation(dx, dy);
+            } else {
+                moveCursorBy(dx, dy);
+            }
+            return;
+        }
     }
     if (!selection_.has_value() || !editing_ || gesture_->type != Gesture::Type::None) {
         return;
@@ -6751,66 +7737,314 @@ void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifi
         // image (drag or arrow keys) and never resizes.
         return;
     }
-    const int step = (modifiers & Qt::ShiftModifier) ? 10 : 1;
-    int dx = 0;
-    int dy = 0;
-    switch (key) {
-    case Qt::Key_Left:
-        dx = -step;
-        break;
-    case Qt::Key_Right:
-        dx = step;
-        break;
-    case Qt::Key_Up:
-        dy = -step;
-        break;
-    case Qt::Key_Down:
-        dy = step;
-        break;
-    default:
+}
+
+void OverlayController::walkLiveGesture(int dx, int dy)
+{
+    // The far end is the gesture's own, not the pointer record's: the preview on
+    // screen is drawn from `gesture_->current`, so continuing from there is what
+    // makes the ink follow the keys even if the pointer never reported the press
+    // (a session driven without a mouse, or one whose press arrived on a surface
+    // whose motion never came).
+    const Point from = gesture_->current;
+    const Point moved = clampPoint(Point{from.x + dx, from.y + dy});
+    // The point the press set stays exactly where it was: a stroke is drawn
+    // from its anchor, and walking the cursor is choosing where the far end
+    // lands, not redrawing what is already there.  For the pen and the brush
+    // that is the whole of it -- they grow toward the cursor and the steps in
+    // between are the stroke -- so this is the pointer moving without a mouse.
+    if (gesture_->type == Gesture::Type::Bezier) {
+        // A pen path is anchors, not a trail: the last anchor has been placed
+        // and what the pointer does now is pull its outgoing handle out.  A
+        // path with nothing placed yet has no anchor to pull, and the step
+        // would have nowhere to land.
+        if (gesture_->points.size() < 2) {
+            return;
+        }
+        updateBezier(moved, true);
+        updateTouch(bezierTouch());
+    } else {
+        // A growing stroke stamps the segments the last step added, so the walk
+        // tells `updateDrawing` the same way a pointer motion would and lets it
+        // append the one point this step contributes.  The two-point tools
+        // replace their pair outright, which is what makes the far end follow.
+        const int pointsBefore = gesture_->points.size();
+        updateDrawing(moved);
+        updateTouch(drawingTouch(pointsBefore));
+    }
+    keyboardCursor_ = moved;
+    pointer_ = moved;
+    // The pointer is wherever the press left it -- the keyboard has not moved
+    // the mouse -- so the magnifier is the only thing on screen that says which
+    // pixel the far end is on, and the warp is what puts the arrow there too.
+    flashMagnifier();
+    requestPointerWarp(moved);
+}
+
+// The cursor the keyboard moves, in global logical pixels.  It starts wherever
+// the pointer last was, so a key press continues from what the user was
+// looking at rather than jumping to a corner of the screen.
+Point OverlayController::cursorPoint() const
+{
+    if (keyboardCursor_.has_value()) {
+        return *keyboardCursor_;
+    }
+    if (pointerOutput_ >= 0) {
+        return pointer_;
+    }
+    const LogicalRect &surface = session_.bounds;
+    return Point{static_cast<std::int32_t>(surface.x + static_cast<std::int64_t>(surface.width) / 2),
+                 static_cast<std::int32_t>(surface.y + static_cast<std::int64_t>(surface.height) / 2)};
+}
+
+void OverlayController::moveCursorBy(int dx, int dy)
+{
+    const Point moved = clampPoint(Point{cursorPoint().x + dx, cursorPoint().y + dy});
+    keyboardCursor_ = moved;
+    pointer_ = moved;
+    // The magnifier is the only way to see where the cursor went: it has not
+    // moved a mouse, so the pointer the compositor draws is wherever it was
+    // left, and the user is aiming at a pixel.  It comes up for a moment and
+    // goes again, so the frame is not permanently covered by it.
+    flashMagnifier();
+    // And the pointer itself, which is the other half of "where the cursor
+    // went": the loupe says which pixel, and the arrow on the screen says where
+    // on the desktop.  Only the CLI can move it, so the request goes over the
+    // pipe the session came in on.  A session with nobody listening is left
+    // alone -- the editor's own cursor has already moved either way.
+    requestPointerWarp(moved);
+    updateAll();
+}
+
+bool OverlayController::pickingMarks(int modifiers) const
+{
+    // Read through the binding table so a build that moves the modifier moves
+    // this with it.  `held` is the only reader that can see it: `matches` wants
+    // a key *and* a modifier, and this is held on its own while a press is
+    // made, with no key of its own to match.
+    return shortcuts_.held(ShortcutAction::SelectMark, modifiers);
+}
+
+void OverlayController::cycleAnnotationFocus(int step)
+{
+    if (annotations_.isEmpty()) {
         return;
     }
-    const Point anchor{selection_->x, selection_->y};
-    const Point current{selection_->x + dx, selection_->y + dy};
-    applySelectionMove(*selection_, anchor, current);
+    const int count = annotations_.size();
+    int index = selectedAnnotation_;
+    if (index < 0 || index >= count) {
+        // Nothing selected yet: Tab starts at the back of the list and Shift+
+        // Tab at the front, so the first press lands on the mark nearest the
+        // end the user is coming from.
+        index = step > 0 ? -1 : 0;
+    }
+    index = ((index + step) % count + count) % count;
+    selectAnnotation(index);
+    // The cursor follows the mark, so the magnifier and the colour readout
+    // point at the thing the keyboard just picked.
+    LogicalRect bounds;
+    if (annotationBounds(annotations_.at(index), &bounds)) {
+        keyboardCursor_ = Point{static_cast<std::int32_t>(bounds.x + static_cast<std::int64_t>(bounds.width) / 2),
+                                static_cast<std::int32_t>(bounds.y + static_cast<std::int64_t>(bounds.height) / 2)};
+        pointer_ = *keyboardCursor_;
+        if (pointerOutput_ < 0) {
+            pointerOutput_ = outputContaining(bounds);
+        }
+    }
+    updateAll();
+}
+
+void OverlayController::selectAllAnnotations()
+{
+    if (annotations_.isEmpty()) {
+        return;
+    }
+    selectAnnotation(annotations_.size() - 1);
+    allSelected_ = true;
+    updateAll();
+}
+
+void OverlayController::nudgeSelectedAnnotation(int dx, int dy)
+{
+    if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
+        return;
+    }
+    const Annotation original = annotations_.at(selectedAnnotation_);
+    LogicalRect bounds;
+    if (!annotationBounds(original, &bounds)) {
+        return;
+    }
+    // The same translation a drag makes, through the same clamp, so a mark
+    // walked to the edge of the image stops there rather than sliding off it.
+    const Annotation moved = translatedAnnotation(original, dx, dy);
+    LogicalRect after;
+    if (annotationBounds(moved, &after) && after.x == bounds.x && after.y == bounds.y) {
+        return; // already against the edge the nudge was pushing toward
+    }
+    // A run of nudges is one edit: the first one of the run is what undo comes
+    // back to, and the key's own auto-repeat does not bury the user's last real
+    // step under a hundred entries.  Any other edit or selection ends the run.
+    if (!nudgeBase_.has_value()) {
+        nudgeBase_ = annotations_;
+        undoStack_.push_back(*nudgeBase_);
+        if (undoStack_.size() > kMaxUndoSteps) {
+            undoStack_.removeFirst();
+        }
+        redoStack_.clear();
+    }
+    annotations_[selectedAnnotation_] = moved;
     updateAll();
 }
 
 // Moves the selection — the pinned image, in pin-edit mode — to follow the
-// pointer, carrying its annotations along. Annotations are stored in global
-// coordinates and the renderer anchors them to the returned selection, so
-// translating them keeps the preview and the rendered result in step.
+// pointer.
 //
-// In pin-edit mode the moving is delegated outright: the daemon repositions
-// the real pin window with its own clamp, and the reply lands back here as the
-// authoritative rect. The editor never paints the image itself, so there is
-// nothing to keep in sync but the annotations.
+// Marks are stored in global coordinates and must remain aligned to the FP16
+// helper surface, which shows the image at the *daemon-confirmed* position.
+// Translating marks here (the optimistic position) races the daemon: by the
+// time the reply arrives, the cursor has often moved on, and applyPinRect then
+// corrects against an already-moved selection_, shifting marks the wrong way
+// and making them appear to fragment.  The marks are only moved in
+// applyPinRect, when the daemon says where the image actually is.
 void OverlayController::applySelectionMove(LogicalRect origin, Point anchor, Point current)
 {
     const LogicalRect moved = moveSelection(origin, anchor, current);
     if (pinEdit_ && selection_.has_value()) {
-        // Image and marks travel together: shifting both by the same delta
-        // keeps every mark on the image pixel it was drawn on.
-        translateAnnotations(moved.x - selection_->x, moved.y - selection_->y);
-        // The daemon does the actual moving (its pin window is the one on
-        // screen) and answers with the rect it clamped to; applyPinRect
-        // corrects this optimistic position when the two disagree.
+        // Optimistically track where the cursor would like the image to be,
+        // for the daemon request and for computing the next incremental delta.
+        // Do NOT translate annotations: they stay at marksOrigin_ (the last
+        // confirmed daemon position) until applyPinRect updates them.
         requestPinMove(Point{moved.x, moved.y});
     }
     selection_ = moved;
+}
+
+// The editor has drawn everything it is going to draw, and asks to be let go.
+//
+// It does not stop here.  A session that rendered a capture is showing that
+// capture, and the caller has not been told about it yet -- for a pin, the
+// pixels the daemon is about to show come from a result this process has not
+// even written.  The two pictures have to overlap or the user sees the marks
+// blink out between them, so the editor asks the CLI to put its capture where
+// it belongs first, and keeps drawing until it is answered.
+//
+// The ask carries the session's whole answer -- the result JSON and, over the
+// pixel channel, the rendered capture -- written before the request so the CLI
+// has both by the time it reads the request.  What the CLI does with them is
+// its own business: for a pin it hands them to the daemon with an ask that
+// holds the daemon's answer until the pin's own frame is on the screen, and for
+// everything else it writes them out and answers at once.
+//
+// Answered by a line on stdin, by the pipe closing, or by the backstop: the
+// session must not be able to outlive the request.  A helper run by hand -- or
+// by a check -- has no CLI on the other end of this pipe, so there is nothing
+// to hand over to and nothing to wait for; it quits, as it always did.
+void OverlayController::beginHandoff()
+{
+    // The same test the pointer walk uses to tell a CLI from a terminal.
+    if (::isatty(STDOUT_FILENO)) {
+        QCoreApplication::quit();
+        return;
+    }
+    QString resultError;
+    const QJsonDocument result = resultDocument(&resultError);
+    if (result.isNull() && !resultError.isEmpty()) {
+        // Nothing to hand over, and the CLI's own read of the result would
+        // report the same thing; saying it here leaves the reason on stderr
+        // instead of in a half-written answer.
+        std::fprintf(stderr, "vshot-qt-ui: %s\n", resultError.toUtf8().constData());
+        QCoreApplication::quit();
+        return;
+    }
+    const QByteArray encoded = result.toJson(QJsonDocument::Compact);
+    std::fwrite(encoded.constData(), 1, static_cast<std::size_t>(encoded.size()), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+    resultSent_ = true;
+    const int flags = ::fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    }
+    // Any line at all is the answer: the CLI has nothing to tell the editor
+    // beyond "it is done", and a refusal still means it is done with the
+    // editor.  A pipe that closes means the same thing -- the CLI is gone, so
+    // nothing is coming.
+    handoffReader_ = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, this);
+    QObject::connect(handoffReader_, &QSocketNotifier::activated, handoffReader_, [this] {
+        char buffer[256];
+        const ssize_t got = ::read(STDIN_FILENO, buffer, sizeof(buffer));
+        if (got <= 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            QCoreApplication::quit();
+            return;
+        }
+        if (got > 0) {
+            QCoreApplication::quit();
+        }
+    });
+    handoffClock_.start();
+    handoffTimer_ = new QTimer(this);
+    handoffTimer_->setSingleShot(true);
+    QObject::connect(handoffTimer_, &QTimer::timeout, this, [this] { QCoreApplication::quit(); });
+    // The backstop for a CLI that never answers at all.  The CLI waits on the
+    // daemon, which has its own deadline, so this only fires when something in
+    // between has gone; without it the editor would keep drawing for ever.
+    handoffTimer_->start(kHandoffWaitMs);
+    writeCliRequest(QByteArrayLiteral("{\"request\":\"release\"}\n"));
+}
+
+// Whether the session rendered a capture of its own, which is what has to be
+// on the screen before this process may stop; see `beginHandoff`.
+bool OverlayController::rendersCapture() const
+{
+    return pixelChannelAvailable() && selection_.has_value();
 }
 
 void OverlayController::setPinTarget(std::uint64_t pinId, const QString &socketPath)
 {
     pinId_ = pinId;
     pinSocketPath_ = socketPath;
+    // Connected now rather than at the first drag.  The daemon says which pin is
+    // the live one on every connection it accepts, and the editor draws the
+    // image's frame from that answer -- waiting for the user to move something
+    // before asking would leave the frame off until then, and leave the answer
+    // to a report racing the connection that carries it.
+    if (pinId_ != 0 && !pinSocketPath_.isEmpty()) {
+        openPinSocket();
+    }
 }
 
-// Opens one short-lived connection, sends the pin's new top-left (global
-// logical pixels) and applies whatever comes back. The daemon serves exactly
-// one request per connection — it writes the reply and disconnects — so a
-// fresh socket per move mirrors the CLI's own client and avoids any
-// reconnect bookkeeping.
+// The daemon's answer to "which pin is the live one".  A pin is live while this
+// editor's own surface holds the keyboard and the pointer is over it; the
+// moment the user clicks away, another pin takes both and the daemon says so.
+//
+// The editor's frame is the only thing this changes.  The marks, the input
+// region and the drag are all about the edit, which is still open, and taking
+// them away because the pointer went elsewhere would end an edit the user never
+// ended.
+void OverlayController::notePinActive(std::uint64_t pinId)
+{
+    const bool active = pinId != 0 && pinId == pinId_;
+    if (active == pinActive_) {
+        return;
+    }
+    pinActive_ = active;
+    // Exactly the frame's own band, so losing it costs one stroke's worth of
+    // pixels rather than the whole output.
+    if (marksOrigin_.has_value()) {
+        const LogicalRect band = *marksOrigin_;
+        const std::int32_t reach = 2;
+        invalidateLogicalRegion(LogicalRect{band.x - reach, band.y - reach,
+                                            band.width + 2 * reach,
+                                            band.height + 2 * reach});
+    } else {
+        repaintEverything();
+    }
+}
+
+// Sends the pin's new top-left (global logical pixels) to the daemon that owns
+// it and applies whatever comes back.  The daemon keeps the connection open and
+// the protocol is newline-delimited, so a drag reuses one socket rather than
+// opening and tearing down one per motion event.
 void OverlayController::requestPinMove(Point globalTopLeft)
 {
     if (pinSocketPath_.isEmpty() || pinId_ == 0) {
@@ -6820,78 +8054,154 @@ void OverlayController::requestPinMove(Point globalTopLeft)
     flushPinMove();
 }
 
-void OverlayController::flushPinMove()
+// Asks the daemon to put the pin being edited back on top of the stack.
+//
+// The click that means this cannot reach the pin's own surface: the editor's
+// layer surface holds the keyboard and covers the output, so the pointer lands
+// on the editor, and the pin surface underneath -- where a click normally raises
+// a pin -- never sees it.  A press on the image is the user saying which pin
+// they mean, and while an edit is open that is the only pin it can be, so the
+// editor asks on their behalf.
+void OverlayController::requestPinRaise()
 {
-    if (pinSocket_ != nullptr || !pendingPinOrigin_.has_value()) {
+    if (pinSocketPath_.isEmpty() || pinId_ == 0) {
         return;
     }
-    if (pinSocketPath_.isEmpty() || pinId_ == 0) {
-        pendingPinOrigin_.reset();
+    if (pinSocket_ == nullptr) {
+        // The pending raise goes out as soon as it connects; `pinRaisePending_`
+        // is what carries it across the connect.
+        pinRaisePending_ = true;
+        openPinSocket();
+        return;
+    }
+    if (pinSocket_->state() != QLocalSocket::ConnectedState) {
+        pinRaisePending_ = true;
+        return;
+    }
+    pinRaisePending_ = false;
+    QJsonObject request;
+    request.insert(QStringLiteral("cmd"), QStringLiteral("raise"));
+    request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
+    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    pinSocket_->write(line);
+    pinSocket_->flush();
+}
+
+void OverlayController::flushPinMove()
+{
+    // A raise asked for before the connection was up goes first: it is what the
+    // press that also started this move meant, and it is a restack the daemon
+    // has to apply before the stack it paints for the move is composed.
+    // `requestPinRaise` is what decides whether the connection is ready for it.
+    if (pinRaisePending_) {
+        requestPinRaise();
+    }
+    if (!pendingPinOrigin_.has_value() || pinSocketPath_.isEmpty() || pinId_ == 0) {
+        return;
+    }
+    if (pinSocket_ == nullptr) {
+        // The pending position goes out as soon as it connects.
+        openPinSocket();
+        return;
+    }
+    if (pinSocket_->state() != QLocalSocket::ConnectedState) {
+        return;
+    }
+    if (pinMovesInFlight_ >= kPinMovesInFlight) {
+        // The reply to an earlier position frees a slot and flushes the newest
+        // one; keeping the queue short is what bounds the lead the marks can
+        // take over the image the daemon has actually drawn.
         return;
     }
     const Point origin = *pendingPinOrigin_;
     pendingPinOrigin_.reset();
+    QJsonObject request;
+    request.insert(QStringLiteral("cmd"), QStringLiteral("move"));
+    request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
+    request.insert(QStringLiteral("x"), static_cast<qint64>(origin.x));
+    request.insert(QStringLiteral("y"), static_cast<qint64>(origin.y));
+    QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    pinSocket_->write(line);
+    pinSocket_->flush();
+    ++pinMovesInFlight_;
+    if (pinDebug_) {
+        pinMoveClock_.start();
+    }
+}
 
+// Opens the drag's one connection.  A refused or dropped connection is not
+// fatal: the editor keeps working, it just cannot move the live pin, and the
+// next move opens a fresh connection.
+void OverlayController::openPinSocket()
+{
     auto *socket = new QLocalSocket;
     pinSocket_ = socket;
-    const auto ownsSocket = [this, socket] { return pinSocket_ == socket; };
-    QObject::connect(socket, &QLocalSocket::connected, socket, [this, socket, origin, ownsSocket] {
-        if (!ownsSocket()) {
-            return;
-        }
-        QJsonObject request;
-        request.insert(QStringLiteral("cmd"), QStringLiteral("move"));
-        request.insert(QStringLiteral("id"), static_cast<qint64>(pinId_));
-        request.insert(QStringLiteral("x"), static_cast<qint64>(origin.x));
-        request.insert(QStringLiteral("y"), static_cast<qint64>(origin.y));
-        QByteArray line = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    QObject::connect(socket, &QLocalSocket::connected, socket, [this] {
+        pinMovesInFlight_ = 0;
+        // Asking for the live-pin answer is what puts this connection in the
+        // daemon's list of clients it writes to.  It is asked for rather than
+        // pushed: an ordinary drag's client has no use for the lines, and a
+        // daemon that wrote them to everyone would be answering the CLI's own
+        // socket with something that is not the reply it is waiting for.
+        QJsonObject watch;
+        watch.insert(QStringLiteral("cmd"), QStringLiteral("watch-active"));
+        QByteArray line = QJsonDocument(watch).toJson(QJsonDocument::Compact);
         line.append('\n');
-        socket->write(line);
-        socket->flush();
+        pinSocket_->write(line);
+        pinSocket_->flush();
+        flushPinMove();
     });
-    QObject::connect(socket, &QLocalSocket::readyRead, socket,
-                     [this, socket, ownsSocket] {
-                         if (ownsSocket()) {
-                             consumePinReply(socket);
-                         }
-                     });
-    // A refused or dropped connection is not fatal: the editor keeps working,
-    // it just cannot move the live pin. A later move retries from scratch.
+    QObject::connect(socket, &QLocalSocket::readyRead, socket, [this] { readPinReplies(); });
+    const auto lost = [this] { dropPinSocket(); };
     QObject::connect(socket, &QLocalSocket::errorOccurred, socket,
-                     [this, socket, ownsSocket](QLocalSocket::LocalSocketError) {
-                         if (ownsSocket()) {
-                             consumePinReply(socket);
-                         }
-                     });
-    // The daemon closes the connection right after replying, so the reply must
-    // be drained here too.
-    QObject::connect(socket, &QLocalSocket::disconnected, socket,
-                     [this, socket, ownsSocket] {
-                         if (ownsSocket()) {
-                             consumePinReply(socket);
-                         }
-                     });
+                     [lost](QLocalSocket::LocalSocketError) { lost(); });
+    QObject::connect(socket, &QLocalSocket::disconnected, socket, lost);
     socket->connectToServer(pinSocketPath_);
 }
 
-// Drains the daemon's answer, applies it and retires this request's socket.
-// Called from every terminal signal; the owner check upstream makes repeats
-// harmless.
-void OverlayController::consumePinReply(QLocalSocket *socket)
+void OverlayController::dropPinSocket()
 {
-    pinReplyBuffer_ += socket->readAll();
-    const qsizetype newline = pinReplyBuffer_.indexOf('\n');
-    QByteArray line;
-    if (newline >= 0) {
-        line = pinReplyBuffer_.left(newline);
+    if (pinSocket_ != nullptr) {
+        // Cleared before deleteLater() so a repeated signal finds nothing to do.
+        pinSocket_->deleteLater();
+        pinSocket_ = nullptr;
     }
     pinReplyBuffer_.clear();
-    // Cleared before deleteLater() so the guard in every handler above stops
-    // this socket from being treated as the live one while it is queued away.
-    pinSocket_ = nullptr;
-    socket->deleteLater();
-    if (!line.isEmpty()) {
-        applyPinReply(line);
+    pinMovesInFlight_ = 0;
+}
+
+// Drains every answer the daemon has sent.  One move is one reply, so each line
+// retires one in-flight position and frees a slot for the newest one.
+void OverlayController::readPinReplies()
+{
+    if (pinSocket_ == nullptr) {
+        return;
+    }
+    pinReplyBuffer_ += pinSocket_->readAll();
+    qsizetype newline = -1;
+    while ((newline = pinReplyBuffer_.indexOf('\n')) >= 0) {
+        const QByteArray line = pinReplyBuffer_.left(newline);
+        pinReplyBuffer_.remove(0, newline + 1);
+        // Only a move's own answer retires a move.  The daemon also says which
+        // pin is the live one, on this same connection and at any time, and
+        // counting that as a reply would free a slot the daemon has not
+        // answered yet and let the queue grow past the bound that keeps the
+        // marks from running ahead of the image.
+        const QJsonObject reply = QJsonDocument::fromJson(line).object();
+        const bool isMoveReply = reply.contains(QStringLiteral("ok"));
+        if (isMoveReply && pinMovesInFlight_ > 0) {
+            --pinMovesInFlight_;
+        }
+        if (pinDebug_ && isMoveReply) {
+            std::fprintf(stderr, "vshot-qt-ui: pin move round trip %lld ms\n",
+                         static_cast<long long>(pinMoveClock_.elapsed()));
+            pinMoveClock_.restart();
+        }
+        if (!line.isEmpty()) {
+            applyPinReply(line);
+        }
     }
     flushPinMove();
 }
@@ -6900,7 +8210,19 @@ void OverlayController::applyPinReply(QByteArray line)
 {
     const QJsonDocument document = QJsonDocument::fromJson(line);
     const QJsonObject reply = document.object();
-    if (!reply.value(QStringLiteral("ok")).toBool()) {
+    // Not every line on this socket is a move's answer: the daemon also says
+    // which pin is the live one, on the same connection and at any time, so the
+    // frame can follow the user's attention rather than a drag.  A line with no
+    // `ok` is not a move's reply at all and must not retire one of the moves in
+    // flight -- reading it as a refusal would free a slot the daemon has not
+    // answered yet and let the queue grow past its bound.
+    if (!reply.contains(QStringLiteral("ok"))) {
+        const QJsonValue active = reply.value(QStringLiteral("active"));
+        if (active.isDouble()) {
+            notePinActive(active.toVariant().toULongLong());
+        }
+        return;
+    }    if (!reply.value(QStringLiteral("ok")).toBool()) {
         // The daemon refused (pin gone, bad request): keep editing locally.
         return;
     }
@@ -6914,25 +8236,49 @@ void OverlayController::applyPinReply(QByteArray line)
     }
 }
 
-// Adopts the rect the daemon clamped the pin to. The pin stays the same size,
-// so only a positional correction can come back; the marks were already moved
-// to the requested spot, so they get the same correction.
+// The daemon confirmed where it placed the pin.  Marks are anchored to
+// marksOrigin_ (the previous confirmed position); translate them by the delta
+// from there to the new confirmed position, then update both marksOrigin_ and
+// selection_ so the next confirmation is computed correctly.
 void OverlayController::applyPinRect(const LogicalRect &rect)
 {
-    if (!selection_.has_value()) {
+    if (!marksOrigin_.has_value()) {
         return;
     }
-    const std::int32_t dx = rect.x - selection_->x;
-    const std::int32_t dy = rect.y - selection_->y;
+    const LogicalRect previous = *marksOrigin_;
+    const std::int32_t dx = rect.x - previous.x;
+    const std::int32_t dy = rect.y - previous.y;
+    marksOrigin_ = LogicalRect{rect.x, rect.y, previous.width, previous.height};
+    // Keep the session's own record of where the image is in step with the
+    // confirmation.  Region capture pins that rect to the output, but here it
+    // describes the image, and it is what the mosaic samples its blocks through
+    // -- left behind, a mosaic drawn on a dragged pin would average the wrong
+    // part of the picture.
+    for (OutputSession &output : session_.outputs) {
+        output.geometry.x = rect.x;
+        output.geometry.y = rect.y;
+    }
+    // Keep the optimistic selection in step with the latest confirmed position
+    // so that the next drag's incremental delta is computed from here.
+    selection_ = *marksOrigin_;
     if (dx == 0 && dy == 0) {
         return;
     }
-    selection_ = LogicalRect{rect.x, rect.y, selection_->width, selection_->height};
     translateAnnotations(dx, dy);
-    updateAll();
+    // Only the image's old and new rects can hold pixels that changed: marks are
+    // clipped to the image, so the union of the two covers every one of them.
+    // A full repaint here was a whole output's worth of work on every motion
+    // event's confirmation.
+    invalidateLogicalRegion(uniteLogical(previous, *marksOrigin_));
+    // The input region follows the image, or the editor would take clicks on
+    // the band it just left and pass through clicks on the band it just took.
+    scheduleInputMask();
+    if (toolbar_ != nullptr && toolbar_->isVisible()) {
+        updateToolbarGeometry();
+    }
 }
 
-void OverlayController::chooseTool(Tool tool)
+void OverlayController::chooseTool(std::optional<Tool> tool)
 {
     // Any tool change invalidates the recognized layer: the marks are about to
     // be drawn over the text, and the pointer is no longer selecting it.
@@ -6954,21 +8300,34 @@ void OverlayController::chooseTool(Tool tool)
     if (tool == Tool::Picker && tool_ != Tool::Picker) {
         // The colour a pick takes has to land somewhere visible, and the picker
         // has no style of its own to hold it: it goes to the tool that was
-        // armed, which is the one the user is about to draw with.  Armed from
-        // Select -- a tool that draws nothing -- the pick goes to the pen
-        // instead, whose colour is the session's own ink.
-        pickerReturnTool_ = tool_ == Tool::Select ? Tool::Pen : tool_;
+        // armed, which is the one the user is about to draw with.  With nothing
+        // armed there is no such tool -- a session starts that way, and an
+        // unarmed session is what the old Select tool became -- so the pick goes
+        // to the pen instead, whose colour is the session's own ink.
+        pickerReturnTool_ = tool_.has_value() ? *tool_ : Tool::Pen;
     }
     tool_ = tool;
-    // Keep the annotation selection when moving to Select so a freshly drawn
-    // annotation can be adjusted right away; drawing tools start fresh.
-    if (tool != Tool::Select) {
+    // The mark selection belongs to the state the marks are adjusted in, and
+    // that state is the one with nothing armed: a mark stays picked up while
+    // the user changes the colour or the width, and arming a drawing tool lets
+    // it go -- the white outline and its handles would otherwise sit under the
+    // ink about to be laid down, and be read as part of it.
+    if (tool.has_value()) {
         selectedAnnotation_ = -1;
     }
     for (CaptureOverlay *overlay : overlays_) {
         overlay->setCursor(Qt::CrossCursor);
     }
     updateAll();
+}
+
+void OverlayController::toggleTool(Tool tool)
+{
+    // The button of the tool already armed disarms it, which is how the user
+    // gets back to the state a fresh capture starts in: nothing drawing, the
+    // selection and the marks the only things a press can act on.
+    chooseTool(tool_.has_value() && *tool_ == tool ? std::nullopt
+                                                   : std::optional<Tool>(tool));
 }
 
 void OverlayController::setCurrentColor(const QColor &color)
@@ -7235,6 +8594,7 @@ void OverlayController::setNumberStyle(NumberStyle style)
 void OverlayController::notifyPanelDragged()
 {
     panelPinned_ = true;
+    scheduleInputMask();
 }
 
 bool OverlayController::pasteImage(const QImage &image, const QString &source)
@@ -7278,8 +8638,9 @@ bool OverlayController::pasteImage(const QImage &image, const QString &source)
     next.push_back(annotation);
     mutateAnnotations(next);
     // Selected, so the handles are up and the image can be moved or resized
-    // without a trip through the toolbar.
-    chooseTool(Tool::Select);
+    // without a trip through the toolbar, and nothing armed so the next drag
+    // adjusts it instead of inking over it.
+    chooseTool(std::nullopt);
     selectAnnotation(next.size() - 1);
     return true;
 }
@@ -7663,8 +9024,8 @@ bool OverlayController::translateSelection(QString *error)
                           static_cast<std::uint32_t>(bottom - top)};
     }
     annotation.rect = box;
-    // One annotation, so the whole translation undoes in one step and rides the
-    // existing commit path as a single bitmap.
+    // One annotation, so the whole translation undoes in one step and goes out
+    // through the renderer as a single mark.
     QVector<Annotation> next = annotations_;
     next.push_back(annotation);
     mutateAnnotations(std::move(next));
@@ -7889,7 +9250,7 @@ bool OverlayController::acceptTranslation(QString *error)
     // through the same painter the preview uses, so the file matches the screen.
     QImage composite =
         output.image.copy(source).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+    const double scale = outputScale(output);
     {
         QPainter painter(&composite);
         painter.setRenderHint(QPainter::Antialiasing, true);
@@ -8156,10 +9517,15 @@ QString OverlayController::styleTargetTool() const
     // the tool it was armed from.  Pointing the style row at that tool is what
     // makes the pick land there -- every setter on the row goes through this --
     // and it puts the colour a pick would replace on screen before the click.
-    if (tool_ == Tool::Picker) {
+    if (tool_.has_value() && *tool_ == Tool::Picker) {
         return toolName(pickerReturnTool_);
     }
-    return toolName(tool_);
+    // Nothing selected and nothing armed: there is no tool to edit, and the
+    // row goes away rather than showing one the user has not chosen -- the
+    // empty name matches no tool's controls, which is exactly what "no tool"
+    // means here.  The styles the tools carry are kept either way, so arming
+    // one brings its own back.
+    return tool_.has_value() ? toolName(*tool_) : QString();
 }
 
 ToolStyle &OverlayController::toolStyle(const QString &tool)
@@ -8182,6 +9548,32 @@ const ToolStyle &OverlayController::toolStyle(const QString &tool) const
 void OverlayController::applyStyleToSelected(
     const std::function<void(Annotation &)> &mutate)
 {
+    if (allSelected_ && !annotations_.isEmpty()) {
+        // Ctrl+A picked every mark up, so a style change is a change to all of
+        // them.  A mark the change does not touch (a font on a stroke) is left
+        // exactly as it was, so this cannot count as an edit on its own.
+        QVector<Annotation> next = annotations_;
+        bool changed = false;
+        for (int index = 0; index < next.size(); ++index) {
+            mutate(next[index]);
+            if (!annotationEquals(next.at(index), annotations_.at(index))) {
+                changed = true;
+            }
+        }
+        if (!changed) {
+            return;
+        }
+        if (styleAdjustmentActive_) {
+            annotations_ = std::move(next);
+            styleAdjustmentChanged_ = true;
+            updateAll();
+            return;
+        }
+        const bool everyMark = allSelected_;
+        mutateAnnotations(std::move(next));
+        allSelected_ = everyMark; // the style change is not a new selection
+        return;
+    }
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
     }
@@ -8414,14 +9806,154 @@ int OverlayController::annotationHandleAt(Point point) const
     return 0;
 }
 
+int OverlayController::annotationBorderAt(Point point) const
+{
+    return selectedAnnotation_ >= 0 ? annotationBorderOf(selectedAnnotation_, point) : 0;
+}
+
+int OverlayController::markUnderPointer() const
+{
+    // Only where a press would actually pick the mark up, so the frame is a
+    // promise the press keeps.  The rim counts on its own -- a press there
+    // picks the mark up with nothing held and nothing armed -- and the body
+    // counts under the pick-up modifier, which is the state this frame exists
+    // to show.
+    if (gesture_->type != Gesture::Type::None) {
+        return -1;
+    }
+    const int hit = annotationHitAt(pointer_);
+    if (hit < 0) {
+        return -1;
+    }
+    if (annotationBorderOf(hit, pointer_) != 0) {
+        return hit;
+    }
+    return pickingMarks(lastModifiers_) ? hit : -1;
+}
+
+void OverlayController::refreshMarkHover()
+{
+    const int hovered = markUnderPointer();
+    // While the pick-up modifier is held, the mark under the pointer is the one
+    // a press would take, so it is also the one the editor treats as selected:
+    // its outline and handles come up, and the pointer travelling across marks
+    // moves the focus with it.  Without this the modifier only ever *framed* the
+    // mark -- `selectedAnnotation_` was written by the press alone -- so holding
+    // it over a mark showed a frame with no handles, and holding it while moving
+    // onto a mark could never make that mark active at all.
+    //
+    // Only the pointer landing on a mark selects one: travelling off a mark
+    // leaves the last one selected, so a frame the user has taken hold of does
+    // not slip away the moment the pointer grazes its edge.
+    //
+    // The selection is set here rather than through `selectAnnotation`, which
+    // ends in `updateAll`: a full repaint on every motion event is the repaint
+    // storm the rect tracking below exists to avoid, and it would also clear
+    // `markHovered_`, so the very frame this is deciding would be forgotten
+    // before it could be drawn.  The two marks that changed -- the one losing
+    // the selection and the one taking it -- are added to the repainted region
+    // instead, in the same pass that already covers the hover frame.
+    const int previousSelection = selectedAnnotation_;
+    const bool selectionMoves =
+        pickingMarks(lastModifiers_) && hovered >= 0 && hovered != selectedAnnotation_;
+    if (selectionMoves) {
+        selectedAnnotation_ = hovered;
+        nudgeBase_.reset();
+        allSelected_ = false;
+    }
+    if (hovered == markHovered_ && !selectionMoves) {
+        return;
+    }
+    const int previous = markHovered_;
+    markHovered_ = hovered;
+    LogicalRect touched;
+    bool any = false;
+    for (int index : {previous, hovered, previousSelection, selectedAnnotation_}) {
+        LogicalRect bounds;
+        if (index >= 0 && index < annotations_.size()
+            && annotationBounds(annotations_.at(index), &bounds)) {
+            const LogicalRect grown =
+                growBy(bounds, annotationReach(annotations_.at(index)) + kSelectionChrome);
+            touched = any ? uniteLogical(touched, grown) : grown;
+            any = true;
+        }
+    }
+    if (any) {
+        updateTouch(touched);
+    }
+}
+
+int OverlayController::annotationBorderOf(int index, Point point) const
+{
+    if (index < 0 || index >= annotations_.size()) {
+        return 0;
+    }
+    const Annotation &annotation = annotations_.at(index);
+    if (annotation.kind == Annotation::Kind::Text) {
+        return 0; // text annotations move but never resize
+    }
+    LogicalRect bounds;
+    if (!annotationBounds(annotation, &bounds)) {
+        return 0;
+    }
+    // The mark's outline as a rectangle in the mark's own frame: the bounds a
+    // handle drags, which is the same box the selection chrome draws.
+    const std::int64_t left = bounds.x;
+    const std::int64_t top = bounds.y;
+    const std::int64_t rightEdge = bounds.right() - 1;
+    const std::int64_t bottomEdge = bounds.bottom() - 1;
+    const std::int64_t right = bounds.right();
+    const std::int64_t bottom = bounds.bottom();
+    const auto close = [](std::int64_t value, std::int64_t edge) {
+        return std::abs(value - edge) <= kBorderGrab;
+    };
+    const bool nearLeft = close(point.x, left);
+    const bool nearRight = close(point.x, rightEdge);
+    const bool nearTop = close(point.y, top);
+    const bool nearBottom = close(point.y, bottomEdge);
+    const bool betweenX = point.x >= left && point.x < right;
+    const bool betweenY = point.y >= top && point.y < bottom;
+    if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
+        // A corner, which stretches both ways at once.  Which diagonal it is
+        // depends on the two edges together, not on which side of the mark the
+        // pointer came from.
+        return nearLeft == nearTop ? 1 : 3;
+    }
+    if (nearTop && betweenX) {
+        return 2; // the top edge stretches vertically
+    }
+    if (nearBottom && betweenX) {
+        return 6;
+    }
+    if (nearLeft && betweenY) {
+        return 8; // the left edge stretches horizontally
+    }
+    if (nearRight && betweenY) {
+        return 4;
+    }
+    return 0;
+}
+
 void OverlayController::selectAnnotation(int index)
 {
     selectedAnnotation_ = index >= 0 && index < annotations_.size() ? index : -1;
+    // Any explicit selection ends the nudge run and the all-marks selection:
+    // they are the state of the keyboard's own walk, and this is the user
+    // pointing at one mark instead.
+    nudgeBase_.reset();
+    allSelected_ = false;
     updateAll();
 }
 
 void OverlayController::deleteSelectedAnnotation()
 {
+    if (allSelected_ && !annotations_.isEmpty()) {
+        // Ctrl+A picked every mark up; the delete key takes all of them, which
+        // is the one way to clear a canvas without picking them off one by one.
+        selectAnnotation(-1);
+        mutateAnnotations(QVector<Annotation>());
+        return;
+    }
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
     }
@@ -8431,7 +9963,7 @@ void OverlayController::deleteSelectedAnnotation()
     mutateAnnotations(std::move(next));
 }
 
-void OverlayController::beginAnnotationDrag(Point point, bool resize)
+void OverlayController::beginAnnotationDrag(Point point, bool resize, bool preserveAspect)
 {
     if (selectedAnnotation_ < 0 || selectedAnnotation_ >= annotations_.size()) {
         return;
@@ -8441,6 +9973,7 @@ void OverlayController::beginAnnotationDrag(Point point, bool resize)
     gesture_->anchor = point;
     gesture_->current = point;
     gesture_->handle = resize ? annotationHandleAt(point) : 0;
+    gesture_->preserveAspect = preserveAspect;
     dragAnnotation_ = annotations_.at(selectedAnnotation_);
     dragSnapshot_ = annotations_;
     dragMoved_ = false;
@@ -8471,7 +10004,8 @@ void OverlayController::updateAnnotationDrag(Point point)
         if (!annotationBounds(dragAnnotation_, &originalBounds)) {
             return;
         }
-        const LogicalRect newBounds = resizeSelection(originalBounds, gesture_->handle, current);
+        const LogicalRect newBounds = resizeSelection(originalBounds, gesture_->handle, current,
+                                                      gesture_->preserveAspect);
         annotations_[selectedAnnotation_] = scaledAnnotation(dragAnnotation_, newBounds);
     }
 }
@@ -8642,9 +10176,44 @@ void OverlayController::beginPinEdit()
     // the toolbar can sit beside the image like a region-capture toolbar.
     selection_ = LogicalRect{session_.bounds.x, session_.bounds.y, session_.bounds.width,
                              session_.bounds.height};
+    // The marks origin starts at the same place: the image is where the
+    // session placed it, and the FP16 surface is already showing it there.
+    marksOrigin_ = *selection_;
+    // The marks the last edit committed, put back so they can be edited again
+    // rather than merely seen.  They are read against the canvas the session
+    // says they were made on, which for a pin is the image's own rect: the pin
+    // may have been dragged since, and a mark placed against the screen would
+    // then land somewhere the user never drew it.
+    if (!session_.annotations.isEmpty()) {
+        const std::uint32_t ratio = static_cast<std::uint32_t>(
+            std::max(1.0, outputScale(session_.outputs.value(0))));
+        QString markError;
+        if (!parseMarks(session_.annotations, *selection_, ratio, &markError)) {
+            // The session named marks the editor cannot place.  Reporting it is
+            // the whole point of parsing strictly -- an editor that opened with
+            // some of the user's marks silently missing would be worse -- and
+            // the pin is still shown, so the failure is a message rather than a
+            // refusal to open.
+            const QString message = uiTr("The pin's marks could not be restored: %1").arg(markError);
+            if (textResultCallback_) {
+                textResultCallback_(TextOutcome::Failed, message);
+            }
+            qWarning("%s", qUtf8Printable(message));
+        } else {
+            // Restoring the marks is the state the user left the pin in, so it
+            // is where undo stops rather than a step that can be undone away.
+            undoStack_.clear();
+            redoStack_.clear();
+        }
+    }
     editing_ = true;
     toolbarOutput_ = 0;
     showToolbar();
+    // The surface covers the whole output so the toolbar has room beside the
+    // image; only the image, its border and the toolbar itself should take
+    // pointer input, or every click on the rest of the screen would land on the
+    // editor instead of on the desktop behind it.
+    scheduleInputMask();
 }
 
 void OverlayController::beginPinEditText()
@@ -8749,6 +10318,16 @@ void OverlayController::terminal(bool cancelled)
     // starting point.
     hideToolbar();
     removeTextEditor();
+    // A session that rendered a capture is still showing it, and the caller
+    // does not have those pixels yet.  Stopping now would take the picture off
+    // the screen before the caller's own copy of it is up -- for a pin, before
+    // the pin exists at all -- which the user sees as the marks blinking out.
+    // So the surface stays, showing the same picture, until the handoff above
+    // says the caller is done with it.
+    if (!cancelled && rendersCapture()) {
+        beginHandoff();
+        return;
+    }
     if (terminalCallback_) {
         terminalCallback_();
     }
@@ -8789,8 +10368,7 @@ int OverlayController::liveStrokeBakes() const
     return liveStrokeBakes_;
 }
 
-QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
-                                                QString *error) const
+QJsonDocument OverlayController::resultDocument(QString *error) const
 {
     QJsonObject root;
     if (cancelled_) {
@@ -8834,301 +10412,50 @@ QJsonDocument OverlayController::resultDocument(const QString &bitmapDirectory,
         root.insert(QStringLiteral("image_path"), resultImagePath_);
     }
 
-    QJsonArray outputAnnotations;
-    for (const Annotation &annotation : annotations_) {
-        QJsonObject value;
-        if (annotation.kind == Annotation::Kind::Image) {
-            // The pixels travel as a raw RGBA8888 file beside the session JSON,
-            // exactly like a text label's bitmap: the protocol carries paths,
-            // not megabytes of base64.
-            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
-            value.insert(QStringLiteral("tool"), QStringLiteral("image"));
-            QJsonObject rect;
-            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
-            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
-            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
-            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
-            value.insert(QStringLiteral("rect"), rect);
-            if (bitmapDirectory.isEmpty() || annotation.pixels.isNull()) {
-                // No directory to write into: the annotation cannot be handed
-                // over, so it is dropped rather than reported as a mark the
-                // renderer would then fail to find.
-                continue;
-            }
-            // Rasterize at the size the image occupies on the canvas, in scene
-            // device pixels -- the same contract a text bitmap is written
-            // under. The source is usually a different size entirely (a photo
-            // pasted small, or a screenshot pasted smaller than its pixels),
-            // and rendering it here means the file is bounded by the canvas
-            // rather than by the source, and that what travels is exactly what
-            // the preview showed.
-            const int scale = sceneScale();
-            const int width = static_cast<int>(annotation.rect.width) * scale;
-            const int height = static_cast<int>(annotation.rect.height) * scale;
-            if (width <= 0 || height <= 0
-                || static_cast<qint64>(width) * static_cast<qint64>(height) > 16LL * 1024 * 1024) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("pasted image is too large to render (%1x%2)")
-                                 .arg(width)
-                                 .arg(height);
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            const QImage pixels = annotation.pixels
-                                      .scaled(width, height, Qt::IgnoreAspectRatio,
-                                              Qt::SmoothTransformation)
-                                      .convertToFormat(QImage::Format_RGBA8888);
-            if (pixels.isNull()) {
-                continue;
-            }
-            const QString path = QStringLiteral("%1/image-%2.rgba")
-                                     .arg(bitmapDirectory)
-                                     .arg(imageBitmapIndex_++);
-            QFile file(path);
-            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
-                || file.write(reinterpret_cast<const char *>(pixels.constBits()),
-                              static_cast<qint64>(pixels.sizeInBytes()))
-                    != static_cast<qint64>(pixels.sizeInBytes())) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("cannot write pasted image `%1`: %2")
-                                 .arg(path, file.errorString());
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            value.insert(QStringLiteral("bitmap_width"), static_cast<qint64>(pixels.width()));
-            value.insert(QStringLiteral("bitmap_height"), static_cast<qint64>(pixels.height()));
-            value.insert(QStringLiteral("bitmap"), path);
-        } else if (annotation.kind == Annotation::Kind::Shape) {
-            value.insert(QStringLiteral("kind"), QStringLiteral("shape"));
-            value.insert(QStringLiteral("tool"), annotation.tool);
-            value.insert(QStringLiteral("color"), colorText(annotation.color));
-            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
-            value.insert(QStringLiteral("dash"), annotation.dash);
-            if (annotation.tool == QStringLiteral("mosaic")) {
-                value.insert(QStringLiteral("mask"), annotation.mask);
-                value.insert(QStringLiteral("strength"),
-                             static_cast<qint64>(annotation.strength));
-            }
-            QJsonObject rect;
-            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
-            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
-            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
-            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
-            value.insert(QStringLiteral("rect"), rect);
-        } else if (annotation.kind == Annotation::Kind::Stroke) {
-            value.insert(QStringLiteral("kind"), QStringLiteral("stroke"));
-            value.insert(QStringLiteral("tool"), annotation.tool);
-            value.insert(QStringLiteral("color"), colorText(annotation.color));
-            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
-            value.insert(QStringLiteral("dash"), annotation.dash);
-            if (annotation.tool == QStringLiteral("arrow")) {
-                value.insert(QStringLiteral("size"), static_cast<qint64>(annotation.size));
-                value.insert(QStringLiteral("arrow_style"), annotation.arrowStyle);
-            }
-            if (annotation.tool == QStringLiteral("mosaic")) {
-                value.insert(QStringLiteral("strength"),
-                             static_cast<qint64>(annotation.strength));
-            }
-            if (annotation.tool == QStringLiteral("wave")) {
-                // The wave's own crest offset and period, in logical pixels.  A
-                // wave the user never tuned carries zeroes, which tells the
-                // renderer to derive both from the width exactly as the editor
-                // does -- so an untouched wave keeps the shape it always had.
-                value.insert(QStringLiteral("amplitude"),
-                             static_cast<qint64>(annotation.amplitude));
-                value.insert(QStringLiteral("wavelength"),
-                             static_cast<qint64>(annotation.wavelength));
-            }
-            if (annotation.tool == QStringLiteral("bezier")) {
-                // The pen path's closure and how it is painted: the two fields
-                // that make the ends of the protocol agree.  Only a bezier
-                // carries them, the same way only an arrow carries `size`.
-                value.insert(QStringLiteral("closed"), annotation.closed);
-                value.insert(QStringLiteral("fill"), annotation.fill);
-            }
-            QJsonArray points;
-            for (const Point &point : annotation.points) {
-                QJsonObject item;
-                item.insert(QStringLiteral("x"), static_cast<qint64>(point.x));
-                item.insert(QStringLiteral("y"), static_cast<qint64>(point.y));
-                points.push_back(item);
-            }
-            value.insert(QStringLiteral("points"), points);
-        } else if (annotation.kind == Annotation::Kind::Translation) {
-            // The translation travels as an image, exactly the way a pasted
-            // image does: its own kind never reaches the renderer, which only
-            // ever has to blit the bitmap the helper drew.  That is what keeps
-            // the final PNG the same pixels the preview showed -- both come
-            // from the placed lines the annotation carries.
-            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
-            value.insert(QStringLiteral("tool"), QStringLiteral("translate"));
-            QJsonObject rect;
-            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x));
-            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y));
-            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
-            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
-            value.insert(QStringLiteral("rect"), rect);
-            if (bitmapDirectory.isEmpty() || annotation.translation.isEmpty()) {
-                continue;
-            }
-            const int scale = sceneScale();
-            const int width = static_cast<int>(annotation.rect.width) * scale;
-            const int height = static_cast<int>(annotation.rect.height) * scale;
-            if (width <= 0 || height <= 0
-                || static_cast<qint64>(width) * static_cast<qint64>(height) > 16LL * 1024 * 1024) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("the translation is too large to render (%1x%2)")
-                                 .arg(width)
-                                 .arg(height);
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            QImage bitmap(width, height, QImage::Format_RGBA8888);
-            if (bitmap.isNull()) {
-                continue;
-            }
-            bitmap.fill(Qt::transparent);
-            {
-                QPainter bitmapPainter(&bitmap);
-                bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
-                bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
-                paintTranslation(
-                    bitmapPainter, annotation.translation,
-                    [&](const TranslatedLine &line) {
-                        return QRectF((line.fill.x - annotation.rect.x) * scale,
-                                      (line.fill.y - annotation.rect.y) * scale,
-                                      line.fill.width * scale, line.fill.height * scale);
-                    },
-                    scale);
-            }
-            const QString path = QStringLiteral("%1/image-%2.rgba")
-                                     .arg(bitmapDirectory)
-                                     .arg(imageBitmapIndex_++);
-            QFile file(path);
-            if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)
-                || file.write(reinterpret_cast<const char *>(bitmap.constBits()),
-                              static_cast<qint64>(bitmap.sizeInBytes()))
-                    != static_cast<qint64>(bitmap.sizeInBytes())) {
-                if (error != nullptr) {
-                    *error = QStringLiteral("cannot write translation bitmap `%1`: %2")
-                                 .arg(path, file.errorString());
-                    return QJsonDocument();
-                }
-                continue;
-            }
-            value.insert(QStringLiteral("bitmap_width"), static_cast<qint64>(width));
-            value.insert(QStringLiteral("bitmap_height"), static_cast<qint64>(height));
-            value.insert(QStringLiteral("bitmap"), path);
-        } else {
-            const bool number = isNumberAnnotation(annotation);
-            value.insert(QStringLiteral("kind"), QStringLiteral("text"));
-            if (number) {
-                // The number tool rides the text annotation, and the one extra
-                // name is what tells the two apart on the way out.  The renderer
-                // does not read it -- it composites the bitmap like any other
-                // text annotation -- which is why the Rust side needs no change
-                // at all to carry a numbered badge.
-                value.insert(QStringLiteral("tool"), QStringLiteral("number"));
-            }
-            QJsonObject origin;
-            origin.insert(QStringLiteral("x"), static_cast<qint64>(annotation.origin.x));
-            origin.insert(QStringLiteral("y"), static_cast<qint64>(annotation.origin.y));
-            value.insert(QStringLiteral("origin"), origin);
-            value.insert(QStringLiteral("text"),
-                         number ? QString::number(annotation.number) : annotation.text);
-            // The protocol still carries the legacy integer glyph multiple;
-            // it is derived from the pixel size here and nowhere else.  A
-            // helper that ships a bitmap below renders the exact size, so this
-            // only ever reaches the Rust fallback font.
-            value.insert(QStringLiteral("scale"), static_cast<qint64>(textPixelsToScale(
-                                                     static_cast<int>(annotation.textPixels))));
-            value.insert(QStringLiteral("color"), colorText(annotation.color));
-            if (!annotation.font.isEmpty()) {
-                value.insert(QStringLiteral("font"), annotation.font);
-            }
-            // Rasterize the label -- or the badge -- so the final PNG matches
-            // what the user saw. The bitmap is rendered in scene device pixels
-            // (the highest output scale), matching how Rust composites it onto
-            // the cropped frame; the renderer is handed that same density, so
-            // the composite is a straight blit at 1:1 rather than a resample.
-            if (!bitmapDirectory.isEmpty()) {
-                const int scale = sceneScale();
-                // A label's box comes from its glyphs; a badge's is the box it
-                // was placed with, which is also where its ink is drawn.
-                const QSize logical =
-                    number ? QSize(static_cast<int>(annotation.rect.width),
-                                   static_cast<int>(annotation.rect.height))
-                           : textMetrics(annotation);
-                const int width = logical.width() * scale;
-                const int height = logical.height() * scale;
-                if (width > 0 && height > 0 &&
-                    static_cast<qint64>(width) * static_cast<qint64>(height) <=
-                        16LL * 1024 * 1024) {
-                    QImage bitmap(width, height, QImage::Format_RGBA8888);
-                    if (!bitmap.isNull()) {
-                        bitmap.fill(Qt::transparent);
-                        QPainter bitmapPainter(&bitmap);
-                        bitmapPainter.setRenderHint(QPainter::Antialiasing, true);
-                        bitmapPainter.setRenderHint(QPainter::TextAntialiasing, true);
-                        if (number) {
-                            // The badge is drawn at the scene's density, into
-                            // the whole bitmap: its top-left is the annotation's
-                            // own origin, which is exactly where the renderer
-                            // blits the file.
-                            bitmapPainter.scale(scale, scale);
-                            paintNumberBadge(bitmapPainter,
-                                             QRectF(0, 0, logical.width(), logical.height()),
-                                             QString::number(annotation.number),
-                                             annotation.numberStyle, annotation.color);
-                        } else {
-                            QFont font = textFont(
-                                annotation.font,
-                                std::max(1, static_cast<int>(annotation.textPixels) * scale));
-                            bitmapPainter.setFont(font);
-                            bitmapPainter.setPen(annotation.color);
-                            const QStringList lines = annotation.text.split(QLatin1Char('\n'));
-                            const QFontMetrics metrics(font);
-                            qreal y = 0.0;
-                            for (const QString &line : lines) {
-                                bitmapPainter.drawText(QRectF(0, y, width, metrics.height()),
-                                                       Qt::AlignLeft | Qt::AlignTop, line);
-                                y += metrics.lineSpacing();
-                            }
-                        }
-                        bitmapPainter.end();
-                        const QString path = QStringLiteral("%1/text-%2.rgba")
-                                                 .arg(bitmapDirectory)
-                                                 .arg(textBitmapIndex_++);
-                        QFile file(path);
-                        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate) &&
-                            file.write(reinterpret_cast<const char *>(bitmap.constBits()),
-                                       static_cast<qint64>(bitmap.sizeInBytes())) ==
-                                static_cast<qint64>(bitmap.sizeInBytes())) {
-                            value.insert(QStringLiteral("bitmap_width"),
-                                         static_cast<qint64>(width));
-                            value.insert(QStringLiteral("bitmap_height"),
-                                         static_cast<qint64>(height));
-                            value.insert(QStringLiteral("bitmap"), path);
-                        } else if (error != nullptr) {
-                            *error = QStringLiteral("cannot write text bitmap `%1`: %2")
-                                         .arg(path, file.errorString());
-                            return QJsonDocument();
-                        }
-                    } else if (error != nullptr) {
-                        *error = QStringLiteral("cannot allocate %1x%2 text bitmap")
-                                     .arg(width)
-                                     .arg(height);
-                        return QJsonDocument();
+    // The same marks as data, for a caller that wants to reopen this image for
+    // editing rather than only keep the flattened result.  They are relative to
+    // the selection, which is the canvas a re-edit hands back: the pin editor
+    // gets the pristine pixels and these marks together, and draws them where
+    // they were.
+    //
+    // Written through `writeMarkAssets`, not `marksDocument`: a pasted image is
+    // its pixels, and a pin-edit session is the one caller that can put them
+    // somewhere the daemon will still be able to read after this process is
+    // gone.  Every other caller has nowhere to write and gets the document
+    // without the marks that have no other form, exactly as before.
+    root.insert(QStringLiteral("marks"), writeMarkAssets(markAssetDirectory_));
+    // The rendered capture goes back over the pixel channel rather than in the
+    // JSON: it is the size of the selection, not of a label.  Qt is the only
+    // renderer, so these images *are* the result -- the CLI takes them instead
+    // of rasterizing the marks again, which is what used to put a committed mark
+    // half a pixel away from the preview it was drawn from.
+    //
+    // Two of them, and the order is the protocol: the marks alone first, then
+    // the flattened capture.  The CLI needs the layer for the HDR half, which an
+    // opaque image cannot mark, and reading them in a fixed order is what lets
+    // it take them without a second header field to tell them apart.
+    if (pixelChannelAvailable()) {
+        QImage composite;
+        QImage marks;
+        QString compositeError;
+        if (produceComposite(&composite, &marks, &compositeError)) {
+            for (const QImage &image : {marks, composite}) {
+                QString sendError;
+                if (!sendPixelImage(kPixelKindResult, image, &sendError)) {
+                    if (error != nullptr) {
+                        *error = sendError;
                     }
+                    return QJsonDocument();
                 }
             }
+            root.insert(QStringLiteral("composite"), true);
+        } else if (!compositeError.isEmpty()) {
+            if (error != nullptr) {
+                *error = compositeError;
+            }
+            return QJsonDocument();
         }
-        outputAnnotations.push_back(value);
     }
-    root.insert(QStringLiteral("annotations"), outputAnnotations);
     return QJsonDocument(root);
 }
 
@@ -9232,6 +10559,35 @@ public:
         return total;
     }
 
+    // The identity of the pixels this mark would rasterize for `output`.  The
+    // cache compares it against what it already holds; a caller that is
+    // compositing several marks into one image uses it the same way, to tell
+    // whether anything it drew has changed.
+    QByteArray key(const Annotation &annotation, const OutputSession &output,
+                   const QSize &size) const
+    {
+        return signature(annotation, output, size);
+    }
+
+    // Draws the mark straight into `painter`, with no cache in the way.
+    //
+    // For a caller compositing marks into a raster of its own -- the magnifier
+    // -- the cache is not merely unnecessary but harmful: its slot would hold
+    // pixels built for this other size and this other frame, and the two would
+    // evict each other on every paint, rebuilding marks that had not changed.
+    // The pixels are the same ones `paint` would produce, drawn through the
+    // same `draw`, so the composite cannot drift from what is on the screen.
+    void drawInto(QPainter *painter, const Annotation &annotation, const OutputSession &output,
+                  const QSize &size) const
+    {
+        // The same hint `paint` gives its own raster, so the composite's marks
+        // are antialiased exactly as the screen's are.
+        const bool antialiased = painter->testRenderHint(QPainter::Antialiasing);
+        painter->setRenderHint(QPainter::Antialiasing, true);
+        draw(painter, annotation, output, size);
+        painter->setRenderHint(QPainter::Antialiasing, antialiased);
+    }
+
     // The device-pixel ratio the pixels were last built at, or 0 before the
     // first build.  Read through `Annotation::rasterDeviceRatio`.
     qreal builtAtRatio() const { return builtAtRatio_; }
@@ -9274,19 +10630,21 @@ protected:
 
     // The key prefix every kind shares: the output the pixels were rasterized
     // against and the surface size they were rasterized for.
+    //
+    // `output.geometry` is deliberately *not* here.  The mosaic and the mosaic
+    // brush sample the source image through it, so it does belong in their keys
+    // -- but in their own, as an offset from the mark, which is what actually
+    // decides which pixels they average.  Putting it here keyed every mark on
+    // where the frame happened to sit: `applyPinRect` rewrites `geometry` on
+    // every daemon confirmation, so dragging a pin invalidated and fully
+    // re-rasterized every mark on it, once per motion event.  A plain shape's
+    // pixels depend only on its own size and style, and a translation moves the
+    // mark and the geometry together, so the difference is what stays constant.
     static void writeContext(QDataStream &stream, const OutputSession &output, const QSize &size)
     {
         const LogicalRect &surface = surfaceOf(output);
-        // The mosaic and the mosaic brush average the source image, and both
-        // locate their samples through `geometry` rather than `surface`, so a
-        // raster of either is only valid for the frame and the geometry it was
-        // built from.  Neither changes within a session today, but leaving them
-        // out of the key would freeze such a mark on stale pixels the moment
-        // one does.
         stream << size.width() << size.height() << output.id << output.scale << surface.x
-               << surface.y << surface.width << surface.height << output.geometry.x
-               << output.geometry.y << output.geometry.width << output.geometry.height
-               << output.image.cacheKey();
+               << surface.y << surface.width << surface.height << output.image.cacheKey();
     }
 
 private:
@@ -9324,11 +10682,14 @@ protected:
         // A plain shape's pixels depend only on its size and style, so a pure
         // translation leaves the cached raster valid and the blit lands it at
         // the new place.  The area mosaic instead averages the source image at
-        // its absolute position, so a move changes every block it draws and its
-        // top-left has to stay part of the key.
+        // its absolute position, so a move changes every block it draws and
+        // where it sits has to stay part of the key.  It is keyed on the rect's
+        // offset *from the frame*, which is what the sampling reads: translating
+        // a mark and the frame together -- what dragging a pin does -- leaves
+        // the offset, and so the pixels, alone.
         if (annotation.tool == QStringLiteral("mosaic")) {
-            stream << static_cast<qint64>(annotation.rect.x)
-                   << static_cast<qint64>(annotation.rect.y);
+            stream << static_cast<qint64>(annotation.rect.x) - output.geometry.x
+                   << static_cast<qint64>(annotation.rect.y) - output.geometry.y;
         }
         stream << static_cast<quint64>(annotation.rect.width)
                << static_cast<quint64>(annotation.rect.height);
@@ -9348,11 +10709,11 @@ protected:
         const QRectF rect = localRect(output, annotation.rect, size);
         if (annotation.tool == QStringLiteral("ellipse")) {
             painter->drawEllipse(rect);
-        } else if (annotation.dash != QStringLiteral("solid")) {
-            // Match the final renderer's band-centerline dash walk.
-            painter->drawPolyline(
-                insetRectPolygon(rect, static_cast<double>(annotation.width)));
         } else {
+            // Qt is the only renderer, so the dashed rectangle is the same
+            // `drawRect` as the solid one with a dashed pen: the two cannot
+            // disagree about where the band sits, because there is only one
+            // place it is decided.
             painter->drawRect(rect);
         }
     }
@@ -9388,9 +10749,12 @@ protected:
                << annotation.amplitude << annotation.wavelength << annotation.fill;
         if (annotation.tool == QStringLiteral("mosaic")) {
             // The freehand mosaic brush averages the source image under the
-            // path, so every point's absolute position has to stay in the key.
+            // path, so every point's position relative to the frame has to stay
+            // in the key -- relative, so that translating the mark and the frame
+            // together leaves the sampled pixels alone.
             for (const Point &point : annotation.points) {
-                stream << point.x << point.y;
+                stream << (static_cast<qint64>(point.x) - output.geometry.x)
+                       << (static_cast<qint64>(point.y) - output.geometry.y);
             }
         } else {
             // A stroke's pixels depend only on the shape of its path, not on
@@ -9434,13 +10798,13 @@ protected:
                            static_cast<int>(annotation.width));
             return;
         }
-        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+        const double scale = outputScale(output);
         QPolygonF polygon;
         QPen pen = penForAnnotation(annotation);
         if (annotation.tool == QStringLiteral("wave") && annotation.points.size() >= 2) {
             // A wave is the sine sample of the segment between its two points,
             // not the segment itself: sample it here the same way the live
-            // preview and the Rust renderer do, and draw it solid.
+            // preview does, and draw it solid.
             // The crest offset and the period are logical pixels like every
             // other number here, and the painter is the logical one: the `scale`
             // argument only says how finely to sample, one point per device
@@ -9560,8 +10924,8 @@ protected:
         }
         painter->setFont(annotationFont(annotation));
         painter->setPen(annotation.color);
-        // Top-left anchored inside the measured bounds so the preview matches
-        // the Rust glyph origin and the re-edit hit test.
+        // Top-left anchored inside the measured bounds, which is where the
+        // re-edit hit test looks for the text.
         painter->drawText(localRect(output, rect, size), Qt::AlignLeft | Qt::AlignTop,
                           annotation.text);
     }
@@ -9630,8 +10994,13 @@ protected:
         QByteArray data;
         QDataStream stream(&data, QIODevice::WriteOnly);
         writeContext(stream, output, size);
-        stream << annotation.pixels.cacheKey() << static_cast<qint64>(annotation.rect.x)
-               << static_cast<qint64>(annotation.rect.y)
+        // The pasted pixels are drawn at the mark's rect, so what the raster
+        // holds depends on where that rect sits *within the frame*, not on where
+        // the frame itself is: a pin drag moves the mark and the geometry
+        // together and leaves the pixels alone.
+        stream << annotation.pixels.cacheKey()
+               << static_cast<qint64>(annotation.rect.x) - output.geometry.x
+               << static_cast<qint64>(annotation.rect.y) - output.geometry.y
                << static_cast<quint64>(annotation.rect.width)
                << static_cast<quint64>(annotation.rect.height);
         return data;
@@ -9674,11 +11043,17 @@ protected:
         writeContext(stream, output, size);
         stream << annotation.font << annotation.translation.size();
         for (const TranslatedLine &line : annotation.translation) {
-            stream << static_cast<qint64>(line.source.x) << static_cast<qint64>(line.source.y)
+            // The lines are drawn where they sit in the frame, so the key holds
+            // their offsets from it -- a pin drag translates the lines and the
+            // geometry by the same amount and the pixels do not change.
+            stream << static_cast<qint64>(line.source.x) - output.geometry.x
+                   << static_cast<qint64>(line.source.y) - output.geometry.y
                    << static_cast<quint64>(line.source.width)
                    << static_cast<quint64>(line.source.height) << line.text << line.family
-                   << line.fontPixels << static_cast<quint32>(line.fill.x)
-                   << static_cast<quint32>(line.fill.y) << static_cast<quint32>(line.fill.width)
+                   << line.fontPixels
+                   << (static_cast<qint64>(line.fill.x) - output.geometry.x)
+                   << (static_cast<qint64>(line.fill.y) - output.geometry.y)
+                   << static_cast<quint32>(line.fill.width)
                    << static_cast<quint32>(line.fill.height)
                    << static_cast<quint32>(line.background.rgba())
                    << static_cast<quint32>(line.textColor.rgba());
@@ -9795,8 +11170,14 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // The editor shows the session bounds (the image) at the selection, which
     // the pin editor lets the user drag around; region capture pins the
     // selection onto the frozen output, so the two coincide there.
+    //
+    // In pin-edit mode the marks clip rect uses marksOrigin_ (the confirmed
+    // daemon position), not the optimistic selection_: the FP16 helper surface
+    // shows the image at the confirmed position, so clipping to the same rect
+    // keeps marks and image in sync.  The optimistic selection_ is only for
+    // computing the next incremental move request.
     const LogicalRect imageArea =
-        pinEdit_ && selection_.has_value() ? *selection_ : output.geometry;
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
     const QRectF imageRect = localRect(output, imageArea, overlay->size());
     painter->save();
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
@@ -9923,12 +11304,19 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
     // Annotations are clipped to the image: dragging the pin around must not
     // leave marks floating on the transparent canvas, and the renderer only
     // ever composites them onto the image.
+    //
+    // That clip is also what keeps the magnifier honest.  It is drawn after
+    // every mark -- it has to be, or a mark over the cursor would hide the
+    // pixel it exists to show -- and the marks are drawn inside this clip, so
+    // a magnifier hung inside it can only ever cover marks.  Where the pin
+    // editor has the image and nothing else, the loupe is bounded by the image
+    // too, which is the right thing: there are no pixels outside it to read.
     if (pinEdit_) {
         painter->setClipRect(imageRect, Qt::IntersectClip);
     }
     painter->setBrush(Qt::NoBrush);
     auto drawAnnotation = [this, &output, overlay, painter](const Annotation &annotation) {
-        const double scale = output.scale > 0 ? static_cast<double>(output.scale) : 1.0;
+        const double scale = outputScale(output);
         const QPen annotationPen = penForAnnotation(annotation);
         if (annotation.kind == Annotation::Kind::Image) {
             if (annotation.pixels.isNull()) {
@@ -9950,9 +11338,6 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             const QRectF rect = localRect(output, annotation.rect, overlay->size());
             if (annotation.tool == QStringLiteral("ellipse")) {
                 painter->drawEllipse(rect);
-            } else if (annotation.dash != QStringLiteral("solid")) {
-                // Match the final renderer's band-centerline dash walk.
-                painter->drawPolyline(insetRectPolygon(rect, annotation.width));
             } else {
                 painter->drawRect(rect);
             }
@@ -9975,8 +11360,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             QFont font = annotationFont(annotation);
             painter->setFont(font);
             painter->setPen(annotation.color);
-            // Top-left anchored inside the measured bounds so the preview
-            // matches the Rust glyph origin and the re-edit hit test.
+            // Top-left anchored inside the measured bounds, which is where the
+            // re-edit hit test looks for the text.
             painter->drawText(localRect(output, bounds, overlay->size()),
                               Qt::AlignLeft | Qt::AlignTop, annotation.text);
             return;
@@ -10114,7 +11499,8 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
         painter->setBrush(Qt::NoBrush);
     }
-    if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty()) {
+    if (gesture_->type == Gesture::Type::Drawing && !gesture_->points.isEmpty() && tool_.has_value()) {
+        const Tool armed = *tool_;
         // Rectangle, ellipse, the area mosaic and the arrow all depend on two
         // points, so drawing them straight is already cheap.  The freehand pen
         // and the mosaic brush grow a point per move and build up through the
@@ -10126,7 +11512,7 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             paintLiveStroke(painter, output, overlay->size(), overlay->outputIndex());
         } else {
             Annotation preview;
-            preview.tool = toolName(tool_);
+            preview.tool = toolName(armed);
             const ToolStyle &previewStyle = toolStyle(preview.tool);
             preview.color = previewStyle.color;
             preview.width = previewStyle.width;
@@ -10136,18 +11522,18 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
             preview.arrowStyle = currentArrowStyle_;
             preview.mask = mosaicShape_;
             preview.strength = mosaicStrength_;
-            if (tool_ == Tool::Rectangle || tool_ == Tool::Ellipse ||
-                (tool_ == Tool::Mosaic && mosaicShape_ != QStringLiteral("brush"))) {
+            if (armed == Tool::Rectangle || armed == Tool::Ellipse ||
+                (armed == Tool::Mosaic && mosaicShape_ != QStringLiteral("brush"))) {
                 preview.kind = Annotation::Kind::Shape;
                 preview.rect = selectionBetween(gesture_->points.constFirst(),
                                                 gesture_->points.constLast());
-                if (tool_ == Tool::Mosaic) {
+                if (armed == Tool::Mosaic) {
                     preview.tool = QStringLiteral("mosaic");
                 }
             } else {
                 preview.kind = Annotation::Kind::Stroke;
                 preview.points = gesture_->points;
-                if (tool_ == Tool::Mosaic) {
+                if (armed == Tool::Mosaic) {
                     preview.tool = QStringLiteral("mosaic");
                 }
             }
@@ -10158,9 +11544,23 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
-    // Highlight the selected annotation with handles while the Select tool is
-    // manipulating it.
-    if (tool_ == Tool::Select && selectedAnnotation_ >= 0 &&
+    // Highlight the selected annotation with handles while it is being
+    // manipulated.  The frame is up whatever tool is armed -- a mark can be
+    // picked up with a drawing tool in hand -- but not while that tool is
+    // mid-stroke, where the frame would chase the ink.
+    //
+    // While nothing is armed, or while the pick-up modifier is held.  The
+    // outline and its eight handles are the chrome of the state that adjusts
+    // marks, and that state is the unarmed one; under a drawing tool they would
+    // sit on top of the ink being laid down -- a pen stroke's own start is under
+    // the left-middle handle -- and be read as part of the picture the user is
+    // annotating.  The pick-up modifier is the other way into that state, and it
+    // deliberately leaves the tool armed: the whole point of it is that picking a
+    // mark up is not a tool change.  So it has to be read here as what it is, or
+    // the modifier that exists to hand the user a mark would be the one state in
+    // which the mark's handles never appear.
+    const bool chromeArmed = !tool_.has_value() || pickingMarks(lastModifiers_);
+    if (chromeArmed && selectedAnnotation_ >= 0 &&
         selectedAnnotation_ < annotations_.size() &&
         (gesture_->type == Gesture::Type::None ||
          gesture_->type == Gesture::Type::MovingAnnotation ||
@@ -10191,10 +11591,26 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
+    // The mark the pick-up modifier has put under the pointer, framed so the
+    // user can see what a press would take before making it.  Without this the
+    // state is invisible: the pointer changes shape, but a shape says a drag is
+    // possible somewhere, not *which* mark the press would land on -- and with
+    // several marks under the pointer the wrong one is a real answer.
+    //
+    // No handles: they are the selected mark's, and this mark is not selected
+    // yet.  The frame is dashed the same way so the two read as one language --
+    // this is the mark, the handles come when it is yours.
+    if (markHovered_ >= 0 && markHovered_ < annotations_.size()
+        && markHovered_ != selectedAnnotation_) {
+        LogicalRect bounds;
+        if (annotationBounds(annotations_.at(markHovered_), &bounds)) {
+            painter->setPen(QPen(Qt::white, 1.0, Qt::DashLine));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRect(localRect(output, bounds, overlay->size()));
+        }
+    }
+
     if (selection_.has_value() && !pinEdit_) {
-        // Pin editing selects the whole image by construction: drawing the
-        // selection rect and its handles would ring the pin with chrome the
-        // user cannot act on.
         LogicalRect visible;
         if (intersection(*selection_, output.geometry, &visible)) {
             painter->setPen(QPen(Qt::white, 2.0, Qt::SolidLine));
@@ -10225,6 +11641,38 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
         }
     }
 
+    // The pin editor's own frame around the image.  The daemon draws the pin's
+    // rim underneath, but that is the pin's identifying edge -- it says "this is
+    // a pin", not "this is what you are editing" -- and it is a different
+    // process besides, so it cannot say what the editor is doing.  The user's
+    // rule is that the editor draws the selection-style frame for whatever it is
+    // annotating, and the pin image is what this session annotates.
+    //
+    // No handles.  The eight handles a region selection carries resize it, and
+    // the CLI refuses any size change to a pin (`qt_overlay.rs`, "pin editing
+    // only moves it"), so handles here would be a promise the editor cannot
+    // keep.  What the pin can do is move, and the pointer already says so.
+    //
+    // Drawn after the marks clip is taken off -- the clip is the image rect, and
+    // a two-pixel stroke centred on the image's edge would otherwise lose its
+    // outer half -- and at `marksOrigin_`, the daemon-confirmed rect, so it stays
+    // in step with the image rather than running ahead of it during a drag.
+    //
+    // Only while this pin is the live one.  The frame is Qt chrome and every
+    // other pin is painted by a Wayland surface one layer below, so the moment
+    // the user's attention moves to another pin this frame would be drawn on
+    // top of it -- and the compositor orders a layer's surfaces by map time with
+    // no way to restack them, so no amount of ordering on this side can put it
+    // back underneath.  The daemon says which pin is live (`notePinActive`), and
+    // the pin being edited is the live one until the user picks another.
+    if (pinEdit_ && pinActive_ && marksOrigin_.has_value() && !session_.outputs.isEmpty()) {
+        const QRectF frame =
+            localRect(output, *marksOrigin_, overlay->size());
+        painter->setPen(QPen(Qt::white, 2.0, Qt::SolidLine));
+        painter->setBrush(Qt::NoBrush);
+        painter->drawRect(frame);
+    }
+
     // Window picking previews a whole window before it is committed, so its
     // pill names the window instead of just measuring it.
     const bool pickPreview = pickMode_ && !editing_ && selection_.has_value();
@@ -10252,25 +11700,789 @@ void OverlayController::paint(CaptureOverlay *overlay, QPainter *painter)
                           target, toolbarBox);
     }
 
+    // The magnifier sits above every mark: it is a reading of the pixels the
+    // user is aiming at, and a mark drawn over it would hide exactly the pixel
+    // it exists to show.  It is drawn last for that reason.
+    //
+    // Any drag brings it up: every one of them is the user placing a point, and
+    // the point is a pixel.  The right button brings it up on its own, and a
+    // keyboard step flashes it, so aiming is covered whatever is moving.
+    const Gesture::Type loupeGesture = gesture_->type;
+    // Every drag but the ones that lay ink down.  A stroke is drawn where the
+    // cursor is, and the loupe is a 120-pixel disc hung off that same cursor:
+    // showing it while drawing covers the ink the user is placing, which is
+    // exactly what pixel-level annotating needs to see.  Moving, resizing and
+    // framing are the drags that aim at pixels already on the screen.
+    const bool dragging = loupeGesture != Gesture::Type::None &&
+        loupeGesture != Gesture::Type::Bezier && loupeGesture != Gesture::Type::Drawing;
     // The pin editor drags the pinned image itself around the screen, and a
     // magnifier there would follow the very picture it is magnifying: the loupe
     // belongs to picking a region out of a frozen frame, not to placing a pin.
-    const bool pinDrag = pinEdit_ && gesture_->type == Gesture::Type::Moving;
+    const bool pinDrag = pinEdit_ && loupeGesture == Gesture::Type::Moving;
     // The eyedropper's loupe follows an idle pointer -- that is the whole
     // instrument, and the readout under it is where the colour is read from --
     // and it stays off the bare canvas a pin editor leaves around its image,
     // where there is no pixel to take.
-    const bool pickerLoupe = tool_ == Tool::Picker && gesture_->type == Gesture::Type::None &&
-        (!pinEdit_ || canDrawAt(pointer_));
-    const bool loupeActive = !pinDrag &&
-        (pickerLoupe || gesture_->type == Gesture::Type::Selecting ||
-         gesture_->type == Gesture::Type::Moving || gesture_->type == Gesture::Type::Resizing ||
-         gesture_->type == Gesture::Type::MovingAnnotation ||
-         gesture_->type == Gesture::Type::ResizingAnnotation);
-    if (loupeActive && pointerOutput_ == overlay->outputIndex()) {
+    const bool pickerLoupe = tool_.has_value() && *tool_ == Tool::Picker &&
+        loupeGesture == Gesture::Type::None && (!pinEdit_ || canDrawAt(pointer_));
+    if (!pinDrag && (magnifierVisible() || pickerLoupe || dragging) &&
+        pointerOutput_ == overlay->outputIndex()) {
+        // The clip goes back to the surface before the loupe is drawn.  The
+        // disc hangs off the cursor by more than its own radius, so near the
+        // edge of the picture it deliberately reaches past it -- and the pin
+        // editor's image clip, taken above for the marks, cut it off there.
+        // That is the one place a magnifier is most wanted, so the loupe is the
+        // editor's chrome rather than a mark and is not bounded by the image.
+        painter->setClipRect(target);
         drawLoupe(overlay, painter);
     }
     painter->restore();
+}
+
+// Draws the committed marks onto a copy of the session's own pixels.
+//
+// The editor's screen and the result are not the same raster: the screen is a
+// window in logical pixels with a device ratio, and the result is the captured
+// frame in the output's device pixels.  The mapping between them is one factor,
+// `density` -- the output's device pixels per logical pixel -- which is exactly
+// what `output.scale` carries for the output the marks were placed on.  So the
+// output is rebuilt here with that scale, which makes every `localRect` and
+// `localPoint` in the painters below land on the result's pixels with no
+// arithmetic of its own.
+//
+// The painter's device ratio is set to the same factor rather than the mark
+// being scaled, so each mark's cached raster is rebuilt at the result's
+// resolution: a mark whose preview was cached at ratio 2 is rasterized again at
+// the output's density instead of being blitted at the wrong one.  The cache
+// belongs to the annotation and keys on the ratio, so a preview and a render at
+// different densities cannot read each other's pixels.
+QImage OverlayController::compositeAnnotations(const QImage &canvas, const QImage &source,
+                                               const LogicalRect &origin, double density,
+                                               QString *error) const
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return QImage();
+    };
+    if (canvas.isNull() || source.isNull()) {
+        return fail(uiTr("There are no pixels to draw the annotations on."));
+    }
+    if (!(density > 0.0)) {
+        return fail(uiTr("The capture's density is not a positive number."));
+    }
+    if (canvas.size() != source.size()) {
+        return fail(uiTr("The annotations would be drawn on pixels of another size."));
+    }
+    if (annotations_.isEmpty()) {
+        return canvas;
+    }
+    // The marks were placed on the output the capture came from, which is the
+    // first one: a capture that spans several outputs is cropped from the scene
+    // at the highest density, and that is what `density` names.  Only its scale
+    // and its place matter here -- the pixels come in as an argument, not from
+    // the session -- so a fresh record is enough and the session need not have
+    // an output at all.  Its place is `origin`, the crop's own rect in the
+    // overlay's logical pixels: a mark's coordinates are global, and the painter
+    // draws in the crop's, so leaving the record at the origin would put every
+    // mark at the selection's offset from the screen's corner.
+    OutputSession output;
+    output.scale = density;
+    output.geometry = LogicalRect{origin.x, origin.y,
+                                  static_cast<std::uint32_t>(canvas.width()),
+                                  static_cast<std::uint32_t>(canvas.height())};
+    output.surface = output.geometry;
+    // What a mosaic samples.  For the flattened result this is the canvas
+    // itself; for the marks alone it is the capture, which the canvas does not
+    // hold.
+    output.image = source;
+
+    QImage composite = canvas.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    if (composite.isNull()) {
+        return fail(uiTr("The capture's pixels could not be converted for drawing."));
+    }
+    // The device ratio is what maps the painter's logical coordinates onto the
+    // result's pixels, and setting it on the image is what makes the painter
+    // pick it up: `AnnotationRaster::paint` reads it back off the paint device,
+    // so the cached rasters are built at the result's resolution rather than the
+    // screen's.
+    composite.setDevicePixelRatio(density);
+    // Off the screen: this runs after the session ended, and a mark drawn
+    // through an overlay's own size would be placed for the window rather than
+    // for the result.
+    QPainter painter(&composite);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.raster == nullptr) {
+            annotation.raster = makeAnnotationRaster(annotation);
+        }
+        annotation.raster->paint(&painter, annotation, output, composite.size(), 0);
+    }
+    painter.end();
+    // The result is a plain raster of device pixels; the ratio was this side's
+    // business and no consumer of the bytes should scale by it.
+    composite.setDevicePixelRatio(1.0);
+    return composite;
+}
+
+// A mark's colour, read the way the CLI wrote it: `#rrggbb`, or `#rrggbbaa`
+// when the alpha is not opaque.  The eight-digit form spells alpha last, which
+// is what `colorText` writes and what `parseColorText` reads back.
+QColor annotationColor(const QJsonValue &value, const QColor &fallback)
+{
+    if (!value.isString()) {
+        return fallback;
+    }
+    const QColor color = parseColorText(value.toString());
+    return color.isValid() ? color : fallback;
+}
+
+// One of a mark's small enumerations, read by name.  `allowed` is the set the
+// wire may carry; anything else is refused rather than silently defaulted,
+// because a mark the editor cannot reproduce exactly is worse than a session
+// that says so.
+bool annotationToken(const QJsonValue &value, const QStringList &allowed, const QString &label,
+                     QString *out, QString *error)
+{
+    if (!value.isString() || !allowed.contains(value.toString())) {
+        return jsonFail(error, label + QStringLiteral(" must be one of ") +
+                                   allowed.join(QStringLiteral(", ")));
+    }
+    *out = value.toString();
+    return true;
+}
+
+bool annotationWhole(const QJsonObject &object, const char *key, std::uint32_t minimum,
+                     std::uint32_t maximum, std::uint32_t *out, const QString &label,
+                     QString *error)
+{
+    std::int64_t value = 0;
+    if (!jsonInteger(object.value(QLatin1String(key)), minimum, maximum, &value)) {
+        return jsonFail(error, QStringLiteral("%1 must be an integer in %2..%3")
+                              .arg(label)
+                              .arg(minimum)
+                              .arg(maximum));
+    }
+    *out = static_cast<std::uint32_t>(value);
+    return true;
+}
+
+// The canvas the marks were made on: a mark's coordinates only mean something
+// against it, and one that fell outside would be painted off the edge and never
+// seen again.  Refusing it is what makes a session from a different capture
+// fail loudly rather than open with invisible marks.
+//
+// `x` and `y` arrive relative to the canvas's top-left, which is the frame
+// `marksDocument` writes them in, so the bounds are the canvas's own size and
+// not its place on the screen.
+bool insideCanvas(std::int64_t x, std::int64_t y, const LogicalRect &canvas, const QString &label,
+                  QString *error)
+{
+    if (x < 0 || y < 0 || x > static_cast<std::int64_t>(canvas.width) ||
+        y > static_cast<std::int64_t>(canvas.height)) {
+        return jsonFail(error, label + QStringLiteral(" lies outside the canvas"));
+    }
+    return true;
+}
+
+bool canvasRect(const QJsonObject &object, const LogicalRect &canvas, LogicalRect *out,
+                const QString &label, QString *error)
+{
+    LogicalRect rect;
+    if (!jsonRect(object, &rect, label, error)) {
+        return false;
+    }
+    if (!insideCanvas(rect.x, rect.y, canvas, label, error) ||
+        !insideCanvas(rect.right(), rect.bottom(), canvas, label, error)) {
+        return false;
+    }
+    // Back into the overlay's global logical pixels, which is where the editor
+    // keeps every mark it holds.
+    rect.x += canvas.x;
+    rect.y += canvas.y;
+    *out = rect;
+    return true;
+}
+
+// A rect written under a `rect` key, which is how every mark but a translation
+// line spells its boxes.
+bool annotationRect(const QJsonObject &object, const LogicalRect &canvas, LogicalRect *out,
+                    const QString &label, QString *error)
+{
+    const QJsonValue value = object.value(QStringLiteral("rect"));
+    if (!value.isObject()) {
+        return jsonFail(error, label + QStringLiteral(" must carry a `rect` object"));
+    }
+    return canvasRect(value.toObject(), canvas, out, label, error);
+}
+
+bool annotationPoint(const QJsonObject &object, const LogicalRect &canvas, Point *out,
+                     const QString &label, QString *error)
+{
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    if (!jsonSigned32(object, "x", &x) || !jsonSigned32(object, "y", &y)) {
+        return jsonFail(error, label + QStringLiteral(" must have integer x and y"));
+    }
+    if (!insideCanvas(x, y, canvas, label, error)) {
+        return false;
+    }
+    out->x = x + canvas.x;
+    out->y = y + canvas.y;
+    return true;
+}
+
+// One mark, read back from the shape `marksDocument` writes.
+//
+// The two directions are one protocol read from either end, so the names here
+// are the ones that writer emits and nothing else.  A mark of a kind this editor
+// does not know is refused rather than skipped: the writer only ever emits the
+// kinds below, so seeing another means the wire is not this protocol, and
+// quietly dropping it would open the pin with a mark the user drew missing.
+//
+// A pasted image arrives as a path to its pixels, not as pixels: it is written
+// beside the session by `writeMarkAssets` and the mark names the file.  Reading
+// it needs the file to still be there, which is why the session directory
+// outlives the session that made it.
+bool parseMark(const QJsonObject &mark, const LogicalRect &canvas, std::uint32_t deviceRatio,
+               Annotation *out, QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+
+    const QJsonValue kindValue = mark.value(QStringLiteral("kind"));
+    if (!kindValue.isString()) {
+        return fail(uiTr("A mark must carry a `kind`."));
+    }
+    const QString kind = kindValue.toString();
+    const QString label = QStringLiteral("mark `%1`").arg(kind);
+
+    const QJsonValue toolValue = mark.value(QStringLiteral("tool"));
+    if (!toolValue.isString()) {
+        return fail(label + QStringLiteral(" must carry a `tool`"));
+    }
+    const QString tool = toolValue.toString();
+
+    Annotation annotation;
+    annotation.tool = tool;
+    annotation.deviceRatio = deviceRatio;
+
+    if (kind == QStringLiteral("shape")) {
+        static const QStringList kShapeTools = {QStringLiteral("rectangle"),
+                                                QStringLiteral("ellipse"),
+                                                QStringLiteral("mosaic")};
+        static const QStringList kDashes = {QStringLiteral("solid"), QStringLiteral("dashed"),
+                                            QStringLiteral("dotted")};
+        static const QStringList kMasks = {QStringLiteral("rect"), QStringLiteral("ellipse")};
+        QString checked;
+        if (!annotationToken(toolValue, kShapeTools, label + QStringLiteral(" tool"), &checked,
+                             error)) {
+            return false;
+        }
+        if (!annotationRect(mark, canvas, &annotation.rect, label, error)) {
+            return false;
+        }
+        annotation.kind = Annotation::Kind::Shape;
+        annotation.color = annotationColor(mark.value(QStringLiteral("color")), annotation.color);
+        if (!annotationWhole(mark, "width", 1, static_cast<std::uint32_t>(kMaxWidth),
+                             &annotation.width, label + QStringLiteral(" width"), error) ||
+            !annotationWhole(mark, "strength", 1,
+                             static_cast<std::uint32_t>(kMaxMosaicStrength), &annotation.strength,
+                             label + QStringLiteral(" strength"), error)) {
+            return false;
+        }
+        if (!annotationToken(mark.value(QStringLiteral("dash")), kDashes,
+                             label + QStringLiteral(" dash"), &annotation.dash, error) ||
+            !annotationToken(mark.value(QStringLiteral("mask")), kMasks,
+                             label + QStringLiteral(" mask"), &annotation.mask, error)) {
+            return false;
+        }
+    } else if (kind == QStringLiteral("stroke")) {
+        // Every tool that lays down a freehand stroke has to be here, and the
+        // mosaic brush is one of them: `finishDrawing` stores it as a Stroke
+        // whenever the shape is the brush rather than a rect or an ellipse, and
+        // its `tool` reads `"mosaic"`.  Leaving it out made the reader refuse a
+        // document the writer had just produced -- and because `parseMarks` is
+        // all-or-nothing, that one mark took every other mark on the pin down
+        // with it, which is how a re-edit came up blank.
+        static const QStringList kStrokeTools = {
+            QStringLiteral("arrow"),  QStringLiteral("pen"),  QStringLiteral("draw"),
+            QStringLiteral("line"),   QStringLiteral("wave"), QStringLiteral("bezier"),
+            QStringLiteral("mosaic")};
+        static const QStringList kDashes = {QStringLiteral("solid"), QStringLiteral("dashed"),
+                                            QStringLiteral("dotted")};
+        static const QStringList kArrowStyles = {QStringLiteral("open"),
+                                                 QStringLiteral("filled")};
+        static const QStringList kFills = {QStringLiteral("stroke"), QStringLiteral("fill"),
+                                           QStringLiteral("both")};
+        QString checked;
+        if (!annotationToken(toolValue, kStrokeTools, label + QStringLiteral(" tool"), &checked,
+                             error)) {
+            return false;
+        }
+        const QJsonValue pointsValue = mark.value(QStringLiteral("points"));
+        if (!pointsValue.isArray()) {
+            return fail(label + QStringLiteral(" must carry a `points` array"));
+        }
+        const QJsonArray points = pointsValue.toArray();
+        if (points.isEmpty()) {
+            return fail(label + QStringLiteral(" must have at least one point"));
+        }
+        annotation.points.reserve(points.size());
+        for (int index = 0; index < points.size(); ++index) {
+            if (!points.at(index).isObject()) {
+                return fail(label + QStringLiteral(" point %1 must be an object").arg(index));
+            }
+            Point point;
+            if (!annotationPoint(points.at(index).toObject(), canvas, &point,
+                                 label + QStringLiteral(" point %1").arg(index), error)) {
+                return false;
+            }
+            annotation.points.push_back(point);
+        }
+        annotation.kind = Annotation::Kind::Stroke;
+        annotation.color = annotationColor(mark.value(QStringLiteral("color")), annotation.color);
+        if (!annotationWhole(mark, "width", 1, static_cast<std::uint32_t>(kMaxWidth),
+                             &annotation.width, label + QStringLiteral(" width"), error) ||
+            !annotationWhole(mark, "size", 1, static_cast<std::uint32_t>(kMaxArrowSize),
+                             &annotation.size, label + QStringLiteral(" size"), error) ||
+            !annotationWhole(mark, "strength", 1,
+                             static_cast<std::uint32_t>(kMaxMosaicStrength), &annotation.strength,
+                             label + QStringLiteral(" strength"), error) ||
+            !annotationWhole(mark, "amplitude", 0, static_cast<std::uint32_t>(kMaxWaveSize),
+                             &annotation.amplitude, label + QStringLiteral(" amplitude"), error) ||
+            !annotationWhole(mark, "wavelength", 0,
+                             static_cast<std::uint32_t>(kMaxWaveWavelength),
+                             &annotation.wavelength, label + QStringLiteral(" wavelength"),
+                             error)) {
+            return false;
+        }
+        if (!annotationToken(mark.value(QStringLiteral("dash")), kDashes,
+                             label + QStringLiteral(" dash"), &annotation.dash, error) ||
+            !annotationToken(mark.value(QStringLiteral("arrow_style")), kArrowStyles,
+                             label + QStringLiteral(" arrow_style"), &annotation.arrowStyle,
+                             error) ||
+            !annotationToken(mark.value(QStringLiteral("fill")), kFills,
+                             label + QStringLiteral(" fill"), &annotation.fill, error)) {
+            return false;
+        }
+        const QJsonValue closed = mark.value(QStringLiteral("closed"));
+        if (!closed.isBool()) {
+            return fail(label + QStringLiteral(" must carry a boolean `closed`"));
+        }
+        annotation.closed = closed.toBool();
+    } else if (kind == QStringLiteral("text")) {
+        const QJsonValue originValue = mark.value(QStringLiteral("origin"));
+        if (!originValue.isObject()) {
+            return fail(label + QStringLiteral(" must carry an `origin` object"));
+        }
+        if (!annotationPoint(originValue.toObject(), canvas, &annotation.origin, label, error)) {
+            return false;
+        }
+        const QJsonValue textValue = mark.value(QStringLiteral("text"));
+        if (!textValue.isString()) {
+            return fail(label + QStringLiteral(" must carry its `text`"));
+        }
+        annotation.kind = Annotation::Kind::Text;
+        annotation.color = annotationColor(mark.value(QStringLiteral("color")), annotation.color);
+        annotation.font = mark.value(QStringLiteral("font")).toString();
+        if (tool == QStringLiteral("number")) {
+            const QJsonValue style = mark.value(QStringLiteral("numberStyle"));
+            if (!style.isString()) {
+                return fail(label + QStringLiteral(" must carry its `numberStyle`"));
+            }
+            annotation.numberStyle = numberStyleForName(style.toString());
+            if (!annotationWhole(mark, "numberSize",
+                                 static_cast<std::uint32_t>(kNumberMinDiameter),
+                                 static_cast<std::uint32_t>(kNumberMaxDiameter),
+                                 &annotation.numberSize, label + QStringLiteral(" numberSize"),
+                                 error)) {
+                return false;
+            }
+            bool ok = false;
+            annotation.number = textValue.toString().toInt(&ok);
+            if (!ok) {
+                return fail(label + QStringLiteral(" must carry an integer count as its `text`"));
+            }
+            // The box is derived from the origin the badge was placed at rather
+            // than read from the wire: the hit test, the drag clamp and the
+            // raster cache are all sized from it, and a box that disagreed with
+            // the diameter would make the badge undraggable.  `layoutNumberBox`
+            // records the box's top-left as the origin, so the centre is that
+            // origin plus half the diameter it is about to lay out.
+            const int half = numberDiameter(annotation.numberSize) / 2;
+            const Point centre{annotation.origin.x + half, annotation.origin.y + half};
+            layoutNumberBox(annotation, centre);
+        } else {
+            annotation.text = textValue.toString();
+            if (!annotationWhole(mark, "textPixels",
+                                 static_cast<std::uint32_t>(kMinTextPixels),
+                                 static_cast<std::uint32_t>(kMaxTextPixels),
+                                 &annotation.textPixels, label + QStringLiteral(" textPixels"),
+                                 error)) {
+                return false;
+            }
+        }
+    } else if (kind == QStringLiteral("image")) {
+        // The pixels are named by path, not carried in the document; the mark
+        // holds the image the path resolves to.  They are the *original* pixels
+        // at their own size, and `rect` is the separate question of where the
+        // mark sits and how far it was scaled to fit, so a resize later can go
+        // back to the original instead of to an already-shrunk copy.
+        if (!annotationRect(mark, canvas, &annotation.rect, label, error)) {
+            return false;
+        }
+        const QJsonValue path = mark.value(QStringLiteral("pixels"));
+        if (!path.isString() || path.toString().isEmpty()) {
+            return fail(label + QStringLiteral(" must carry its `pixels` path"));
+        }
+        QImage pixels;
+        if (!pixels.load(path.toString())) {
+            return fail(label + QStringLiteral(" could not read its pixels from `%1`")
+                            .arg(path.toString()));
+        }
+        annotation.kind = Annotation::Kind::Image;
+        annotation.pixels = pixels;
+    } else if (kind == QStringLiteral("translation")) {
+        // A translation is its lines, and the lines are all numbers and strings,
+        // so the whole mark is in the document and needs no asset.  Each line's
+        // two boxes are read through the same point reader as everything else,
+        // so a line that lands outside the canvas is refused here rather than
+        // drawn off the image later.
+        if (!annotationRect(mark, canvas, &annotation.rect, label, error)) {
+            return false;
+        }
+        const QJsonValue linesValue = mark.value(QStringLiteral("lines"));
+        if (!linesValue.isArray() || linesValue.toArray().isEmpty()) {
+            return fail(label + QStringLiteral(" must carry a non-empty `lines` array"));
+        }
+        const QJsonArray lines = linesValue.toArray();
+        annotation.translation.reserve(lines.size());
+        for (int index = 0; index < lines.size(); ++index) {
+            const QString lineLabel = label + QStringLiteral(" line %1").arg(index);
+            if (!lines.at(index).isObject()) {
+                return fail(lineLabel + QStringLiteral(" must be an object"));
+            }
+            const QJsonObject entry = lines.at(index).toObject();
+            TranslatedLine line;
+            if (!canvasRect(entry, canvas, &line.source, lineLabel, error) ||
+                !canvasRect(entry, canvas, &line.fill, lineLabel, error)) {
+                return false;
+            }
+            const QJsonValue text = entry.value(QStringLiteral("text"));
+            if (!text.isString()) {
+                return fail(lineLabel + QStringLiteral(" must carry its `text`"));
+            }
+            line.text = text.toString();
+            line.family = entry.value(QStringLiteral("family")).toString();
+            std::uint32_t fontPixels = 0;
+            if (!annotationWhole(entry, "font_pixels", 1,
+                                 static_cast<std::uint32_t>(kMaxTextPixels), &fontPixels,
+                                 lineLabel + QStringLiteral(" font_pixels"), error)) {
+                return false;
+            }
+            line.fontPixels = static_cast<int>(fontPixels);
+            line.background =
+                annotationColor(entry.value(QStringLiteral("background")), line.background);
+            line.textColor =
+                annotationColor(entry.value(QStringLiteral("text_color")), line.textColor);
+            annotation.translation.push_back(line);
+        }
+        annotation.kind = Annotation::Kind::Translation;
+        annotation.font = mark.value(QStringLiteral("font")).toString();
+    } else {
+        return fail(QStringLiteral("mark kind `%1` is not one this editor can reopen").arg(kind));
+    }
+
+    *out = annotation;
+    return true;
+}
+
+// Reads the marks a session carried into annotations the editor can place.
+//
+// The wire shape is the one `marksDocument` writes and the editor's own result
+// uses, so the two directions are one protocol read from either end.  A mark
+// that cannot be rebuilt -- an unknown tool, a missing field, a rectangle off
+// the canvas -- fails the whole session rather than being skipped: an editor
+// that opened with some of the user's marks silently missing is worse than one
+// that says it cannot open at all.
+bool OverlayController::parseMarks(const QJsonArray &marks, const LogicalRect &canvas,
+                                   std::uint32_t deviceRatio, QString *error)
+{
+    QVector<Annotation> restored;
+    restored.reserve(marks.size());
+    for (int index = 0; index < marks.size(); ++index) {
+        if (!marks.at(index).isObject()) {
+            if (error != nullptr) {
+                *error = QStringLiteral("mark %1 is not an object").arg(index);
+            }
+            return false;
+        }
+        Annotation annotation;
+        if (!parseMark(marks.at(index).toObject(), canvas, deviceRatio, &annotation, error)) {
+            return false;
+        }
+        restored.push_back(annotation);
+    }
+    annotations_ = std::move(restored);
+    return true;
+}
+
+// A logical rect as the wire's own object, offset by the canvas: the document is
+// relative to the selection, which is the canvas a re-edit hands back.  Written
+// flat rather than under a `rect` key, which is how a translation's two boxes
+// per line are spelled; `parseMark` reads them back through `canvasRect`.
+static QJsonObject rectJson(const LogicalRect &rect, const LogicalRect &canvas)
+{
+    QJsonObject value;
+    value.insert(QStringLiteral("x"), static_cast<qint64>(rect.x) - canvas.x);
+    value.insert(QStringLiteral("y"), static_cast<qint64>(rect.y) - canvas.y);
+    value.insert(QStringLiteral("width"), static_cast<qint64>(rect.width));
+    value.insert(QStringLiteral("height"), static_cast<qint64>(rect.height));
+    return value;
+}
+
+QJsonArray OverlayController::marksDocument() const
+{
+    return marksDocumentInto(QString());
+}
+
+QJsonArray OverlayController::writeMarkAssets(const QString &directory) const
+{
+    return marksDocumentInto(directory);
+}
+
+QJsonArray OverlayController::marksDocumentInto(const QString &directory) const
+{
+    QJsonArray marks;
+    if (!selection_.has_value()) {
+        return marks;
+    }
+    // The marks are kept in the overlay's global logical pixels; the document
+    // is relative to the selection, because the selection is the canvas a
+    // re-edit hands back.
+    const LogicalRect &canvas = *selection_;
+    int asset = 0;
+    for (const Annotation &annotation : annotations_) {
+        QJsonObject value;
+        if (annotation.kind == Annotation::Kind::Shape) {
+            value.insert(QStringLiteral("kind"), QStringLiteral("shape"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
+            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
+            value.insert(QStringLiteral("dash"), annotation.dash);
+            value.insert(QStringLiteral("mask"), annotation.mask);
+            value.insert(QStringLiteral("strength"), static_cast<qint64>(annotation.strength));
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x - canvas.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y - canvas.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+        } else if (annotation.kind == Annotation::Kind::Stroke) {
+            value.insert(QStringLiteral("kind"), QStringLiteral("stroke"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
+            value.insert(QStringLiteral("width"), static_cast<qint64>(annotation.width));
+            value.insert(QStringLiteral("dash"), annotation.dash);
+            value.insert(QStringLiteral("size"), static_cast<qint64>(annotation.size));
+            value.insert(QStringLiteral("arrow_style"), annotation.arrowStyle);
+            value.insert(QStringLiteral("strength"), static_cast<qint64>(annotation.strength));
+            value.insert(QStringLiteral("amplitude"), static_cast<qint64>(annotation.amplitude));
+            value.insert(QStringLiteral("wavelength"), static_cast<qint64>(annotation.wavelength));
+            value.insert(QStringLiteral("closed"), annotation.closed);
+            value.insert(QStringLiteral("fill"), annotation.fill);
+            QJsonArray points;
+            for (const Point &point : annotation.points) {
+                QJsonObject item;
+                item.insert(QStringLiteral("x"), static_cast<qint64>(point.x - canvas.x));
+                item.insert(QStringLiteral("y"), static_cast<qint64>(point.y - canvas.y));
+                points.push_back(item);
+            }
+            value.insert(QStringLiteral("points"), points);
+        } else if (annotation.kind == Annotation::Kind::Text) {
+            const bool number = isNumberAnnotation(annotation);
+            value.insert(QStringLiteral("kind"), QStringLiteral("text"));
+            // Every text mark names its tool, not only a badge.  The reader
+            // requires one -- a mark without a `tool` is refused, and a refusal
+            // fails the whole document rather than the one mark -- so leaving it
+            // off a plain label did not merely lose the label: it made every pin
+            // carrying one impossible to reopen, marks and all.
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            if (number) {
+                value.insert(QStringLiteral("numberStyle"), numberStyleValue(annotation.numberStyle));
+                value.insert(QStringLiteral("numberSize"),
+                             static_cast<qint64>(annotation.numberSize));
+            } else {
+                value.insert(QStringLiteral("textPixels"),
+                             static_cast<qint64>(annotation.textPixels));
+            }
+            QJsonObject origin;
+            origin.insert(QStringLiteral("x"), static_cast<qint64>(annotation.origin.x - canvas.x));
+            origin.insert(QStringLiteral("y"), static_cast<qint64>(annotation.origin.y - canvas.y));
+            value.insert(QStringLiteral("origin"), origin);
+            value.insert(QStringLiteral("text"),
+                         number ? QString::number(annotation.number) : annotation.text);
+            value.insert(QStringLiteral("color"), colorText(annotation.color));
+            if (!annotation.font.isEmpty()) {
+                value.insert(QStringLiteral("font"), annotation.font);
+            }
+        } else if (annotation.kind == Annotation::Kind::Image) {
+            // A pasted image is its pixels: there is no smaller form that
+            // rebuilds it, so the pixels travel.  They are written beside the
+            // session and named by path -- a pasted screenshot is megabytes, and
+            // this document goes over a newline-delimited socket to the daemon,
+            // where inline data would be a single enormous line.
+            //
+            // Without a directory to write into the mark is left out, which is
+            // what a caller that only wants the geometry gets.
+            const QString path = writeMarkAsset(directory, annotation, &asset);
+            if (path.isEmpty()) {
+                continue;
+            }
+            value.insert(QStringLiteral("kind"), QStringLiteral("image"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            value.insert(QStringLiteral("pixels"), path);
+            // The pixels' own size, which is not the rect's: the rect is where
+            // the image is placed and how much it was scaled to fit, and the
+            // reader needs both to rebuild the mark and to resize it later
+            // without going back through a scaled copy.
+            value.insert(QStringLiteral("pixel_width"),
+                         static_cast<qint64>(annotation.pixels.width()));
+            value.insert(QStringLiteral("pixel_height"),
+                         static_cast<qint64>(annotation.pixels.height()));
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x - canvas.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y - canvas.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+        } else if (annotation.kind == Annotation::Kind::Translation) {
+            // A translation is its lines, which are numbers and strings and
+            // travel in the document itself; it needs no asset.  It is written
+            // as its own kind so the reader can tell it from a shape, and its
+            // boxes are relative to the canvas like every other rect.
+            value.insert(QStringLiteral("kind"), QStringLiteral("translation"));
+            value.insert(QStringLiteral("tool"), annotation.tool);
+            if (!annotation.font.isEmpty()) {
+                value.insert(QStringLiteral("font"), annotation.font);
+            }
+            QJsonArray lines;
+            for (const TranslatedLine &line : annotation.translation) {
+                QJsonObject entry;
+                entry.insert(QStringLiteral("source"), rectJson(line.source, canvas));
+                entry.insert(QStringLiteral("fill"), rectJson(line.fill, canvas));
+                entry.insert(QStringLiteral("text"), line.text);
+                entry.insert(QStringLiteral("family"), line.family);
+                entry.insert(QStringLiteral("font_pixels"), static_cast<qint64>(line.fontPixels));
+                entry.insert(QStringLiteral("background"), colorText(line.background));
+                entry.insert(QStringLiteral("text_color"), colorText(line.textColor));
+                lines.push_back(entry);
+            }
+            value.insert(QStringLiteral("lines"), lines);
+            QJsonObject rect;
+            rect.insert(QStringLiteral("x"), static_cast<qint64>(annotation.rect.x - canvas.x));
+            rect.insert(QStringLiteral("y"), static_cast<qint64>(annotation.rect.y - canvas.y));
+            rect.insert(QStringLiteral("width"), static_cast<qint64>(annotation.rect.width));
+            rect.insert(QStringLiteral("height"), static_cast<qint64>(annotation.rect.height));
+            value.insert(QStringLiteral("rect"), rect);
+        } else {
+            continue;
+        }
+        marks.push_back(value);
+    }
+    return marks;
+}
+
+// One mark's pixels as a file in `directory`, or an empty string when there is
+// nowhere to write them.  The name is built from the mark's own place in the
+// document rather than from its content: two identical pastes are two marks, and
+// naming them by content would make one file serve both and lose the fact that
+// they are separate things the user can move apart.
+QString OverlayController::writeMarkAsset(const QString &directory, const Annotation &annotation,
+                                          int *counter) const
+{
+    if (directory.isEmpty() || annotation.pixels.isNull() || counter == nullptr) {
+        return QString();
+    }
+    const QString name = QStringLiteral("mark-%1.png").arg(++*counter);
+    const QString path = QDir(directory).filePath(name);
+    if (!annotation.pixels.save(path, "PNG")) {
+        return QString();
+    }
+    return path;
+}
+
+bool OverlayController::produceComposite(QImage *composite, QImage *marks, QString *error) const
+{
+    const auto fail = [error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    if (composite == nullptr) {
+        return fail(uiTr("There is nowhere to put the rendered capture."));
+    }
+    if (!selection_.has_value()) {
+        // A picking session never frames anything, and a cancelled one has no
+        // marks worth rendering: neither is a failure.
+        return false;
+    }
+    const int index = outputContaining(*selection_);
+    if (index < 0 || index >= session_.outputs.size()) {
+        return fail(uiTr("The selection is on no output."));
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (output.image.isNull()) {
+        return fail(uiTr("The captured frame is not available."));
+    }
+    const double density = outputScale(output);
+    // The same crop the translate mode writes: the selection in the output's
+    // own device pixels, which is the size the result is.
+    const QRect source = sourceRect(output, *selection_)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+    const QImage crop = output.image.copy(source);
+    if (crop.isNull()) {
+        return fail(uiTr("The selection's pixels could not be read."));
+    }
+    const QImage rendered = compositeAnnotations(crop, crop, *selection_, density, error);
+    if (rendered.isNull()) {
+        return false;
+    }
+    *composite = rendered;
+    if (marks != nullptr) {
+        // The marks on their own: the same painter over a transparent canvas,
+        // still reading the capture for the marks that sample it.  An opaque
+        // image cannot be composited onto the HDR half -- it would replace the
+        // light rather than mark it -- so the CLI needs the layer, not the
+        // flattened result.
+        //
+        // Cleared explicitly: a `QImage` built from a size alone owns
+        // uninitialized bytes, and a layer that started as whatever the last
+        // allocation held would composite a translucent mark over noise.
+        QImage blank(crop.size(), QImage::Format_ARGB32_Premultiplied);
+        if (blank.isNull()) {
+            return fail(uiTr("The capture's pixels could not be converted for drawing."));
+        }
+        blank.fill(Qt::transparent);
+        const QImage layer =
+            compositeAnnotations(blank, crop, *selection_, density, error);
+        if (layer.isNull()) {
+            return false;
+        }
+        *marks = layer;
+    }
+    return true;
 }
 
 void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &output,
@@ -10280,8 +12492,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         return;
     }
     const bool brush = tool_ == Tool::Mosaic;
-    const int widthLogical = std::max(1, static_cast<int>(toolStyle(toolName(tool_)).width));
-    const int scale = static_cast<int>(output.scale > 0 ? output.scale : 1);
+    const QString liveTool = tool_.has_value() ? toolName(*tool_) : QStringLiteral("pen");
+    const int widthLogical = std::max(1, static_cast<int>(toolStyle(liveTool).width));
+    const double scale = outputScale(output);
     const double deviceRadius = brush
         ? std::clamp(brushRadiusForStrength(
                          mosaicStrength_,
@@ -10300,9 +12513,9 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
     {
         QDataStream stream(&key, QIODevice::WriteOnly);
         const LogicalRect &surface = surfaceOf(output);
-        const ToolStyle &liveStyle = toolStyle(toolName(tool_));
+        const ToolStyle &liveStyle = toolStyle(liveTool);
         stream << size.width() << size.height() << output.id << output.scale << surface.x
-               << surface.y << surface.width << surface.height << toolName(tool_)
+               << surface.y << surface.width << surface.height << liveTool
                << static_cast<quint32>(liveStyle.color.rgba()) << liveStyle.width << currentDash_
                << mosaicStrength_ << mosaicShape_ << ratio;
     }
@@ -10390,7 +12603,7 @@ void OverlayController::paintLiveStroke(QPainter *painter, const OutputSession &
         } else {
             Annotation style;
             style.kind = Annotation::Kind::Stroke;
-            style.tool = toolName(tool_);
+            style.tool = liveTool;
             const ToolStyle &strokeStyle = toolStyle(style.tool);
             style.color = strokeStyle.color;
             style.width = strokeStyle.width;
@@ -10423,23 +12636,65 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
 {
     const OutputSession &output = overlay->output();
     const QPointF local = localPoint(output, pointer_, overlay->size());
-    const std::uint32_t scale = output.scale > 0 ? output.scale : 1;
-    const int sourceWidth = static_cast<int>(output.image.width());
-    const int sourceHeight = static_cast<int>(output.image.height());
-    if (sourceWidth <= 0 || sourceHeight <= 0) {
+    // The loupe reads the *picture*: the capture with the marks the user has
+    // already made painted onto it.  Reading the bare frame -- as this once did
+    // -- made the magnifier the one place on screen that disagreed with
+    // everything else, which is the opposite of what it is for: it is a
+    // pixel-level reading of what is being annotated, so a mark that is on the
+    // screen has to be in it.  The frame is still what the sample is *taken*
+    // from in the sense that matters -- the composite is a copy of it, never
+    // the frame itself, so nothing here can reach the saved picture.
+    const QImage *frame = loupeFrame(output);
+    const int sourceWidth = frame != nullptr ? frame->width() : output.image.width();
+    const int sourceHeight = frame != nullptr ? frame->height() : output.image.height();
+    if (sourceWidth <= 0 || sourceHeight <= 0 || frame == nullptr) {
         return;
     }
-    const int centerX = std::clamp(
-        static_cast<int>(std::floor((pointer_.x - output.geometry.x) * static_cast<double>(scale))),
-        0, sourceWidth - 1);
-    const int centerY = std::clamp(
-        static_cast<int>(std::floor((pointer_.y - output.geometry.y) * static_cast<double>(scale))),
-        0, sourceHeight - 1);
-    const int sampleLeft = std::clamp(centerX - kLoupeRadius, 0, sourceWidth - 1);
-    const int sampleTop = std::clamp(centerY - kLoupeRadius, 0, sourceHeight - 1);
-    const int sampleWidth = std::min(2 * kLoupeRadius + 1, sourceWidth - sampleLeft);
-    const int sampleHeight = std::min(2 * kLoupeRadius + 1, sourceHeight - sampleTop);
-    const QRect source(sampleLeft, sampleTop, sampleWidth, sampleHeight);
+    // The magnifier samples the *image*, so it has to count from where the image
+    // actually is: in the pin editor that is the daemon-confirmed rect, not the
+    // rect the session recorded when the editor opened, and counting from the
+    // stale one made the loupe show the wrong part of the picture while a pin
+    // was being dragged -- the "scrambled magnifier".
+    const LogicalRect &image = pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
+    // The frame holds device pixels and the pointer is in logical ones, so the
+    // offset has to cross the output's scale -- the number it is, not a rounded
+    // one: the pin editor's output is zoomed, and a scale truncated to 0 would
+    // pin every sample to the frame's first pixel.
+    const double scale = outputScale(output);
+    // A region capture's frame is the *whole* frozen output, not the selection
+    // the user framed, so counting from the output's origin alone would let the
+    // loupe read the desktop beside the capture.  What the magnifier is for is
+    // the pixels of the picture being annotated, so the sample is held inside
+    // that picture: a cursor past its edge reads the edge pixel, which is the
+    // same thing the loupe does at the frame's own border.  In the pin editor
+    // the frame *is* the picture, and the two are the same rect.
+    //
+    // Only a *committed* picture bounds the sample.  While the user is still
+    // framing the selection, `selection_` is the rect being dragged into
+    // existence -- a press and a move to the same point leaves it one pixel
+    // across -- and holding the loupe inside that would pin every sample to a
+    // single pixel for the whole drag, which is the one time the magnifier is
+    // read most.  Until the selection is made, the frame is the picture.
+    const bool bounded = !pinEdit_ && editing_ && selection_.has_value();
+    const LogicalRect &picture = bounded ? *selection_ : image;
+    const int minX = std::clamp(static_cast<int>(std::floor((picture.x - image.x) * scale)), 0,
+                                sourceWidth - 1);
+    const int minY = std::clamp(static_cast<int>(std::floor((picture.y - image.y) * scale)), 0,
+                                sourceHeight - 1);
+    const int maxX = std::clamp(
+        static_cast<int>(std::ceil((picture.x + static_cast<std::int64_t>(picture.width) - image.x) *
+                                   scale)) -
+            1,
+        minX, sourceWidth - 1);
+    const int maxY = std::clamp(
+        static_cast<int>(std::ceil((picture.y + static_cast<std::int64_t>(picture.height) - image.y) *
+                                   scale)) -
+            1,
+        minY, sourceHeight - 1);
+    const int centerX =
+        std::clamp(static_cast<int>(std::floor((pointer_.x - image.x) * scale)), minX, maxX);
+    const int centerY =
+        std::clamp(static_cast<int>(std::floor((pointer_.y - image.y) * scale)), minY, maxY);
     const qreal radius = kLoupeDiameter / 2.0;
 
     QPointF center = local + QPointF(radius * 1.1, radius * 1.1);
@@ -10458,10 +12713,16 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     clipPath.addEllipse(center, radius, radius);
     painter->setClipPath(clipPath);
     painter->setRenderHint(QPainter::SmoothPixmapTransform, false);
-    const QRectF target(center.x() - radius + (sampleLeft - (centerX - kLoupeRadius)) * kLoupeZoom,
-                        center.y() - radius + (sampleTop - (centerY - kLoupeRadius)) * kLoupeZoom,
-                        sampleWidth * kLoupeZoom, sampleHeight * kLoupeZoom);
-    painter->drawImage(target, output.image, source);
+    // The crop is the fixed window the loupe magnifies, centred on the cursor's
+    // own pixel.  Near a screen edge that window runs off the frame; sampling
+    // only the part still inside leaves the rest of the circle showing whatever
+    // is underneath, which is the "scrambled magnifier".  Replicating the edge
+    // pixels instead keeps the cursor's pixel dead centre and the whole circle
+    // filled, which is the one thing the magnifier is read for.
+    const QImage crop = loupeCrop(*frame, centerX, centerY);
+    painter->drawImage(QRectF(center.x() - radius, center.y() - radius, 2.0 * radius,
+                              2.0 * radius),
+                       crop);
     painter->restore();
 
     painter->save();
@@ -10476,16 +12737,369 @@ void OverlayController::drawLoupe(CaptureOverlay *overlay, QPainter *painter)
     painter->drawLine(center, center - QPointF(0, radius / 2.5));
     painter->drawLine(center, center + QPointF(0, radius / 2.5));
     const QString coordinates = QStringLiteral("%1, %2").arg(centerX).arg(centerY);
+    // The pixel's own colour, as the picker's own reading of it.  The circle
+    // and the pill sample the same pixel, so what the pill says is what the
+    // magnifier shows.
+    const QColor pixelColor = frame->pixelColor(centerX, centerY);
     painter->restore();
+    // The pill hangs just under the loupe.  When there is no room below -- a
+    // cursor near the bottom edge -- hanging it "above the anchor" would drop it
+    // back inside the circle and cover the very pixels the magnifier exists to
+    // show, so it is lifted clear over the top of the loupe instead.
+    QPointF pillAnchor = center + QPointF(0, radius + 2.0);
+    const int pillHeight = QFontMetrics(pillFont()).height() + 8;
+    if (pillAnchor.y() + 10.0 + pillHeight > overlay->height()) {
+        pillAnchor.setY(center.y() - radius - 12.0);
+    }
     // Under the eyedropper the readout is the pixel itself, chip and hex: that
-    // is the value the click is about to take.  Everywhere else the loupe is
-    // there to place a corner, and the numbers are what is wanted.
-    const QRectF bounds(0, 0, overlay->width(), overlay->height());
-    if (tool_ == Tool::Picker) {
-        drawColorPill(painter, center + QPointF(0, radius + 2.0),
-                      output.image.pixelColor(centerX, centerY), bounds);
+    // is the value the click is about to take, and a pair of numbers says
+    // nothing about it.  Everywhere else the loupe is there to place a corner,
+    // and the numbers are what is wanted.
+    const bool picking = colorPickerVisible() && pixelColor.isValid();
+    if (picking) {
+        // The colour readout goes on the other side of the loupe from the
+        // coordinates, so the two never overlap and neither covers the circle.
+        QPointF colourAnchor = center + QPointF(0, radius + 2.0);
+        if (pillAnchor.y() > center.y()) {
+            colourAnchor = center + QPointF(0, radius + 2.0 + pillHeight + 2.0);
+            if (colourAnchor.y() + 10.0 + 2 * pillHeight > overlay->height()) {
+                colourAnchor.setY(center.y() - radius - 12.0);
+            }
+        } else {
+            colourAnchor.setY(center.y() - radius - 12.0);
+        }
+        drawColorPill(overlay, painter, colourAnchor, pixelColor);
     } else {
-        drawInfoPill(painter, center + QPointF(0, radius + 2.0), coordinates, bounds);
+        drawInfoPill(painter, pillAnchor, coordinates,
+                     QRectF(0, 0, overlay->width(), overlay->height()));
+    }
+}
+
+// The picker's readout: the pixel's code on a swatch of the pixel itself, with
+// the keys that act on it on a line of their own below.
+//
+// Two lines rather than one, because the two halves are not the same kind of
+// thing.  The top line is a *reading* -- it is the colour, shown, and it has to
+// change as the cursor moves or the user is reading a swatch of where the
+// pointer used to be -- while the bottom line is a fixed hint about the keys.
+// Run together they made the swatch as wide as the hint, which put a band of
+// the sampled colour across the screen; split, the swatch is only as wide as
+// the code it prints.
+//
+// The text on the swatch is black or white, whichever the swatch's own
+// luminance is further from: a fixed white would vanish on a white pixel, which
+// is exactly the pixel a colour picker gets pointed at.
+void OverlayController::drawColorPill(CaptureOverlay *overlay, QPainter *painter,
+                                      const QPointF &anchor, const QColor &color)
+{
+    const QRectF bounds(0, 0, overlay->width(), overlay->height());
+    const QFontMetrics metrics(pillFont());
+    const QString code = color.name(QColor::HexRgb).toUpper();
+    const QString hint = QStringLiteral("%1  %2")
+                             .arg(shortcutHint(ShortcutAction::CopyColor, uiTr("copy")),
+                                  shortcutHint(ShortcutAction::AdoptColor, uiTr("use")));
+
+    const int codeWidth = metrics.horizontalAdvance(code);
+    const int hintWidth = metrics.horizontalAdvance(hint);
+    const int width = std::max(codeWidth, hintWidth) + 16;
+    const int lineHeight = metrics.height() + 4;
+    const int height = 2 * lineHeight;
+
+    qreal x = anchor.x() - width / 2.0;
+    x = std::clamp(x, bounds.left() + 2.0,
+                   std::max(bounds.left() + 2.0, bounds.right() - width - 2.0));
+    qreal y = anchor.y() + 10.0;
+    if (y + height > bounds.bottom()) {
+        y = anchor.y() - height - 10.0;
+    }
+    y = std::clamp(y, bounds.top() + 2.0,
+                   std::max(bounds.top() + 2.0, bounds.bottom() - height - 2.0));
+    const QRectF pill(x, y, width, height);
+
+    // The swatch is opaque whatever the pixel's alpha: the readout is the
+    // colour as it appears on screen, and the compositor has already put it
+    // over whatever was behind it.
+    QColor ground = color;
+    ground.setAlpha(255);
+    // Rec. 601 luma, which is what "how bright does this look" means for a
+    // background: at 0.299/0.587/0.114 the crossover sits at the point where
+    // black and white text are equally readable, so the choice is never a
+    // guess.  The ink is pure black or pure white rather than a tint, because
+    // the code has to stay legible at pill size.
+    const double luma = (0.299 * ground.redF() + 0.587 * ground.greenF() +
+                         0.114 * ground.blueF()) *
+        255.0;
+    const QColor ink = luma > 140.0 ? QColor(0, 0, 0) : QColor(255, 255, 255);
+
+    painter->setFont(pillFont());
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(ground);
+    painter->drawRoundedRect(pill, 4, 4);
+    painter->setPen(QPen(QColor(120, 120, 120), 1.0));
+    painter->setBrush(Qt::NoBrush);
+    painter->drawRoundedRect(pill.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+
+    painter->setPen(ink);
+    painter->drawText(QRectF(pill.left(), pill.top(), pill.width(), lineHeight),
+                      Qt::AlignCenter, code);
+    // The hint keeps the pill's dark ground rather than the swatch: it is a
+    // caption, and a caption on the sampled colour would move and change
+    // contrast every time the cursor did.
+    const QRectF hintRect(pill.left(), pill.top() + lineHeight, pill.width(), lineHeight);
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(QColor(20, 20, 20, 225));
+    painter->drawRect(hintRect);
+    painter->setPen(QPen(QColor(120, 120, 120), 1.0));
+    painter->setBrush(Qt::NoBrush);
+    painter->drawRect(hintRect.adjusted(0.5, 0.0, -0.5, -0.5));
+    painter->setPen(Qt::white);
+    painter->drawText(hintRect, Qt::AlignCenter, hint);
+}
+
+// The frame the magnifier and the colour readout sample: the frozen image of
+// the output, which is what the overlay is showing.
+const QImage *OverlayController::outputFrame(const OutputSession &output) const
+{
+    return output.image.isNull() ? nullptr : &output.image;
+}
+
+QByteArray OverlayController::loupeCompositeKey(const OutputSession &output) const
+{
+    QByteArray key;
+    QDataStream stream(&key, QIODevice::WriteOnly);
+    // The frame itself, and where it sits.  `geometry` is here rather than in
+    // the marks' own caches: the composite is a picture of a *place*, so
+    // sliding the pin's image under the marks has to move the marks with it
+    // and a stale composite would leave them where they were.
+    stream << output.id << output.image.cacheKey() << output.geometry.x << output.geometry.y
+           << output.geometry.width << output.geometry.height << output.scale
+           << (pinEdit_ && marksOrigin_.has_value());
+    if (pinEdit_ && marksOrigin_.has_value()) {
+        stream << marksOrigin_->x << marksOrigin_->y << marksOrigin_->width
+               << marksOrigin_->height;
+    }
+    stream << annotations_.size();
+    // Every mark's own identity, as the raster caches compute it: a mark that
+    // has not changed contributes the same bytes, and one that has contributes
+    // different ones.  This is what makes a style change or a drag rebuild the
+    // composite without the editor having to remember to say so.
+    for (const Annotation &annotation : annotations_) {
+        if (annotation.raster == nullptr) {
+            annotation.raster = makeAnnotationRaster(annotation);
+        }
+        stream << annotation.raster->key(annotation, output, output.image.size());
+    }
+    return key;
+}
+
+void OverlayController::invalidateLoupeComposite()
+{
+    loupeCompositeKey_.clear();
+    loupeComposite_ = QImage();
+    loupeCompositeOutput_ = -1;
+}
+
+const QImage *OverlayController::loupeFrame(const OutputSession &output)
+{
+    const QImage *frame = outputFrame(output);
+    if (frame == nullptr) {
+        return nullptr;
+    }
+    if (annotations_.isEmpty()) {
+        // Nothing has been drawn, so the picture *is* the frame.  The loupe
+        // then reads the capture's own pixels, which is the one reading that
+        // cannot be wrong.
+        return frame;
+    }
+    const QByteArray key = loupeCompositeKey(output);
+    if (!loupeComposite_.isNull() && key == loupeCompositeKey_ &&
+        static_cast<uint32_t>(loupeCompositeOutput_) == output.id) {
+        return &loupeComposite_;
+    }
+    // Where the frame sits on the screen.  In the pin editor that is the
+    // daemon-confirmed rect rather than the session's own record of it, which
+    // is what the rest of the editor counts from too; the two agree once the
+    // daemon has answered, and before that the confirmed one is the one the
+    // picture is actually drawn at.
+    const LogicalRect picture =
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
+    // The frame's own size, so the composite is the picture pixel for pixel: a
+    // mark lands on exactly the device pixels it lands on in the render.  The
+    // cost is that a mark overhanging the picture is cut off at its edge --
+    // which is also what the screen does, so the two agree.
+    QImage composite(frame->size(), QImage::Format_ARGB32_Premultiplied);
+    if (composite.isNull()) {
+        return frame;
+    }
+    composite.fill(Qt::transparent);
+    {
+        QPainter painter(&composite);
+        painter.drawImage(0, 0, *frame);
+        // The marks were measured against the picture, so this is the record
+        // they are drawn through: `surface` is the picture's own rect and the
+        // size handed to the painter is its device size, which together make
+        // every global coordinate land on the frame's own pixels.  The pixels
+        // stay the *frame's*, not the composite's, so a mosaic samples the
+        // capture rather than the marks already painted over it -- exactly as
+        // the render does.
+        OutputSession placed;
+        placed.id = output.id;
+        placed.scale = output.scale;
+        placed.geometry = picture;
+        placed.surface = picture;
+        placed.image = *frame;
+        for (const Annotation &annotation : annotations_) {
+            if (annotation.raster == nullptr) {
+                annotation.raster = makeAnnotationRaster(annotation);
+            }
+            annotation.raster->drawInto(&painter, annotation, placed, composite.size());
+        }
+    }
+    loupeComposite_ = composite;
+    loupeCompositeKey_ = key;
+    loupeCompositeOutput_ = static_cast<int>(output.id);
+    return &loupeComposite_;
+}
+
+bool OverlayController::magnifierVisible() const
+{
+    return magnifierHeld_ || magnifierTyped_;
+}
+
+bool CaptureOverlay::magnifierVisible() const
+{
+    return controller_ != nullptr && controller_->magnifierVisible();
+}
+
+bool CaptureOverlay::colorPickerVisible() const
+{
+    return controller_ != nullptr && controller_->colorPickerVisible();
+}
+
+bool OverlayController::colorPickerVisible() const
+{
+    // Only the right button's magnifier.  The loupe a drag brings up, and the
+    // one a keyboard step flashes, are coordinate readouts for placing a mark:
+    // they are there to say *where* the cursor is, and the colour under it is
+    // not what the user is aiming at.  The right button is the one press whose
+    // whole purpose is the pixel, so it is the one that carries the picker.
+    return magnifierHeld_;
+}
+
+void OverlayController::flashMagnifier()
+{
+    magnifierTyped_ = true;
+    if (magnifierTimer_ == nullptr) {
+        magnifierTimer_ = new QTimer(this);
+        magnifierTimer_->setSingleShot(true);
+        QObject::connect(magnifierTimer_, &QTimer::timeout, this,
+                         [this] { endMagnifierFlash(); });
+    }
+    // Two seconds: long enough to read a coordinate and step again, short
+    // enough that a frame left up by a stray key press goes away on its own.
+    magnifierTimer_->start(2000);
+}
+
+void OverlayController::endMagnifierFlash()
+{
+    if (!magnifierTyped_) {
+        return;
+    }
+    magnifierTyped_ = false;
+    if (magnifierTimer_ != nullptr) {
+        magnifierTimer_->stop();
+    }
+    if (!magnifierHeld_) {
+        updateAll();
+    }
+}
+
+// The pixel the magnifier is centred on, in the output's own device pixels.
+// The image pixel under the cursor is what the user is aiming at: the pill's
+// coordinates, the hex code, and the circle all read from this one place, so
+// they cannot disagree about which pixel is "under the cursor".
+QColor OverlayController::pixelUnderCursor(int *pixelIndexX, int *pixelIndexY) const
+{
+    if (pixelIndexX != nullptr) {
+        *pixelIndexX = -1;
+    }
+    if (pixelIndexY != nullptr) {
+        *pixelIndexY = -1;
+    }
+    if (pointerOutput_ < 0 || pointerOutput_ >= session_.outputs.size()) {
+        return QColor();
+    }
+    const OutputSession &output = session_.outputs.at(pointerOutput_);
+    const QImage *frame = outputFrame(output);
+    if (frame == nullptr || frame->isNull()) {
+        return QColor();
+    }
+    const double scale = outputScale(output);
+    const LogicalRect &image =
+        pinEdit_ && marksOrigin_.has_value() ? *marksOrigin_ : output.geometry;
+    const int x = std::clamp(
+        static_cast<int>(std::floor((pointer_.x - image.x) * scale)), 0, frame->width() - 1);
+    const int y = std::clamp(
+        static_cast<int>(std::floor((pointer_.y - image.y) * scale)), 0, frame->height() - 1);
+    if (pixelIndexX != nullptr) {
+        *pixelIndexX = x;
+    }
+    if (pixelIndexY != nullptr) {
+        *pixelIndexY = y;
+    }
+    return frame->pixelColor(x, y);
+}
+
+void OverlayController::copyColorUnderCursor()
+{
+    const QColor color = pixelUnderCursor(nullptr, nullptr);
+    if (!color.isValid()) {
+        return;
+    }
+    // The code as it is written in a stylesheet or a config file: the same
+    // `#RRGGBB` the pill prints, so the copy and the readout cannot disagree.
+    if (!writeClipboard(color.name(QColor::HexRgb).toUpper())) {
+        std::fprintf(stderr, "vshot-qt-ui: could not copy the colour code\n");
+        std::fflush(stderr);
+    }
+}
+
+void OverlayController::adoptColorUnderCursor()
+{
+    const QColor color = pixelUnderCursor(nullptr, nullptr);
+    if (!color.isValid()) {
+        return;
+    }
+    // Only where there is a palette to take it: a tool with no colour of its
+    // own -- the mosaic, whose look is its strength -- has nothing to set, and
+    // silently restyling some other tool would be worse than doing nothing.
+    const QString target = styleTargetTool();
+    if (target == QStringLiteral("mosaic")) {
+        return;
+    }
+    // Opaque, because the pixel is: the alpha a tool happens to be carrying is
+    // the user's choice about the ink, not about this colour.
+    QColor adopted = color;
+    adopted.setAlpha(255);
+    setCurrentColor(adopted);
+}
+
+void OverlayController::copyToClipboard()
+{
+    QImage composite;
+    QString error;
+    if (!produceComposite(&composite, nullptr, &error)) {
+        // A session that has framed nothing has nothing to copy, and that is
+        // not a failure worth a diagnostic; anything else is.
+        if (!error.isEmpty()) {
+            std::fprintf(stderr, "vshot-qt-ui: %s\n", error.toUtf8().constData());
+            std::fflush(stderr);
+        }
+        return;
+    }
+    if (!runWlCopyImage(composite)) {
+        std::fprintf(stderr, "vshot-qt-ui: could not copy the capture\n");
+        std::fflush(stderr);
     }
 }
 
@@ -10524,9 +13138,32 @@ QPointF CaptureOverlay::localFromGlobal(Point point) const
     return localPoint(output(), point, size());
 }
 
-bool CaptureOverlay::showLayerSurface()
+// Wayland has no "no input here" request: an unset input region means the whole
+// surface is interactive, and Qt sends no request at all for an empty mask,
+// which is exactly that default.  A region parked outside the surface is the
+// portable way to say "click straight through", the same trick `PinSurface`
+// uses.
+//
+// The mask is a round trip to the compositor and a pin drag recomputes it every
+// frame, so an unchanged one is not re-sent.
+void CaptureOverlay::setInputMask(const QRegion &mask)
 {
-    if (layerWindow_ == nullptr) {
+    static const QRegion clickThrough(QRect(-8, -8, 1, 1));
+    const QRegion wanted = mask.isEmpty() ? clickThrough : mask;
+    if (wanted == inputMask_) {
+        return;
+    }
+    winId();
+    QWindow *window = windowHandle();
+    if (window == nullptr) {
+        return;
+    }
+    inputMask_ = wanted;
+    window->setMask(wanted);
+}
+
+bool CaptureOverlay::showLayerSurface()
+{    if (layerWindow_ == nullptr) {
         winId();
         layerWindow_ = windowHandle();
         if (layerWindow_ == nullptr) {
@@ -10593,40 +13230,59 @@ bool CaptureOverlay::showLayerSurfaceAt(int globalX, int globalY, int width, int
     return true;
 }
 
+void CaptureOverlay::detachController()
+{
+    controller_ = nullptr;
+    hide();
+}
+
 void CaptureOverlay::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
+    if (controller_ == nullptr) {
+        return;
+    }
     QPainter painter(this);
     controller_->paint(this, &painter);
 }
 
 void CaptureOverlay::mousePressEvent(QMouseEvent *event)
 {
-    controller_->press(this, event->position(), event->button(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->press(this, event->position(), event->button(), event->modifiers());
+    }
     event->accept();
 }
 
 void CaptureOverlay::mouseMoveEvent(QMouseEvent *event)
 {
-    controller_->move(this, event->position(), event->buttons(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->move(this, event->position(), event->buttons(), event->modifiers());
+    }
     event->accept();
 }
 
 void CaptureOverlay::mouseReleaseEvent(QMouseEvent *event)
 {
-    controller_->release(this, event->position(), event->button(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->release(this, event->position(), event->button(), event->modifiers());
+    }
     event->accept();
 }
 
 void CaptureOverlay::mouseDoubleClickEvent(QMouseEvent *event)
 {
-    controller_->doubleClick(this, event->position(), event->button());
+    if (controller_ != nullptr) {
+        controller_->doubleClick(this, event->position(), event->button());
+    }
     event->accept();
 }
 
 void CaptureOverlay::keyPressEvent(QKeyEvent *event)
 {
-    controller_->key(this, event->key(), event->modifiers());
+    if (controller_ != nullptr) {
+        controller_->key(this, event->key(), event->modifiers());
+    }
     event->accept();
 }
 
@@ -10634,13 +13290,59 @@ void CaptureOverlay::closeEvent(QCloseEvent *event)
 {
     // The compositor (or a stray close request) must not hang the Rust side:
     // treat an externally closed overlay as a cancelled session.
-    controller_->cancel();
+    if (controller_ != nullptr) {
+        controller_->cancel();
+    }
     event->accept();
+}
+
+void CaptureOverlay::wantKeyboard()
+{
+    if (layerWindow_ == nullptr || keyboardWanted_) {
+        return;
+    }
+    auto *layer = LayerShellQt::Window::get(layerWindow_);
+    if (layer == nullptr) {
+        return;
+    }
+    keyboardWanted_ = true;
+    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
+    // The interactivity change only reaches the compositor with the next commit,
+    // so the keyboard is asked for now rather than at some later repaint.
+    layerWindow_->requestUpdate();
+}
+
+void CaptureOverlay::offerKeyboardBack()
+{
+    if (layerWindow_ == nullptr || !keyboardWanted_) {
+        return;
+    }
+    auto *layer = LayerShellQt::Window::get(layerWindow_);
+    if (layer == nullptr) {
+        return;
+    }
+    keyboardWanted_ = false;
+    // `None`, not `OnDemand`: the surface covers a whole output and would
+    // otherwise still take the keyboard whenever the compositor felt like giving
+    // it one.  The pointer coming back is what asks for it again.
+    layer->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+    layerWindow_->requestUpdate();
+}
+
+void CaptureOverlay::enterEvent(QEnterEvent *event)
+{
+    wantKeyboard();
+    QWidget::enterEvent(event);
 }
 
 void CaptureOverlay::leaveEvent(QEvent *event)
 {
     setCursor(Qt::CrossCursor);
+    // The pointer leaving is the user having gone elsewhere, so the keyboard
+    // goes back with it.  Without this the surface holds it for as long as it is
+    // mapped -- the compositor routes every key to whichever surface has it, so
+    // no other window could be typed into while the editor was open.
+    offerKeyboardBack();
     QWidget::leaveEvent(event);
 }
 

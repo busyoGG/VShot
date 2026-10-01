@@ -19,7 +19,7 @@ pub use wlr::WlrCapture;
 
 use crate::error::{Result, VshotError};
 use crate::geometry::Rect;
-use crate::model::{Frame, HdrFrame, OutputColor};
+use crate::model::{Frame, HdrFrame, OutputColor, ToneMapOptions};
 
 /// The compositor families vshot can capture from.
 ///
@@ -61,6 +61,20 @@ impl Capturer {
         match self {
             Self::Wlr(capture) => capture.capture_output(name, cursor),
             Self::Kwin(capture) => capture.capture_output(name, cursor),
+        }
+    }
+
+    /// How the SDR side of HDR content is mapped down, for the paths that read
+    /// an HDR buffer inside the capture layer: the frozen scene the user
+    /// annotates on.  The caller sets this once, from the same request that
+    /// later tone-maps the SDR half of the file, so what is drawn on and what
+    /// is written out are the same pixels.
+    pub fn set_tone_map(&mut self, tone_map: ToneMapOptions) {
+        match self {
+            Self::Wlr(capture) => capture.set_tone_map(tone_map),
+            // KWin's screenshots arrive as SDR PNG over D-Bus: there is no HDR
+            // buffer here for a map to apply to.
+            Self::Kwin(_) => {}
         }
     }
 

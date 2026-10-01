@@ -29,6 +29,7 @@
 #include "settings_window.hpp"
 
 #include "config.hpp"
+#include "shortcuts.hpp"
 #include "text_size.hpp"
 #include "i18n.hpp"
 
@@ -37,16 +38,21 @@
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QMouseEvent>
+#include <QDoubleSpinBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
@@ -56,9 +62,12 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSpinBox>
+#include <QTimer>
 #include <QStackedWidget>
 #include <QStyle>
+#include <QStringList>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QWidget>
 
 #include <unistd.h>
@@ -120,6 +129,8 @@ constexpr int kDefaultReplayFps = 30;
 // CLI falls back to, which the box's leading entry shows so the default is
 // readable rather than implied by the word "default".
 constexpr const char *kDefaultPngCompression = "fast";
+constexpr const char *kDefaultHdrFormat = "avif";
+constexpr const char *kDefaultToneMap = "auto";
 constexpr const char *kDefaultEncoder = "h264";
 constexpr const char *kDefaultEncoderBackend = "auto";
 constexpr const char *kDefaultLongInject = "auto";
@@ -139,6 +150,7 @@ QLabel#pageTitle   { color: %2; font-size: 17px; font-weight: 600; }
 QLabel#pageHint    { color: %3; font-size: 12px; }
 QLabel#rowLabel    { color: %2; font-size: 13px; }
 QLabel#rowHint     { color: %3; font-size: 11px; }
+QLabel#rowValue    { color: %3; font-size: 12px; font-weight: 600; }
 QLabel#status      { color: %3; font-size: 11px; }
 QLabel#status[error="true"] { color: #ffb4ab; }
 
@@ -152,13 +164,17 @@ QListWidget#sidebar::item { color: %6; border-radius: 8px;
 QListWidget#sidebar::item:hover { background: #262d37; color: %2; }
 QListWidget#sidebar::item:selected { background: %7; color: %8; font-weight: 600; }
 
-QComboBox, QLineEdit, QSpinBox { color: %2; background: %9;
+/* QDoubleSpinBox is a sibling of QSpinBox, not a subclass of it, so the class
+   selector above does not reach it: a page that used one for a percentage got
+   the platform's own box next to restyled ones.  It is listed here so the two
+   look alike. */
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { color: %2; background: %9;
             border: 1px solid %10; border-radius: 8px;
             padding: 0 10px; min-height: 32px; font-size: 13px;
             selection-color: %8; selection-background-color: %7; }
-QComboBox:hover, QLineEdit:hover, QSpinBox:hover { border-color: #4d5765; }
-QComboBox:focus, QLineEdit:focus, QSpinBox:focus { border-color: %7; }
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+QComboBox:hover, QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #4d5765; }
+QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: %7; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
             color: %11; background: #242a33; }
 
 /* The indicator is painted by the widgets themselves (see ModernComboBox and
@@ -183,6 +199,16 @@ QPushButton#saveButton:hover { background: #e9ecff; }
 QPushButton#saveButton:pressed { background: #c7cdf2; }
 QPushButton#swatch { text-align: left; padding-left: 8px; font-size: 12px;
             font-family: monospace; }
+
+/* A modal box opened from this dialog inherits the sheet, and the QDialog rule
+   above then forces its background dark.  Qt gives a box's own labels no object
+   name, so they match nothing and keep the palette's WindowText -- which on a
+   light system scheme is near-black, and near-black on the dark background is
+   unreadable.  The labels are named here instead, and given the same ink the
+   dialog's own text uses. */
+QMessageBox { background: %1; }
+QMessageBox QLabel, QMessageBox QLabel#qt_msgbox_label,
+            QMessageBox QLabel#qt_msgboxex_icon_label { color: %2; background: transparent; }
 
 QScrollArea { border: 0; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
@@ -368,6 +394,106 @@ private:
     }
 };
 
+/// [`ModernSpinBox`] for a value that is a real number rather than a count.
+///
+/// The tone-map white level is a fraction of the range, so it is stepped in
+/// hundredths and shown as a percentage: the map's own arithmetic is in
+/// fractions, but "80 %" is what a user can picture.
+class ModernDoubleSpinBox final : public QDoubleSpinBox {
+public:
+    explicit ModernDoubleSpinBox(QWidget *parent = nullptr)
+        : QDoubleSpinBox(parent)
+    {
+        setButtonSymbols(QAbstractSpinBox::NoButtons);
+        setDecimals(2);
+        setSingleStep(0.01);
+        lineEdit()->installEventFilter(this);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        QDoubleSpinBox::paintEvent(event);
+        QPainter painter(this);
+        paintChevron(painter, upBox(), kChevron, false);
+        paintChevron(painter, downBox(), kChevron, true);
+    }
+
+    bool onArrow(const QPointF &position) const
+    {
+        return upBox().contains(position) || downBox().contains(position);
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == lineEdit()) {
+            if (event->type() == QEvent::MouseButtonPress) {
+                auto *mouse = static_cast<QMouseEvent *>(event);
+                if (mouse->button() == Qt::LeftButton) {
+                    const QPointF position =
+                        lineEdit()->mapTo(this, mouse->position().toPoint());
+                    if (upBox().contains(position)) {
+                        stepUp();
+                        setFocus(Qt::MouseFocusReason);
+                        return true;
+                    }
+                    if (downBox().contains(position)) {
+                        stepDown();
+                        setFocus(Qt::MouseFocusReason);
+                        return true;
+                    }
+                }
+            } else if (event->type() == QEvent::MouseMove) {
+                auto *mouse = static_cast<QMouseEvent *>(event);
+                const QPointF position =
+                    lineEdit()->mapTo(this, mouse->position().toPoint());
+                lineEdit()->setCursor(onArrow(position) ? Qt::PointingHandCursor
+                                                        : Qt::IBeamCursor);
+            }
+        }
+        return QDoubleSpinBox::eventFilter(watched, event);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        const QPointF position = event->position();
+        if (event->button() == Qt::LeftButton && upBox().contains(position)) {
+            stepUp();
+            event->accept();
+            return;
+        }
+        if (event->button() == Qt::LeftButton && downBox().contains(position)) {
+            stepDown();
+            event->accept();
+            return;
+        }
+        QDoubleSpinBox::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        const QPointF position = event->position();
+        const bool onArrow = upBox().contains(position) || downBox().contains(position);
+        setCursor(onArrow ? Qt::PointingHandCursor : Qt::IBeamCursor);
+        QDoubleSpinBox::mouseMoveEvent(event);
+    }
+
+private:
+    QRectF upBox() const
+    {
+        constexpr qreal strip = 26.0;
+        constexpr qreal arrowWidth = 16.0;
+        return QRectF(width() - strip, 0.0, arrowWidth, height() / 2.0);
+    }
+
+    QRectF downBox() const
+    {
+        QRectF box = upBox();
+        box.moveTop(box.height());
+        return box;
+    }
+};
+
 /// A two-state switch: a pill that slides rather than a tick box.
 ///
 /// Drawn here for the same reason the chevrons are -- the platform's check
@@ -525,60 +651,16 @@ QStringList parseFollowText(const QString &text)
 /// itself after five seconds, so this is that plus room to start and exit.
 constexpr int kMicrophoneListTimeoutMs = 8000;
 
-/// The audio inputs `vshot record mics` lists, as `(node name, label)` pairs:
-/// the name is what `--mic` accepts and what the file keeps, the label is the
-/// description a person reads.
+/// Reads what `vshot record mics` printed into `(node name, label)` pairs.
 ///
-/// The list has to come from the running session -- it is the only thing that
-/// knows which inputs exist -- so this runs `vshot`, which is the binary beside
-/// this helper: the same discovery the capture overlay makes for the OCR engine,
-/// and for the same reason (this process *is* the helper, so its own path names
-/// the program to run).
-///
-/// Nothing here can fail the settings window.  A machine without PipeWire, a
-/// session with no inputs, or a vshot that cannot be found all yield an empty
-/// list, and the row then offers the two answers that always exist; the button
-/// beside it re-asks, which is what one does after fixing the machine.
-QList<QPair<QString, QString>> detectedMicrophones()
+/// The lines are `serial<TAB>name<TAB>description`.  The serial is not offered:
+/// a name is stable across sessions and a serial is not, and the file has to
+/// outlive the session.  Anything that does not look like a line is skipped, so
+/// a warning on stdout does not become a device.
+QList<QPair<QString, QString>> parseMicrophoneListing(const QString &listing)
 {
-    char buffer[4096];
-    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-    if (length <= 0) {
-        return {};
-    }
-    buffer[length] = '\0';
-    const QString helper = QString::fromLocal8Bit(buffer);
-    QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
-    if (!QFileInfo::exists(program)) {
-        const QString beside =
-            QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
-        if (QFileInfo::exists(beside)) {
-            program = QDir::cleanPath(beside);
-        } else {
-            program = QStringLiteral("vshot");
-        }
-    }
-
-    QProcess process;
-    process.setProgram(program);
-    process.setArguments({QStringLiteral("record"), QStringLiteral("mics")});
-    process.setStandardInputFile(QProcess::nullDevice());
-    process.start();
-    if (!process.waitForStarted(kMicrophoneListTimeoutMs)) {
-        return {};
-    }
-    if (!process.waitForFinished(kMicrophoneListTimeoutMs)) {
-        process.kill();
-        process.waitForFinished();
-        return {};
-    }
-
     QList<QPair<QString, QString>> inputs;
-    const QString listing = QString::fromUtf8(process.readAllStandardOutput());
     for (const QString &line : listing.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
-        // `serial<TAB>name<TAB>description`.  The serial is not offered: a name
-        // is stable across sessions and a serial is not, and the file has to
-        // outlive the session.
         const QStringList fields = line.split(QLatin1Char('\t'));
         if (fields.size() < 2 || fields.at(1).isEmpty()) {
             continue;
@@ -588,6 +670,136 @@ QList<QPair<QString, QString>> detectedMicrophones()
     }
     return inputs;
 }
+
+/// The path of the `vshot` binary to ask: this process *is* the helper, so its
+/// own path names the program beside it.  A build tree puts it in the parent,
+/// and anything else falls back to the name on `PATH`.
+QString helperProgram()
+{
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        return QStringLiteral("vshot");
+    }
+    buffer[length] = '\0';
+    const QString helper = QString::fromLocal8Bit(buffer);
+    const QString program = QFileInfo(helper).absolutePath() + QStringLiteral("/vshot");
+    if (QFileInfo::exists(program)) {
+        return program;
+    }
+    const QString beside =
+        QFileInfo(helper).absolutePath() + QStringLiteral("/../target/release/vshot");
+    if (QFileInfo::exists(beside)) {
+        return QDir::cleanPath(beside);
+    }
+    return QStringLiteral("vshot");
+}
+
+/// The audio inputs `vshot record mics` lists, as `(node name, label)` pairs:
+/// the name is what `--mic` accepts and what the file keeps, the label is the
+/// description a person reads.
+///
+/// The list has to come from the running session -- it is the only thing that
+/// knows which inputs exist -- so this runs `vshot`, the same discovery the
+/// capture overlay makes for the OCR engine.
+///
+/// It is asked for **once**, and in the background.  The command starts a
+/// second process that has to bring PipeWire up before it can answer, which
+/// takes about a second, and both the recording and the replay card carry a
+/// microphone row -- so asking synchronously while building the pages left the
+/// window blank for two seconds before it appeared, every time it was opened,
+/// to fill in a list most users never look at.  The window now opens at once
+/// with the two answers that always exist, and the devices drop into both boxes
+/// when the answer lands; the Detect button re-asks.
+///
+/// Nothing here can fail the settings window.  A machine without PipeWire, a
+/// session with no inputs, or a vshot that cannot be found all yield an empty
+/// list, and the row then offers the two answers that always exist.
+class MicrophoneProbe : public QObject {
+public:
+    explicit MicrophoneProbe(QObject *parent = nullptr)
+        : QObject(parent)
+    {
+    }
+
+    /// Fires when the listing arrives, from the event loop -- never from inside
+    /// [`start`].  Both cards connect here rather than to a signal of their own,
+    /// because the answer is the same for both.
+    std::function<void()> onFinished;
+
+    /// Asks for the listing, unless it is already on its way or already in.
+    void start()
+    {
+        if (finished_ || process_ != nullptr) {
+            return;
+        }
+        process_ = new QProcess(this);
+        process_->setProgram(helperProgram());
+        process_->setArguments({QStringLiteral("record"), QStringLiteral("mics")});
+        process_->setStandardInputFile(QProcess::nullDevice());
+        // Both are wired: a program that cannot be started reports it through
+        // `errorOccurred` and never reaches `finished`, and a program that
+        // starts and then hangs would otherwise leave the row waiting forever.
+        connect(process_, &QProcess::finished, this, [this] { finish(true); });
+        connect(process_, &QProcess::errorOccurred, this, [this] { finish(false); });
+        process_->start();
+        QTimer::singleShot(kMicrophoneListTimeoutMs, this, [this] { finish(false); });
+    }
+
+    /// Asks again from scratch, whatever the last answer was.
+    ///
+    /// This is what the Detect button does, and the reason it is not [`start`]:
+    /// the point of pressing it is that something changed -- a microphone was
+    /// plugged in, PipeWire was started -- so an answer already in is exactly
+    /// the one the user is asking to replace.
+    void restart()
+    {
+        if (process_ != nullptr) {
+            return;
+        }
+        finished_ = false;
+        inputs_.clear();
+        start();
+    }
+
+    /// The inputs, empty until the answer lands.
+    const QList<QPair<QString, QString>> &inputs() const { return inputs_; }
+    /// Whether the answer has landed, whether or not it found anything.
+    bool finished() const { return finished_; }
+
+private:
+    /// Reads the listing and hands it on.  `readable` is false when the answer
+    /// is a failure rather than a listing -- a program that would not start, or
+    /// one the timeout gave up on -- in which case the inputs stay empty.
+    void finish(bool readable)
+    {
+        // The timeout, the process and the error can all arrive: the first one
+        // here is the answer, and the rest are the same answer said again.
+        if (finished_) {
+            return;
+        }
+        finished_ = true;
+        if (process_ != nullptr) {
+            if (readable) {
+                inputs_ = parseMicrophoneListing(
+                    QString::fromUtf8(process_->readAllStandardOutput()));
+            }
+            if (process_->state() != QProcess::NotRunning) {
+                process_->kill();
+                process_->waitForFinished(100);
+            }
+            process_->deleteLater();
+            process_ = nullptr;
+        }
+        if (onFinished) {
+            onFinished();
+        }
+    }
+
+    QProcess *process_ = nullptr;
+    QList<QPair<QString, QString>> inputs_;
+    bool finished_ = false;
+};
 
 /// A small square of a colour, drawn with the same rounding as the swatch
 /// button it sits in.
@@ -669,6 +881,344 @@ private:
     QString title_;
     QColor color_{255, 64, 64, 255};
 };
+
+/// The button that captures a key: it shows the binding an action has, and
+/// while it is armed it takes the next key press as the new one.
+///
+/// A line edit cannot do this. Typing "Ctrl+K" into one is a spelling the user
+/// has to guess, and a wrong guess is silently stored as a binding that matches
+/// nothing -- which reads as "this action has no key" rather than as a mistake.
+/// Capturing the real key is both quicker and the only way the spelling is
+/// guaranteed to be one `QKeySequence` understands.
+///
+/// Escape while armed puts the binding back to what it was, and Backspace or
+/// Delete clears it, which is the one thing a capture widget has to offer that
+/// a key press cannot express.
+///
+/// The button shows what the *action* answers to -- several keys joined by
+/// commas -- but records one combination at a time: what it hands to
+/// `onKeysChanged` is the single key the user pressed, and the binding it is
+/// showing is the list the dialog around it keeps.
+class KeyCaptureButton final : public QPushButton {
+public:
+    explicit KeyCaptureButton(QWidget *parent = nullptr)
+        : QPushButton(parent)
+    {
+        setCursor(Qt::PointingHandCursor);
+        setMinimumWidth(150);
+        setFocusPolicy(Qt::StrongFocus);
+        connect(this, &QPushButton::clicked, this, [this] {
+            if (onActivated) {
+                onActivated();
+                return;
+            }
+            setArmed(true);
+        });
+    }
+
+    /// When set, a click calls this instead of arming the button.  The row on
+    /// the settings page opens the editor with it -- the action's keys are a
+    /// list there, and a list is not something a button can capture in place --
+    /// while the editor's own record button leaves it unset and arms.
+    std::function<void()> onActivated;
+
+    /// The key the user just recorded, or an empty sequence when they cleared
+    /// the binding.  Not a list: one press is one combination.
+    QKeySequence keys() const { return keys_; }
+    void setKeys(const QKeySequence &keys)
+    {
+        keys_ = keys;
+        updateText();
+    }
+
+    /// Fires with the binding the user pressed, or an empty sequence when they
+    /// cleared one.  Not fired by `setKeys`.
+    std::function<void(const QKeySequence &)> onKeysChanged;
+
+protected:
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (!armed_) {
+            QPushButton::keyPressEvent(event);
+            return;
+        }
+        event->accept();
+        const int key = event->key();
+        // The two keys a capture has to answer that are not keys to bind:
+        // Escape means "never mind", and the delete keys mean "no key at all".
+        // Neither can be bound from here either, which is the price of that --
+        // both are still reachable by hand-editing the file.
+        if (key == Qt::Key_Escape) {
+            setArmed(false);
+            return;
+        }
+        if (key == Qt::Key_Backspace || key == Qt::Key_Delete) {
+            setArmed(false);
+            take(QKeySequence());
+            return;
+        }
+        // A modifier on its own is not a key press: the binding has to wait for
+        // the key it belongs to, or holding Ctrl would immediately bind "Ctrl".
+        // Tab is let through to the base class so the focus can still be moved
+        // with the keyboard while a button is armed.
+        if (key == Qt::Key_Tab || isModifier(key)) {
+            QPushButton::keyPressEvent(event);
+            return;
+        }
+        setArmed(false);
+        // The modifiers the event carries, minus the ones that are part of the
+        // key itself: `QKeySequence` wants them in its own bits, and an event
+        // for Shift+Backtab already has Shift in its modifiers.
+        take(QKeySequence(static_cast<int>(static_cast<int>(event->modifiers()) | key)));
+    }
+
+    void focusOutEvent(QFocusEvent *event) override
+    {
+        // Losing the focus while armed is the same as pressing Escape: a button
+        // left armed would swallow the next key wherever it landed, which is
+        // not a thing a user can be expected to notice has happened.
+        if (armed_) {
+            setArmed(false);
+        }
+        QPushButton::focusOutEvent(event);
+    }
+
+private:
+    static bool isModifier(int key)
+    {
+        switch (key) {
+        case Qt::Key_Shift:
+        case Qt::Key_Control:
+        case Qt::Key_Alt:
+        case Qt::Key_Meta:
+        case Qt::Key_AltGr:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void setArmed(bool armed)
+    {
+        armed_ = armed;
+        updateText();
+        if (armed) {
+            setFocus(Qt::MouseFocusReason);
+        }
+    }
+
+    void take(const QKeySequence &keys)
+    {
+        keys_ = keys;
+        updateText();
+        if (onKeysChanged) {
+            onKeysChanged(keys);
+        }
+    }
+
+    void updateText()
+    {
+        if (armed_) {
+            setText(uiTr("Press the keys for this action"));
+            return;
+        }
+        setText(keys_.isEmpty() ? uiTr("None")
+                                : keys_.toString(QKeySequence::PortableText));
+    }
+
+    QKeySequence keys_;
+    bool armed_ = false;
+};
+
+/// The dialog one key-binding row opens: record a key at the top, one row per
+/// key the action already answers to below, each with the button that removes
+/// it.
+///
+/// The row on the page can only ever show *that* an action has several keys;
+/// this is where one of them can be taken away again, and where a new one can
+/// be added without throwing away the ones already there.  It edits a copy and
+/// hands the whole list back, so a dialog the user cancels leaves the action
+/// exactly as it was.
+///
+/// The conflict rule is the reason this is a dialog rather than a row of
+/// widgets: recording a key another action already owns has to *ask*, and the
+/// answer decides whether the other action loses the key.  A key the action
+/// being edited already owns is not a conflict -- it is the user pressing the
+/// same key twice -- so it is taken as the duplicate it is and nothing is
+/// added.
+class ShortcutEditorDialog final : public QDialog {
+public:
+    /// `action` is the one being edited, `preferences` the state to edit.  The
+    /// dialog reads and writes the preferences it is handed, so the page sees
+    /// every change the moment it is made and a Cancel only has to put back the
+    /// copy it took.  `ask` puts a conflict to the user and answers whether the
+    /// combination moves; empty means the ordinary message box.
+    ShortcutEditorDialog(ShortcutAction action, ShortcutPreferences *preferences,
+                         QWidget *parent, std::function<bool(const QString &)> ask)
+        : QDialog(parent)
+        , action_(action)
+        , preferences_(preferences)
+        , saved_(*preferences)
+        , ask_(std::move(ask))
+    {
+        setObjectName(QStringLiteral("shortcutEditor"));
+        setWindowTitle(shortcutBinding(action).label);
+        setModal(true);
+        setMinimumWidth(380);
+        // Its own copy of the sheet rather than the settings window's.  A
+        // child would inherit that one anyway, but the conflict prompt this
+        // dialog puts up is a `QMessageBox` -- and a box is only styled by
+        // rules the sheet it inherits actually carries.  Carrying the sheet
+        // here means the prompt is styled the same whether the editor was
+        // opened from the window or built on its own.
+        setStyleSheet(dialogStyleSheet());
+
+        auto *layout = new QVBoxLayout(this);
+        layout->setContentsMargins(16, 16, 16, 16);
+        layout->setSpacing(10);
+
+        auto *heading = new QLabel(shortcutBinding(action).label, this);
+        heading->setObjectName(QStringLiteral("rowLabel"));
+        layout->addWidget(heading);
+        auto *hint = new QLabel(shortcutBinding(action).hint, this);
+        hint->setObjectName(QStringLiteral("rowHint"));
+        hint->setWordWrap(true);
+        layout->addWidget(hint);
+
+        record_ = new KeyCaptureButton(this);
+        record_->setObjectName(QStringLiteral("shortcutRecord"));
+        record_->setToolTip(uiTr("Click, then press the key"));
+        record_->onKeysChanged = [this](const QKeySequence &keys) { record(keys); };
+        layout->addWidget(record_);
+
+        list_ = new QWidget(this);
+        list_->setObjectName(QStringLiteral("shortcutList"));
+        listLayout_ = new QVBoxLayout(list_);
+        listLayout_->setContentsMargins(0, 0, 0, 0);
+        listLayout_->setSpacing(6);
+        layout->addWidget(list_);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
+        auto *close = buttons->addButton(uiTr("Done"), QDialogButtonBox::AcceptRole);
+        close->setObjectName(QStringLiteral("shortcutDone"));
+        // Cancel is the one that undoes: everything recorded so far is dropped
+        // and the action goes back to the keys it opened with.
+        connect(buttons, &QDialogButtonBox::rejected, this, [this] {
+            *preferences_ = saved_;
+            reject();
+        });
+        connect(close, &QPushButton::clicked, this, &QDialog::accept);
+        layout->addWidget(buttons);
+
+        refresh();
+    }
+
+    /// The dialog's own copy of the bindings, so a check can read back what a
+    /// click left behind without a config file in the way.
+    const ShortcutPreferences &preferences() const { return *preferences_; }
+
+private:
+    /// The ordinary conflict prompt: a modal message box whose default is No,
+    /// so a stray Enter does not take a key off another action.
+    bool askMove(const QString &question)
+    {
+        return QMessageBox::question(this, uiTr("Key already in use"), question,
+                                     QMessageBox::Yes | QMessageBox::No,
+                                     QMessageBox::No) == QMessageBox::Yes;
+    }
+
+    /// Takes one recorded key: dedupes it, asks about a conflict, and puts it
+    /// on the list.
+    void record(const QKeySequence &keys)
+    {
+        if (keys.isEmpty()) {
+            // Backspace or Delete while armed: the whole binding goes, which is
+            // the same answer the row on the page has always given.
+            preferences_->setKeys(action_, QVector<QKeySequence>());
+            refresh();
+            return;
+        }
+        // Already this action's: the user pressed a key it already answers to.
+        // Adding it again would leave two rows for one combination, each with
+        // its own remove button, so it is taken as the no-op it is.
+        if (preferences_->keysFor(action_).contains(keys)) {
+            refresh();
+            return;
+        }
+        const ShortcutAction owner = preferences_->ownerOtherThan(action_, keys);
+        if (owner != ShortcutAction::kActionCount) {
+            const QString question = uiTr("%1 is already bound to \"%2\". "
+                                          "Move it to \"%3\"?")
+                                         .arg(keys.toString(QKeySequence::PortableText),
+                                              shortcutBinding(owner).label,
+                                              shortcutBinding(action_).label);
+            const bool move = ask_ ? ask_(question) : askMove(question);
+            if (!move) {
+                // Declined: nothing moves, and the key stays where it was.  The
+                // button still has to stop showing it as the action's own.
+                refresh();
+                return;
+            }
+            preferences_->removeKey(owner, keys);
+        }
+        preferences_->addKey(action_, keys);
+        refresh();
+    }
+
+    /// Rebuilds the list of keys and the record button from the preferences.
+    void refresh()
+    {
+        while (QLayoutItem *item = listLayout_->takeAt(0)) {
+            if (QWidget *widget = item->widget()) {
+                // Reparented before it is dropped: `deleteLater` leaves the row
+                // alive until the event loop comes back round, and a row that
+                // is still a child of the list is a row `findChild` still hands
+                // out -- which is a remove button that answers a click after
+                // the key it belonged to is gone.
+                widget->setParent(nullptr);
+                widget->deleteLater();
+            }
+            delete item;
+        }
+        const QVector<QKeySequence> keys = preferences_->keysFor(action_);
+        for (const QKeySequence &key : keys) {
+            auto *row = new QWidget(list_);
+            auto *rowLayout = new QHBoxLayout(row);
+            rowLayout->setContentsMargins(0, 0, 0, 0);
+            rowLayout->setSpacing(8);
+            auto *label = new QLabel(key.toString(QKeySequence::PortableText), row);
+            label->setObjectName(QStringLiteral("rowValue"));
+            rowLayout->addWidget(label, 1);
+            auto *remove = new QPushButton(uiTr("Remove"), row);
+            remove->setObjectName(QStringLiteral("shortcutRemove"));
+            remove->setCursor(Qt::PointingHandCursor);
+            connect(remove, &QPushButton::clicked, this, [this, key] {
+                preferences_->removeKey(action_, key);
+                refresh();
+            });
+            rowLayout->addWidget(remove);
+            listLayout_->addWidget(row);
+        }
+        if (keys.isEmpty()) {
+            auto *empty = new QLabel(uiTr("None"), list_);
+            empty->setObjectName(QStringLiteral("rowHint"));
+            listLayout_->addWidget(empty);
+        }
+        // The record button keeps the *first* key as its own text: it is the
+        // button the page's row shows, and a button that printed the whole list
+        // would be wider than the row it sits in.
+        record_->setKeys(keys.isEmpty() ? QKeySequence() : keys.constFirst());
+    }
+
+    ShortcutAction action_;
+    ShortcutPreferences *preferences_;
+    ShortcutPreferences saved_;
+    std::function<bool(const QString &)> ask_;
+    KeyCaptureButton *record_ = nullptr;
+    QWidget *list_ = nullptr;
+    QVBoxLayout *listLayout_ = nullptr;
+};
+
 
 /// One page of settings: a heading, a one-line explanation, and a stack of
 /// cards.  Cards are added through [`addCard`], rows through [`addRow`].
@@ -774,14 +1324,20 @@ void addRow(QWidget *card, const QString &label, const QString &hint, QWidget *c
 /// window.  Both the recording and the replay card carry one of these, so the
 /// filling lives here once.
 ///
+/// `inputs` is the probe's answer, which may be empty -- on the first fill it
+/// has not landed yet, and on a machine with no PipeWire it never will.  An
+/// empty list is not "no devices": it is "nothing to add", and the remembered
+/// name is added back below either way, so a box filled before the answer
+/// arrives still shows the device the file names.
+///
 /// `wanted` is the marker to keep selected: the box's current entry on a
 /// re-detect, and the file's own value on the first fill.
-void fillMicrophoneCombo(QComboBox *box, const QString &wanted)
+void fillMicrophoneCombo(QComboBox *box, const QString &wanted,
+                         const QList<QPair<QString, QString>> &inputs)
 {
     box->clear();
     box->addItem(uiTr("Do not record audio"), kNoMicrophone);
     box->addItem(uiTr("The session's default input"), kDefaultMicrophone);
-    const QList<QPair<QString, QString>> inputs = detectedMicrophones();
     for (const QPair<QString, QString> &input : inputs) {
         box->addItem(input.second, input.first);
         box->setItemData(box->count() - 1, input.first, Qt::ToolTipRole);
@@ -953,13 +1509,24 @@ QIcon sectionIcon(int index, const QColor &color)
         frame.closeSubpath();
         painter.drawPath(frame);
         painter.drawLine(QPointF(3.0, 7.0), QPointF(15.0, 7.0));
-    } else {
+    } else if (index == 6) {
         // A pushpin: the pin overlay, which is what this section configures.
         painter.drawLine(QPointF(9.0, 3.0), QPointF(15.0, 3.0));
         painter.drawLine(QPointF(12.0, 3.0), QPointF(12.0, 8.5));
         painter.drawLine(QPointF(12.0, 8.5), QPointF(15.0, 11.0));
         painter.drawLine(QPointF(15.0, 11.0), QPointF(9.0, 11.0));
         painter.drawLine(QPointF(9.0, 11.0), QPointF(9.0, 16.0));
+    } else {
+        // Three keys with a fourth pressed: the keyboard bindings.
+        painter.drawLine(QPointF(3.0, 3.5), QPointF(15.0, 3.5));
+        painter.drawLine(QPointF(3.0, 14.5), QPointF(15.0, 14.5));
+        painter.drawLine(QPointF(3.0, 3.5), QPointF(3.0, 14.5));
+        painter.drawLine(QPointF(15.0, 3.5), QPointF(15.0, 14.5));
+        painter.drawLine(QPointF(6.5, 3.5), QPointF(6.5, 14.5));
+        painter.drawLine(QPointF(11.5, 3.5), QPointF(11.5, 14.5));
+        painter.setBrush(color);
+        painter.drawRect(QRectF(4.0, 6.0, 2.0, 6.0));
+        painter.setBrush(Qt::NoBrush);
     }
     return QIcon(pixmap);
 }
@@ -969,8 +1536,14 @@ QIcon sectionIcon(int index, const QColor &color)
 /// hand in the file while it is open is not silently reverted by a Cancel.
 class SettingsDialog final : public QDialog {
 public:
-    SettingsDialog()
+    /// `ownedShortcuts` is null for the ordinary window, which reads and writes
+    /// the file; a caller that passes one gets the same pages over bindings of
+    /// its own, which is what lets the offline check read the multi-key editor
+    /// back without a config file standing in for it.
+    explicit SettingsDialog(ShortcutPreferences *ownedShortcuts = nullptr)
         : config_(loadConfig())
+        , shortcuts_(ownedShortcuts != nullptr ? *ownedShortcuts : loadShortcutPreferences())
+        , shortcutsOwner_(ownedShortcuts)
     {
         setWindowTitle(uiTr("vshot settings"));
         setStyleSheet(dialogStyleSheet());
@@ -1014,6 +1587,7 @@ public:
             uiTr("Recording"),
             uiTr("File dialogs"),
             uiTr("Pin appearance"),
+            uiTr("Keyboard"),
         };
         for (int row = 0; row < sections.size(); ++row) {
             sidebar_->addItem(new QListWidgetItem(sectionIcon(row, QColor(kInkDim)),
@@ -1035,6 +1609,7 @@ public:
         pages_->addWidget(buildRecordingPage());
         pages_->addWidget(buildDialogPage());
         pages_->addWidget(buildPinPage());
+        pages_->addWidget(buildKeyboardPage());
         bodyLayout->addWidget(pages_, 1);
 
         connect(sidebar_, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -1046,6 +1621,13 @@ public:
 
         root->addWidget(body, 1);
         root->addWidget(buildFooter());
+
+        // Last, and queued rather than called: the pages are up and readable
+        // without the input listing, and asking for it here would block the
+        // constructor on a second process for about a second.  Queued so the
+        // window is on screen before the probe starts, which is what makes the
+        // two boxes fill in visibly rather than after a pause.
+        QTimer::singleShot(0, this, [this] { askForMicrophones(); });
     }
 
 private:
@@ -1136,10 +1718,18 @@ private:
                        uiTr("The style the toolbar opens with next time. Leaving the editor "
                             "writes this back, whether or not the capture went through."));
 
-        QWidget *shape = addCard(page, QString());
+        // The armed tool and the colour it draws in -- the two things a user
+        // reaches for before every capture -- in one card, under a heading of
+        // their own so the card says what it holds. A card with no heading and
+        // three unrelated rows in it is what this used to be.
+        QWidget *shape = addCard(page, uiTr("Tool"));
         toolBox_ = new ModernComboBox(shape);
         toolBox_->setObjectName(QStringLiteral("tool"));
         toolBox_->setMinimumWidth(180);
+        // Nothing armed is the first entry, and the value a config file written
+        // before the Select tool went away carries: the two have to land on the
+        // same state, so the empty value is spelled here as it is stored.
+        toolBox_->addItem(uiTr("No tool"), QString());
         for (const QString &value : toolNames()) {
             toolBox_->addItem(value, value);
         }
@@ -1253,10 +1843,15 @@ private:
     /// Fills the recording card's microphone row.  The config is read through
     /// [`rememberedMicrophone`]; rebuilding from the box rather than the config
     /// is what makes re-detecting midway through an edit keep the user's choice.
+    ///
+    /// The inputs come from the probe, which may not have answered yet: the row
+    /// is filled at once with what is known, and filled again when the listing
+    /// lands (see [`askForMicrophones`]).
     void fillMicrophoneBox()
     {
         const QString shown = recordMicBox_->currentData().toString();
-        fillMicrophoneCombo(recordMicBox_, shown.isEmpty() ? rememberedMicrophone() : shown);
+        fillMicrophoneCombo(recordMicBox_, shown.isEmpty() ? rememberedMicrophone() : shown,
+                            microphones_.inputs());
     }
 
     QString rememberedReplayMicrophone() const
@@ -1270,7 +1865,54 @@ private:
     {
         const QString shown = replayMicBox_->currentData().toString();
         fillMicrophoneCombo(replayMicBox_,
-                            shown.isEmpty() ? rememberedReplayMicrophone() : shown);
+                            shown.isEmpty() ? rememberedReplayMicrophone() : shown,
+                            microphones_.inputs());
+    }
+
+    /// Asks the session for its inputs, and fills both rows again when the
+    /// answer lands.  `again` is what the Detect button passes: the point of
+    /// pressing it is that something changed, so an answer already in is the one
+    /// the user is asking to replace.
+    ///
+    /// The first call is made after the window is up rather than while it is
+    /// being built: the command takes about a second, and the rows are readable
+    /// without it -- they open on the two answers that always exist and the name
+    /// the file remembers -- so waiting for it before showing anything bought
+    /// nothing.
+    void askForMicrophones(bool again = false)
+    {
+        // Both rows are refilled from the box, so a choice made while the probe
+        // was out is kept rather than reset to the file's value.
+        microphones_.onFinished = [this] {
+            fillMicrophoneBox();
+            fillReplayMicrophoneBox();
+        };
+        if (again) {
+            microphones_.restart();
+        } else {
+            microphones_.start();
+        }
+    }
+
+    /// Whether the white-level box does anything for the mode now selected.
+    ///
+    /// `auto` and `fixed` both read a level; `normalize` works its own out from
+    /// the capture's peak, so the box is greyed rather than left live and
+    /// ignored.  The leading "built-in default" entry means `auto`, which does
+    /// read one.
+    void updateToneMapWhiteEnabled()
+    {
+        const QString mode = toneMapBox_->currentData().toString();
+        toneMapWhiteSpin_->setEnabled(mode != QStringLiteral("normalize"));
+    }
+
+    /// Whether the area ratio does anything for the switch's position.
+    ///
+    /// With the area test off there is no share to weigh -- the one-pixel rule
+    /// stands -- so the box is greyed rather than left live and ignored.
+    void updateHdrAreaRatioEnabled()
+    {
+        hdrAreaRatioSpin_->setEnabled(hdrAreaSwitch_->isChecked());
     }
 
     QWidget *buildOutputPage()
@@ -1282,7 +1924,14 @@ private:
                             "gives nothing: an argument, or an environment variable, always "
                             "wins over these."));
 
-        QWidget *output = addCard(page, QString());
+        // One card per subject, because a subject is what a user opens the page
+        // for: how the PNG is written, how an HDR capture is split into two
+        // files, and which output a capture takes when the command line names
+        // none. Under one card they were told apart by a rule and a bold label
+        // between rows that looked like every other row; a card apiece gives
+        // each subject an edge of its own. They are ordered by how often each is
+        // the reason someone opened this page.
+        QWidget *output = addCard(page, uiTr("PNG"));
         compressionBox_ =
             choiceBox(output, compressionNames(), QString::fromLatin1(kDefaultPngCompression));
         compressionBox_->setObjectName(QStringLiteral("pngCompression"));
@@ -1292,6 +1941,96 @@ private:
                uiTr("All levels are lossless; slower ones buy a smaller file"),
                compressionBox_, true);
 
+        output = addCard(page, uiTr("HDR"));
+        hdrFormatBox_ =
+            choiceBox(output, hdrFormatNames(), QString::fromLatin1(kDefaultHdrFormat));
+        hdrFormatBox_->setObjectName(QStringLiteral("hdrFormat"));
+        hdrFormatBox_->setMinimumWidth(200);
+        selectChoice(hdrFormatBox_, config_.cli.hdrFormat);
+        addRow(output, uiTr("HDR format"),
+               uiTr("The second file of a capture that carries HDR content, written "
+                    "beside the PNG with the same name. AVIF is ten-bit BT.2020 PQ and "
+                    "says so in the file, so every reader shows it right, but it is "
+                    "lossy; Radiance RGBE is the light exactly as captured, and is read "
+                    "by few"),
+               hdrFormatBox_, true);
+
+        toneMapBox_ = choiceBox(output, toneMapNames(), QString::fromLatin1(kDefaultToneMap));
+        toneMapBox_->setObjectName(QStringLiteral("toneMap"));
+        toneMapBox_->setMinimumWidth(200);
+        selectChoice(toneMapBox_, config_.cli.toneMap);
+        addRow(output, uiTr("HDR to SDR"),
+               uiTr("How the SDR half of an HDR capture is made from the HDR one. "
+                    "Auto reads each capture: an SDR picture comes out exactly as it "
+                    "was, and one with highlights makes room for them. Fixed always "
+                    "maps SDR white to the level below, so a pixel's value does not "
+                    "depend on what else is in the picture. Normalize scales the "
+                    "capture so its brightest point becomes white"),
+               toneMapBox_, false);
+
+        toneMapWhiteSpin_ = new ModernDoubleSpinBox(output);
+        toneMapWhiteSpin_->setObjectName(QStringLiteral("toneMapWhite"));
+        // The map works in fractions and the box shows percentages, so the two
+        // are converted on the way in and on the way out -- including the span,
+        // which is why it is scaled here rather than taken as it comes.
+        toneMapWhiteSpin_->setRange(kMinToneMapWhite * 100.0, kMaxToneMapWhite * 100.0);
+        toneMapWhiteSpin_->setSuffix(uiTr(" %"));
+        toneMapWhiteSpin_->setMinimumWidth(120);
+        toneMapWhiteSpin_->setValue(
+            (config_.cli.toneMapWhite > 0.0 ? config_.cli.toneMapWhite : kDefaultToneMapWhite) *
+            100.0);
+        addRow(output, uiTr("SDR white level"),
+               uiTr("Where SDR white lands in the range, as a percentage. The rest is "
+                    "spent on light above white, so a lower level keeps highlights more "
+                    "apart and makes the picture dimmer. Used by Auto (only for a "
+                    "capture that has highlights) and by Fixed"),
+               toneMapWhiteSpin_, false);
+        // A level is only read by two of the three modes, and Normalize works
+        // its own out from the capture's peak: a box that did nothing would
+        // read as a setting that was ignored.
+        connect(toneMapBox_, &QComboBox::currentIndexChanged, this,
+                [this] { updateToneMapWhiteEnabled(); });
+        updateToneMapWhiteEnabled();
+
+        hdrAreaSwitch_ = new ModernSwitch(output);
+        hdrAreaSwitch_->setObjectName(QStringLiteral("hdrAreaTest"));
+        hdrAreaSwitch_->setChecked(config_.cli.hdrAreaTest);
+        hdrAreaSwitch_->setToolTip(
+            uiTr("Off: one bright pixel is enough. On: the ratio below has to be met"));
+        addRow(output, uiTr("Judge HDR by area"),
+               uiTr("Whether a capture counts as HDR content by how much of it is brighter "
+                    "than SDR white rather than by any single pixel. A ten-bit PQ screen "
+                    "rounds ordinary SDR white a few thousandths over, so with this off a "
+                    "handful of rounding pixels can pass a whole desktop off as HDR and dim "
+                    "it. Only outputs the compositor describes as HDR are asked at all"),
+               hdrAreaSwitch_, false);
+
+        hdrAreaRatioSpin_ = new ModernDoubleSpinBox(output);
+        hdrAreaRatioSpin_->setObjectName(QStringLiteral("hdrAreaRatio"));
+        hdrAreaRatioSpin_->setDecimals(4);
+        hdrAreaRatioSpin_->setSingleStep(0.0005);
+        // The ratio is a share of the frame, shown as a percentage of it: the
+        // box's own arithmetic is in fractions, but "0.05 %" is what a user can
+        // picture.  Four decimals of a percent is the resolution the built-in
+        // default needs.
+        hdrAreaRatioSpin_->setRange(0.0, 100.0);
+        hdrAreaRatioSpin_->setSuffix(uiTr(" %"));
+        hdrAreaRatioSpin_->setMinimumWidth(120);
+        hdrAreaRatioSpin_->setValue((config_.cli.hdrAreaRatio >= 0.0 ? config_.cli.hdrAreaRatio
+                                                                     : kDefaultHdrAreaRatio) *
+                                    100.0);
+        addRow(output, uiTr("HDR area"),
+               uiTr("How much of the capture has to be brighter than SDR white to count as "
+                    "HDR content, as a percentage of it. Zero means every capture of an HDR "
+                    "output is HDR content, with no test at all"),
+               hdrAreaRatioSpin_, false);
+        // A ratio is only read when the switch above is on, so a live box under
+        // an off switch would read as a setting that was ignored.
+        connect(hdrAreaSwitch_, &QAbstractButton::toggled, this,
+                [this] { updateHdrAreaRatioEnabled(); });
+        updateHdrAreaRatioEnabled();
+
+        output = addCard(page, uiTr("Which output"));
         monitorEdit_ = new QLineEdit(output);
         monitorEdit_->setObjectName(QStringLiteral("monitor"));
         monitorEdit_->setMinimumWidth(220);
@@ -1301,7 +2040,7 @@ private:
                uiTr("Which output a capture takes when the command line names none. Leave it "
                     "empty to use whichever output the pointer is on -- `current` says the "
                     "same thing -- or write a name like `eDP-1` to pin one down"),
-               monitorEdit_, false);
+               monitorEdit_, true);
 
         return scroll;
     }
@@ -1315,7 +2054,11 @@ private:
                             "command line gives nothing: an argument, or an environment "
                             "variable, always wins over these."));
 
-        QWidget *scrolling = addCard(page, QString());
+        // How the page is scrolled, then how the frames are stitched: the first
+        // is what a user changes when a capture comes back wrong, the second
+        // when one comes back short. A card each, so the two read as the
+        // separate subjects they are.
+        QWidget *scrolling = addCard(page, uiTr("Scrolling"));
         notchesSpin_ = optionalSpin(scrolling, kDefaultLongNotches, kMaxFrameValue, QString());
         notchesSpin_->setObjectName(QStringLiteral("longNotches"));
         notchesSpin_->setMinimumWidth(120);
@@ -1341,6 +2084,7 @@ private:
         timeoutSpin_->setValue(rememberedOr(config_.cli.longTimeout, kDefaultLongTimeout));
         addRow(scrolling, uiTr("Timeout"), QString(), timeoutSpin_, false);
 
+        scrolling = addCard(page, uiTr("Stitching"));
         ignoreTopSpin_ = optionalSpin(scrolling, kDefaultLongIgnoreTop, kMaxFrameValue, uiTr(" px"));
         ignoreTopSpin_->setObjectName(QStringLiteral("longIgnoreTop"));
         ignoreTopSpin_->setMinimumWidth(120);
@@ -1393,12 +2137,16 @@ private:
                        uiTr("Defaults for `record` and `replay`. Used only where the command "
                             "line gives nothing: an argument, or an environment variable, "
                             "always wins over these."));
-
         // Recording is the one card whose control asks the running session a
         // question -- which audio inputs it has -- so the answer is what the
         // row offers: a name has to be a PipeWire node's own, and nobody can
         // type one of those from memory.
-        QWidget *recording = addCard(page, uiTr("Recording"));
+        // Three subjects, in the order a user meets them: what the encoder does,
+        // then what is recorded -- the source and the sound, which are the rows
+        // a user changes between two recordings -- then the receipt at the end,
+        // which is set once and never looked at again. A card each, so the
+        // heading is the card's own rather than a label between rows.
+        QWidget *recording = addCard(page, uiTr("Encoder"));
         recordEncoderBox_ =
             choiceBox(recording, encoderNames(), QString::fromLatin1(kDefaultEncoder));
         recordEncoderBox_->setObjectName(QStringLiteral("recordEncoder"));
@@ -1424,6 +2172,7 @@ private:
         recordFpsSpin_->setValue(rememberedOr(config_.cli.recordFps, kDefaultRecordFps));
         addRow(recording, uiTr("Frame rate"), uiTr("1-240"), recordFpsSpin_, false);
 
+        recording = addCard(page, uiTr("What is recorded"));
         recordFollowEdit_ = new QLineEdit(recording);
         recordFollowEdit_->setObjectName(QStringLiteral("recordFollow"));
         recordFollowEdit_->setMinimumWidth(240);
@@ -1432,7 +2181,7 @@ private:
         addRow(recording, uiTr("Follow the focus"),
                uiTr("Window names, comma-separated (`record window` with no NAME); the "
                     "recording moves to whichever the focus lands on"),
-               recordFollowEdit_, false);
+               recordFollowEdit_, true);
 
         recordPortalSwitch_ = new ModernSwitch(recording);
         recordPortalSwitch_->setObjectName(QStringLiteral("recordPortal"));
@@ -1452,7 +2201,7 @@ private:
         recordMicDetectButton_->setToolTip(
             uiTr("Ask the running session which inputs it has"));
         connect(recordMicDetectButton_, &QPushButton::clicked, this,
-                [this] { fillMicrophoneBox(); });
+                [this] { askForMicrophones(true); });
         fillMicrophoneBox();
 
         auto *microphoneRow = new QWidget(recording);
@@ -1468,13 +2217,14 @@ private:
                     "file keeps"),
                microphoneRow, false);
 
+        recording = addCard(page, uiTr("Notification"));
         recordNotifySwitch_ = new ModernSwitch(recording);
         recordNotifySwitch_->setObjectName(QStringLiteral("recordNotify"));
         recordNotifySwitch_->setChecked(config_.cli.recordNotify);
         recordNotifySwitch_->setToolTip(uiTr("A receipt for a recording started from a keybinding"));
         addRow(recording, uiTr("Notify when the recording is written"),
                uiTr("A desktop notification naming the file; it needs a notification daemon"),
-               recordNotifySwitch_, false);
+               recordNotifySwitch_, true);
 
         buildReplayCard(page);
 
@@ -1489,8 +2239,12 @@ private:
     /// values each row meant.
     void buildReplayCard(QWidget *page)
     {
-        QWidget *replay = addCard(page, uiTr("Replay"));
-
+        // The same three subjects as the recording page, in the same order, so
+        // the two pages can be read against each other. The ring's own two
+        // numbers lead the first card here: they are the rows that decide
+        // whether a replay is possible at all, and they have no counterpart on
+        // the other page.
+        QWidget *replay = addCard(page, uiTr("Ring"));
         // The one numeric default that keeps a ceiling, and it is not ours to
         // lift: the ring holds encoded packets in RAM, so the window is a memory
         // budget -- an hour of a 30 Mbps capture is already gigabytes -- and the
@@ -1515,6 +2269,7 @@ private:
                     "for, at the cost of a bigger ring"),
                replayGopSpin_, false);
 
+        replay = addCard(page, uiTr("Encoder"));
         replayEncoderBox_ =
             choiceBox(replay, encoderNames(), QString::fromLatin1(kDefaultEncoder));
         replayEncoderBox_->setObjectName(QStringLiteral("replayEncoder"));
@@ -1522,7 +2277,7 @@ private:
         selectChoice(replayEncoderBox_, config_.cli.replayEncoder);
         addRow(replay, uiTr("Encoder"),
                uiTr("All three encode on the GPU's media engine"),
-               replayEncoderBox_, false);
+               replayEncoderBox_, true);
 
         replayEncoderBackendBox_ = choiceBox(replay, encoderBackendNames(),
                                              QString::fromLatin1(kDefaultEncoderBackend));
@@ -1534,6 +2289,7 @@ private:
                     "(VAAPI and Vulkan import the dma-buf, NVENC copies frames via the CPU)"),
                replayEncoderBackendBox_, false);
 
+        replay = addCard(page, uiTr("What is recorded"));
         replayFpsSpin_ = optionalSpin(replay, kDefaultReplayFps, kMaxFrameValue, uiTr(" fps"));
         replayFpsSpin_->setObjectName(QStringLiteral("replayFps"));
         replayFpsSpin_->setMinimumWidth(120);
@@ -1541,7 +2297,7 @@ private:
         addRow(replay, uiTr("Frame rate"),
                uiTr("1-240; a rate below the recording's halves the encoder's work over a "
                     "long session"),
-               replayFpsSpin_, false);
+               replayFpsSpin_, true);
 
         replayFollowEdit_ = new QLineEdit(replay);
         replayFollowEdit_->setObjectName(QStringLiteral("replayFollow"));
@@ -1571,7 +2327,7 @@ private:
         replayMicDetectButton_->setToolTip(
             uiTr("Ask the running session which inputs it has"));
         connect(replayMicDetectButton_, &QPushButton::clicked, this,
-                [this] { fillReplayMicrophoneBox(); });
+                [this] { askForMicrophones(true); });
         fillReplayMicrophoneBox();
 
         auto *replayMicrophoneRow = new QWidget(replay);
@@ -1595,6 +2351,7 @@ private:
                uiTr("Where `replay save` lands when it names no path; strftime is expanded"),
                replaySaveDirEdit_, false);
 
+        replay = addCard(page, uiTr("Notification"));
         replayNotifySwitch_ = new ModernSwitch(replay);
         replayNotifySwitch_->setObjectName(QStringLiteral("replayNotify"));
         replayNotifySwitch_->setChecked(config_.cli.replayNotify);
@@ -1602,7 +2359,7 @@ private:
             uiTr("A receipt for a save triggered from a keybinding"));
         addRow(replay, uiTr("Notify when a save is written"),
                uiTr("A desktop notification naming the file; it needs a notification daemon"),
-               replayNotifySwitch_, false);
+               replayNotifySwitch_, true);
     }
 
     QWidget *buildDialogPage()
@@ -1777,6 +2534,118 @@ private:
         return scroll;
     }
 
+    /// What a row's button shows for `action`: every key it answers to, joined
+    /// by commas, or the word for "none".  A row that printed only the first
+    /// key would hide the rest of them behind a dialog the user has no reason
+    /// to open.
+    QString shortcutKeysText(ShortcutAction action) const
+    {
+        const QVector<QKeySequence> keys = shortcuts_.keysFor(action);
+        if (keys.isEmpty()) {
+            return uiTr("None");
+        }
+        QStringList parts;
+        parts.reserve(keys.size());
+        for (const QKeySequence &key : keys) {
+            parts.append(key.toString(QKeySequence::PortableText));
+        }
+        return parts.join(QStringLiteral(", "));
+    }
+
+    /// The dialog one key-binding row opens, built over the dialog's own
+    /// bindings.  It edits them in place, so a change is visible on the page the
+    /// moment it is made and there is nothing to copy back; Cancel is the
+    /// dialog's own job.
+    ///
+    /// Shown with `open` rather than `exec`: the editor is window-modal, which
+    /// is what a child of a settings window wants, but it does not spin a
+    /// nested event loop of its own.  A nested loop here would be a second
+    /// place for the application to be re-entered from, and the page would have
+    /// no way to redraw the row that lost a key while it ran.
+    void openShortcutEditor(ShortcutAction action)
+    {
+        QDialog *dialog = createShortcutEditorDialog(action, &shortcuts_, this);
+        connect(dialog, &QDialog::finished, this, [this, dialog] {
+            refreshShortcutRows();
+            // Off the parent before it is dropped: `deleteLater` leaves the
+            // dialog alive until the event loop comes back round, and one that
+            // is still a child is one `findChild` still hands out -- so the next
+            // row the user clicks would be answered by the editor they just
+            // closed.
+            dialog->setParent(nullptr);
+            dialog->deleteLater();
+        });
+        dialog->open();
+    }
+
+    /// Repaints every row's button from the bindings.  A dialog can move a key
+    /// off another action, so the row that lost it has to be redrawn too -- not
+    /// only the one that was opened.
+    void refreshShortcutRows()
+    {
+        for (QAbstractButton *button : findChildren<QAbstractButton *>()) {
+            const QString name = button->objectName();
+            if (!name.startsWith(QStringLiteral("shortcut_"))) {
+                continue;
+            }
+            const QString id = name.mid(QStringLiteral("shortcut_").size());
+            for (int index = 0; index < static_cast<int>(ShortcutAction::kActionCount);
+                 ++index) {
+                const ShortcutAction action = static_cast<ShortcutAction>(index);
+                if (shortcutBinding(action).id != id) {
+                    continue;
+                }
+                if (auto *capture = dynamic_cast<KeyCaptureButton *>(button)) {
+                    capture->setKeys(shortcutKeysText(action));
+                }
+                break;
+            }
+        }
+    }
+
+    QWidget *buildKeyboardPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("Keyboard"),
+                       uiTr("Which key does what, while a capture is on the screen. Every "
+                            "action here is also a toolbar button, so a key that is in the "
+                            "way can be cleared instead of moved."));
+        QWidget *card = addCard(page, QString());
+        bool first = true;
+        for (int index = 0; index < static_cast<int>(ShortcutAction::kActionCount);
+             ++index) {
+            const ShortcutAction action = static_cast<ShortcutAction>(index);
+            const ShortcutBinding &binding = shortcutBinding(action);
+            if (binding.label.isEmpty()) {
+                continue;
+            }
+            // The held modifiers are listed but not editable: a `QKeySequence`
+            // cannot say "Alt on its own" without also saying Alt+F4, so a row
+            // that offered to rebind one would be offering a binding the editor
+            // could never deliver.  A label with no button, rather than a button
+            // the user has to discover does nothing.
+            if (!binding.rebindable) {
+                auto *text = new QLabel(card);
+                text->setObjectName(QStringLiteral("rowValue"));
+                text->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+                text->setText(binding.defaultKeys);
+                addRow(card, binding.label, binding.hint, text, first);
+                first = false;
+                continue;
+            }
+            auto *button = new KeyCaptureButton(card);
+            button->setObjectName(QStringLiteral("shortcut_") + binding.id);
+            button->setToolTip(uiTr("Click to see and change this action's keys"));
+            button->setKeys(shortcutKeysText(action));
+            button->onActivated = [this, action] { openShortcutEditor(action); };
+            addRow(card, binding.label, binding.hint, button, first);
+            first = false;
+        }
+
+        return scroll;
+    }
+
     /// A colour button plus the button that gives it back to the built-in
     /// colour, laid out as one control for [`addRow`].
     QWidget *colorRow(ColorButton *button, QPushButton *clear)
@@ -1853,6 +2722,22 @@ private:
 
         CliPreferences &cli = config.cli;
         cli.pngCompression = compressionBox_->currentData().toString();
+        cli.hdrFormat = hdrFormatBox_->currentData().toString();
+        cli.toneMap = toneMapBox_->currentData().toString();
+        // A box still sitting on the built-in default writes nothing, exactly
+        // like the spin boxes: the file then keeps following the map's own
+        // default instead of freezing today's number into it.
+        const double white = toneMapWhiteSpin_->value() / 100.0;
+        cli.toneMapWhite = std::abs(white - kDefaultToneMapWhite) < 1e-6 ? 0.0 : white;
+        cli.hdrAreaTest = hdrAreaSwitch_->isChecked();
+        // A box still sitting on the built-in default writes nothing, as the
+        // white level above does -- the file then follows the daemon's own
+        // default instead of freezing today's number into it.  Zero is not the
+        // default, so a user who asks for "always HDR" still writes a zero and
+        // still reads it back: the sentinel is only for a box nobody touched.
+        const double ratio = hdrAreaRatioSpin_->value() / 100.0;
+        cli.hdrAreaRatio =
+            std::abs(ratio - kDefaultHdrAreaRatio) < 1e-9 ? -1.0 : ratio;
         cli.monitor = monitorEdit_->text().trimmed();
         // Every spin box is read back with the built-in default it opened on: a
         // value still sitting there is written as the sentinel, which is what
@@ -1912,7 +2797,27 @@ private:
         pin.borderColor = pinBorderColor_;
         pin.activeBorderColor = pinActiveColorColor_;
 
+        if (shortcutsOwner_ != nullptr) {
+            // A caller that handed the dialog its own bindings reads them back
+            // itself; there is no file in that arrangement to write, and the
+            // status line has nothing to report about one.
+            *shortcutsOwner_ = shortcuts_;
+            status_->setText(uiTr("Saved"));
+            return;
+        }
         if (!saveConfig(config)) {
+            status_->setProperty("error", true);
+            status_->setText(uiTr("Could not write the config file."));
+            status_->style()->unpolish(status_);
+            status_->style()->polish(status_);
+            return;
+        }
+        // The bindings are their own section, which `Config` does not carry:
+        // the editor reads them out of the file on every start rather than out
+        // of a capture process that has to be told.  Written after the config,
+        // so a failure there leaves the file with the bindings it already had
+        // instead of half of one save.
+        if (!saveShortcutPreferences(shortcuts_)) {
             status_->setProperty("error", true);
             status_->setText(uiTr("Could not write the config file."));
             status_->style()->unpolish(status_);
@@ -1932,6 +2837,12 @@ private:
     }
 
     Config config_;
+    ShortcutPreferences shortcuts_;
+    /// The caller's bindings when the dialog was handed some, and null for the
+    /// ordinary window, which reads and writes the file.
+    ShortcutPreferences *shortcutsOwner_ = nullptr;
+    /// The session's audio inputs, asked for once and shared by both cards.
+    MicrophoneProbe microphones_;
     QListWidget *sidebar_ = nullptr;
     QStackedWidget *pages_ = nullptr;
     QComboBox *toolBox_ = nullptr;
@@ -1946,6 +2857,11 @@ private:
     QComboBox *mosaicShapeBox_ = nullptr;
     QSpinBox *mosaicStrengthSpin_ = nullptr;
     QComboBox *compressionBox_ = nullptr;
+    QComboBox *hdrFormatBox_ = nullptr;
+    QComboBox *toneMapBox_ = nullptr;
+    QDoubleSpinBox *toneMapWhiteSpin_ = nullptr;
+    ModernSwitch *hdrAreaSwitch_ = nullptr;
+    QDoubleSpinBox *hdrAreaRatioSpin_ = nullptr;
     QLineEdit *monitorEdit_ = nullptr;
     QSpinBox *densitySpin_ = nullptr;
     QSpinBox *notchesSpin_ = nullptr;
@@ -1992,9 +2908,20 @@ private:
 
 } // namespace
 
+QDialog *createShortcutEditorDialog(ShortcutAction action, ShortcutPreferences *preferences,
+                                    QWidget *parent, std::function<bool(const QString &)> ask)
+{
+    return new ShortcutEditorDialog(action, preferences, parent, std::move(ask));
+}
+
 QDialog *createSettingsDialog()
 {
     return new SettingsDialog();
+}
+
+QDialog *createSettingsDialogForShortcuts(ShortcutPreferences *shortcuts)
+{
+    return new SettingsDialog(shortcuts);
 }
 
 int runSettingsWindow()

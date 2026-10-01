@@ -42,6 +42,17 @@ constexpr int kMaxTextPixels = kGlyphCellHeight * 64; // 448 px, legacy scale 64
 constexpr int kMinTextScale = 1;
 constexpr int kMaxTextScale = 64;
 
+/// The largest wave amplitude, in logical pixels.  It is the toolbar's slider
+/// range, which the editor's own controls clamp to.
+constexpr int kMaxWaveSize = 64;
+
+/// The largest wave wavelength, in logical pixels.  A wave is read as a shape
+/// rather than a texture, so its period is allowed to be longer than its
+/// height; this is the wavelength slider's own top, and the reader has to
+/// accept everything the slider can set or a long wave would be written into a
+/// document the editor then refuses to open.
+constexpr int kMaxWaveWavelength = 256;
+
 /// The pixel size a new label starts at.  This is the old default `scale = 2`
 /// spelled in pixels, so existing documents and habits both keep their size.
 constexpr int kDefaultTextPixels = kGlyphCellHeight * 2; // 14 px

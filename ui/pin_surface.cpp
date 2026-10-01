@@ -69,23 +69,37 @@ constexpr int kMenuHeadingPaddingY = 4;
 constexpr int kMenuCursorGap = 4;  // menu offset from the pointer
 
 // The action rows every pin's menu ends with, in paint order, after the
-// color-card rows: `Save as…` first, `Recognize text…` second. Naming the count
-// lets the layout, the painting and the hit-testing agree while a row is added
-// instead of each hard-coding "exactly one action row".
+// color-card rows: `Copy image` first and `Close` last, with the row that
+// throws the pin away at the bottom of a list where every other row is
+// reversible. Naming the count lets the layout, the painting and the
+// hit-testing agree while a row is added instead of each hard-coding "exactly
+// one action row".
 enum ActionRow {
-    kSaveAction = 0,
-    kRecognizeAction = 1,
-    kActionRowCount = 2,
+    kCopyImageAction = 0,
+    kSaveAction = 1,
+    kEditAction = 2,
+    kResetZoomAction = 3,
+    kRecognizeAction = 4,
+    kCloseAction = 5,
+    kActionRowCount = 6,
 };
 
 // The label of action row `index`, in the order the rows are painted.
 QString actionRowLabel(int index)
 {
     switch (index) {
+    case kCopyImageAction:
+        return uiTr("Copy image");
     case kSaveAction:
         return uiTr("Save as…");
+    case kEditAction:
+        return uiTr("Edit");
+    case kResetZoomAction:
+        return uiTr("Reset zoom");
     case kRecognizeAction:
         return uiTr("Recognize text…");
+    case kCloseAction:
+        return uiTr("Close");
     default:
         return QString();
     }
@@ -136,6 +150,40 @@ QRect labelBox(const QFontMetrics &metrics, const QString &text)
 {
     const int pad = metrics.height() / 3;
     return metrics.boundingRect(text).adjusted(-pad, -pad / 2, pad, pad / 2);
+}
+
+// The font every corner tag is drawn with -- the `HDR` marker and the badge
+// that reports a zoom or a copy.  Fixed, so a tag does not grow with the image
+// it is drawn over.
+QFont tagFont()
+{
+    QFont font;
+    font.setPixelSize(kLabelPixelSize);
+    font.setBold(true);
+    return font;
+}
+
+// The marker's text: the pin under the pointer is one whose light comes from a
+// shape of its own.
+const QString kHdrTag = QStringLiteral("HDR");
+
+// Where a tag of `text` lands when it is anchored at `corner`: just inside the
+// pin's top-left for the marker, just inside its bottom-right for the badge.
+// One definition, because the painter and the repaint region both ask it -- on
+// a pin too small to hold the tag, the tag reaches past the pin, and a repaint
+// region computed without it leaves the tag's outer pixels at the old
+// position every time the pin is zoomed or dragged.
+QRect tagBox(const QString &text, const QPoint &corner, bool atBottomRight, const QRect &bounds)
+{
+    const QFontMetrics metrics(tagFont());
+    const int pad = metrics.height() / 3;
+    QRect box = labelBox(metrics, text);
+    if (atBottomRight) {
+        box.moveBottomRight(corner - QPoint(pad, pad));
+    } else {
+        box.moveTopLeft(corner + QPoint(pad, pad));
+    }
+    return box.intersected(bounds.adjusted(0, 0, -1, -1));
 }
 
 // Wayland has no "no input here" request: an unset input region means the
@@ -339,6 +387,18 @@ void PinSurface::setPins(const QVector<Item> &pins)
             dirty |= dirtyRect(localRect(entry.item));
         }
     }
+    // The corner tags are drawn above every pin and are anchored to one pin's
+    // own corner, so on a pin smaller than a tag the tag reaches past the pin --
+    // outside the rect the loops above cover.  Both the stack on its way out and
+    // the one arriving are asked, because a zoom or a drag carries the tag with
+    // its pin; a region computed from the pins alone would leave the tag's outer
+    // pixels at the old position.
+    for (const Entry &entry : entries_) {
+        dirty |= tagBoxes(entry.item.id, localRect(entry.item));
+    }
+    for (const Entry &entry : next) {
+        dirty |= tagBoxes(entry.item.id, localRect(entry.item));
+    }
 
     entries_ = next;
     // A pin that is gone can be neither picked, dragged nor announced.
@@ -361,6 +421,7 @@ void PinSurface::setPins(const QVector<Item> &pins)
         closeMenu();
     }
     applyMask();
+    repaintRegion_ = dirty;
     if (surfaceReady_ && !dirty.isNull()) {
         update(dirty);
     }
@@ -489,6 +550,22 @@ QRect PinSurface::dirtyRect(const QRect &pin) const
     return expandOutline(pin, bleed());
 }
 
+QRect PinSurface::tagBoxes(quint64 id, const QRect &target) const
+{
+    const QRect visible = target.intersected(rect());
+    if (visible.isEmpty()) {
+        return QRect();
+    }
+    QRect boxes;
+    if (id == hoverId_) {
+        boxes |= tagBox(kHdrTag, visible.topLeft(), false, rect());
+    }
+    if (id == badgeId_ && !badgeText_.isEmpty()) {
+        boxes |= tagBox(badgeText_, visible.bottomRight(), true, rect());
+    }
+    return boxes;
+}
+
 bool PinSurface::event(QEvent *event)
 {
     // The window's activation is a separate fact from the widget's focus, and
@@ -501,7 +578,41 @@ bool PinSurface::event(QEvent *event)
             traceFocus(QStringLiteral("window deactivate"));
         }
     }
+    // The compositor's own frame callback, which Qt turns into an
+    // `UpdateRequest` on the window once the buffer it was armed for has been
+    // presented.  That is the only moment a client can know something it drew
+    // is on the screen rather than merely queued, and it is what the daemon
+    // waits on before it lets a handoff finish.  Installed once, on the first
+    // event with a window behind it.
+    if (event->type() == QEvent::Show && !frameWatch_) {
+        if (QWindow *window = windowHandle()) {
+            frameWatch_ = true;
+            window->installEventFilter(this);
+        }
+    }
     return QWidget::event(event);
+}
+
+bool PinSurface::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::UpdateRequest && painted_) {
+        painted_();
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+// Asks Qt for the compositor's next frame callback, so `setPaintedCallback`
+// fires once the frame being composed now has been presented.
+//
+// Called after the stack has been handed over: the repaint that carries the
+// change is committed either way, and this arms the callback that says the
+// compositor took it.  A surface with nothing to draw may never be given one,
+// which is why the caller waits with a deadline rather than for ever.
+void PinSurface::requestPainted()
+{
+    if (QWindow *window = windowHandle()) {
+        window->requestUpdate();
+    }
 }
 
 // Which pin a key press would act on is the one under the pointer: that is what
@@ -545,11 +656,13 @@ void PinSurface::reportActive()
 
 void PinSurface::trackHover(const QPoint &local)
 {
-    // Only an HDR pin carries the marker: over any other pin the pointer is
-    // simply over a pin, and the surface has nothing to say about it.
+    // Only an HDR capture carries the marker: over any other pin the pointer is
+    // simply over a pin, and the surface has nothing to say about it.  It is the
+    // capture that is marked, not the picture being shown -- the tag is what says
+    // which of the two an HDR pin is currently drawn from.
     const quint64 under = pinAt(local);
     const Entry *entry = entryFor(under);
-    moveHoverTo(entry != nullptr && entry->item.hdr ? under : 0);
+    moveHoverTo(entry != nullptr && entry->item.capturedHdr ? under : 0);
 }
 
 void PinSurface::moveHoverTo(quint64 id)
@@ -567,19 +680,16 @@ void PinSurface::moveHoverTo(quint64 id)
         update(was.adjusted(-1, -1, 1, 1));
     }
     if (const Entry *entry = entryFor(id)) {
-        update(localRect(entry->item));
+        // Only the tag is about to appear: the tag belongs to the pin, and the
+        // pin itself has already been painted.  The box can reach past a small
+        // pin, which the pin's own rect would not have covered.
+        update(tagBoxes(id, localRect(entry->item)));
     }
 }
 
 void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool shownAsHdr)
 {
-    QFont font = painter.font();
-    font.setPixelSize(kLabelPixelSize);
-    font.setBold(true);
-    const QFontMetrics metrics(font);
-    const QString text = QStringLiteral("HDR");
-    const int pad = metrics.height() / 3;
-    QRect box = labelBox(metrics, text);
+    QFont font = tagFont();
     // Anchored inside the part of the pin this output actually shows: a pin
     // hanging off the edge of the screen keeps its tag in the frame instead of
     // pushing it out with the corner it is anchored to.
@@ -587,8 +697,7 @@ void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool sho
     if (visible.isEmpty()) {
         return;
     }
-    box.moveTopLeft(visible.topLeft() + QPoint(pad, pad));
-    box = box.intersected(rect().adjusted(0, 0, -1, -1));
+    const QRect box = tagBox(kHdrTag, visible.topLeft(), false, rect());
     if (box.width() <= 0 || box.height() <= 0) {
         return;
     }
@@ -609,7 +718,7 @@ void PinSurface::paintHdrMarker(QPainter &painter, const QRect &target, bool sho
     painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), kLabelRadius,
                             kLabelRadius);
     painter.setPen(ink);
-    painter.drawText(box, Qt::AlignCenter, text);
+    painter.drawText(box, Qt::AlignCenter, kHdrTag);
     painter.restore();
     hoverMarker_ = box;
 }
@@ -755,13 +864,13 @@ void PinSurface::paintEvent(QPaintEvent *event)
         // The corners, clamped to what this pin's size can carry: a radius past
         // half the shorter side turns the image into a lozenge.
         const int radius = paintRadius(style_.radius, target.size());
-        // An HDR pin's picture, its shadow and its rim are all drawn by the
-        // surface helper, on a surface of its own below this one: only a surface
+        // A pin the helper draws has its picture, its shadow and its rim all on
+        // the helper's surface, which sits below this one: only a surface
         // carrying the output's *own* colour description is passed through
         // untouched, and that is a surface this Qt window can never be.  The
-        // three have to travel together — one surface, one commit — or the
-        // picture would trail its own edge the moment the pin was dragged.  What
-        // is left here is the chrome: the badges, the menus and the `HDR` tag.
+        // three travel together -- one surface, one commit -- or the picture
+        // would trail its own edge the moment the pin was dragged.  What is
+        // left here is the chrome: the badges, the menus and the `HDR` tag.
         const bool hdr = entry.item.hdr && hdrPixels_;
         if (hdr) {
             continue;
@@ -845,18 +954,11 @@ void PinSurface::paintEvent(QPaintEvent *event)
     // Transient badge pinned to the image's bottom-right corner that is still
     // on this output. The font size is fixed: the badge reports what just
     // happened to the pin, it must not grow with the image itself.
-    QFont font = painter.font();
-    font.setPixelSize(kLabelPixelSize);
-    font.setBold(true);
+    QFont font = tagFont();
     painter.setFont(font);
-    const QFontMetrics metrics(font);
     const QString text = badgeText_;
-    const int pad = metrics.height() / 3;
-    QRect badgeBox = labelBox(metrics, text);
     const QRect corner = localRect(badge->item).intersected(rect());
-    badgeBox.moveBottomRight(corner.bottomRight() - QPoint(pad, pad));
-    // A pin may hang partially off-screen; keep the badge readable.
-    badgeBox = badgeBox.intersected(rect().adjusted(0, 0, -1, -1));
+    const QRect badgeBox = tagBox(text, corner.bottomRight(), true, rect());
     if (badgeBox.width() <= 0 || badgeBox.height() <= 0) {
         return;
     }
@@ -888,9 +990,10 @@ void PinSurface::showBadge(quint64 id, const QString &text)
     badgeText_ = text;
     badgeId_ = id;
     zoomTimer_->start(kBadgeMs);
-    // The badge is painted inside the pin's rect, so repainting that rect is
-    // what puts it up and what takes the previous one down.
-    update(localRect(entry->item));
+    // The badge is painted inside the pin's rect and just outside its corner on
+    // a pin too small to hold it, so both are asked for.
+    const QRect target = localRect(entry->item);
+    update(dirtyRect(target) | tagBoxes(id, target));
 }
 
 void PinSurface::showMessage(quint64 id, const QString &text)
@@ -1006,6 +1109,12 @@ int PinSurface::menuRowAt(const QPoint &local) const
     if (menuId_ == 0 || menuRect_.isEmpty()) {
         return -1;
     }
+    // Both axes: the input region this surface holds also carries the pins, so a
+    // pointer far to the side of the menu still reaches here -- and a row that
+    // only looked at the vertical offset lit up under it.
+    if (local.x() < menuRect_.left() || local.x() > menuRect_.right()) {
+        return -1;
+    }
     const MenuLayout layout = menuLayout();
     if (layout.rowHeight <= 0) {
         return -1;
@@ -1056,6 +1165,13 @@ void PinSurface::paintMenu(QPainter &painter)
 
     const qreal labelX = menuRect_.left() + kMenuPaddingX;
     const qreal valueX = labelX + layout.labelWidth + kMenuLabelGap;
+    // A row is a full-width rectangle, so the first and last of them would square
+    // off the rounded box they sit in -- and the highlight, which is painted over
+    // the fill, would show its corners outside it.  Clip the rows to the box's
+    // own outline, the one the fill above was drawn with.
+    QPainterPath clip;
+    clip.addRoundedRect(QRectF(menuRect_).adjusted(0.5, 0.5, -0.5, -0.5), kMenuRadius, kMenuRadius);
+    painter.setClipPath(clip, Qt::IntersectClip);
     for (int index = 0; index < layout.copyRows; ++index) {
         const QRect row(menuRect_.left(), menuRect_.top() + layout.rowsTop + index * layout.rowHeight,
                         menuRect_.width(), layout.rowHeight);
@@ -1088,7 +1204,12 @@ void PinSurface::paintMenu(QPainter &painter)
         const QRect action(menuRect_.left(),
                            menuRect_.top() + layout.actionTop + index * layout.rowHeight,
                            menuRect_.width(), layout.rowHeight);
-        if (index == kSaveAction && layout.copyRows > 0) {
+        // A separator above the first of the action rows, so they do not read
+        // as formats to copy, and a second above `Close`: the one row that
+        // throws the pin away sits apart from the rows that only do something
+        // to it. The first is drawn only when there are copy rows above it --
+        // at the very top of the box it would be a stray line.
+        if ((index == 0 && layout.copyRows > 0) || index == kCloseAction) {
             painter.setPen(QPen(QColor(0, 0, 0, 40), 1.0));
             painter.drawLine(menuRect_.left() + 1, action.top(), menuRect_.right() - 1,
                              action.top());
@@ -1139,16 +1260,38 @@ void PinSurface::activateRow(int row)
     }
     const int action = row - copyRows;
     const quint64 id = menuId_;
-    if (action == kSaveAction && saveRequested_) {
+    if (action == kCopyImageAction && copyImageRequested_) {
+        const std::function<bool(quint64)> copyImage = copyImageRequested_;
+        // The daemon owns the pixels and the clipboard; its answer decides
+        // whether the badge says the copy landed, exactly as a color row's
+        // does.
+        const bool copied = copyImage(id);
+        showBadge(id, copied ? uiTr("Copied image") : uiTr("Copy failed"));
+    } else if (action == kSaveAction && saveRequested_) {
         const std::function<void(quint64)> save = saveRequested_;
         // The daemon runs the dialog and writes the file; the badge that says
         // how it went arrives over showMessage() once that is known.
         save(id);
+    } else if (action == kEditAction && editRequested_) {
+        const std::function<void(quint64)> edit = editRequested_;
+        // The daemon spawns the editor, which opens on the pin's own marks.
+        edit(id);
+    } else if (action == kResetZoomAction && resetZoomRequested_) {
+        const std::function<void(quint64)> resetZoom = resetZoomRequested_;
+        // The daemon rescales the pin; the badge it shows is the zoom one, so
+        // the new factor is reported the way the wheel reports its own.
+        resetZoom(id);
+        showZoomBadge(id);
     } else if (action == kRecognizeAction && recognizeRequested_) {
         const std::function<void(quint64)> recognize = recognizeRequested_;
         // The daemon spawns the editor, which opens on the pin's text; unlike a
         // save, nothing about it comes back through this surface.
         recognize(id);
+    } else if (action == kCloseAction && closeRequested_) {
+        const std::function<void(quint64)> close = closeRequested_;
+        // Closing takes the pin out of this surface's stack, which clears the
+        // callback while it runs; invoke a copy.
+        close(id);
     }
 }
 

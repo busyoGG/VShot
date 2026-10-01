@@ -316,8 +316,8 @@ fn expand_strftime(template: &str) -> String {
 }
 
 /// The save path for a request: the session's own default when the control
-/// line names none.  The directory is made when vshot chose it (the videos
-/// directory), an error of the user's when they named a missing one.
+/// line names none.  The directory is made either way — a `--save-dir` is a
+/// strftime pattern, so it names one that may not exist yet.
 ///
 /// Only the names vshot builds itself are templates: `--save-dir` and the
 /// timestamped default are documented as strftime-expanded, and a PATH the
@@ -329,8 +329,8 @@ fn resolve_save_path(
     save_dir: Option<&Path>,
     label: &str,
 ) -> Result<PathBuf> {
-    let (path, owned_default) = match requested {
-        Some(path) => (path.to_path_buf(), false),
+    let path = match requested {
+        Some(path) => path.to_path_buf(),
         None => {
             let base = match save_dir {
                 Some(dir) => dir.to_path_buf(),
@@ -343,31 +343,14 @@ fn resolve_save_path(
                 })?,
             };
             let name = format!("{label}-%Y%m%d-%H%M%S.mp4");
-            let expanded = expand_strftime(&base.join(name).to_string_lossy());
-            (PathBuf::from(expanded), true)
+            PathBuf::from(expand_strftime(&base.join(name).to_string_lossy()))
         }
     };
     let mut path = path;
     if path.extension().and_then(|ext| ext.to_str()) != Some("mp4") {
         path.set_extension("mp4");
     }
-    match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(directory) if owned_default => {
-            std::fs::create_dir_all(directory).map_err(|source| {
-                VshotError::Recording(format!(
-                    "could not create the videos directory {}: {source}",
-                    directory.display()
-                ))
-            })?;
-        }
-        Some(directory) if !directory.is_dir() => {
-            return Err(VshotError::Recording(format!(
-                "the directory {} does not exist",
-                directory.display()
-            )));
-        }
-        _ => {}
-    }
+    crate::output::create_parent_directories(&path)?;
     Ok(path)
 }
 

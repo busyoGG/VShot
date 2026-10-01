@@ -127,15 +127,6 @@ bool withinRange(const QColor &actual, const QColor &low, const QColor &high, in
         actual.blue() >= low.blue() - tolerance && actual.blue() <= high.blue() + tolerance;
 }
 
-QByteArray readAll(const QString &path)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return QByteArray();
-    }
-    return file.readAll();
-}
-
 // A translated envelope: `lines[].text` is the translation, `source` keeps what
 // the engine read, an `error` marks the line that failed, and the per-character
 // boxes are gone -- that is the shape `vshot translate --stdin-ocr --json`
@@ -942,6 +933,20 @@ vshot::Session controllerSession(const QImage &frame, const QString &mode)
     return session;
 }
 
+// The helper's own render of the session, with the selection's own top-left as
+// the origin -- the same crop the CLI hands to the daemon.  An empty image
+// means the render refused, which the caller reports.
+QImage renderSelection(const vshot::OverlayController &controller)
+{
+    QImage composite;
+    QImage marks;
+    QString error;
+    if (!controller.produceComposite(&composite, &marks, &error)) {
+        return QImage();
+    }
+    return composite;
+}
+
 QImage lightFrame()
 {
     QImage frame(400, 400, QImage::Format_ARGB32);
@@ -1103,37 +1108,35 @@ void checkControllerWithStub()
         }
     }
 
-    // The commit path: the annotation travels as an image the renderer already
-    // knows how to blit, and that bitmap holds the fill and the glyphs.  The
-    // pixels are raw RGBA8888, so they are read as bytes rather than decoded.
-    const QJsonDocument document = controller.resultDocument(directory.path(), &error);
-    expect(error.isEmpty(), "the result document reports no error", error);
-    const QJsonArray annotations = document.object().value(QStringLiteral("annotations")).toArray();
-    expect(annotations.size() == 1, "the result carries the annotation");
-    if (annotations.size() == 1) {
-        const QJsonObject object = annotations.at(0).toObject();
-        expect(object.value(QStringLiteral("kind")).toString() == QStringLiteral("image"),
-               "as an image the renderer already knows how to blit");
-        const QByteArray bytes = readAll(object.value(QStringLiteral("bitmap")).toString());
-        const int width = object.value(QStringLiteral("bitmap_width")).toInt();
-        const int height = object.value(QStringLiteral("bitmap_height")).toInt();
-        expect(!bytes.isEmpty() && bytes.size() == width * height * 4,
-               "with its pixels written at the declared size",
-               QStringLiteral("%1 bytes for %2x%3").arg(bytes.size()).arg(width).arg(height));
+    // The commit path: the annotation is drawn by the helper and reaches the
+    // canvas with the line's fill and the translated glyphs on it.  A
+    // translation carries its lines' text and boxes, not pixels, so the render
+    // is the only place those pixels exist -- if the fill or the glyphs stopped
+    // being drawn, nothing else here would notice.
+    const QImage composite = renderSelection(controller);
+    expect(!composite.isNull(), "the session renders with the translation on it");
+    if (!composite.isNull() && controller.annotations().size() == 1) {
+        const vshot::LogicalRect &canvas = *controller.selection();
+        const vshot::LogicalRect &placed = controller.annotations().constFirst().rect;
         int fillPixels = 0;
         int inkPixels = 0;
-        for (int index = 0; index + 3 < bytes.size(); index += 4) {
-            const QColor colour(static_cast<uchar>(bytes.at(index)),
-                                static_cast<uchar>(bytes.at(index + 1)),
-                                static_cast<uchar>(bytes.at(index + 2)));
-            if (near(colour, QColor(245, 245, 245))) {
-                ++fillPixels;
-            } else if (colour.lightness() < 80) {
-                ++inkPixels;
+        const QRect box(placed.x - canvas.x, placed.y - canvas.y,
+                        static_cast<int>(placed.width), static_cast<int>(placed.height));
+        for (int y = box.top(); y < box.bottom(); ++y) {
+            for (int x = box.left(); x < box.right(); ++x) {
+                if (!composite.rect().contains(x, y)) {
+                    continue;
+                }
+                const QColor colour = composite.pixelColor(x, y);
+                if (near(colour, QColor(245, 245, 245))) {
+                    ++fillPixels;
+                } else if (colour.lightness() < 80) {
+                    ++inkPixels;
+                }
             }
         }
         expect(fillPixels > 0 && inkPixels > 0,
-               "and which holds both the fill and the translated glyphs",
+               "and the render holds both the fill and the translated glyphs",
                QStringLiteral("%1 fill, %2 ink").arg(fillPixels).arg(inkPixels));
     }
     qunsetenv("VSHOT_BIN");
@@ -1254,7 +1257,7 @@ void checkStandaloneFlow()
     expect(controller.isFinished() && !controller.isCancelled(), "the second Enter accepts");
     expect(QFile::exists(session.resultPath), "the composited PNG is written",
            session.resultPath);
-    const QJsonDocument document = controller.resultDocument(directory.path());
+    const QJsonDocument document = controller.resultDocument();
     expect(document.object().value(QStringLiteral("translated_text")).toString() ==
                QStringLiteral("你好"),
            "the result carries the translated text");

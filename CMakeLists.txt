@@ -19,9 +19,13 @@ add_executable(vshot-qt-ui
     ui/annotate_surface.hpp
     ui/config.cpp
     ui/config.hpp
+    ui/shortcuts.cpp
+    ui/shortcuts.hpp
     ui/text_size.hpp
     ui/session_protocol.cpp
     ui/session_protocol.hpp
+    ui/pixel_fd.cpp
+    ui/pixel_fd.hpp
     ui/capture_overlay.cpp
     ui/capture_overlay.hpp
     ui/text_layer.cpp
@@ -81,6 +85,10 @@ if(VSHOT_BUILD_CHECKS)
         ui/config_check.cpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
+        ui/i18n.cpp
+        ui/i18n.hpp
     )
     target_link_libraries(vshot-config-check PRIVATE Qt6::Core Qt6::Gui)
     target_compile_features(vshot-config-check PRIVATE cxx_std_17)
@@ -112,6 +120,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/settings_window.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/shadow.cpp
         ui/shadow.hpp
         ui/i18n.cpp
@@ -258,6 +268,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-paste-check
         ui/paste_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -267,6 +279,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/session_protocol.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp
@@ -293,6 +307,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-backdrop-check
         ui/backdrop_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -302,6 +318,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/session_protocol.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp
@@ -327,6 +345,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-toolbar-check
         ui/toolbar_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -336,6 +356,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/session_protocol.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp
@@ -360,6 +382,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-annotation-check
         ui/annotation_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -369,6 +393,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/session_protocol.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp
@@ -394,6 +420,8 @@ if(VSHOT_BUILD_CHECKS)
     add_executable(vshot-dpr-check
         ui/dpr_check.cpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -403,6 +431,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/session_protocol.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp
@@ -434,6 +464,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/shadow.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp
@@ -508,6 +540,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/translation_layer.cpp
         ui/translation_layer.hpp
         ui/capture_overlay.cpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
         ui/capture_overlay.hpp
         ui/text_layer.cpp
         ui/text_layer.hpp
@@ -515,6 +549,8 @@ if(VSHOT_BUILD_CHECKS)
         ui/session_protocol.hpp
         ui/config.cpp
         ui/config.hpp
+        ui/shortcuts.cpp
+        ui/shortcuts.hpp
         ui/text_size.hpp
         ui/i18n.cpp
         ui/i18n.hpp

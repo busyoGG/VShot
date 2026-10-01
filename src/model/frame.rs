@@ -81,6 +81,11 @@ impl Frame {
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_compression(compression.into());
+            // Say the pixels are sRGB.  Without it a file of sRGB bytes has no
+            // colour space at all, and a viewer on a wide-gamut display is free
+            // to read them as that display's own gamut -- which is exactly what
+            // a P3 or BT.2020 panel is, so an untagged capture came out tinted.
+            encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
             if let Some(density) = density {
                 let pixels_per_meter = density_to_pixels_per_meter(density);
                 encoder.set_pixel_dims(Some(png::PixelDimensions {
@@ -1238,10 +1243,10 @@ fn point_from_f64(x: f64, y: f64) -> Point {
 /// Rasterizes one stroke, compositing a translucent colour exactly once per
 /// covered pixel.
 ///
-/// An opaque stroke keeps the original single-pass drawing: every plot blends
-/// straight onto the frame, byte-for-byte what the segment routines used to do.
-/// Only a translucent stroke pays for a coverage mask, and that mask spans
-/// nothing larger than the path's own bounding box.
+/// A stroke whose coverage is fractional — an anti-aliased edge — has to reach
+/// the frame that way, so this is where the two forms meet: an opaque stroke
+/// keeps the original single-pass drawing, and everything else goes through a
+/// coverage mask.
 fn stroke_with_coverage(
     frame: &mut Frame,
     color: [u8; 4],
@@ -1261,11 +1266,35 @@ fn stroke_with_coverage(
     mask.composite(frame, color);
 }
 
+/// How many samples per axis a rasterizer takes inside one pixel.
+///
+/// The pixel tests below are exact — a pixel is in the shape or out of it — so
+/// on their own every edge of a diagonal or a curve is a staircase.  Qt's own
+/// preview draws the same mark with `QPainter::Antialiasing`, and the committed
+/// image is the one the user compares against that preview, so the rasterizers
+/// that go by a pixel's centre instead take [`SUPERSAMPLE`]² samples spread over
+/// the pixel and hand [`Ink`] the fraction that landed inside.  Four is the
+/// usual trade: sixteen samples per pixel, and an edge that reads as smooth
+/// rather than as the two-step stair a single sample leaves.
+const SUPERSAMPLE: u32 = 4;
+
+/// The offset of one sub-sample from its pixel's own sample point, in whole
+/// pixels.  Sample `i` of `SUPERSAMPLE` sits at `(2i + 1) / (2 * SUPERSAMPLE)`
+/// across the pixel, so the run is centred on the point the rasterizer would
+/// have tested on its own — a shape that covered that point still covers half
+/// the pixel's samples, and nothing shifts by the half pixel a corner-anchored
+/// run would have moved it.
+#[inline]
+fn subsample_offset(index: u32) -> f64 {
+    (f64::from(2 * index + 1)) / (2.0 * f64::from(SUPERSAMPLE)) - 0.5
+}
+
 /// Where a stroke rasterizer sends the pixels it covers.
 ///
-/// An opaque stroke plots straight onto the frame; a translucent one records
-/// coverage instead, so no pixel is composited twice no matter how many
-/// segments overlap it.
+/// A rasterizer that is exact — a rectangle's own rows and columns — plots
+/// straight onto the frame or into a mask.  One that goes by a pixel's centre
+/// sends a coverage fraction instead, so the pixel can take the colour only in
+/// the proportion that landed inside the mark.
 enum Ink<'a> {
     /// Blend `color` onto the frame, source-over, once per plot.
     Direct {
@@ -1284,23 +1313,50 @@ impl Ink<'_> {
             Ink::Mask(mask) => mask.plot(x, y),
         }
     }
+
+    /// Adds `coverage` (0..=1) to the pixel at `(x, y)`.
+    ///
+    /// A fully covered pixel plots outright, so a shape's interior costs
+    /// nothing beyond what it always did; only the edge pixels carry a
+    /// fraction, and only those end up blended with an alpha below the
+    /// stroke's own.
+    #[inline]
+    fn plot_coverage(&mut self, x: i64, y: i64, coverage: f64) {
+        if coverage <= 0.0 {
+            return;
+        }
+        if coverage >= 1.0 {
+            self.plot(x, y);
+            return;
+        }
+        match self {
+            Ink::Direct { frame, color } => {
+                let mut edge = *color;
+                edge[3] = ((f64::from(color[3]) * coverage).round() as i64).clamp(0, 255) as u8;
+                frame.blend_pixel_at(x, y, edge);
+            }
+            Ink::Mask(mask) => mask.plot_coverage(x, y, coverage),
+        }
+    }
 }
 
 /// A bounding-box-limited coverage mask for a single stroke.
 ///
-/// A rasterizer marks every pixel the path covers. Coverage is a hard edge — a
-/// pixel is in or out, never an anti-aliased fraction — so marking a shared
-/// pixel once is exactly the union of the path's pixels. That is why an opaque
+/// A rasterizer that is exact marks every pixel the path covers, and a shared
+/// pixel is marked once — the union of the path's pixels. That is why an opaque
 /// stroke composites to the same bytes it would have got by blending each
 /// segment separately: at alpha 255 a source-over blend is a plain copy, so
 /// "keep the maximum at overlaps" and "blend every segment" land the same
-/// result.
+/// result.  A rasterizer that goes by a pixel's centre instead adds a fraction
+/// per sample; the mask keeps the largest, which is the same union read as
+/// coverage rather than as a flag.
 struct StrokeMask {
     x0: i64,
     y0: i64,
     width: usize,
     height: usize,
-    covered: Vec<bool>,
+    /// Coverage per pixel, 0..=255.
+    covered: Vec<u8>,
 }
 
 impl StrokeMask {
@@ -1319,7 +1375,7 @@ impl StrokeMask {
             y0,
             width,
             height,
-            covered: vec![false; width * height],
+            covered: vec![0u8; width * height],
         }
     }
 
@@ -1327,26 +1383,55 @@ impl StrokeMask {
         self.width == 0 || self.height == 0
     }
 
+    /// The mask's index for a pixel, or `None` when it lies outside.
     #[inline]
-    fn plot(&mut self, x: i64, y: i64) {
+    fn index_of(&self, x: i64, y: i64) -> Option<usize> {
         let local_x = x - self.x0;
         let local_y = y - self.y0;
         if local_x < 0 || local_y < 0 {
-            return;
+            return None;
         }
         let (local_x, local_y) = (local_x as usize, local_y as usize);
         if local_x >= self.width || local_y >= self.height {
-            return;
+            return None;
         }
-        self.covered[local_y * self.width + local_x] = true;
+        Some(local_y * self.width + local_x)
+    }
+
+    #[inline]
+    fn plot(&mut self, x: i64, y: i64) {
+        if let Some(index) = self.index_of(x, y) {
+            self.covered[index] = 255;
+        }
+    }
+
+    /// Raises the pixel's coverage to `coverage` (0..=1) if that is more than
+    /// it already holds.
+    #[inline]
+    fn plot_coverage(&mut self, x: i64, y: i64, coverage: f64) {
+        let Some(index) = self.index_of(x, y) else {
+            return;
+        };
+        let value = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
+        if value > self.covered[index] {
+            self.covered[index] = value;
+        }
     }
 
     fn composite(&self, frame: &mut Frame, color: [u8; 4]) {
         for row in 0..self.height {
             for column in 0..self.width {
-                if self.covered[row * self.width + column] {
-                    frame.blend_pixel_at(self.x0 + column as i64, self.y0 + row as i64, color);
+                let coverage = self.covered[row * self.width + column];
+                if coverage == 0 {
+                    continue;
                 }
+                let mut edge = color;
+                // At full coverage the colour is used as it stands, so an
+                // opaque stroke stays byte-for-byte what it always was.
+                if coverage < 255 {
+                    edge[3] = ((u32::from(color[3]) * u32::from(coverage) + 127) / 255) as u8;
+                }
+                frame.blend_pixel_at(self.x0 + column as i64, self.y0 + row as i64, edge);
             }
         }
     }
@@ -1580,6 +1665,9 @@ fn rasterize_rect_border(
 }
 
 /// Draws the ring of a circle as a rasterizer.
+///
+/// The band is where the pixel's centre falls, so the edge is a staircase; the
+/// samples spread over the pixel turn it into a smooth one.
 fn rasterize_circle(ink: &mut Ink<'_>, frame: Size, center: Point, radius: u32, width: u32) {
     let radius = i128::from(radius);
     let stroke_width = i128::from(width);
@@ -1594,23 +1682,43 @@ fn rasterize_circle(ink: &mut Ink<'_>, frame: Size, center: Point, radius: u32, 
         return;
     }
 
-    let inner_radius_twice = (radius * 2 - stroke_width).max(0);
-    let outer_radius_twice = radius * 2 + stroke_width;
+    // Twice the squared radii, so a sample at distance `d` is inside when
+    // `4d²` lies between them.  The samples are on a finer grid than the
+    // pixels, so these are kept in floating point rather than scaled to whole
+    // numbers as the centre test was.
+    let inner_radius_twice = (radius * 2 - stroke_width).max(0) as f64;
+    let outer_radius_twice = (radius * 2 + stroke_width) as f64;
     let inner_distance = inner_radius_twice * inner_radius_twice;
     let outer_distance = outer_radius_twice * outer_radius_twice;
+    let center_x = center_x as f64;
+    let center_y = center_y as f64;
+    let samples = f64::from(SUPERSAMPLE * SUPERSAMPLE);
     for y in y_start..y_end {
         for x in x_start..x_end {
-            let dx = x - center_x;
-            let dy = y - center_y;
-            let distance = 4 * (dx * dx + dy * dy);
-            if distance >= inner_distance && distance <= outer_distance {
-                ink.plot(x as i64, y as i64);
+            let mut inside = 0u32;
+            for sy in 0..SUPERSAMPLE {
+                let py = y as f64 + subsample_offset(sy);
+                for sx in 0..SUPERSAMPLE {
+                    let px = x as f64 + subsample_offset(sx);
+                    let dx = px - center_x;
+                    let dy = py - center_y;
+                    let distance = 4.0 * (dx * dx + dy * dy);
+                    if distance >= inner_distance && distance <= outer_distance {
+                        inside += 1;
+                    }
+                }
+            }
+            if inside > 0 {
+                ink.plot_coverage(x as i64, y as i64, f64::from(inside) / samples);
             }
         }
     }
 }
 
 /// Draws the ring of the ellipse inscribed in `(left, top, right, bottom)`.
+///
+/// The band is where the pixel's centre falls, so the edge is a staircase; the
+/// samples spread over the pixel turn it into a smooth one.
 fn rasterize_ellipse(
     ink: &mut Ink<'_>,
     frame: Size,
@@ -1629,10 +1737,10 @@ fn rasterize_ellipse(
     let outer_b = (rect_height + stroke_width) / 2;
     let inner_a = rect_width.saturating_sub(stroke_width) / 2;
     let inner_b = rect_height.saturating_sub(stroke_width) / 2;
-    let outer_a_squared = outer_a * outer_a;
-    let outer_b_squared = outer_b * outer_b;
-    let inner_a_squared = inner_a * inner_a;
-    let inner_b_squared = inner_b * inner_b;
+    let outer_a_squared = (outer_a * outer_a) as f64;
+    let outer_b_squared = (outer_b * outer_b) as f64;
+    let inner_a_squared = (inner_a * inner_a) as f64;
+    let inner_b_squared = (inner_b * inner_b) as f64;
     let outer_threshold = outer_a_squared * outer_b_squared;
     let inner_threshold = inner_a_squared * inner_b_squared;
     let has_inner = inner_a > 0 && inner_b > 0;
@@ -1643,20 +1751,37 @@ fn rasterize_ellipse(
     if x_start >= x_end || y_start >= y_end {
         return;
     }
+    let center_x = center_x as f64;
+    let center_y = center_y as f64;
+    let samples = f64::from(SUPERSAMPLE * SUPERSAMPLE);
     for y in y_start..y_end {
         for x in x_start..x_end {
-            let dx = x - center_x;
-            let dy = y - center_y;
-            // Pixel is inside the outer ellipse and outside the inner ellipse:
-            // dx²/a² + dy²/b² <= 1 is equivalent to dx²·b² + dy²·a² <= a²·b².
-            if dx * dx * outer_b_squared + dy * dy * outer_a_squared > outer_threshold {
-                continue;
+            let mut inside = 0u32;
+            for sy in 0..SUPERSAMPLE {
+                let py = y as f64 + subsample_offset(sy);
+                for sx in 0..SUPERSAMPLE {
+                    let px = x as f64 + subsample_offset(sx);
+                    let dx = px - center_x;
+                    let dy = py - center_y;
+                    // Inside the outer ellipse and outside the inner one:
+                    // dx²/a² + dy²/b² <= 1 is equivalent to
+                    // dx²·b² + dy²·a² <= a²·b².
+                    let outside_outer =
+                        dx * dx * outer_b_squared + dy * dy * outer_a_squared > outer_threshold;
+                    if outside_outer {
+                        continue;
+                    }
+                    if has_inner
+                        && dx * dx * inner_b_squared + dy * dy * inner_a_squared < inner_threshold
+                    {
+                        continue;
+                    }
+                    inside += 1;
+                }
             }
-            if has_inner && dx * dx * inner_b_squared + dy * dy * inner_a_squared < inner_threshold
-            {
-                continue;
+            if inside > 0 {
+                ink.plot_coverage(x as i64, y as i64, f64::from(inside) / samples);
             }
-            ink.plot(x as i64, y as i64);
         }
     }
 }
@@ -1741,6 +1866,11 @@ fn rasterize_dashed_ellipse(
 }
 
 /// Fills the triangle `first, second, third`.
+///
+/// The edge is where a sample falls on one side of each side's line, which
+/// leaves the head's two slanted sides a staircase; the samples spread over the
+/// pixel turn it into a smooth one, as they do for the stem the head is joined
+/// to.
 fn rasterize_triangle(ink: &mut Ink<'_>, frame: Size, first: Point, second: Point, third: Point) {
     let min_x = i64::from(first.x)
         .min(i64::from(second.x))
@@ -1762,32 +1892,49 @@ fn rasterize_triangle(ink: &mut Ink<'_>, frame: Size, first: Point, second: Poin
         return;
     }
 
-    let edge = |a: Point, b: Point, x: i64, y: i64| {
-        (i128::from(b.x) - i128::from(a.x)) * (i128::from(y) - i128::from(a.y))
-            - (i128::from(b.y) - i128::from(a.y)) * (i128::from(x) - i128::from(a.x))
+    let edge = |a: Point, b: Point, x: f64, y: f64| {
+        (f64::from(b.x) - f64::from(a.x)) * (y - f64::from(a.y))
+            - (f64::from(b.y) - f64::from(a.y)) * (x - f64::from(a.x))
     };
-    let area = edge(first, second, i64::from(third.x), i64::from(third.y));
-    if area == 0 {
+    // The winding only picks which side of each edge is the inside, so it is
+    // read once at the vertices rather than per sample.
+    let area = edge(first, second, f64::from(third.x), f64::from(third.y));
+    if area == 0.0 {
         return;
     }
+    let samples = f64::from(SUPERSAMPLE * SUPERSAMPLE);
     for y in min_y..=max_y {
         for x in min_x..=max_x {
-            let first_edge = edge(first, second, x, y);
-            let second_edge = edge(second, third, x, y);
-            let third_edge = edge(third, first, x, y);
-            let inside = if area > 0 {
-                first_edge >= 0 && second_edge >= 0 && third_edge >= 0
-            } else {
-                first_edge <= 0 && second_edge <= 0 && third_edge <= 0
-            };
-            if inside {
-                ink.plot(x, y);
+            let mut inside = 0u32;
+            for sy in 0..SUPERSAMPLE {
+                let py = y as f64 + subsample_offset(sy);
+                for sx in 0..SUPERSAMPLE {
+                    let px = x as f64 + subsample_offset(sx);
+                    let first_edge = edge(first, second, px, py);
+                    let second_edge = edge(second, third, px, py);
+                    let third_edge = edge(third, first, px, py);
+                    let hit = if area > 0.0 {
+                        first_edge >= 0.0 && second_edge >= 0.0 && third_edge >= 0.0
+                    } else {
+                        first_edge <= 0.0 && second_edge <= 0.0 && third_edge <= 0.0
+                    };
+                    if hit {
+                        inside += 1;
+                    }
+                }
             }
+            ink.plot_coverage(x, y, f64::from(inside) / samples);
         }
     }
 }
 
 /// Draws the capsule — the `width`-thick stroke of the segment `start..end`.
+///
+/// The edge is where a pixel's centre falls within half the width of the line,
+/// which leaves every diagonal and every round cap a staircase; the samples
+/// spread over the pixel turn it into a smooth one.  This is the rasterizer
+/// every polyline tool is built on — freehand, the arrow's stem, the wave, the
+/// bezier — so it is where most of the jaggedness was.
 fn rasterize_capsule(ink: &mut Ink<'_>, frame: Size, start: Point, end: Point, width: u32) {
     let padding = (i128::from(width) + 1) / 2;
     let start_x = i128::from(start.x);
@@ -1811,25 +1958,34 @@ fn rasterize_capsule(ink: &mut Ink<'_>, frame: Size, start: Point, end: Point, w
     let length_squared = dx.mul_add(dx, dy * dy);
     let threshold = f64::from(width) / 2.0;
     let threshold_squared = threshold * threshold;
+    let samples = f64::from(SUPERSAMPLE * SUPERSAMPLE);
     for y in y_start..y_end {
         for x in x_start..x_end {
-            let px = x as f64;
-            let py = y as f64;
-            let distance_squared = if length_squared == 0.0 {
-                let delta_x = px - x1;
-                let delta_y = py - y1;
-                delta_x.mul_add(delta_x, delta_y * delta_y)
-            } else {
-                let projection = ((px - x1) * dx + (py - y1) * dy) / length_squared;
-                let projection = projection.clamp(0.0, 1.0);
-                let nearest_x = x1 + projection * dx;
-                let nearest_y = y1 + projection * dy;
-                let delta_x = px - nearest_x;
-                let delta_y = py - nearest_y;
-                delta_x.mul_add(delta_x, delta_y * delta_y)
-            };
-            if distance_squared <= threshold_squared {
-                ink.plot(x as i64, y as i64);
+            let mut inside = 0u32;
+            for sy in 0..SUPERSAMPLE {
+                let py = y as f64 + subsample_offset(sy);
+                for sx in 0..SUPERSAMPLE {
+                    let px = x as f64 + subsample_offset(sx);
+                    let distance_squared = if length_squared == 0.0 {
+                        let delta_x = px - x1;
+                        let delta_y = py - y1;
+                        delta_x.mul_add(delta_x, delta_y * delta_y)
+                    } else {
+                        let projection = ((px - x1) * dx + (py - y1) * dy) / length_squared;
+                        let projection = projection.clamp(0.0, 1.0);
+                        let nearest_x = x1 + projection * dx;
+                        let nearest_y = y1 + projection * dy;
+                        let delta_x = px - nearest_x;
+                        let delta_y = py - nearest_y;
+                        delta_x.mul_add(delta_x, delta_y * delta_y)
+                    };
+                    if distance_squared <= threshold_squared {
+                        inside += 1;
+                    }
+                }
+            }
+            if inside > 0 {
+                ink.plot_coverage(x as i64, y as i64, f64::from(inside) / samples);
             }
         }
     }
@@ -1963,6 +2119,19 @@ fn ascii_glyph(byte: u8) -> Option<[u8; 7]> {
 mod tests {
     use super::*;
 
+    /// Whether a pixel carries the colour at all, whatever the alpha.
+    ///
+    /// A stroke's edge is anti-aliased now — a pixel the path only partly
+    /// covers takes the colour in that proportion — so "is this pixel painted"
+    /// is a question about its alpha being above zero, not about it being 255.
+    /// Tests that name a pixel on a mark's *interior* still compare the whole
+    /// value; the ones that sample an edge read through this.
+    fn painted(frame: &Frame, point: Point, rgb: [u8; 3]) -> bool {
+        frame.pixel(point).is_some_and(|pixel| {
+            pixel[3] > 0 && pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]
+        })
+    }
+
     #[test]
     fn crop_preserves_top_left_rgba_pixels() {
         let frame = Frame::new(
@@ -2039,6 +2208,21 @@ mod tests {
             u32::from_be_bytes(single[phys + 4..phys + 8].try_into().unwrap()),
             3780
         );
+    }
+
+    #[test]
+    fn png_declares_its_colour_space() {
+        // The pixels are sRGB, and without the chunk a viewer on a wide-gamut
+        // display is free to read them as that display's own gamut — a P3 or
+        // BT.2020 panel — so an untagged capture came out tinted.
+        let frame = Frame::solid(Size::new(2, 1), [10, 20, 30, 255]).unwrap();
+        let encoded = frame.to_png().unwrap();
+        assert_eq!(Frame::from_png(&encoded).unwrap(), frame);
+        let srgb = encoded
+            .windows(4)
+            .position(|chunk| chunk == &b"sRGB"[..])
+            .expect("the PNG declares its colour space");
+        assert_eq!(encoded[srgb + 4], 0); // the perceptual rendering intent
     }
 
     #[test]
@@ -2168,14 +2352,17 @@ mod tests {
         frame
             .stroke_ellipse(Rect::new(0, 0, 10, 8), [0, 255, 0, 255], 2, LineDash::Solid)
             .unwrap();
-        // Ring passes through the rect edge midpoints; the center stays transparent.
+        // The ring runs along the rect's own edge, so the pixel on it is only
+        // partly inside the band: painted, at whatever fraction the samples
+        // found.  What matters is that the ring reaches the midpoint at all --
+        // the interior stays clear.
         for point in [
             Point::new(0, 4),
             Point::new(9, 4),
             Point::new(4, 0),
             Point::new(4, 7),
         ] {
-            assert_eq!(frame.pixel(point), Some([0, 255, 0, 255]), "{point:?}");
+            assert!(painted(&frame, point, [0, 255, 0]), "{point:?}");
         }
         assert_eq!(frame.pixel(Point::new(4, 4)), Some([0, 0, 0, 0]));
         // A wide rect must produce an ellipse, not the circle the old fallback drew:
@@ -2238,8 +2425,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frame.pixel(Point::new(4, 5)), Some([0, 0, 255, 255]));
-        assert_eq!(frame.pixel(Point::new(9, 5)), Some([0, 0, 255, 255]));
-        assert_eq!(frame.pixel(Point::new(8, 4)), Some([0, 0, 255, 255]));
+        assert!(painted(&frame, Point::new(9, 5), [0, 0, 255]));
+        assert!(painted(&frame, Point::new(8, 4), [0, 0, 255]));
     }
 
     #[test]
@@ -2272,8 +2459,46 @@ mod tests {
             .unwrap();
         // head length = min(max(6, 4w) * 3, length) = 18, so the base sits at
         // x = 7 and the wing reaches y = 15; the shaft midpoint of that wing
-        // line is (16, 10).
-        assert_eq!(large.pixel(Point::new(16, 10)), Some([0, 0, 255, 255]));
+        // line is (16, 10), where the wing's own edge lands on the sample.
+        assert!(painted(&large, Point::new(16, 10), [0, 0, 255]));
+    }
+
+    // The filled head is the one part of an arrow whose edges are neither
+    // axis-aligned nor a capsule: its two sides run from the tip back to the
+    // wing tips at a slant, and a binary fill leaves them a staircase.  Qt's
+    // preview antialiases the same triangle, and the committed image is what
+    // the user compares against that preview.
+    #[test]
+    fn a_filled_arrow_head_has_a_soft_slanted_edge() {
+        // The head alone, drawn at the geometry `draw_arrow_with_style` derives
+        // for a 2..25 arrow of head size 3: tip at (25, 15), base at x = 7, and
+        // wings reaching y = 5 and y = 25.
+        let mut frame = Frame::solid(Size::new(30, 30), [0, 0, 0, 0]).unwrap();
+        let frame_size = frame.size;
+        stroke_with_coverage(&mut frame, [0, 0, 255, 255], (0, 0, 30, 30), |ink| {
+            rasterize_triangle(
+                ink,
+                frame_size,
+                Point::new(25, 15),
+                Point::new(7, 5),
+                Point::new(7, 25),
+            );
+        });
+        // Every pixel the slant crosses takes the ink only in part, so a fill
+        // that goes by a sample point leaves none of them: a hard edge shows up
+        // as a count of zero.
+        let partial = (0..30)
+            .flat_map(|x| (0..30).map(move |y| Point::new(x, y)))
+            .filter(|point| {
+                frame
+                    .pixel(*point)
+                    .is_some_and(|pixel| pixel[3] > 0 && pixel[3] < 255)
+            })
+            .count();
+        assert!(partial > 0, "the slanted sides are drawn hard");
+        // The inside is still solid, so the soft edge is an edge and not a blur
+        // over the whole head.
+        assert_eq!(frame.pixel(Point::new(20, 15)), Some([0, 0, 255, 255]));
     }
 
     #[test]
@@ -2291,8 +2516,9 @@ mod tests {
             .unwrap();
         // Shaft gap: d = 4 lies in the first 3px off run.
         assert_eq!(frame.pixel(Point::new(5, 5)), Some([0, 0, 0, 0]));
-        // The head is always solid: head length 6 puts the wing tip at (19, 8).
-        assert_eq!(frame.pixel(Point::new(22, 7)), Some([0, 0, 255, 255]));
+        // The head is always solid: head length 6 puts the wing tip at (19, 8),
+        // so (22, 7) is on the head's own edge and is painted at least partly.
+        assert!(painted(&frame, Point::new(22, 7), [0, 0, 255]));
     }
 
     #[test]
@@ -2570,9 +2796,12 @@ mod tests {
             .draw_wave(WAVE_START, WAVE_END, [255, 0, 0, 255], 1, 6, 18)
             .unwrap();
         // The wave is rounded to whole cycles, so both endpoints are covered
-        // on the centre line y = 16.
-        assert_eq!(frame.pixel(WAVE_START), Some([255, 0, 0, 255]), "start");
-        assert_eq!(frame.pixel(WAVE_END), Some([255, 0, 0, 255]), "end");
+        // on the centre line y = 16.  The pen is a pixel wide, so the endpoint
+        // pixel is only half covered by it — anti-aliased, as Qt's own preview
+        // draws it — and what is asserted is that the colour lands there at
+        // all rather than at some other row.
+        assert!(painted(&frame, WAVE_START, [255, 0, 0]), "start");
+        assert!(painted(&frame, WAVE_END, [255, 0, 0]), "end");
     }
 
     #[test]
@@ -2584,19 +2813,18 @@ mod tests {
         frame
             .draw_wave(Point::new(4, 16), end, [255, 0, 0, 255], 1, 6, 18)
             .unwrap();
-        assert_eq!(
-            frame.pixel(Point::new(4, 16)),
-            Some([255, 0, 0, 255]),
-            "start"
-        );
-        assert_eq!(frame.pixel(end), Some([255, 0, 0, 255]), "end");
+        assert!(painted(&frame, Point::new(4, 16), [255, 0, 0]), "start");
+        assert!(painted(&frame, end, [255, 0, 0]), "end");
     }
 
     #[test]
     fn wave_crests_reach_the_amplitude_and_do_not_overshoot() {
         let mut frame = Frame::solid(Size::new(64, 32), [0, 0, 0, 0]).unwrap();
-        // Width 1 keeps the covered band within half a pixel of the centre
-        // line, so the extreme covered row is the rounded crest itself.
+        // A width-1 pen: its half-width is 0.5, so the crest — 5.9 px off the
+        // centre line at the sampled peak — reaches at most into the row at
+        // offset 6 and no further.  Anti-aliasing puts part of the pen in that
+        // row rather than all of it, so the row is read as painted rather than
+        // as solid.
         frame
             .draw_wave(WAVE_START, WAVE_END, [255, 0, 0, 255], 1, 6, 18)
             .unwrap();
@@ -2604,15 +2832,15 @@ mod tests {
         let mut below = 0i64;
         for y in 0..32 {
             for x in 0..64 {
-                if frame.pixel(Point::new(x, y)) == Some([255, 0, 0, 255]) {
+                if painted(&frame, Point::new(x, y), [255, 0, 0]) {
                     let up = i64::from(y) - 16;
                     above = above.max(up);
                     below = below.max(-up);
                 }
             }
         }
-        // The nearest sample to the quarter-period crest is 0.985 of it, which
-        // rounds to a full amplitude; nothing reaches further than that.
+        // The crest is 6 above the centre line, and the pen covers the row it
+        // lands on: nothing reaches further than that.
         assert_eq!(above, 6, "crest reaches the amplitude");
         assert_eq!(below, 6, "trough reaches the amplitude");
     }
@@ -2790,9 +3018,11 @@ mod tests {
         // The interior stays clear even though the pen closed the path.
         assert_eq!(frame.pixel(Point::new(12, 9)), Some([0, 0, 0, 0]));
         // The outline is still stroked, including the segment that closes the
-        // path: (12, 20) back to (4, 4) passes through (8, 12).
-        assert_eq!(frame.pixel(Point::new(12, 4)), Some([255, 0, 0, 255]));
-        assert_eq!(frame.pixel(Point::new(8, 12)), Some([255, 0, 0, 255]));
+        // path: (12, 20) back to (4, 4) passes through (8, 12).  A stroke's
+        // edge is anti-aliased, so those samples read as painted rather than as
+        // a full 255.
+        assert!(painted(&frame, Point::new(12, 4), [255, 0, 0]));
+        assert!(painted(&frame, Point::new(8, 12), [255, 0, 0]));
     }
 
     #[test]

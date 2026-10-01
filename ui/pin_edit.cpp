@@ -15,6 +15,7 @@
 #include <QScreen>
 
 #include <cstdio>
+#include <unistd.h>
 
 namespace vshot {
 namespace {
@@ -81,10 +82,36 @@ int runPinEdit(const QString &sessionPath)
 
     OverlayController controller(std::move(surfaceSession));
     controller.setPinEditMode(true);
+    // Where a mark's pixels go: a pasted image is its pixels and has no other
+    // form, so the marks that have any travel as paths to files written here.
+    // Beside the session, which is the directory this edit was handed and the
+    // only one it owns; the daemon copies each file into a directory of its own
+    // when the result arrives, so nothing has to outlive this process.
+    controller.setMarkAssetDirectory(QFileInfo(sessionPath).absolutePath());
     // The editor drives the real pin window over the daemon socket instead of
     // painting a second copy of the image.
     controller.setPinTarget(session.pinId, session.pinSocket);
+    // How the session ends when there is nothing to hand over: Escape, the
+    // toolbar's cancel button, or a window that closes on its own.  A confirmed
+    // edit does not come through here -- `terminal` takes the handoff instead,
+    // and the surface is kept up until the CLI answers.  A cancelled one has
+    // nothing to hand over: no pin is going up in place of the picture, so
+    // there is no gap to cover and the editor stops at once.  Without this the
+    // process kept its surface mapped and its event loop running for ever, and
+    // the daemon -- which was told the edit was over and went back to drawing
+    // the pin itself -- left three surfaces stacked over one pin: the HDR half,
+    // the daemon's, and this one, which took no input and answered no keys.
     controller.setTerminalCallback([] { QCoreApplication::quit(); });
+    // The keyboard walks a cursor of its own here too -- the arrow keys nudge
+    // the selected mark and the letters walk the pointer -- and the pointer the
+    // compositor draws is not it.  Only the CLI on the other end of this pipe
+    // can move that one, so the walk asks, and this says there is someone to
+    // ask.  The test is what tells a CLI from a terminal: a helper run by hand
+    // writes its result to stdout, and a request written into the same stream
+    // would be printed among it as garbage.
+    if (!::isatty(STDOUT_FILENO)) {
+        controller.enablePointerWarp();
+    }
 
     QString overlayError;
     CaptureOverlay *overlay = controller.addOverlay(0, screen, &overlayError);
@@ -116,11 +143,16 @@ int runPinEdit(const QString &sessionPath)
     }
 
     // The helper already reports the pin image's final rect as the selection:
-    // the daemon repositions the pin there and renders the annotations
-    // relative to it, so nothing needs rewriting here.
+    // the daemon repositions the pin there and draws the marks relative to it,
+    // so nothing needs rewriting here.  The handoff wrote the result and sent
+    // the rendered pixels while the surface was still up, so there is nothing
+    // left to say -- asking again would send the capture a second time.
+    if (controller.resultSent()) {
+        return 0;
+    }
     QJsonDocument result;
     QString resultError;
-    result = controller.resultDocument(QFileInfo(sessionPath).absolutePath(), &resultError);
+    result = controller.resultDocument(&resultError);
     if (result.isNull() && !resultError.isEmpty()) {
         reportError(resultError);
         return 1;

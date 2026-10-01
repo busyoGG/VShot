@@ -7,9 +7,13 @@
 // The shape of the thing, in one paragraph: one compose texture the size of an
 // output holds the picture as it should look, half-float and PQ-encoded; a
 // command clears the region that changed, draws the pins into it -- shadow,
-// image, rim, in that order -- and copies that region into a dma-buf the
-// compositor takes.  A region is not the whole output: a pin that moved by three
-// pixels costs three pixels of drawing and three pixels of copying.
+// image, rim, in that order -- and copies the whole picture into a dma-buf the
+// compositor takes.  The drawing is regional -- a pin that moved by three pixels
+// costs three pixels of drawing -- but the copy is not: the compositor may
+// re-read a buffer the damage does not cover (it does so when the attached
+// buffer changes, which with two buffers alternated is every other commit), and
+// a slot that had only ever been handed the damaged regions would then show a
+// pin where it used to be.
 //
 // Three details are worth knowing before reading the shaders:
 //
@@ -119,8 +123,10 @@ int vshot_fp16_draw_shadow(vshot_fp16 *ctx, uint64_t id, int x, int y, int w, in
 int vshot_fp16_draw_image(vshot_fp16 *ctx, uint64_t id, int x, int y, int w, int h, int r) {
     (void)ctx;(void)id;(void)x;(void)y;(void)w;(void)h;(void)r; return -1;
 }
-int vshot_fp16_draw_rim(vshot_fp16 *ctx, int x, int y, int w, int h, int r, int t, float a, float b, float c) {
-    (void)ctx;(void)x;(void)y;(void)w;(void)h;(void)r;(void)t;(void)a;(void)b;(void)c; return -1;
+int vshot_fp16_draw_rim(vshot_fp16 *ctx, int x, int y, int w, int h, int r, int t, float a, float b,
+                        float c, float alpha) {
+    (void)ctx;(void)x;(void)y;(void)w;(void)h;(void)r;(void)t;(void)a;(void)b;(void)c;(void)alpha;
+    return -1;
 }
 int vshot_fp16_present(vshot_fp16 *ctx, int slot, int x, int y, int w, int h) {
     (void)ctx;(void)slot;(void)x;(void)y;(void)w;(void)h; return -1;
@@ -316,10 +322,11 @@ static const char kFragmentRim[] =
     "uniform float u_radius;\n"
     "uniform float u_thickness;\n"
     "uniform vec3 u_colour;\n"
+    "uniform float u_alpha;\n"
     "void main() {\n"
     "    float d = sd_round_box(v_local, u_half, u_radius);\n"
     "    float coverage = clamp(u_thickness * 0.5 - abs(d) + 0.5, 0.0, 1.0);\n"
-    "    o_colour = vec4(u_colour, coverage);\n"
+    "    o_colour = vec4(u_colour, coverage * u_alpha);\n"
     "}\n";
 
 // --- the context -----------------------------------------------------------
@@ -1289,7 +1296,7 @@ int vshot_fp16_draw_image(vshot_fp16 *ctx, uint64_t image_id, int x, int y, int 
 }
 
 int vshot_fp16_draw_rim(vshot_fp16 *ctx, int x, int y, int width, int height, int radius,
-                        int thickness, float red, float green, float blue) {
+                        int thickness, float red, float green, float blue, float alpha) {
     if (!ctx || width <= 0 || height <= 0 || thickness <= 0) {
         return -1;
     }
@@ -1311,6 +1318,7 @@ int vshot_fp16_draw_rim(vshot_fp16 *ctx, int x, int y, int width, int height, in
                       (float)thickness);
     ctx->gl.Uniform3f(ctx->gl.GetUniformLocation(ctx->programs[PROGRAM_RIM], "u_colour"), red,
                       green, blue);
+    ctx->gl.Uniform1f(ctx->gl.GetUniformLocation(ctx->programs[PROGRAM_RIM], "u_alpha"), alpha);
     quad(ctx, (float)x - pad, (float)y - pad, (float)width + 2.0f * pad, (float)height + 2.0f * pad,
          0.0f, 0.0f, 0.0f, 0.0f, (float)x + (float)width * 0.5f, (float)y + (float)height * 0.5f);
     draw_quad(ctx, PROGRAM_RIM);

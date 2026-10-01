@@ -25,10 +25,14 @@ namespace vshot {
 struct EditorPreferences {
     /// Tool the toolbar opens with: select | rectangle | ellipse | arrow | pen
     /// | text | mosaic.
-    QString tool = QStringLiteral("select");
-    /// How the Select tool starts a drag on an annotation that is already
-    /// selected: `precise` (the default) needs the press on the mark itself,
-    /// `loose` moves it from anywhere on screen.
+    /// The tool the editor opens with.  There is no "select" here any more:
+    /// a session with nothing armed is that state, and the empty string is
+    /// what a config written before the tool went away carries, so it lands
+    /// on the same thing.
+    QString tool;
+    /// How a drag on a mark that is already selected is started: `precise`
+    /// (the default) needs the press on the mark itself, `loose` moves it from
+    /// anywhere on screen.
     ///
     /// A mark that is hard to hit -- a hairline pen stroke, a run of small text
     /// -- is what the second mode is for: once it is selected, the whole screen
@@ -58,6 +62,30 @@ struct EditorPreferences {
 /// "the user wants `fast`" apart from "the user never touched this".
 struct CliPreferences {
     QString pngCompression; ///< `none` | `fastest` | `fast` | `balanced` | `high`
+    /// How the HDR half of a capture is written: `avif` or `hdr`.  Empty means
+    /// the file says nothing and the built-in default (AVIF) stands.
+    QString hdrFormat;
+    /// How the SDR copy of an HDR capture is mapped down: `auto`, `fixed` or
+    /// `normalize`.  Empty means the file says nothing and the built-in default
+    /// (auto) stands.
+    QString toneMap;
+    /// Where SDR white lands for the modes that take a level, as a fraction of
+    /// the range.  Zero means the file says nothing; the map's own default is
+    /// what stands, which is why a written value is never zero.
+    double toneMapWhite = 0.0;
+    /// Whether HDR content is judged by the share of the capture brighter than
+    /// SDR white rather than by any single pixel (`cli.hdr-area-test`).  On when
+    /// the file says nothing, which is what the built-in default is, so only
+    /// "off" is ever written.
+    bool hdrAreaTest = true;
+    /// The share that share has to reach (`cli.hdr-area-ratio`), in [0, 1].
+    ///
+    /// Negative means the file says nothing and the built-in default stands.
+    /// Unlike the tone-map white level, **zero is a value here**: the switch on
+    /// with a ratio of zero is the state that treats every capture of an HDR
+    /// output as HDR content, so it has to be writable and has to read back as
+    /// itself rather than as an absent key.
+    double hdrAreaRatio = -1.0;
     QString monitor;        ///< an output name, or `current`
     std::uint32_t longNotches = 0;
     std::uint32_t longMaxHeight = 0;
@@ -198,6 +226,15 @@ constexpr int kMaxShadowSize = 512;
 constexpr int kMaxShadowOffset = 512;
 constexpr int kMaxShadowOpacity = 255;
 
+/// The ceilings on a mark's own style, in the units the toolbar's controls show
+/// them in.  They live here rather than in `config.cpp` because the session
+/// reader has to accept exactly the marks the editor writes back: a value the
+/// file takes but the toolbar cannot show would come back clamped the next time
+/// that mark was touched.
+constexpr int kMaxWidth = 64;
+constexpr int kMaxArrowSize = 8;
+constexpr int kMaxMosaicStrength = 3;
+
 /// The look of a pinned image.
 ///
 /// A pin has no decoration from anyone else either -- it is a layer surface
@@ -316,6 +353,22 @@ const QStringList &dashNames();
 const QStringList &arrowStyleNames();
 const QStringList &mosaicShapeNames();
 const QStringList &compressionNames();
+/// The HDR half's format: `avif`, `hdr`.
+const QStringList &hdrFormatNames();
+/// How the SDR half is mapped down from the HDR one: `auto`, `fixed`,
+/// `normalize`.  The names are the ones `--tone-map` accepts.
+const QStringList &toneMapNames();
+/// The span a tone-map white level may take, as a fraction of the range: the
+/// same numbers `model::hdr::ToneMapOptions` clamps to, repeated here because
+/// the settings window has to bound its number box by them.
+constexpr double kMinToneMapWhite = 0.5;
+constexpr double kMaxToneMapWhite = 0.95;
+/// What the white level is when the file says nothing: the map's own default.
+constexpr double kDefaultToneMapWhite = 0.8;
+/// What the HDR area test's ratio is when the file says nothing: the same floor
+/// `model::hdr::HdrDecision::default` weighs a capture against, repeated here
+/// because the settings window has to open its number box on it.
+constexpr double kDefaultHdrAreaRatio = 0.0005;
 const QStringList &injectNames();
 const QStringList &encoderNames();
 /// The hardware backends `record --encoder-backend` and its replay twin accept:

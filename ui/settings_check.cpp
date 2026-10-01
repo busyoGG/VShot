@@ -21,6 +21,7 @@
 #include "config.hpp"
 #include "i18n.hpp"
 #include "settings_window.hpp"
+#include "shortcuts.hpp"
 
 #include <QApplication>
 #include <QAbstractButton>
@@ -34,19 +35,29 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeyEvent>
+#include <QKeySequence>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
+#include <QDoubleSpinBox>
 #include <QSpinBox>
+
+#include <cmath>
+#include <cstring>
+#include <chrono>
 #include <QStackedWidget>
 #include <QTemporaryDir>
 #include <QVBoxLayout>
 
 #include <cstdio>
+#include <functional>
 #include <memory>
 
 namespace {
@@ -148,6 +159,39 @@ void checkEveryFieldReachesTheFile()
 
     expect(choose(find<QComboBox>(dialog.get(), "pngCompression"), QStringLiteral("balanced")),
            "the compression list offers balanced");
+    expect(choose(find<QComboBox>(dialog.get(), "hdrFormat"), QStringLiteral("hdr")),
+           "the HDR format list offers hdr");
+    expect(choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("fixed")),
+           "the tone-map list offers fixed");
+    // A level of 0.72 is neither the default nor a whole percentage, so a round
+    // trip that snapped or ignored it would show up below.
+    find<QDoubleSpinBox>(dialog.get(), "toneMapWhite")->setValue(72.0);
+    // The box is a percentage and the map works in fractions, so its span is
+    // the map's own scaled -- a range left in fractions would cap the value
+    // just typed at 0.95 and the round trip below would read that back.
+    QDoubleSpinBox *white = find<QDoubleSpinBox>(dialog.get(), "toneMapWhite");
+    expect(std::abs(white->minimum() - vshot::kMinToneMapWhite * 100.0) < 1e-6 &&
+               std::abs(white->maximum() - vshot::kMaxToneMapWhite * 100.0) < 1e-6,
+           "the white-level box is bounded in the units it shows",
+           QStringLiteral("%1..%2").arg(white->minimum()).arg(white->maximum()));
+    // Only two of the three modes read a level, and `normalize` works its own
+    // out from the capture: the box is greyed rather than left live and
+    // ignored.
+    choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("normalize"));
+    expect(!white->isEnabled(), "the level box is off while normalizing");
+    choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("fixed"));
+    expect(white->isEnabled(), "the level box is back on for fixed");
+    // The area test's switch and its ratio are the same shape of pair: a ratio
+    // is only weighed when the switch is on, so the box is greyed rather than
+    // left live and ignored.  The ratio is set to a value that is neither the
+    // default nor a whole percentage, so a round trip that snapped or dropped it
+    // would show up below -- and to a *non-zero* one, because zero is the state
+    // that means "always HDR" and the file has to keep it.
+    QDoubleSpinBox *ratio = find<QDoubleSpinBox>(dialog.get(), "hdrAreaRatio");
+    expect(ratio->isEnabled(), "the ratio box is on while the area test is");
+    find<QAbstractButton>(dialog.get(), "hdrAreaTest")->setChecked(false);
+    expect(!ratio->isEnabled(), "the ratio box is off with the area test");
+    ratio->setValue(0.25);
     find<QLineEdit>(dialog.get(), "monitor")->setText(QStringLiteral("  HDMI-A-1  "));
     find<QSpinBox>(dialog.get(), "pinDensity")->setValue(3);
     find<QSpinBox>(dialog.get(), "longNotches")->setValue(7);
@@ -247,6 +291,21 @@ void checkEveryFieldReachesTheFile()
     expect(saved.editor.mosaicStrength == 3, "the mosaic strength reached the file");
     expect(saved.cli.pngCompression == QStringLiteral("balanced"),
            "the compression default reached the file", saved.cli.pngCompression);
+    expect(saved.cli.hdrFormat == QStringLiteral("hdr"),
+           "the HDR format default reached the file", saved.cli.hdrFormat);
+    expect(saved.cli.toneMap == QStringLiteral("fixed"),
+           "the tone-map default reached the file", saved.cli.toneMap);
+    // The box shows a percentage and the file holds the fraction, so this is
+    // also what checks the conversion between them.
+    expect(std::abs(saved.cli.toneMapWhite - 0.72) < 1e-6,
+           "the tone-map white level reached the file",
+           QString::number(saved.cli.toneMapWhite));
+    // The switch was turned off above and the ratio box left on a value that is
+    // not the default, so both have to come back -- and the ratio is the one
+    // setting whose zero is a value rather than "the file says nothing".
+    expect(!saved.cli.hdrAreaTest, "the area-test switch reached the file");
+    expect(std::abs(saved.cli.hdrAreaRatio - 0.0025) < 1e-9,
+           "the HDR area ratio reached the file", QString::number(saved.cli.hdrAreaRatio));
     // Whitespace around a hand-typed monitor name is trimmed rather than saved.
     expect(saved.cli.monitor == QStringLiteral("HDMI-A-1"),
            "the monitor default reached the file", saved.cli.monitor);
@@ -734,6 +793,8 @@ void checkEverySettingIsOnThePageTheSidebarNames()
         {"replaySaveDir", "Recording"},
         {"pinDensity", "Pin appearance"},
         {"pinRadius", "Pin appearance"},
+        {"shortcut_undo", "Keyboard"},
+        {"shortcut_cursor-left", "Keyboard"},
         {"dialogRadius", "File dialogs"},
         {"width", "Annotation editor"},
         {"selectMode", "Annotation editor"},
@@ -779,6 +840,466 @@ void checkEverySettingIsOnThePageTheSidebarNames()
         expect(item != nullptr && item->spacerItem() != nullptr,
                "the page ends with a stretch, so its cards keep their own height",
                sidebar->item(index)->text());
+    }
+}
+
+/// That a binding changed in the window is the binding the file ends up with.
+///
+/// The keyboard page is one row per action and each row is a button that opens
+/// that action's key editor; the editor is where a key is recorded and where
+/// the keys already there are listed. That is a wiring that can go wrong in a
+/// way no other row can: the editor can show a key the preferences never
+/// received, or the preferences can hold one the file is never told about. The
+/// first reads as a setting that did not take, the second as one that quietly
+/// reverted after the window closed -- and neither is visible while the window
+/// is still open, because the editor's own rows are what the user checks, not
+/// the file.
+///
+/// So the row is driven the way a user drives it, Save is pressed, and the file
+/// is read. The three answers an editor can hold are all tried: a rebound key,
+/// a cleared one, and the default it opened on.
+void checkTheKeyboardRowsReachTheFile()
+{
+    std::printf("--- the keyboard rows reach the file --------------------------------\n");
+    writeConfig(QStringLiteral("{}"));
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    if (!dialog) {
+        std::printf("FAIL  the settings dialog could not be built\n");
+        ++failures;
+        return;
+    }
+
+    const auto button = [&dialog](const QString &id) {
+        return dialog->findChild<QAbstractButton *>(QStringLiteral("shortcut_") + id);
+    };
+    QAbstractButton *undo = button(QStringLiteral("undo"));
+    QAbstractButton *copy = button(QStringLiteral("copy"));
+    QAbstractButton *magnifier = button(QStringLiteral("magnifier"));
+    if (undo == nullptr || copy == nullptr || magnifier == nullptr) {
+        expect(false, "every rebindable action has a row of its own");
+        return;
+    }
+
+    // Every action is offered, and the held modifiers are named without being
+    // offered: a row that could be edited into a binding the editor cannot
+    // deliver is worse than a row that only says what the key is.
+    int rebindable = 0;
+    int listed = 0;
+    for (const vshot::ShortcutBinding &binding : vshot::shortcutBindings()) {
+        if (binding.label.isEmpty()) {
+            continue;
+        }
+        ++listed;
+        if (binding.rebindable) {
+            ++rebindable;
+        }
+        if (!binding.rebindable) {
+            continue;
+        }
+        if (button(binding.id) == nullptr) {
+            expect(false, "the action has a row", binding.id);
+        }
+    }
+    expect(rebindable > 0 && listed == static_cast<int>(vshot::ShortcutAction::kActionCount),
+           "every action the editor binds is listed on the page",
+           QStringLiteral("%1 listed, %2 rebindable").arg(listed).arg(rebindable));
+
+    // The default, before anything is touched: what the button shows has to be
+    // the key the editor reads, or the page is advertising a binding the file
+    // was never asked for.
+    expect(undo->text() == QStringLiteral("Ctrl+Z"), "a row opens on its built-in key",
+           undo->text());
+    // Every key, not just the first.  An action may carry several -- any one of
+    // them fires it -- and a row that printed only the leading one hid the rest
+    // of the binding from the only place the user can read it.  `Ctrl+Y` is the
+    // second key of Redo, so it is the one a first-key-only row would drop.
+    QAbstractButton *redo = button(QStringLiteral("redo"));
+    expect(redo != nullptr && redo->text() == QStringLiteral("Ctrl+Y, Ctrl+Shift+Z"),
+           "a row shows every key the action is bound to",
+           redo != nullptr ? redo->text() : QStringLiteral("<no row>"));
+
+    // A rebound key: the press is delivered as a real key event, which is the
+    // only spelling the button and the file can agree on without a translation
+    // step between them.
+    const auto press = [](QAbstractButton *target, int key,
+                          Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+        QKeyEvent event(QEvent::KeyPress, key, modifiers);
+        target->setFocus(Qt::OtherFocusReason);
+        QCoreApplication::sendEvent(target, &event);
+    };
+
+    // A row opens the editor for its action, and the editor is where the keys
+    // live: the record button at the top, one row per key below.
+    undo->click();
+    QDialog *editor = dialog->findChild<QDialog *>(QStringLiteral("shortcutEditor"));
+    if (editor == nullptr) {
+        expect(false, "clicking a row opens the key editor for that action");
+        return;
+    }
+    expect(editor->windowTitle() == vshot::uiTr("Undo"),
+           "the editor is the one for the row that was clicked", editor->windowTitle());
+
+    auto *record = editor->findChild<QAbstractButton *>(QStringLiteral("shortcutRecord"));
+    if (record == nullptr) {
+        expect(false, "the editor has a button that records a key");
+        return;
+    }
+    record->click();
+    expect(record->text() == vshot::uiTr("Press the keys for this action"),
+           "clicking the record button asks for a key", record->text());
+    press(record, Qt::Key_K, Qt::ControlModifier);
+    expect(editor->findChildren<QLabel *>(QStringLiteral("rowValue")).size() == 2,
+           "the key pressed joins the one the action already had",
+           QString::number(editor->findChildren<QLabel *>(QStringLiteral("rowValue")).size()));
+
+    // The same key a second time: it is already this action's, so it is not
+    // added again -- two rows for one combination would be two things to remove
+    // for one key.
+    record->click();
+    press(record, Qt::Key_K, Qt::ControlModifier);
+    expect(editor->findChildren<QLabel *>(QStringLiteral("rowValue")).size() == 2,
+           "recording a key the action already has does not add a second row",
+           QString::number(editor->findChildren<QLabel *>(QStringLiteral("rowValue")).size()));
+
+    // Removing one key leaves the other: the action had a binding before the
+    // editor opened and it still has one after a key is taken off.  The first
+    // row is the one that goes, which is the key the action opened on.
+    auto *remove = editor->findChild<QAbstractButton *>(QStringLiteral("shortcutRemove"));
+    if (remove == nullptr) {
+        expect(false, "every key the editor lists has a button that removes it");
+        return;
+    }
+    remove->click();
+    const QList<QLabel *> left = editor->findChildren<QLabel *>(QStringLiteral("rowValue"));
+    expect(left.size() == 1 && left.constFirst()->text() == QStringLiteral("Ctrl+K"),
+           "removing a key takes that key off and leaves the rest of the binding",
+           QStringLiteral("%1 row(s)").arg(left.size()));
+
+    // And the key goes back on beside it, so the file has both of the keys the
+    // action ended up with -- an action holding a list is the thing the editor
+    // exists for, and one key alone would not tell a list from a single binding.
+    record->click();
+    press(record, Qt::Key_Z, Qt::ControlModifier);
+    expect(editor->findChildren<QLabel *>(QStringLiteral("rowValue")).size() == 2,
+           "a key taken off can be put back",
+           QString::number(editor->findChildren<QLabel *>(QStringLiteral("rowValue")).size()));
+    editor->close();
+
+    // The magnifier's row: Escape puts the binding back rather than storing a
+    // half-pressed one, and a modifier on its own is not a key press -- binding
+    // "Ctrl" would fire on Ctrl+F4 too, so the button has to wait for the key it
+    // belongs to.
+    magnifier->click();
+    QDialog *magnifierEditor = dialog->findChild<QDialog *>(QStringLiteral("shortcutEditor"));
+    if (magnifierEditor == nullptr) {
+        expect(false, "the magnifier's row opens an editor of its own");
+        return;
+    }
+    auto *magnifierRecord =
+        magnifierEditor->findChild<QAbstractButton *>(QStringLiteral("shortcutRecord"));
+    if (magnifierRecord == nullptr) {
+        expect(false, "the magnifier's editor records keys");
+        return;
+    }
+    magnifierRecord->click();
+    press(magnifierRecord, Qt::Key_Escape);
+    expect(magnifierEditor->findChildren<QLabel *>(QStringLiteral("rowValue")).size() == 1
+               && magnifierEditor->findChildren<QLabel *>(QStringLiteral("rowValue"))
+                          .constFirst()
+                          ->text()
+                   == QStringLiteral("M"),
+           "escape leaves the binding alone");
+
+    magnifierRecord->click();
+    press(magnifierRecord, Qt::Key_Control);
+    expect(magnifierRecord->text() == vshot::uiTr("Press the keys for this action"),
+           "a modifier on its own is not taken as the key", magnifierRecord->text());
+    press(magnifierRecord, Qt::Key_F4, Qt::ControlModifier);
+    expect(magnifierEditor->findChildren<QLabel *>(QStringLiteral("rowValue")).size() == 2,
+           "the key after the modifier is added beside the one already there",
+           QString::number(
+               magnifierEditor->findChildren<QLabel *>(QStringLiteral("rowValue")).size()));
+    magnifierEditor->close();
+
+    // The copy row is cleared outright: an editor with no keys at all is how
+    // the user says "this action has no key", which a key press cannot express.
+    copy->click();
+    QDialog *copyEditor = dialog->findChild<QDialog *>(QStringLiteral("shortcutEditor"));
+    if (copyEditor == nullptr) {
+        expect(false, "the copy row opens an editor of its own");
+        return;
+    }
+    while (auto *drop = copyEditor->findChild<QAbstractButton *>(QStringLiteral("shortcutRemove"))) {
+        drop->click();
+    }
+    expect(copyEditor->findChildren<QLabel *>(QStringLiteral("rowValue")).isEmpty(),
+           "removing every key clears the binding");
+    copyEditor->close();
+
+    QAbstractButton *save =
+        dialog->findChild<QAbstractButton *>(QStringLiteral("saveButton"));
+    if (save == nullptr) {
+        expect(false, "the dialog has a save button");
+        return;
+    }
+    save->click();
+
+    const vshot::ShortcutPreferences saved = vshot::loadShortcutPreferences();
+    expect(saved.textFor(vshot::ShortcutAction::Undo) == QStringLiteral("Ctrl+K, Ctrl+Z"),
+           "the keys the editor ended on are the keys in the file, in order",
+           saved.textFor(vshot::ShortcutAction::Undo));
+    // Cleared, not defaulted: the file has to be able to say "this action has no
+    // key", which is a different answer from "the file says nothing".
+    expect(!saved.hasKeys(vshot::ShortcutAction::Copy),
+           "a cleared binding is written as cleared, not as the default");
+    expect(saved.textFor(vshot::ShortcutAction::Copy).isEmpty(),
+           "a cleared binding is written as empty",
+           saved.textFor(vshot::ShortcutAction::Copy));
+    // Two keys on one action, in the order they were recorded: the row on the
+    // page shows both, and the file has to hold both.
+    expect(saved.textFor(vshot::ShortcutAction::ShowMagnifier) == QStringLiteral("M, Ctrl+F4"),
+           "an action with two keys writes both, in order",
+           saved.textFor(vshot::ShortcutAction::ShowMagnifier));
+    // Untouched rows stay out of the file, so a later version that moves a
+    // default still reaches anyone who never chose one.
+    expect(saved.textFor(vshot::ShortcutAction::Confirm) == QStringLiteral("Return, Enter"),
+           "an untouched row keeps the built-in key",
+           saved.textFor(vshot::ShortcutAction::Confirm));
+
+    // And the binding the file holds is the one the editor hears: both keys of
+    // it, which is the whole point of an action holding a list -- a binding
+    // with two alternatives is two keys the editor answers to, not one key and
+    // a chord.
+    expect(saved.matches(vshot::ShortcutAction::Undo,
+                         QKeySequence(Qt::ControlModifier | Qt::Key_K)),
+           "the editor hears the key that was added");
+    expect(saved.matches(vshot::ShortcutAction::Undo,
+                         QKeySequence(Qt::ControlModifier | Qt::Key_Z)),
+           "and the key the action already had");
+    expect(saved.matches(vshot::ShortcutAction::ShowMagnifier, QKeySequence(Qt::Key_M)),
+           "the first of two keys is heard");
+    expect(saved.matches(vshot::ShortcutAction::ShowMagnifier,
+                         QKeySequence(Qt::ControlModifier | Qt::Key_F4)),
+           "the second of two keys is heard");
+}
+
+/// That a key another action holds is asked about before it moves, and that the
+/// answer decides.
+///
+/// The conflict rule is the one part of the key editor that cannot be seen in
+/// the file afterwards: whether the key was taken from the other action or
+/// refused for it is a decision the dialog has to make *while* it is open, and
+/// getting it wrong is silent either way -- the user either loses a binding they
+/// never agreed to lose, or records a key that does nothing because the action
+/// that already held it still does.
+void checkAKeyAnotherActionHoldsIsAskedAbout()
+{
+    std::printf("--- a key another action holds is asked about ----------------------\n");
+    vshot::ShortcutPreferences preferences;
+    // Undo opens on Ctrl+Z and Redo on Ctrl+Y; a third action's row is where the
+    // conflict is set up, so neither of the two the dialog shows is special.
+    const auto openEditor = [&preferences](vshot::ShortcutAction action,
+                                           std::function<bool(const QString &)> ask) {
+        return std::unique_ptr<QDialog>(
+            vshot::createShortcutEditorDialog(action, &preferences, nullptr, std::move(ask)));
+    };
+    const auto record = [](QDialog *editor, int key,
+                           Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+        auto *button = editor->findChild<QAbstractButton *>(QStringLiteral("shortcutRecord"));
+        if (button == nullptr) {
+            expect(false, "the editor has a record button");
+            return;
+        }
+        button->click();
+        QKeyEvent event(QEvent::KeyPress, key, modifiers);
+        button->setFocus(Qt::OtherFocusReason);
+        QCoreApplication::sendEvent(button, &event);
+    };
+
+    // Declining: the key stays on the action that had it and is not added here.
+    // The action being edited opens on its own key, so what is checked is that
+    // the key it *tried* to take is not among the ones it is left with.
+    QString asked;
+    {
+        std::unique_ptr<QDialog> editor = openEditor(vshot::ShortcutAction::SelectAll,
+                                                     [&asked](const QString &question) {
+                                                         asked = question;
+                                                         return false;
+                                                     });
+        record(editor.get(), Qt::Key_Z, Qt::ControlModifier);
+        expect(!asked.isEmpty(), "recording a key another action holds asks about it");
+        expect(!preferences.keysFor(vshot::ShortcutAction::SelectAll).contains(
+                   QKeySequence(Qt::ControlModifier | Qt::Key_Z)),
+               "declining does not add the key to this action",
+               QString::number(
+                   preferences.keysFor(vshot::ShortcutAction::SelectAll).size()));
+        expect(preferences.keysFor(vshot::ShortcutAction::Undo).contains(
+                   QKeySequence(Qt::ControlModifier | Qt::Key_Z)),
+               "declining leaves the key where it was");
+    }
+
+    // Accepting: the combination moves -- it is taken off the other action and
+    // put on this one, which is what makes it reachable rather than shadowed.
+    {
+        std::unique_ptr<QDialog> editor = openEditor(vshot::ShortcutAction::SelectAll,
+                                                     [](const QString &) { return true; });
+        record(editor.get(), Qt::Key_Z, Qt::ControlModifier);
+        expect(preferences.keysFor(vshot::ShortcutAction::SelectAll).contains(
+                   QKeySequence(Qt::ControlModifier | Qt::Key_Z)),
+               "accepting puts the key on this action");
+        expect(!preferences.keysFor(vshot::ShortcutAction::Undo).contains(
+                   QKeySequence(Qt::ControlModifier | Qt::Key_Z)),
+               "accepting takes the key off the action that had it");
+    }
+
+    // The action that already holds a key is never asked about itself: pressing
+    // the same combination twice is the user repeating themselves, not a
+    // conflict, and a prompt there would be a prompt with no right answer.
+    {
+        int askedTimes = 0;
+        std::unique_ptr<QDialog> editor = openEditor(
+            vshot::ShortcutAction::Redo, [&askedTimes](const QString &) {
+                ++askedTimes;
+                return true;
+            });
+        const int before = preferences.keysFor(vshot::ShortcutAction::Redo).size();
+        record(editor.get(), Qt::Key_Y, Qt::ControlModifier);
+        expect(askedTimes == 0, "recording a key the action already has asks nothing",
+               QString::number(askedTimes));
+        expect(preferences.keysFor(vshot::ShortcutAction::Redo).size() == before,
+               "the key is not added a second time",
+               QString::number(preferences.keysFor(vshot::ShortcutAction::Redo).size()));
+    }
+}
+
+/// That the conflict prompt's text can actually be read on the box it is drawn
+/// on.
+///
+/// The prompt is a `QMessageBox`, and the settings sheet styles `QDialog` --
+/// which Qt matches on subclasses too -- so the box is forced onto the dialog's
+/// own dark background.  Its message label, though, is a bare `QLabel` with no
+/// object name, so it matches no rule and keeps whatever `WindowText` the system
+/// scheme gives it: on a light scheme that is near-black, on near-black, which
+/// is a prompt the user cannot read.  The rule that fixes it is a colour on
+/// `QMessageBox`'s labels, and this is what keeps it there.
+///
+/// The check drives the real path -- a recording that collides with a key
+/// another action holds -- rather than restyling a box of its own, so it fails
+/// if the prompt stops being reached as well as if the rule is dropped.
+void checkTheConflictPromptCanBeRead()
+{
+    std::printf("--- the conflict prompt can be read --------------------------------\n");
+    vshot::ShortcutPreferences preferences;
+    QMessageBox *prompt = nullptr;
+    std::unique_ptr<QDialog> editor;
+    editor.reset(vshot::createShortcutEditorDialog(
+        vshot::ShortcutAction::SelectAll, &preferences, nullptr,
+        [&prompt, &editor](const QString &question) {
+            // Parented to the editor and left unstyled, exactly as the real
+            // prompt is: what makes its text readable has to be the sheet the
+            // editor already carries, not anything this check does.
+            prompt = new QMessageBox(QMessageBox::Question, vshot::uiTr("Key already in use"),
+                                     question, QMessageBox::Yes | QMessageBox::No, editor.get());
+            prompt->ensurePolished();
+            return false;
+        }));
+    if (editor == nullptr) {
+        expect(false, "the key editor could be built");
+        return;
+    }
+    auto *button = editor->findChild<QAbstractButton *>(QStringLiteral("shortcutRecord"));
+    if (button == nullptr) {
+        expect(false, "the editor has a record button");
+        return;
+    }
+    button->click();
+    button->setFocus(Qt::OtherFocusReason);
+    QKeyEvent event(QEvent::KeyPress, Qt::Key_Z, Qt::ControlModifier);
+    QCoreApplication::sendEvent(button, &event);
+    std::unique_ptr<QMessageBox> box(prompt);
+    if (box == nullptr) {
+        expect(false, "recording a held key brings the prompt up");
+        return;
+    }
+
+    const QColor background = box->palette().color(QPalette::Window);
+    QLabel *message = nullptr;
+    for (QLabel *label : box->findChildren<QLabel *>()) {
+        if (!label->text().isEmpty()) {
+            message = label;
+            break;
+        }
+    }
+    if (message == nullptr) {
+        expect(false, "the prompt has a message label");
+        return;
+    }
+    const QColor ink = message->palette().color(QPalette::WindowText);
+    const auto channel = [](double value) {
+        const double c = value / 255.0;
+        return c <= 0.03928 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+    };
+    const auto luminance = [&channel](const QColor &color) {
+        return 0.2126 * channel(color.red()) + 0.7152 * channel(color.green()) +
+               0.0722 * channel(color.blue());
+    };
+    const double lighter = std::max(luminance(background), luminance(ink));
+    const double darker = std::min(luminance(background), luminance(ink));
+    const double ratio = (lighter + 0.05) / (darker + 0.05);
+    expect(ratio >= 4.5, "the prompt's text reads against its own background",
+           QStringLiteral("%1 on %2, %3:1")
+               .arg(ink.name(), background.name(), QString::number(ratio, 'f', 2)));
+}
+
+/// That opening the window does not wait on the session.
+///
+/// The microphone rows are filled from `vshot record mics`, which starts a
+/// second process that has to bring PipeWire up before it can answer -- about a
+/// second, measured.  Both the recording and the replay card carry one of those
+/// rows, so asking for the listing while the pages are being built made opening
+/// the window take two seconds, every time, to fill in a list most users never
+/// look at.  The listing is now asked for after the window is up, and this is
+/// what keeps it that way: a future edit that reaches for the probe from inside
+/// a page builder would put the wait straight back, and nothing about the
+/// window would look wrong.
+///
+/// The bar is deliberately loose.  The point is not that construction is fast,
+/// it is that it is not *waiting on a subprocess*: a second of slack is far
+/// above any amount of widget building and far below the second the command
+/// itself takes, so this fails on the regression and not on a slow machine.
+void checkOpeningTheWindowDoesNotWaitOnTheSession()
+{
+    std::printf("--- the window does not wait on the session -------------------------\n");
+    writeConfig(QStringLiteral("{}"));
+    const auto started = std::chrono::steady_clock::now();
+    std::unique_ptr<QDialog> dialog(vshot::createSettingsDialog());
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    if (!dialog) {
+        std::printf("FAIL  the settings dialog could not be built\n");
+        ++failures;
+        return;
+    }
+    // A second, not the two the synchronous version took: one listing is what a
+    // builder that asked for it itself would pay, and that alone is the bug.
+    expect(elapsed < 1000, "building the window does not wait for the input listing",
+           QStringLiteral("%1 ms").arg(elapsed));
+
+    // And the rows are readable without it: the two answers that always exist
+    // are there before the listing lands, which is what makes not waiting
+    // acceptable rather than a window that opens empty.
+    for (const char *name : {"recordMic", "replayMic"}) {
+        QComboBox *box = dialog->findChild<QComboBox *>(QString::fromLatin1(name));
+        if (box == nullptr) {
+            expect(false, "the microphone row exists", name);
+            continue;
+        }
+        expect(box->count() >= 2, "the microphone row is usable before the listing lands",
+               QStringLiteral("%1: %2 entries").arg(QString::fromLatin1(name)).arg(box->count()));
+        expect(box->itemData(0).toString() != box->itemData(1).toString(),
+               "its two built-in answers are different",
+               QString::fromLatin1(name));
     }
 }
 
@@ -882,6 +1403,46 @@ void checkTheBuiltInDefaultsAreTheClis()
                    .arg(rust));
     }
 
+    // The tone-map white level is the one default in the window that is not a
+    // count, and it is shown as a percentage while the map works in fractions.
+    // Both the default and the span it is bounded by are the map's own numbers,
+    // so they are read out of it rather than trusted to stay in step.
+    const QString hdr = readSource(QStringLiteral("src/model/hdr.rs"));
+    const struct {
+        const char *marker;
+        double expected;
+        const char *what;
+    } mapNumbers[] = {
+        {"const SDR_WHITE_LEVEL: f32 = ", vshot::kDefaultToneMapWhite,
+         "the level the box opens on is the map's own default"},
+        {"pub const MIN_WHITE: f32 = ", vshot::kMinToneMapWhite,
+         "the bottom of the box is the map's own floor"},
+        {"pub const MAX_WHITE: f32 = ", vshot::kMaxToneMapWhite,
+         "the top of the box is the map's own ceiling"},
+        // The area ratio is the second of these, and it is read from the same
+        // struct: a box that opened on a different floor than the daemon
+        // applies would judge captures the window never saw.
+        {"            ratio: ", vshot::kDefaultHdrAreaRatio,
+         "the ratio the box opens on is the daemon's own floor"},
+    };
+    for (const auto &row : mapNumbers) {
+        const int at = hdr.indexOf(QString::fromLatin1(row.marker));
+        double rust = -1.0;
+        if (at >= 0) {
+            const int start = at + static_cast<int>(std::strlen(row.marker));
+            int end = start;
+            while (end < hdr.size() &&
+                   (hdr.at(end).isDigit() || hdr.at(end) == QLatin1Char('.'))) {
+                ++end;
+            }
+            rust = hdr.mid(start, end - start).toDouble();
+        }
+        expect(std::abs(rust - row.expected) < 1e-6, row.what,
+               QStringLiteral("the window says %1, hdr.rs says %2")
+                   .arg(row.expected)
+                   .arg(rust));
+    }
+
     // The arrows have to be usable.  They are painted in a strip the spin box's
     // own line edit covers, and a click there used to land on the line edit and
     // do nothing at all -- the arrows were decoration.
@@ -919,6 +1480,24 @@ void checkTheBuiltInDefaultsAreTheClis()
     const QString saved = QString::fromUtf8(file.readAll());
     expect(!saved.contains(QStringLiteral("30000")) && !saved.contains(QStringLiteral("6000")),
            "defaults nobody touched are not written into the file", saved.trimmed());
+    // The area ratio is the second default with a box of its own, and it is the
+    // one whose *zero* is a value rather than "unset": the default has to stay
+    // out of the file like the others, but a user who asks for zero has to get
+    // a zero written and read back.
+    expect(!saved.contains(QStringLiteral("hdr-area-ratio")),
+           "the area ratio's own default is not written into the file", saved.trimmed());
+    QDoubleSpinBox *areaRatio = find<QDoubleSpinBox>(dialog.get(), "hdrAreaRatio");
+    areaRatio->setValue(0.0);
+    find<QPushButton>(dialog.get(), "saveButton")->click();
+    QFile zeroFile(configPath());
+    if (zeroFile.open(QIODevice::ReadOnly)) {
+        const QString zeroSaved = QString::fromUtf8(zeroFile.readAll());
+        expect(zeroSaved.contains(QStringLiteral("hdr-area-ratio")),
+               "a ratio of zero is written rather than dropped", zeroSaved.trimmed());
+        expect(std::abs(vshot::loadConfig().cli.hdrAreaRatio) < 1e-9,
+               "and it reads back as zero rather than as the built-in default",
+               QString::number(vshot::loadConfig().cli.hdrAreaRatio));
+    }
 
     // The leading entry of each combo box names the built-in default rather than
     // saying the word "default", so a user can read which level or codec they
@@ -1041,6 +1620,10 @@ int main(int argc, char **argv)
     checkCancelChangesNothing();
     checkTheOcrEngineSurvivesASave();
     checkEverySettingIsOnThePageTheSidebarNames();
+    checkTheKeyboardRowsReachTheFile();
+    checkAKeyAnotherActionHoldsIsAskedAbout();
+    checkTheConflictPromptCanBeRead();
+    checkOpeningTheWindowDoesNotWaitOnTheSession();
     checkTheBuiltInDefaultsAreTheClis();
     checkTheDesktopEntryAndIconAgree();
 

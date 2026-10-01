@@ -24,7 +24,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use crate::error::{Result, VshotError};
 use crate::geometry::{Rect, Size};
 use crate::model::hdr::{OutputColor, Primaries, Rgb10Summary, Transfer};
-use crate::model::{Frame, HdrFrame};
+use crate::model::{Frame, HdrFrame, ToneMapOptions};
 use crate::parallel::map_rows;
 
 use super::dmabuf::{is_hdr_fourcc, swap_red_blue_10, DmabufFrame, GbmBuffer};
@@ -514,36 +514,21 @@ struct ColorQuery {
     reference_nits: Option<f32>,
 }
 
-/// The gamut behind an explicit set of primaries, in the protocol's units of one
-/// millionth.
+/// The gamut a description's chromaticities describe.
 ///
 /// Every description carries the coordinates whether or not it also names a
 /// gamut, and one built from a monitor rule or an EDID often names none — so
-/// this is the only reading available then.  The two gamuts this pipeline knows
-/// are told apart by all three primaries at once; anything else lands on the
-/// nearer of them, which is a near miss (a P3 description reads as BT.709)
-/// rather than a wrong transfer function.
+/// this is the only reading available then.  The coordinates are taken as they
+/// are: a set this pipeline has a name for reads as that name, and any other
+/// gamut keeps the matrix its coordinates imply instead of being read as
+/// BT.709, which shifted every colour of a Display P3 or EDID-only output.
 fn classify_primaries(r_x: i32, r_y: i32, g_x: i32, g_y: i32, b_x: i32, b_y: i32) -> Primaries {
     const SCALE: f32 = 1_000_000.0;
-    const BT709: [(f32, f32); 3] = [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)];
-    const BT2020: [(f32, f32); 3] = [(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)];
-    let given = [
+    Primaries::from_chromaticities(
         (r_x as f32 / SCALE, r_y as f32 / SCALE),
         (g_x as f32 / SCALE, g_y as f32 / SCALE),
         (b_x as f32 / SCALE, b_y as f32 / SCALE),
-    ];
-    let distance = |known: [(f32, f32); 3]| -> f32 {
-        given
-            .iter()
-            .zip(known)
-            .map(|((x, y), (kx, ky))| (x - kx).abs() + (y - ky).abs())
-            .sum()
-    };
-    if distance(BT2020) < distance(BT709) {
-        Primaries::Bt2020
-    } else {
-        Primaries::Bt709
-    }
+    )
 }
 
 impl ColorQuery {
@@ -561,6 +546,7 @@ impl ColorQuery {
             // The named set is authoritative when there is one; the coordinates
             // are read only when it is absent.
             Some(6) => Primaries::Bt2020,
+            Some(8) | Some(9) => Primaries::DisplayP3,
             Some(_) => Primaries::Bt709,
             None => self.primaries_coords.unwrap_or(Primaries::Bt709),
         };
@@ -619,6 +605,13 @@ impl CaptureState {
 pub struct WlrCapture {
     event_queue: EventQueue<CaptureState>,
     state: CaptureState,
+    /// How an HDR buffer this backend reads itself is mapped down to SDR: the
+    /// frozen scene the user annotates on, and the SDR half written beside an
+    /// HDR capture, have to be the same map or the marks would be drawn over
+    /// pixels that never reach the file.  It is set from the request rather
+    /// than passed to every call, because the captures that need it are the
+    /// ones taken on paths with no request in hand.
+    tone_map: ToneMapOptions,
 }
 
 impl WlrCapture {
@@ -649,7 +642,16 @@ impl WlrCapture {
                 "at least one wl_output".into(),
             ));
         }
-        Ok(Self { event_queue, state })
+        Ok(Self {
+            event_queue,
+            state,
+            tone_map: ToneMapOptions::default(),
+        })
+    }
+
+    /// Sets the map used for every HDR buffer this capture reads itself.
+    pub fn set_tone_map(&mut self, tone_map: ToneMapOptions) {
+        self.tone_map = tone_map;
     }
 
     pub fn capture_output(&mut self, name: &str, cursor: bool) -> Result<Frame> {
@@ -680,7 +682,8 @@ impl WlrCapture {
         // as sRGB.
         let frame = match self.hdr_output_color(name)? {
             Some(color) if is_10bit_shm(buffer.format) => {
-                decode_output_rgb10(name, &buffer, y_invert, color)?.tone_map_to_srgb()?
+                decode_output_rgb10(name, &buffer, y_invert, color)?
+                    .tone_map_to_srgb_with(self.tone_map)?
             }
             _ => buffer.into_frame(y_invert)?,
         };
@@ -829,9 +832,9 @@ impl WlrCapture {
             let hdr = decode_output_rgb10(name, &buffer, y_invert, color)?;
             if debug {
                 eprintln!(
-                    "vshot: hdr shm {name}: peak={} is_hdr={}",
+                    "vshot: hdr shm {name}: peak={} over_white={:.5}",
                     hdr.peak(),
-                    hdr.is_hdr()
+                    hdr.highlight_share()
                 );
             }
             return Ok(Some(hdr));
@@ -880,12 +883,12 @@ impl WlrCapture {
         )?;
         if std::env::var_os("VSHOT_HDR_DEBUG").is_some() {
             eprintln!(
-                "vshot: hdr decoded {name}: {}x{} fourcc=0x{:08x} peak={} is_hdr={}",
+                "vshot: hdr decoded {name}: {}x{} fourcc=0x{:08x} peak={} over_white={:.5}",
                 frame.width,
                 frame.height,
                 frame.fourcc,
                 hdr.peak(),
-                hdr.is_hdr()
+                hdr.highlight_share()
             );
         }
         Ok(Some(hdr))
@@ -1897,11 +1900,12 @@ mod tests {
             classify_primaries(640_000, 330_000, 300_000, 600_000, 150_000, 60_000),
             Primaries::Bt709
         );
-        // A gamut that is neither lands on the nearer set rather than nowhere:
-        // here Display P3, whose blue and red sit between the two.
+        // A gamut that is neither reads as its own coordinates rather than as
+        // the nearer of the two: here Display P3, whose green and red sit
+        // between the two BT sets, and which used to be read as BT.709.
         assert_eq!(
             classify_primaries(680_000, 320_000, 265_000, 690_000, 150_000, 60_000),
-            Primaries::Bt709
+            Primaries::DisplayP3
         );
     }
 

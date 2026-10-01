@@ -22,6 +22,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QBuffer>
+#include <QIODevice>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMimeData>
@@ -43,6 +45,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -102,6 +105,43 @@ bool runWlCopy(const QString &text)
         return false;
     }
     process.write(text.toUtf8());
+    process.closeWriteChannel();
+    const bool finished = process.waitForFinished(kClipboardTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(kClipboardTimeoutMs);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
+// The same, for pixels: `wl-copy --type image/png` reads the encoding from the
+// bytes themselves, so nothing has to be declared beyond the type and the
+// result is an image a paste target can take.  The overlay has its own copy of
+// this; the two processes share no code.
+//
+// A pinned image is a few megabytes, and `wl-copy` reads it from the pipe while
+// it is being written, so the write has to happen with an event loop running --
+// which this process has, but a nested one inside a synchronous wait would
+// re-enter the pin stack's own handlers.  The bytes are small enough for a
+// single write on any image a pin can hold, and `wl-copy` keeps reading until
+// the channel closes, so closing it right after is what ends the transfer.
+bool runWlCopyImage(const QImage &image)
+{
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+        return false;
+    }
+    buffer.close();
+    QProcess process;
+    process.setProgram(QStringLiteral("wl-copy"));
+    process.setArguments({QStringLiteral("--type"), QStringLiteral("image/png")});
+    process.start();
+    if (!process.waitForStarted(kClipboardTimeoutMs)) {
+        return false;
+    }
+    process.write(bytes);
     process.closeWriteChannel();
     const bool finished = process.waitForFinished(kClipboardTimeoutMs);
     if (!finished) {
@@ -267,19 +307,31 @@ void installTerminateNotifier(QObject *context, std::function<void()> onTerminat
                      });
 }
 
+// Writes one reply.  The connection is deliberately left open: a client that
+// drives a drag sends many requests over one socket, and hanging up after each
+// reply would make it pay a connect and an accept per motion event.  A client
+// that only wanted one answer (the CLI) simply closes its end, which the
+// server turns into a deleteLater.
 void respond(QLocalSocket *socket, const QJsonObject &payload)
 {
     const QByteArray encoded = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     socket->write(encoded);
     socket->write("\n", 1);
     socket->flush();
-    socket->disconnectFromServer();
 }
 
 // After the last pin is gone the daemon owns no surfaces, so it exits and
 // lets the next pin command spawn a fresh daemon. The grace period serves a
 // concurrent add (or a reply still in flight) before quitting.
 constexpr int kIdleQuitMs = 500;
+
+// How long a reply that waits for a presented frame is held before it is sent
+// anyway.  The repaint it reports has already been committed when the callback
+// is asked for, so the answer is one frame away; past this, the surface is not
+// going to draw one at all -- an output with nothing visible on it, a
+// compositor that never calls back -- and the client is answered rather than
+// left waiting on a frame that is not coming.
+constexpr int kFrameWaitMs = 250;
 
 constexpr double kMinScale = 0.1;
 constexpr double kMaxScale = 8.0;
@@ -403,15 +455,147 @@ struct Pin {
     // This capture's HDR half, as PQ codes in a file this daemon owns, or empty
     // for a pin that has none.  The pixels above are the tone map of it, so the
     // pin's size and every hit test are unchanged; this file is what the surface
-    // helper shows instead, and it is drawn only while the helper has the pin's
-    // output.  A pin whose pixels are replaced from an SDR editor loses it.
+    // helper is handed as the pin's picture.  A pin whose pixels are replaced
+    // from an SDR editor loses it.
     QString hdrPath;
-    // The light the HDR half's `1.0` stands for, from its own header.  The
-    // surface helper draws the pin's rim in the terms that surface is described
-    // in, so it has to be told what one whole white is worth there; this is the
-    // only place that number is known, because the daemon never decodes the
-    // HDR half itself.
-    double hdrWhite = 203.0;
+    // The HDR half as it was before any edit, kept beside `original` and for the
+    // same reason: `hdrPath` becomes the *flattened* HDR once an edit lands, and
+    // that picture has the marks baked into it.  Drawing it under an open editor
+    // would put a duplicate of every mark behind the editable ones, and
+    // compositing the marks onto it again would draw each of them twice.  So the
+    // pristine file is kept and the editor and the helper are both handed it
+    // while an edit is open.
+    //
+    // It is the whole record of the HDR half -- the `VSHTPQ02` header names the
+    // white and the six chromaticity coordinates, and the words follow it -- so
+    // nothing has to be kept beside it for the picture to be shown exactly.
+    QString hdrBasePath;
+    // This pin's picture as the surface helper reads it, a PNG in the helper's
+    // own directory, or empty for a pin whose picture is its PQ half above.
+    //
+    // The helper draws every pin, not only the HDR ones -- see `PinHdr` -- and
+    // this is how a pin that is not HDR gets there: it reads the PNG and encodes
+    // it against the output's own reference white.  It holds `image`, the
+    // flattened result, because that is what the screen shows.
+    QString picturePath;
+    // The same for a pin whose pixels an edit is replacing: the pristine picture
+    // the editor's marks belong to.  Written when the edit opens and dropped when
+    // it lands, exactly as `hdrBasePath` is and for the same reason -- the editor
+    // draws its marks itself, so a helper painting the flattened picture
+    // underneath would put a duplicate of each mark behind the editable ones.
+    QString pictureBasePath;
+    // The pin's own pixels as they were before any edit, and the marks the last
+    // edit left on them, exactly as the editor reported them.
+    //
+    // The pin's `image` is the flattened result -- marks and all -- which is
+    // what the screen shows and what a save writes.  Re-editing it would mean
+    // drawing on top of the last edit's ink with no way back, so the daemon
+    // keeps both halves of what the editor needs to open again: the picture the
+    // marks were placed on, and the marks themselves as data.  `edited` is what
+    // says whether the two are worth sending; a pin that has never been
+    // annotated has neither and opens blank.
+    QImage original;
+    QJsonArray marks;
+    bool edited = false;
+    // A directory this pin owns for the pixels of the marks it holds, made on
+    // the first mark that has any.  A pasted image is its pixels and the marks
+    // name them by path, but the file the editor wrote lives in the directory
+    // that edit ran in -- gone by the time the pin is read back, and gone
+    // immediately for a pin added from a region session, whose session
+    // directory the CLI deletes as soon as the request is answered.  So every
+    // such file is copied here, where it lives as long as the pin does.
+    std::unique_ptr<QTemporaryDir> assets;
+    // Names the copies, so two marks cannot land on one file.
+    quint64 assetSequence = 0;
+
+    // Takes the marks an editor reported, copying the pixels they name into a
+    // directory this pin owns and re-pointing the marks at the copies.
+    //
+    // The editor writes each mark's pixels beside the session it was given, and
+    // that directory belongs to the edit: the CLI removes it the moment the
+    // request is answered.  The daemon keeps the marks, so the files have to
+    // move somewhere that outlives the request, and this is that somewhere.
+    // A mark with no `pixels` -- every kind but a pasted image -- is left as it
+    // is; the path is the only field that is rewritten.
+    QJsonArray keepMarks(const QJsonArray &marks)
+    {
+        QJsonArray kept;
+        for (const QJsonValue &value : marks) {
+            if (!value.isObject()) {
+                kept.push_back(value);
+                continue;
+            }
+            QJsonObject mark = value.toObject();
+            const QString path = mark.value(QStringLiteral("pixels")).toString();
+            if (path.isEmpty()) {
+                kept.push_back(mark);
+                continue;
+            }
+            const QString copy = assetPath();
+            if (copy.isEmpty() || !QFile::copy(path, copy)) {
+                // The pixels could not be taken.  The mark is dropped rather
+                // than kept naming a file that will not be there: a pasted
+                // image with no pixels is a mark the editor would refuse on the
+                // next open, and one refusal fails the whole session.
+                continue;
+            }
+            mark.insert(QStringLiteral("pixels"), copy);
+            kept.push_back(mark);
+        }
+        return kept;
+    }
+
+    // A fresh name inside this pin's asset directory, made on first use, or an
+    // empty string when no directory could be made.
+    QString assetPath()
+    {
+        if (assets == nullptr) {
+            auto directory = std::make_unique<QTemporaryDir>(
+                QDir::tempPath() + QStringLiteral("/vshot-pin-XXXXXX"));
+            if (!directory->isValid()) {
+                return QString();
+            }
+            assets = std::move(directory);
+        }
+        return assets->filePath(QStringLiteral("mark-%1.png").arg(++assetSequence));
+    }
+
+    // The pixels an edit should start from: the pristine capture on a pin that
+    // has been annotated before, its own image on one that has not.
+    const QImage &editBase() const { return edited && !original.isNull() ? original : image; }
+
+    // The HDR half an edit should start from, on the same rule.  Empty for a pin
+    // with no HDR half at all, which is every SDR pin and every pin whose capture
+    // carried no light above white.
+    const QString &editHdrBase() const
+    {
+        return edited && !hdrBasePath.isEmpty() ? hdrBasePath : hdrPath;
+    }
+
+    // The file the helper draws this pin from, empty when this side has none to
+    // hand it -- see `syncHdr`, which is where that is decided.
+    const QString &picture() const { return hdrPath.isEmpty() ? picturePath : hdrPath; }
+
+    // The picture the helper should draw for the pin an edit is open on.
+    //
+    // The editor draws every mark itself, live and editable, so the stack under
+    // it has to show the pristine picture those marks belong to: a flattened one
+    // would put a duplicate of each mark on screen, one that does not move when
+    // the mark is dragged and does not go when it is deleted.
+    //
+    // Which file that is depends on where the pristine pixels live.  A capture
+    // with an HDR half already has them in a file of their own -- `hdrPath` on
+    // the first edit, `hdrBasePath` on every one after.  Every other pin's are
+    // in `original`, which is not a file, so an edit writes one when it opens
+    // and names it here.  A pin with neither is one this side could not hand
+    // over at all, and the empty answer keeps it out of the stack.
+    const QString &editPicture() const
+    {
+        if (!hdrPath.isEmpty()) {
+            return edited && !hdrBasePath.isEmpty() ? hdrBasePath : hdrPath;
+        }
+        return pictureBasePath.isEmpty() ? picturePath : pictureBasePath;
+    }
 
     QSize displaySize() const
     {
@@ -637,50 +821,56 @@ PinDensity resolveDensity(const QJsonObject &request, QScreen *target, const QIm
     return {inferDensity(image, target), "the image size and the target output"};
 }
 
-// Whether `path` is a PQ image the surface helper will be able to read: the
-// magic, and a length that matches what its own header says.  This is the one
-// thing the daemon can check about an HDR half it never decodes, and it has to
-// check something: the helper leaves a pin's rect transparent, so a half it
-// cannot read would leave that rect painted by neither side and the pin would
-// read as a hole in the screen.
-bool isPqImage(const QString &path)
+// Why `path` is not a PQ image the surface helper could read, or an empty
+// string when it is.  This is the one thing the daemon can check about an HDR
+// half it never decodes, and it has to check something: the helper leaves a
+// pin's rect transparent, so a half it cannot read would leave that rect
+// painted by neither side and the pin would read as a hole in the screen.
+//
+// The magic names the layout, and the layout names the gamut: a file carrying
+// another magic was written by a VShot whose format this build does not know --
+// an older helper against a newer daemon, which is what a stale binary beside a
+// fresh one produces -- and an older helper would draw these codes as if they
+// were BT.2020, shifting every colour of a wide-gamut capture.
+//
+// The reason travels back rather than a bare `false`, because a refusal the user
+// never hears about is indistinguishable from a pin that simply has no HDR half:
+// the picture comes out dim and there is nothing to say why.  Naming the magic
+// found and the magic expected is what tells a stale helper apart from a
+// truncated or foreign file.
+constexpr int kPqHeader = 44;
+
+QString pqRejection(const QString &path)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        return false;
+        return QStringLiteral("it cannot be opened: %1").arg(file.errorString());
     }
-    const QByteArray header = file.read(20);
-    if (header.size() != 20 || !header.startsWith(QByteArrayLiteral("VSHTPQ01"))) {
-        return false;
+    const QByteArray header = file.read(kPqHeader);
+    if (header.size() != kPqHeader) {
+        return QStringLiteral("it holds %1 bytes, short of the %2-byte header")
+            .arg(file.size())
+            .arg(kPqHeader);
+    }
+    if (!header.startsWith(QByteArrayLiteral("VSHTPQ02"))) {
+        return QStringLiteral("it starts with `%1` where this build writes `VSHTPQ02`")
+            .arg(QString::fromLatin1(header.left(8)));
     }
     const auto *bytes = reinterpret_cast<const uchar *>(header.constData());
     const quint32 width = qFromLittleEndian<quint32>(bytes + 8);
     const quint32 height = qFromLittleEndian<quint32>(bytes + 12);
     if (width == 0 || height == 0) {
-        return false;
+        return QStringLiteral("its header says %1x%2").arg(width).arg(height);
     }
-    const qint64 expected = 20 + static_cast<qint64>(width) * height * 4;
-    return file.size() == expected;
-}
-
-// What the HDR half's own white is worth, in cd/m², as its header states it.
-// VShot's own default stands in when the file cannot say, which is what a
-// capture on an output with no stated reference is written with.
-double pqWhiteNits(const QString &path)
-{
-    constexpr double fallback = 203.0;
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return fallback;
+    const qint64 expected = kPqHeader + static_cast<qint64>(width) * height * 4;
+    if (file.size() != expected) {
+        return QStringLiteral("it holds %1 bytes where its %2x%3 header calls for %4")
+            .arg(file.size())
+            .arg(width)
+            .arg(height)
+            .arg(expected);
     }
-    const QByteArray header = file.read(20);
-    if (header.size() != 20 || !header.startsWith(QByteArrayLiteral("VSHTPQ01"))) {
-        return fallback;
-    }
-    const auto *bytes = reinterpret_cast<const uchar *>(header.constData());
-    float nits = 0.0f;
-    std::memcpy(&nits, bytes + 16, sizeof nits);
-    return std::isfinite(nits) && nits > 0.0f ? static_cast<double>(nits) : fallback;
+    return QString();
 }
 
 // Where the HDR surface helper may live: next to this executable (installed
@@ -711,8 +901,8 @@ QString hdrHelperProgram()
     return QString();
 }
 
-// The HDR half of the pin stack: a helper process that shows pinned HDR images
-// on layer surfaces of its own.
+// The whole pin stack: a helper process that shows every pinned picture, its
+// shadow and its rim, on layer surfaces of its own.
 //
 // A pin surface is a Qt window, and Qt builds a window's colour description from
 // a `QColorSpace` -- named BT.2020, with no luminances.  The compositor leaves a
@@ -721,15 +911,24 @@ QString hdrHelperProgram()
 // is converted and tone-mapped down to SDR.  The helper is a plain Wayland
 // client of our own: it can put the output's own description on a surface, whose
 // ten-bit buffer is then a passthrough, so the pixels reach the panel as the
-// light they stand for.  It draws the images; the Qt surfaces keep the rim, the
-// badges and the menus, and leave the images transparent for it to show through.
+// light they stand for.
 //
-// The helper's surfaces sit on the same layer as ours, and the compositor stacks
-// a layer in map order with no restack request, so they have to be up first: the
+// It draws *every* pin, not only the HDR ones, and that is what keeps the stack
+// in one order.  The helper's surfaces sit on the same layer as ours and the
+// compositor stacks a layer in map order with no restack request, so they have
+// to be up first -- and anything the Qt surfaces painted afterwards would land
+// above every pin the helper draws, including the pins in front of it: a pin's
+// rim showing over a pin that was meant to cover it.  An SDR pin therefore
+// travels as a PNG and is encoded against this output's own reference white
+// (`PinHdr::takePicture`), and the Qt surfaces keep only what belongs to no
+// single pin in the stack: the badges, the menus, the `HDR` tag and the input
+// mask.
+//
+// The helper's surfaces have to be mapped before the daemon's first one: the
 // process is started as the daemon starts, and `ensureMapped` -- called before
 // the first surface of ours is mapped -- waits for it to say it is on screen.
 // Nothing else waits on it: a helper that never comes up simply leaves every pin
-// an ordinary SDR one.
+// an ordinary SDR one painted by the Qt surface itself.
 class PinHdr
 {
 public:
@@ -807,11 +1006,11 @@ public:
             stop();
             return;
         }
-        // The helper answers every command with one line.  Nothing reads them,
-        // so they have to be drained or its writes would block once the socket's
-        // buffer filled.
-        QObject::connect(&socket_, &QLocalSocket::readyRead, &socket_,
-                         [this] { socket_.readAll(); });
+        // The helper answers every stack it composes with `{"ok":true}`, and
+        // every stack it cannot compose with `{"ok":false,"error":...}`.  Those
+        // lines are read in `drainReplies`/`waitForReply` rather than here, so
+        // that the one caller that has to act on the answer gets it: a lambda on
+        // this signal would race the blocking wait for the same bytes.
     }
 
     bool mapped() const { return mapped_; }
@@ -823,45 +1022,182 @@ public:
     // Copies one PQ image into the helper's directory and answers the copy's
     // path: the CLI's file is gone the moment it is answered, and the helper
     // reads the pixels by path, so the copy is what lives as long as the pin.
-    QString takeImage(const QString &source)
+    //
+    // An empty answer means the pin has no HDR half, which is ordinary -- a
+    // file, a clipboard image, a capture on an SDR output.  A half that was
+    // offered and refused is not, so the reason is left in `reason` for the
+    // caller to report; without that the two read alike and the pin just comes
+    // out dim.
+    QString takeImage(const QString &source, QString *reason = nullptr)
     {
-        if (!mapped_ || !directory_.isValid() || !isPqImage(source)) {
+        if (reason != nullptr) {
+            reason->clear();
+        }
+        if (source.isEmpty()) {
+            return QString();
+        }
+        if (!mapped_ || !directory_.isValid()) {
+            // No helper at all is not a refusal: there is simply no surface to
+            // put an HDR half on, and the pin's SDR picture is complete without
+            // it.  Failing the pin here would lose the capture on every
+            // compositor the helper cannot come up on.
+            return QString();
+        }
+        const QString rejected = pqRejection(source);
+        if (!rejected.isEmpty()) {
+            if (reason != nullptr) {
+                *reason = rejected;
+            }
             return QString();
         }
         const QString destination =
             directory_.filePath(QStringLiteral("pin-%1.pq").arg(++sequence_));
         if (!QFile::copy(source, destination)) {
+            if (reason != nullptr) {
+                *reason = QStringLiteral("it could not be copied beside the helper");
+            }
             return QString();
         }
         return destination;
     }
 
-    // Hands the helper the whole stack of HDR pins, in the daemon's own paint
-    // order, together with the look they are drawn with.  Every other pin is the
-    // Qt surface's to draw and is left out.
-    void sync(const QJsonArray &pins, const QJsonObject &style)
+    // Writes one SDR picture into the helper's directory as a PNG and answers
+    // its path, or an empty string when there is no helper or the file could not
+    // be written.
+    //
+    // Every pin the helper draws needs one, because the helper is a single
+    // surface below the daemon's and a layer's surfaces are stacked in map order
+    // with no restack request: whatever the Qt surface painted would composite
+    // above every pin the helper draws, including the ones in front of it.  So
+    // the whole stack is the helper's, and this is how a pin that is not HDR
+    // gets there -- the helper reads the PNG and encodes it against the output's
+    // own reference white.
+    //
+    // Nothing is cached across calls: a pin's pixels change only when an edit
+    // replaces them, and an edit sends the whole stack anyway.
+    QString takePicture(const QImage &image)
+    {
+        if (image.isNull() || !mapped_ || !directory_.isValid()) {
+            return QString();
+        }
+        const QString destination =
+            directory_.filePath(QStringLiteral("pin-%1.png").arg(++sequence_));
+        return image.save(destination, "PNG") ? destination : QString();
+    }
+
+    // The same for a picture the caller already has as a PNG file -- what the
+    // editor wrote when it replaced a pin's pixels.  Copying it is both cheaper
+    // than decoding and re-encoding, and exact: an image the daemon read back
+    // and saved again could come out a byte different from the one the editor
+    // drew, and this file is the one the user's marks were flattened into.
+    QString takePictureFile(const QString &source)
+    {
+        if (source.isEmpty() || !mapped_ || !directory_.isValid()) {
+            return QString();
+        }
+        const QString destination =
+            directory_.filePath(QStringLiteral("pin-%1.png").arg(++sequence_));
+        return QFile::copy(source, destination) ? destination : QString();
+    }
+
+    // Hands the helper the whole stack of pins, in the daemon's own paint order,
+    // together with the look they are drawn with.  Answers whether anything was
+    // sent, since only a stack the helper was actually handed can be refused by
+    // it.
+    //
+    // `active` is not in the array: which pin shows the live rim is what the
+    // pointer is doing rather than what the stack holds, and a moved pointer is
+    // not a stack change.  It is compared with the rest so a change of it still
+    // reaches the helper.
+    bool sync(const QJsonArray &pins, const QJsonObject &style, quint64 active)
     {
         if (!mapped_ || socket_.state() != QLocalSocket::ConnectedState) {
-            return;
+            return false;
         }
-        // The same stack and the same look again — a pin coming to the front, an
-        // SDR pin moving — is nothing for the helper to do.  Its picture is
-        // derived from these two alone, so asking for it twice would have it
-        // recompose the whole output for an image identical to the one already
-        // on it.
-        if (sent_ && pins == sent_.value() && style == sentStyle_) {
-            return;
+        // The same stack, the same look and the same live pin again -- a pin
+        // coming to the front, a stack the daemon repeats -- is nothing for the
+        // helper to do.  Its picture is derived from these three alone, so
+        // asking for it twice would have it recompose the whole output for an
+        // image identical to the one already on it.
+        if (sent_ && pins == sent_.value() && style == sentStyle_ && active == sentActive_) {
+            return false;
         }
         sent_ = pins;
         sentStyle_ = style;
+        sentActive_ = active;
         QJsonObject command;
         command.insert(QStringLiteral("cmd"), QStringLiteral("pins"));
         command.insert(QStringLiteral("style"), style);
         command.insert(QStringLiteral("pins"), pins);
+        command.insert(QStringLiteral("active"), static_cast<qint64>(active));
         QByteArray line = QJsonDocument(command).toJson(QJsonDocument::Compact);
         line.append('\n');
         socket_.write(line);
         socket_.flush();
+        return true;
+    }
+
+    // The helper's answer to the stack just handed over, or an empty string
+    // when it composed it.  It composes the whole stack in one go and refuses
+    // the whole command when any file in it cannot be read, so the answer is
+    // about the stack and not about one pin.
+    //
+    // This is the only place a mismatch the daemon cannot see for itself shows
+    // up: the daemon checks the magic it writes, so a helper built against
+    // another .pq layout is refused over there and nowhere else.  A refusal
+    // leaves every HDR pin showing the last picture the helper managed, which is
+    // what makes it worth carrying back to whoever asked rather than dropping.
+    //
+    // It waits, because the answer has to be in hand before the request that
+    // caused it is answered -- otherwise there is nothing left to put it in.
+    // The wait is bounded, and a helper that is slow rather than refusing is not
+    // an error: the pin is composed all the same, just later than this reply.
+    QString refusalAfterSync()
+    {
+        QElapsedTimer timer;
+        timer.start();
+        QByteArray buffer;
+        while (socket_.state() == QLocalSocket::ConnectedState) {
+            if (socket_.bytesAvailable() == 0) {
+                if (timer.hasExpired(kReplyWaitMs)) {
+                    return QString();
+                }
+                if (!socket_.waitForReadyRead(50)) {
+                    continue;
+                }
+            }
+            buffer.append(socket_.readAll());
+            qsizetype newline = -1;
+            while ((newline = buffer.indexOf('\n')) >= 0) {
+                const QByteArray line = buffer.left(newline);
+                buffer.remove(0, newline + 1);
+                const QJsonDocument document = QJsonDocument::fromJson(line);
+                if (!document.isObject()) {
+                    continue;
+                }
+                const QJsonObject reply = document.object();
+                // The `mapped` event is not an answer to a stack; everything
+                // else the helper sends is.
+                if (reply.contains(QStringLiteral("event"))) {
+                    continue;
+                }
+                if (reply.value(QStringLiteral("ok")).toBool()) {
+                    return QString();
+                }
+                return reply.value(QStringLiteral("error")).toString();
+            }
+        }
+        return QString();
+    }
+
+    // Reads and drops whatever the helper has already answered, so a refusal
+    // left over from an earlier stack is never mistaken for this one's.  Called
+    // before a stack is handed over.
+    void discardReplies()
+    {
+        if (socket_.state() == QLocalSocket::ConnectedState) {
+            socket_.readAll();
+        }
     }
 
 private:
@@ -919,6 +1255,10 @@ private:
     static constexpr int kSocketWaitMs = 2000;
     static constexpr int kConnectWaitMs = 1000;
     static constexpr int kMappedWaitMs = 2000;
+    // How long the answer to one stack is waited for before the request that
+    // caused it is answered without it.  A helper composing a full 4K output
+    // takes a fraction of this; past it, the helper is not refusing but slow.
+    static constexpr int kReplyWaitMs = 400;
 
     QString program_;
     QString socketPath_;
@@ -927,9 +1267,10 @@ private:
     QLocalSocket socket_;
     QStringList outputs_;
     // The pin stack the helper was last handed, so an unchanged one is not
-    // handed over again, and the look that went with it.
+    // handed over again, and the look and the live pin that went with it.
     std::optional<QJsonArray> sent_;
     QJsonObject sentStyle_;
+    quint64 sentActive_ = 0;
     bool attempted_ = false;
     bool mapped_ = false;
     quint64 sequence_ = 0;
@@ -953,6 +1294,14 @@ public:
                 QCoreApplication::quit();
             }
         });
+        // The backstop for a held reply: a compositor that never hands back a
+        // frame callback must not leave a client waiting for ever.  The wait is
+        // short because a frame is what it is waiting for -- the repaint was
+        // committed before the callback was asked for, so the answer is one
+        // frame away or the surface is not going to draw one at all.
+        frameDeadline_ = new QTimer(this);
+        frameDeadline_->setSingleShot(true);
+        connect(frameDeadline_, &QTimer::timeout, this, [this] { releaseHeldReplies(); });
     }
 
     void handleNewConnection()
@@ -960,7 +1309,12 @@ public:
         while (QLocalSocket *socket = server_->nextPendingConnection()) {
             connect(socket, &QLocalSocket::readyRead, this,
                     [this, socket] { readRequest(socket); });
-            connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
+            connect(socket, &QLocalSocket::disconnected, socket, [this, socket] {
+                // The client is gone; whatever it left mid-request goes with it.
+                buffer_.remove(socket);
+                reportedActive_.remove(socket);
+                socket->deleteLater();
+            });
         }
     }
 
@@ -996,7 +1350,8 @@ public:
         const QVector<Pin *> pins = pins_;
         pins_.clear();
         byId_.clear();
-        editingPin_ = nullptr;
+        editingPinId_ = 0;
+        notifyActive();
         destroySurfaces();
         for (Pin *pin : pins) {
             delete pin;
@@ -1004,6 +1359,45 @@ public:
     }
 
 private:
+    // One answer held until the frame carrying the change it reports has been
+    // presented.  The socket is a QPointer: a client that gave up and closed
+    // while the daemon waited must not be written to.
+    struct HeldReply
+    {
+        QPointer<QLocalSocket> socket;
+        QJsonObject reply;
+    };
+
+    // A surface put a frame on the screen, so whatever the daemon was holding
+    // for that frame is now true and can be answered.
+    //
+    // Only the first frame after the answers were queued releases them: the
+    // request went out with the repaint this batch caused, and that repaint is
+    // the one the client is waiting to see.  A later frame says nothing new.
+    void framePresented()
+    {
+        if (pendingReplies_.isEmpty()) {
+            return;
+        }
+        frameDeadline_->stop();
+        const QVector<HeldReply> held = std::move(pendingReplies_);
+        pendingReplies_.clear();
+        for (const HeldReply &entry : held) {
+            if (entry.socket != nullptr) {
+                respond(entry.socket, entry.reply);
+            }
+        }
+    }
+
+    // Answers anything still held, so a compositor that never delivers a frame
+    // callback -- a surface with nothing to draw, an output that went away --
+    // cannot leave a client waiting on a reply that will never come.  The
+    // change is applied either way; only the confirmation is early.
+    void releaseHeldReplies()
+    {
+        framePresented();
+    }
+
     static QJsonObject okReply()
     {
         return QJsonObject{{QStringLiteral("ok"), true}};
@@ -1024,38 +1418,263 @@ private:
                            {QStringLiteral("error"), message}};
     }
 
-    // Requests are newline-terminated single JSON objects.
+    // Requests are newline-terminated single JSON objects.  One connection may
+    // carry as many as the client sends: a drag pipelines its positions, so the
+    // loop below drains every complete line before it answers.
     void readRequest(QLocalSocket *socket)
     {
         buffer_[socket] += socket->readAll();
-        const qsizetype newline = buffer_[socket].indexOf('\n');
-        if (newline < 0) {
-            return; // still streaming
+        QElapsedTimer clock;
+        if (debug_) {
+            clock.start();
         }
-        const QByteArray line = buffer_[socket].left(newline);
-        buffer_.remove(socket);
+        // Positions are applied as they are read but the stack is rendered once,
+        // after the whole batch: a client that pipelines several drag positions
+        // gets one repaint and one answer each, and every answer carries the
+        // position that repaint actually landed on.
+        struct Moved
+        {
+            QLocalSocket *socket;
+            quint64 id;
+            // Whether this particular move asked for its answer to wait for a
+            // presented frame.  A client with more than one move in flight has
+            // to be able to tell which answer is the one that ends its handoff,
+            // so the ask is echoed in the reply.
+            bool ack;
+        };
+        QVector<Moved> moved;
+        // Adds whose HDR half only the helper can accept or refuse: they wait
+        // for the one answer that covers the stack rendered below.
+        struct Deferred
+        {
+            QLocalSocket *socket;
+            QJsonObject reply;
+            bool ack;
+        };
+        QVector<Deferred> renders;
+        // Whether anything in this batch changed the stack by adding a pin.  An
+        // add leaves nothing in `moved` -- it is not a move -- and only an add
+        // that carried an HDR half leaves anything in `renders`, so without this
+        // an ordinary add would never render: the pin would sit in the model,
+        // invisible, until some later command happened to compose the stack,
+        // which is what made an SDR pin appear only once an HDR one was pinned
+        // after it.  Set from the reply rather than from the command, because
+        // the stack is `addPin`'s to change and a refusal changes nothing.
+        bool added = false;
+        qsizetype newline = -1;
+        while ((newline = buffer_[socket].indexOf('\n')) >= 0) {
+            const QByteArray line = buffer_[socket].left(newline);
+            buffer_[socket].remove(0, newline + 1);
 
-        QJsonParseError parseError;
-        const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
-        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-            respond(socket, error(QStringLiteral("invalid pin request JSON: %1")
-                                      .arg(parseError.errorString())));
+            QJsonParseError parseError;
+            const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
+            if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+                respond(socket, error(QStringLiteral("invalid pin request JSON: %1")
+                                          .arg(parseError.errorString())));
+                continue;
+            }
+            const QJsonObject request = document.object();
+            const QString command = request.value(QStringLiteral("cmd")).toString();
+            // A client that wants to be told which pin is the live one as it
+            // changes.  Only the pin editor asks, and only because its frame is
+            // Qt chrome drawn above every pin surface: a frame left up for a pin
+            // the user has moved on from would sit on top of every other pin,
+            // and the compositor offers no way to put it back underneath.  The
+            // answer is a line of its own -- no `ok`, so it is never mistaken
+            // for a move's reply by a client that reads the socket for those --
+            // and it goes out on every change, which is why it is asked for
+            // rather than pushed at everyone who connects.
+            if (command == QStringLiteral("watch-active")) {
+                const quint64 live = liveEditingPin();
+                reportedActive_.insert(socket, live);
+                respond(socket, activeNotice(live));
+                continue;
+            }
+            // The pin editor putting the pin it is annotating back on top.
+            //
+            // It has to ask because the pin's own surface cannot hear the click:
+            // the editor's layer surface holds the keyboard and covers the
+            // output, so the pointer never reaches the pin surface underneath,
+            // and that surface is where `bringToFront` is normally reached from.
+            // Clicking a pin that happens to be under the editor is the user
+            // saying which pin they mean, and for the one being edited that is
+            // exactly the gesture that has to bring it back to the front.
+            //
+            // Handled here rather than in `dispatch` because it has nothing to
+            // render: the stack it changes is `bringToFront`'s to hand over.
+            // The answer carries no `ok`, so a client reading this socket for
+            // its move replies never mistakes it for one.
+            if (command == QStringLiteral("raise")) {
+                const quint64 id = request.value(QStringLiteral("id")).toVariant().toULongLong();
+                Pin *pin = id != 0 ? byId_.value(id, nullptr) : nullptr;
+                if (pin != nullptr) {
+                    bringToFront(pin);
+                }
+                QJsonObject reply;
+                reply.insert(QStringLiteral("raised"), static_cast<qint64>(pin != nullptr ? id : 0));
+                respond(socket, reply);
+                continue;
+            }
+            // A client that asks to be told when its change is on the screen,
+            // not merely applied.  `ack` is that ask: the reply waits for the
+            // compositor's frame callback for the repaint this batch causes.
+            // Only ever set by a client that is about to stop drawing, and only
+            // on the request it is about to stop on -- a drag pipelined ahead of
+            // it carries the ask on that one move alone.
+            const bool ack = request.value(QStringLiteral("ack")).toBool();
+            if (command == QStringLiteral("move")) {
+                quint64 id = 0;
+                const QJsonObject reply = movePin(request, &id);
+                if (reply.value(QStringLiteral("ok")).toBool()) {
+                    moved.append({socket, id, ack});
+                } else {
+                    respond(socket, reply);
+                    armIdleQuit();
+                }
+                continue;
+            }
+            // An `add` whose HDR half the helper will refuse has to hear about
+            // it in the same reply, and the answer only exists once the stack
+            // has been handed over.  So the add is not answered here: it is
+            // answered below, after the render, like a move.  `addPin` itself
+            // does not render, so nothing is composed twice.
+            if (command == QStringLiteral("add")) {
+                const QJsonObject reply = addPin(request);
+                if (reply.value(QStringLiteral("ok")).toBool()) {
+                    added = true;
+                }
+                // Only an add that brought an HDR half has anything to wait for
+                // from the helper: its answer to the stack the pin lands in.
+                // Every other add is answered here -- unless the client asked
+                // for a frame, which is the pin editor handing over the picture
+                // it is still drawing, and then the answer waits for the stack
+                // below the same way a move's does.
+                const bool deferred =
+                    reply.value(QStringLiteral("ok")).toBool()
+                    && (!request.value(QStringLiteral("hdr")).toString().isEmpty() || ack);
+                if (deferred) {
+                    renders.append({socket, reply, ack});
+                } else {
+                    respond(socket, reply);
+                    if (!reply.value(QStringLiteral("ok")).toBool(true)) {
+                        armIdleQuit();
+                    }
+                }
+                continue;
+            }
+            const bool quit = command == QStringLiteral("quit");
+            // The command is asked what it changed before it is asked to do it:
+            // only the two adds change the stack, and every other command
+            // renders for itself -- a show, a hide or a zoom does not wait for
+            // the batch to end, and must not be made to.
+            const bool adds = command == QStringLiteral("add-clipboard");
+            const QJsonObject reply = dispatch(request);
+            if (adds && reply.value(QStringLiteral("ok")).toBool()) {
+                added = true;
+            }
+            respond(socket, reply);
+            // A daemon that owns nothing has no reason to stay resident, and a
+            // failed first add (an empty clipboard, an unreadable file) would
+            // otherwise leave one running forever with nothing pinned.
+            if (!reply.value(QStringLiteral("ok")).toBool(true)) {
+                armIdleQuit();
+            }
+            if (quit) {
+                shutdownAll();
+                QCoreApplication::quit();
+                return;
+            }
+        }
+        if (buffer_.value(socket).isEmpty()) {
+            buffer_.remove(socket);
+        }
+        // Nothing to render means nothing to answer, and an add that is not
+        // waiting on the helper was already answered above.  An add that landed
+        // is the exception: it changed the stack, and the stack is rendered
+        // here, once, for the whole batch.
+        if (moved.isEmpty() && renders.isEmpty() && !added) {
             return;
         }
-        const QJsonObject request = document.object();
-        const bool quit =
-            request.value(QStringLiteral("cmd")).toString() == QStringLiteral("quit");
-        const QJsonObject reply = dispatch(request);
-        respond(socket, reply);
-        // A daemon that owns nothing has no reason to stay resident, and a
-        // failed first add (an empty clipboard, an unreadable file) would
-        // otherwise leave one running forever with nothing pinned.
-        if (!reply.value(QStringLiteral("ok")).toBool(true)) {
-            armIdleQuit();
+        // Only wait for the helper's verdict when it was actually handed a new
+        // stack.  A stack it already has is nothing for it to answer, and
+        // blocking on a reply that is never coming is a stall: it used to cost
+        // every motion event of every drag the full deadline.
+        //
+        // Whatever the helper has already said is dropped first, so the verdict
+        // read below is this stack's and not an earlier one's: `syncAll` is
+        // called from places that never read the answer -- a zoom, a show -- and
+        // their replies would otherwise be waiting in the buffer to be mistaken
+        // for this one's.
+        hdr_.discardReplies();
+        const bool handedHdr = syncAll();
+        // The stack has been handed to every surface and queued for painting;
+        // nothing is on the screen yet.  A client that asked to be told when it
+        // is -- the pin editor, which has to stop drawing without leaving a gap
+        // -- has its answer held until the compositor's own frame callback
+        // arrives, so it is released only once the picture it was drawing over
+        // is really there.  Every other client is answered at once, as before.
+        const auto answer = [this](QLocalSocket *socket, const QJsonObject &reply, bool ack) {
+            // The ask is echoed back so the client knows which of its answers
+            // is the one that waited for the frame: a move pipelined behind
+            // another gets an ordinary reply, and only this one ends a handoff.
+            QJsonObject sent = reply;
+            if (ack) {
+                sent.insert(QStringLiteral("ack"), true);
+                pendingReplies_.append({socket, sent});
+            } else {
+                respond(socket, sent);
+            }
+        };
+        for (const Moved &entry : moved) {
+            const Pin *pin = byId_.value(entry.id, nullptr);
+            if (pin == nullptr) {
+                respond(entry.socket,
+                        error(QStringLiteral("pin %1 no longer exists").arg(entry.id)));
+                continue;
+            }
+            answer(entry.socket, moveReply(*pin), entry.ack);
         }
-        if (quit) {
-            shutdownAll();
-            QCoreApplication::quit();
+        // One stack was handed over, so one answer came back: the same verdict
+        // covers every add in this batch that carried an HDR half.  The pin
+        // stays pinned either way -- it still has its SDR picture, which is
+        // what the user has to look at while fixing the mismatch.
+        //
+        // Read only when there is an add to put it in.  The verdict exists to
+        // answer a client that just pinned something and needs to know the HDR
+        // half did not take; a batch of pure moves has nobody to tell, and
+        // waiting for the helper to compose before answering them is a stall on
+        // every motion event of a drag -- which is exactly what the drag cannot
+        // afford.
+        const QString refused = (handedHdr && !renders.isEmpty()) ? hdr_.refusalAfterSync()
+                                                                  : QString();
+        for (const Deferred &entry : renders) {
+            if (refused.isEmpty()) {
+                answer(entry.socket, entry.reply, entry.ack);
+            } else {
+                answer(entry.socket,
+                       error(QStringLiteral("the HDR surface helper refused the pin "
+                                            "stack: %1")
+                                 .arg(refused)),
+                       entry.ack);
+            }
+        }
+        if (!pendingReplies_.isEmpty()) {
+            // Armed after the answers are queued, so a frame landing while they
+            // are being assembled cannot release them early: the repaint this
+            // batch caused is committed by `syncAll` above, and the callback
+            // asked for here is the one that follows it.
+            for (const QPointer<PinSurface> &surface : surfaces_) {
+                if (surface != nullptr) {
+                    surface->requestPainted();
+                }
+            }
+            frameDeadline_->start(kFrameWaitMs);
+        }
+        if (debug_) {
+            std::fprintf(stderr, "vshot-pin: %lld move(s) applied and rendered in %lld ms\n",
+                         static_cast<long long>(moved.size()),
+                         static_cast<long long>(clock.elapsed()));
+            std::fflush(stderr);
         }
     }
 
@@ -1069,7 +1688,9 @@ private:
             return addClipboardPin(request);
         }
         if (command == QStringLiteral("move")) {
-            return movePin(request);
+            // `readRequest` handles moves itself: it applies them and answers
+            // once the batch has been rendered.
+            return error(QStringLiteral("pin move must be answered by the reader"));
         }
         if (command == QStringLiteral("save")) {
             return savePin(request);
@@ -1090,7 +1711,10 @@ private:
             const QVector<Pin *> pins = pins_;
             pins_.clear();
             byId_.clear();
-            editingPin_ = nullptr;
+            editingPinId_ = 0;
+            // An open editor is annotating a pin that no longer exists; its
+            // frame must go with the pin rather than stay over the desktop.
+            notifyActive();
             destroySurfaces();
             for (Pin *pin : pins) {
                 delete pin;
@@ -1340,24 +1964,79 @@ wl-clipboard package"));
         reloadStyle();
         // `ensureSurfaces` has made the helper known, so its directory exists and
         // the HDR half can be taken; without a helper the pin is an SDR one.
+        //
+        // A half the CLI offered and this side cannot read is a mismatch between
+        // two builds, and it is refused rather than quietly dropped: letting it
+        // through would fall the pin back to its SDR copy in silence, which is
+        // the dim picture the user has no way to explain.  The check is the
+        // helper's to make -- it is the side that reads the file -- and its
+        // answer arrives with the stack below.
         if (!hdrSource.isEmpty()) {
-            pin->hdrPath = hdr_.takeImage(hdrSource);
-            pin->hdrWhite = pqWhiteNits(pin->hdrPath);
+            QString refused;
+            pin->hdrPath = hdr_.takeImage(hdrSource, &refused);
+            if (!refused.isEmpty()) {
+                delete pin;
+                armIdleQuit();
+                return error(QStringLiteral("cannot use the HDR half of `%1`: %2")
+                                 .arg(hdrSource)
+                                 .arg(refused));
+            }
+        }
+        // The helper draws this pin too -- the whole stack is its picture -- so a
+        // capture without an HDR half is handed over as a PNG.  The picture is
+        // what the screen shows, which is `image`: on a capture pinned from an
+        // editing session that is the flattening of its marks, and the marks
+        // themselves travel beside it for the next edit to open on.
+        //
+        // Written from the decoded pixels rather than copied from `sourcePath`,
+        // even when the request named a file: the helper reads PNG alone, and a
+        // pin made from a JPEG or from a rendered card has no PNG of its own at
+        // all.  One encode of the pixels is the same picture in every case.
+        if (pin->hdrPath.isEmpty()) {
+            pin->picturePath = hdr_.takePicture(pin->image);
+        }
+        // The marks the capture was pinned with, when it came out of an editing
+        // session that had any: they are what a second edit opens on, so the
+        // pin can be annotated again on the user's own marks rather than on the
+        // pixels they were flattened into.  A capture nothing was drawn on --
+        // a file, the clipboard, a bare region -- carries none, and the pin
+        // opens blank the way it always did.
+        //
+        // The picture the marks were drawn on comes with them, and is what the
+        // editor is handed: `image` is the flattening, so editing from it would
+        // paint every mark a second time over its own baked copy.  A request
+        // that carried marks without a base cannot be edited again, so the pin
+        // stays unannotated rather than opening on a picture the marks do not
+        // belong to.
+        const QJsonValue marks = request.value(QStringLiteral("annotations"));
+        const QString basePath = request.value(QStringLiteral("base")).toString();
+        if (marks.isArray() && !marks.toArray().isEmpty() && !basePath.isEmpty()) {
+            const QImage base(basePath);
+            if (!base.isNull()) {
+                pin->original = base;
+                pin->marks = pin->keepMarks(marks.toArray());
+                pin->edited = true;
+            }
         }
         // Appended, so it is painted last: a new pin lands in front of the pins
         // that were already there.
         pins_.push_back(pin);
         byId_.insert(pin->id, pin);
         idleQuit_->stop();
-        syncAll();
+        // The stack is rendered by `readRequest` once the whole batch has been
+        // read, the way a drag's positions are, so that a client pinning several
+        // images at once gets one composition of the output rather than one per
+        // image.
         return okReply();
     }
 
     // Replaces the pixels of an existing pin and/or moves it. Coordinates are
-    // global logical pixels (the editor's frame of reference); the response
-    // carries the rect the pin actually landed on, after clamping, so the
-    // caller can follow it.
-    QJsonObject movePin(const QJsonObject &request)
+    // global logical pixels (the editor's frame of reference).  Applies the
+    // change only: it does not render and does not answer -- the batch that
+    // carried it does both once, in `readRequest`, and `moveReply` carries the
+    // rect the pin actually landed on, after clamping, so a pipelined drag
+    // repaints the stack once for several positions.
+    QJsonObject movePin(const QJsonObject &request, quint64 *movedId)
     {
         bool idOk = false;
         const quint64 id = request.value(QStringLiteral("id")).toVariant().toULongLong(&idOk);
@@ -1374,6 +2053,12 @@ wl-clipboard package"));
         }
         const QString path = request.value(QStringLiteral("path")).toString();
         const QString hdr = request.value(QStringLiteral("hdr")).toString();
+        // Read before anything is replaced: whether this pin has been edited
+        // before is what decides, below, whether the HDR file being dropped is
+        // the pristine capture (keep it) or the previous edit's flattening (throw
+        // it away).  `edited` is set by the block that replaces the pixels, so it
+        // can no longer answer that question by the time the HDR half is handled.
+        const bool wasEdited = pin->edited;
         if (!path.isEmpty()) {
             const QImage image(path);
             if (image.isNull()) {
@@ -1382,39 +2067,133 @@ wl-clipboard package"));
             // Keep the on-screen size the user arranged, even though the new
             // pixels may have a different density.
             const QSize display = pin->displaySize();
+            // The picture the edit started from becomes the pin's pristine copy
+            // the first time its pixels are replaced; a later edit reuses the
+            // one already held, so the base stays the capture itself rather
+            // than the previous edit's flattening.
+            if (!pin->edited) {
+                pin->original = pin->image;
+            }
             pin->image = image;
+            // The marks the editor reports, relative to the image it was given.
+            // They are what a later edit opens on; the flattened pixels above
+            // are what the screen shows and what a save writes.  Their own
+            // pixels are taken into this pin's directory as they arrive, since
+            // the editor's session directory goes with the request.
+            pin->marks = pin->keepMarks(request.value(QStringLiteral("annotations")).toArray());
+            pin->edited = true;
             if (image.width() > 0) {
                 pin->scale = std::clamp(static_cast<double>(display.width()) / image.width(),
                                         kMinScale, kMaxScale);
             }
             // The pixels were replaced, so whatever HDR half the pin had is no
             // longer theirs -- unless this same request brings its replacement
-            // along, which is what an HDR pin's edit does.
+            // along, which is what an HDR pin's edit does.  The file being
+            // dropped is the *pristine* one the first time, and it is kept
+            // rather than removed: it is what the next edit draws on and what an
+            // open editor shows behind its marks.  The file the previous edit
+            // left, if any, is the one that goes.
             if (hdr.isEmpty() && !pin->hdrPath.isEmpty()) {
-                QFile::remove(pin->hdrPath);
+                if (wasEdited) {
+                    QFile::remove(pin->hdrPath);
+                } else {
+                    pin->hdrBasePath = pin->hdrPath;
+                }
                 pin->hdrPath.clear();
             }
         }
         if (!hdr.isEmpty()) {
-            // An unreadable half clears the pin's own, so a pin whose pixels
-            // changed is never left showing a stale HDR image: it falls back to
-            // the SDR picture it was given.
-            const QString taken = hdr_.takeImage(hdr);
+            // A half this side cannot read is left off rather than refused here:
+            // the helper is the side that reads it, and its answer to the stack
+            // -- which is what the move reply carries -- is the one that counts.
+            // Keeping the pristine file while the edit's own flattening replaces
+            // it is what lets the pin be edited again on the capture rather than
+            // on the last edit's ink; only the flattening from the edit before
+            // this one is discarded.
             if (!pin->hdrPath.isEmpty()) {
-                QFile::remove(pin->hdrPath);
+                if (wasEdited) {
+                    QFile::remove(pin->hdrPath);
+                } else {
+                    pin->hdrBasePath = pin->hdrPath;
+                }
             }
-            pin->hdrPath = taken;
-            pin->hdrWhite = pqWhiteNits(taken);
+            pin->hdrPath = hdr_.takeImage(hdr);
+        }
+        // A pin that ends this request with no HDR half has nothing left for the
+        // pristine one to be the base *of*: an edit that replaced the pixels from
+        // the SDR editor only -- which is what a pin whose capture turned out to
+        // hold no light above white sends -- takes the whole half away, base and
+        // all.  Leaving it behind would keep a file alive for a pin that no
+        // longer shows one.
+        if (pin->hdrPath.isEmpty() && !pin->hdrBasePath.isEmpty()) {
+            QFile::remove(pin->hdrBasePath);
+            pin->hdrBasePath.clear();
+        }
+        // The helper draws this pin too, and its pixels have just been replaced.
+        // The editor wrote the flattened result as a PNG of its own, so the
+        // daemon takes that file rather than re-encoding the image it just read
+        // from it.  `pictureBasePath` is left alone: while an edit is open the
+        // stack shows the pristine picture the marks belong to -- the editor
+        // draws every mark itself, and a flattened one underneath would put a
+        // baked copy of each behind the live one -- and it is the file that
+        // `picturePath` takes over from once the edit ends.
+        if (!path.isEmpty() && pin->hdrPath.isEmpty()) {
+            const QString written = hdr_.takePictureFile(path);
+            if (!written.isEmpty()) {
+                QFile::remove(pin->picturePath);
+                pin->picturePath = written;
+            }
         }
         pin->origin = clampOrigin(*pin, QPoint(x, y));
-        syncAll();
-        const QRect landed = pin->globalRect();
+        if (movedId != nullptr) {
+            *movedId = id;
+        }
+        return okReply();
+    }
+
+    // Where the pin ended up, which is what a move answers with.
+    static QJsonObject moveReply(const Pin &pin)
+    {
+        const QRect landed = pin.globalRect();
         QJsonObject reply = okReply();
         reply.insert(QStringLiteral("x"), static_cast<qint64>(landed.x()));
         reply.insert(QStringLiteral("y"), static_cast<qint64>(landed.y()));
         reply.insert(QStringLiteral("width"), static_cast<qint64>(landed.width()));
         reply.insert(QStringLiteral("height"), static_cast<qint64>(landed.height()));
         return reply;
+    }
+
+    // The picture the helper draws for a pin, for as long as this pin is the one
+    // an edit is open on: the pristine pixels the editor's marks belong to.
+    //
+    // The helper draws every pin, so this is the file the stack names for it
+    // while `editingPinId_` is its id.  It is written when the edit opens and
+    // dropped when it ends, exactly as `hdrBasePath` is and for the same reason:
+    // the editor draws every mark itself, and a helper painting the flattened
+    // picture underneath would put a duplicate of each mark on screen -- one that
+    // does not move when the mark is dragged and does not go when it is deleted.
+    //
+    // A capture with an HDR half needs nothing written: its pristine pixels are
+    // already a file, and `editHdrBase` is what the stack names for it.
+    void openEditPicture(Pin *pin)
+    {
+        if (pin == nullptr || !pin->hdrPath.isEmpty()) {
+            return;
+        }
+        closeEditPicture(pin);
+        pin->pictureBasePath = hdr_.takePicture(pin->editBase());
+    }
+
+    // The edit is over: the pin's flattened pixels are the ones to draw again, so
+    // the pristine PNG has no reader left.  Called on every path an edit can end
+    // by -- the apply child exiting, and the pin going away under an open editor.
+    void closeEditPicture(Pin *pin)
+    {
+        if (pin == nullptr || pin->pictureBasePath.isEmpty()) {
+            return;
+        }
+        QFile::remove(pin->pictureBasePath);
+        pin->pictureBasePath.clear();
     }
 
     // One edit round: export the pin's pixels, describe the pin-edit session,
@@ -1425,7 +2204,7 @@ wl-clipboard package"));
     // menu's `Recognize text…` row for the text one.
     void startEdit(Pin *pin, bool textMode)
     {
-        if (editingPin_ != nullptr) {
+        if (editingPinId_ != 0) {
             return; // one edit session at a time
         }
         // The editor draws its own overlay above the pins but leaves the image
@@ -1450,7 +2229,12 @@ wl-clipboard package"));
             return;
         }
         const QString imagePath = directory->filePath(QStringLiteral("pin.png"));
-        if (!pin->image.save(imagePath, "PNG")) {
+        // What the editor draws on: the pin's own pixels the first time, and the
+        // pristine capture the marks were placed on every time after.  Editing
+        // the flattened result would put new marks on top of old ink with no way
+        // back to either.
+        const QImage base = pin->editBase();
+        if (!base.save(imagePath, "PNG")) {
             delete directory;
             return;
         }
@@ -1473,16 +2257,21 @@ wl-clipboard package"));
         output.insert(QStringLiteral("surface"), surface);
         output.insert(QStringLiteral("scale"), 1);
         output.insert(QStringLiteral("pixel_width"),
-                      static_cast<qint64>(pin->image.width()));
+                      static_cast<qint64>(base.width()));
         output.insert(QStringLiteral("pixel_height"),
-                      static_cast<qint64>(pin->image.height()));
+                      static_cast<qint64>(base.height()));
         output.insert(QStringLiteral("path"), imagePath);
         // An HDR pin carries a second file, and the editor has to put its marks
         // on that half too or the pin would drop back to SDR the moment it is
         // annotated.  The path stays valid for the whole edit: the file lives in
         // the helper's directory, which the daemon owns.
-        if (!pin->hdrPath.isEmpty()) {
-            output.insert(QStringLiteral("hdr"), pin->hdrPath);
+        //
+        // The *pristine* half, not the one the last edit flattened: the editor
+        // composites the marks it was handed onto this file, so handing it a
+        // picture that already carries them would draw every mark a second time.
+        const QString &hdrBase = pin->editHdrBase();
+        if (!hdrBase.isEmpty()) {
+            output.insert(QStringLiteral("hdr"), hdrBase);
         }
 
         QJsonObject bounds;
@@ -1502,11 +2291,45 @@ wl-clipboard package"));
         }
         session.insert(QStringLiteral("bounds"), bounds);
         session.insert(QStringLiteral("id"), static_cast<qint64>(pin->id));
+        // How wide this pin's border is drawn, so the editor can treat the rim
+        // as part of the pin: the stroke is centred on the image's edge and
+        // reaches half this far outside it, and a drag that starts there should
+        // move the pin rather than read as a click on the bare canvas.
+        session.insert(QStringLiteral("border_width"), static_cast<qint64>(style_.borderWidth));
         // The editor drives the real pin window while editing (moving it with
         // the pin's own code path instead of rendering a second copy of the
         // image), which it does over this daemon socket.
         session.insert(QStringLiteral("socket"), socketPath_);
+        // The marks the last edit left, so the editor opens on them and they
+        // stay editable.  Absent on a pin that has never been annotated, which
+        // is what makes the editor open blank for a first edit.
+        if (!pin->marks.isEmpty()) {
+            session.insert(QStringLiteral("annotations"), pin->marks);
+        }
         session.insert(QStringLiteral("outputs"), QJsonArray{output});
+
+        // The desktop, as the layout places every output.  The editor's
+        // keyboard cursor walks a pointer of its own and asks the CLI to move
+        // the real one there, and a pointer position is expressed in this
+        // space -- the CLI subtracts this origin and scales to this size.  The
+        // session's own `bounds` is the pin, which is not the screen, so the
+        // desktop has to travel separately or a warp on a multi-monitor layout
+        // would land at a fraction of where it belongs.
+        QRect desktop;
+        for (QScreen *each : QGuiApplication::screens()) {
+            if (each == nullptr) {
+                continue;
+            }
+            desktop = desktop.isNull() ? each->geometry() : desktop.united(each->geometry());
+        }
+        if (!desktop.isNull()) {
+            QJsonObject layout;
+            layout.insert(QStringLiteral("x"), static_cast<qint64>(desktop.x()));
+            layout.insert(QStringLiteral("y"), static_cast<qint64>(desktop.y()));
+            layout.insert(QStringLiteral("width"), static_cast<qint64>(desktop.width()));
+            layout.insert(QStringLiteral("height"), static_cast<qint64>(desktop.height()));
+            session.insert(QStringLiteral("desktop"), layout);
+        }
 
         const QString sessionPath = directory->filePath(QStringLiteral("session.json"));
         {
@@ -1518,7 +2341,12 @@ wl-clipboard package"));
             file.write(QJsonDocument(session).toJson(QJsonDocument::Compact));
         }
 
-        editingPin_ = pin;
+        editingPinId_ = pin->id;
+        // The editor opens on a pin that has just been brought to the front and
+        // is about to take the keyboard, so it starts live: the frame is drawn
+        // from the first paint rather than after the surface's first report.
+        // Nothing has to be told -- the editor's connection is not up yet, and
+        // the answer is written to it the moment it is.
 
         QString cliPath = QString::fromLocal8Bit(qgetenv("VSHOT_BIN"));
         if (cliPath.isEmpty()) {
@@ -1551,7 +2379,7 @@ wl-clipboard package"));
             std::fprintf(stderr, "vshot-qt-ui: cannot locate the vshot CLI for pin editing; \
                                   set VSHOT_BIN\n");
             std::fflush(stderr);
-            editingPin_ = nullptr;
+            editingPinId_ = 0;
             delete directory;
             return;
         }
@@ -1559,8 +2387,24 @@ wl-clipboard package"));
         // QProcess handle only as a watcher so we can drop the editing flag
         // when it exits; the temp dir dies right after.
         QProcess *watcher = new QProcess(this);
-        connect(watcher, &QProcess::finished, watcher, [this, watcher, directory] {
-            editingPin_ = nullptr;
+        // The id rather than the pin: a pin the user closed while the editor was
+        // open is deleted by the time this fires, and a pointer to it would be
+        // dangling.  Clearing the flag on an id that is no longer editing is
+        // harmless, and the pin being gone already cleared it.
+        const quint64 editing = pin->id;
+        connect(watcher, &QProcess::finished, watcher, [this, watcher, directory, editing] {
+            if (editingPinId_ == editing) {
+                editingPinId_ = 0;
+            }
+            // The editor has drawn its marks into the pin's pixels by now, so
+            // the surface goes back to painting the pin itself rather than the
+            // picture the marks were placed on -- and the helper back to the file
+            // that holds those pixels rather than the pristine one.  The pristine
+            // PNG has no reader left either way, whether or not this was the edit
+            // that was still open.
+            closeEditPicture(byId_.value(editing, nullptr));
+            syncAll();
+            notifyActive();
             delete directory;
             watcher->deleteLater();
         });
@@ -1568,6 +2412,13 @@ wl-clipboard package"));
         watcher->setArguments({QStringLiteral("pin"), QStringLiteral("--apply"), sessionPath});
         watcher->setStandardInputFile(QProcess::nullDevice());
         watcher->start();
+        // The editor draws the marks live from here on, so the stack under it
+        // stops drawing the pin's flattened pixels and shows the picture they
+        // were placed on instead -- for the helper as much as for the Qt surface.
+        // Done after the child is started so a failure to start it does not leave
+        // the pin showing its base with nobody drawing the marks.
+        openEditPicture(pin);
+        syncAll();
     }
 
     // What the save dialog opens with: the file the pin came from, so a re-save
@@ -1781,7 +2632,7 @@ wl-clipboard package"));
         });
         // The surface is the only place that knows whether it still holds the
         // keyboard and which pin the pointer last picked, which together decide
-        // whose rim is the live one.  An HDR pin's rim is drawn by the helper, so
+        // whose rim is the live one.  Every pin's rim is drawn by the helper, so
         // that answer has to travel.
         surface->setActiveCallback([this](quint64 id) {
             if (id == hdrActiveId_) {
@@ -1789,7 +2640,15 @@ wl-clipboard package"));
             }
             hdrActiveId_ = id;
             syncHdr();
+            // The editor's frame follows the same answer: it is Qt chrome drawn
+            // above every pin surface, so it may only be up while its own pin is
+            // the live one.
+            notifyActive();
         });
+        // A frame this surface put on the screen.  A reply the daemon is
+        // holding until the change it carries is visible -- the pin editor's
+        // handoff -- is released by these.
+        surface->setPaintedCallback([this] { framePresented(); });
         surface->setDragCallback([this](quint64 id, QPoint topLeft) {
             Pin *pin = byId_.value(id, nullptr);
             if (pin == nullptr) {
@@ -1821,6 +2680,24 @@ wl-clipboard package"));
             }
             return copied;
         });
+        // `Copy image` puts the pin's own pixels on the clipboard -- the
+        // flattened result, marks and all, which is what the screen shows and
+        // what a save writes.  The surface holds a copy of those pixels for
+        // painting, but the pin is the only place the daemon's own is kept, so
+        // the encode happens here.
+        surface->setCopyImageCallback([this](quint64 id) {
+            const Pin *pin = byId_.value(id, nullptr);
+            if (pin == nullptr || pin->image.isNull()) {
+                return false;
+            }
+            const bool copied = runWlCopyImage(pin->image);
+            if (debug_ || !copied) {
+                qWarning("pin %llu: %s its image (%dx%d)", static_cast<unsigned long long>(id),
+                         copied ? "copied" : "could not copy", pin->image.width(),
+                         pin->image.height());
+            }
+            return copied;
+        });
         // `Save as…` runs the dialog and writes the file; the surface only
         // reports the outcome, through the same badge a copy uses.
         surface->setSaveCallback([this](quint64 id) {
@@ -1837,6 +2714,12 @@ wl-clipboard package"));
             if (Pin *pin = byId_.value(id, nullptr)) {
                 startEdit(pin, true);
             }
+        });
+        // `Reset zoom` puts a pin back at the size it arrived at, whatever the
+        // wheel has done to it since; the surface reports the new factor
+        // through the same badge the wheel uses.
+        surface->setResetZoomCallback([this](quint64 id) {
+            resetZoomPin(byId_.value(id, nullptr));
         });
         if (!surface->showLayerSurface()) {
             delete surface;
@@ -1871,6 +2754,12 @@ wl-clipboard package"));
     // compositor orders the surfaces of a layer by map time and offers no
     // request to restack them, so with one surface per pin this would have to
     // be a remap — and remapping loses the keyboard focus a click just gave.
+    //
+    // A pin's own surface cannot do this while an edit is open on that pin: the
+    // editor's layer surface holds the keyboard and covers the output, so the
+    // pointer reaches the editor and never the pin surface underneath.  The
+    // editor asks instead, over the pin socket, which is what
+    // `{"cmd":"raise"}` is for.
     void bringToFront(Pin *pin)
     {
         if (pin == nullptr || pins_.isEmpty() || pins_.constLast() == pin) {
@@ -1895,8 +2784,10 @@ wl-clipboard package"));
         surface->setDragCallback({});
         surface->setZoomCallback({});
         surface->setCopyCallback({});
+        surface->setCopyImageCallback({});
         surface->setSaveCallback({});
         surface->setRecognizeCallback({});
+        surface->setResetZoomCallback({});
         QObject::disconnect(surface, nullptr, this, nullptr);
         surface->setPinnedVisible(false);
         surface->hide();
@@ -1922,16 +2813,26 @@ wl-clipboard package"));
         if (pin == nullptr) {
             return;
         }
-        if (editingPin_ == pin) {
-            editingPin_ = nullptr;
+        if (editingPinId_ == pin->id) {
+            editingPinId_ = 0;
         }
+        // The pin that was being annotated is gone, so the editor is annotating
+        // nothing the daemon knows about and must stop drawing its frame.
+        notifyActive();
+        closeEditPicture(pin);
         pins_.removeAll(pin);
         if (byId_.value(pin->id, nullptr) == pin) {
             byId_.remove(pin->id);
         }
-        // The HDR half is a file of ours; the pin going away takes it.
-        if (!pin->hdrPath.isEmpty()) {
-            QFile::remove(pin->hdrPath);
+        // The halves are files of ours; the pin going away takes every one of
+        // them -- the HDR half, the pristine one an edit would have started
+        // from, and the two PNGs the helper is handed.
+        const QStringList owned = {pin->hdrPath, pin->hdrBasePath, pin->picturePath,
+                                   pin->pictureBasePath};
+        for (const QString &path : owned) {
+            if (!path.isEmpty()) {
+                QFile::remove(path);
+            }
         }
         delete pin;
         if (pins_.isEmpty()) {
@@ -1939,7 +2840,7 @@ wl-clipboard package"));
             // daemon's own layer surfaces and have no reason to outlive the last
             // pin.
             destroySurfaces();
-            // ... and the helper is told to clear, so no HDR image survives the
+            // ... and the helper is told to clear, so no picture survives the
             // pin it belonged to.
             syncHdr();
             armIdleQuit();
@@ -1948,9 +2849,63 @@ wl-clipboard package"));
         syncAll();
     }
 
+    // The pin an open edit session is annotating while it is still the live one,
+    // 0 otherwise.  A pin is live while its surface holds the keyboard and the
+    // pointer is over it -- the same answer `hdrActiveId_` already carries for
+    // the helper's rim.
+    //
+    // 0 is not "no live pin" here so much as "no pin surface has the keyboard",
+    // which is the ordinary state of an open editor: the editor's own surface is
+    // the one holding it.  Only another pin taking the keyboard -- a click on
+    // one -- says the edit has stopped being what the user is working on.
+    quint64 liveEditingPin() const
+    {
+        if (editingPinId_ == 0) {
+            return 0;
+        }
+        return hdrActiveId_ == 0 || hdrActiveId_ == editingPinId_ ? editingPinId_ : 0;
+    }
+
+    // Tells every client that asked which pin is the live one, when the answer
+    // changes.
+    //
+    // The editor draws its frame around the image in Qt, and every other pin is
+    // painted by a Wayland surface one layer below -- the compositor orders a
+    // layer's surfaces by map time and offers no restack, so a frame drawn for a
+    // pin that is no longer live would sit on top of every other pin on the
+    // screen.
+    //
+    // Only on a change, and only to clients in the map: `syncAll` runs on every
+    // motion event of a drag, and a line per client per event would put the
+    // editor's move replies behind a growing queue of answers it has no use for.
+    void notifyActive()
+    {
+        const quint64 live = liveEditingPin();
+        const QJsonObject notice = activeNotice(live);
+        for (auto it = reportedActive_.begin(); it != reportedActive_.end(); ++it) {
+            if (it.value() == live || it.key() == nullptr) {
+                continue;
+            }
+            it.value() = live;
+            respond(it.key(), notice);
+        }
+    }
+
+    static QJsonObject activeNotice(quint64 live)
+    {
+        QJsonObject notice;
+        notice.insert(QStringLiteral("active"), static_cast<qint64>(live));
+        return notice;
+    }
+
     // Hands every surface the whole stack, in paint order: the daemon owns the
     // order, and a surface only needs to be told which entries changed.
-    void syncAll()
+    //
+    // The answer is whether the helper was actually given something new to
+    // compose, and it is what decides whether a caller may wait for the helper's
+    // verdict: a stack the helper already has is nothing for it to answer, and
+    // waiting for a reply that is never coming is a stall, not a check.
+    bool syncAll()
     {
         QVector<PinSurface::Item> items;
         items.reserve(pins_.size());
@@ -1964,24 +2919,26 @@ wl-clipboard package"));
                 if (surface->isPinnedVisible() != allVisible_) {
                     surface->setPinnedVisible(allVisible_);
                 }
-                // Only an output the helper described can show an HDR pin; on
-                // any other the surface paints the image itself.
+                // Only an output the helper described can show a helper-drawn
+                // pin; on any other this surface paints the image itself.
                 const QScreen *screen = surface->screen();
                 surface->setHdrPixels(screen != nullptr
                                       && hdr_.isHdrOutput(screen->name()));
                 surface->setPins(items);
             }
         }
-        syncHdr();
+        return syncHdr();
     }
 
-    // Hands the helper the HDR pins alone: it draws those images, in the same
-    // paint order, along with their shadows and rims, and the Qt surfaces leave
-    // their rects transparent.
-    void syncHdr()
+    // Hands the helper the whole stack: it draws every picture, every shadow
+    // and every rim, in the daemon's own paint order, and the Qt surfaces leave
+    // their rects transparent.  Answers whether it actually handed a stack over:
+    // an unchanged stack is not sent again, and only a stack the helper was
+    // handed can come back refused.
+    bool syncHdr()
     {
         if (!hdr_.mapped()) {
-            return;
+            return false;
         }
         QJsonObject style;
         style.insert(QStringLiteral("radius"), static_cast<qint64>(style_.radius));
@@ -2005,48 +2962,79 @@ wl-clipboard package"));
         }
         QJsonArray array;
         for (const Pin *pin : pins_) {
-            if (pin->hdrPath.isEmpty()) {
+            // The pin being edited is drawn from its pristine picture, so the
+            // editor's marks land over the image they were placed on rather
+            // than over the last edit's flattening of them.  Every other pin is
+            // drawn from the file that holds its current pixels -- the PQ half
+            // when the capture had one, the PNG the daemon wrote when it did
+            // not.
+            const QString &picture =
+                pin->id == editingPinId_ ? pin->editPicture() : pin->picture();
+            // A pin this side could not hand over is one the helper cannot draw,
+            // and it is left out rather than named with an empty path: an entry
+            // with no file would make the helper refuse the whole stack, and
+            // every other pin would keep the last picture it managed.  That
+            // happens when there is no helper directory to write a PNG into, and
+            // then `item.hdr` is false everywhere and the Qt surfaces paint the
+            // stack themselves.
+            if (picture.isEmpty()) {
                 continue;
             }
             QJsonObject entry;
             entry.insert(QStringLiteral("id"), static_cast<qint64>(pin->id));
-            entry.insert(QStringLiteral("path"), pin->hdrPath);
+            entry.insert(pin->hdrPath.isEmpty() ? QStringLiteral("png") : QStringLiteral("hdr"),
+                         picture);
             entry.insert(QStringLiteral("x"), pin->origin.x());
             entry.insert(QStringLiteral("y"), pin->origin.y());
             entry.insert(QStringLiteral("scale"), pin->scale);
             entry.insert(QStringLiteral("visible"), allVisible_);
-            // Which pin's rim shows as the live one, and what one whole white is
-            // worth on the output the HDR half came from: the helper draws the
-            // rim itself, in the terms its own surface is described in.
-            entry.insert(QStringLiteral("active"), pin->id == hdrActiveId_);
-            entry.insert(QStringLiteral("white"), pin->hdrWhite);
             array.append(entry);
         }
-        hdr_.sync(array, style);
+        return hdr_.sync(array, style, hdrActiveId_);
     }
 
-    // One colour as the three channels the helper reads, 0-255.
+    // One colour as the four channels the helper reads, 0-255.  The alpha is
+    // part of the colour: a rim the user set to `#00000000` has to reach the
+    // helper as a transparent one, or the HDR copy of a pin would draw a black
+    // rim where the SDR copy draws none.
     static QJsonArray rgbArray(const QColor &color)
     {
-        return QJsonArray{color.red(), color.green(), color.blue()};
+        return QJsonArray{color.red(), color.green(), color.blue(), color.alpha()};
     }
 
     // How one pinned image looks on an output. A pin may span several outputs,
     // so its global state is handed over as it is and each surface paints the
     // part that overlaps it.
-    static PinSurface::Item itemFor(const Pin &pin)
+    PinSurface::Item itemFor(const Pin &pin) const
     {
         PinSurface::Item item;
         item.id = pin.id;
-        item.image = pin.image;
+        // The pin being edited shows the picture its marks belong to, not the
+        // flattening: the editor draws every mark itself, live and editable, so
+        // a surface still painting the baked copy underneath would put a
+        // duplicate of each mark on screen -- one that does not move when the
+        // mark is dragged and does not go when it is deleted.  Every other pin
+        // shows its flattened image, which is what a pin is.
+        item.image = pin.id == editingPinId_ ? pin.editBase() : pin.image;
         item.density = pin.density;
         item.scale = pin.scale;
         item.origin = pin.origin;
         item.colorRows = pin.colorRows;
-        // Whether the surface leaves the image to the helper is its own to
-        // decide -- it depends on this output -- but whether there *is* an HDR
-        // half is the pin's.
-        item.hdr = !pin.hdrPath.isEmpty();
+        // Whether the surface leaves the picture, the shadow and the rim to the
+        // helper is its own to decide -- it depends on this output -- but whether
+        // there *is* a helper picture is the pin's.  It is not only the HDR pins:
+        // the helper's surface is below this one, so anything painted here would
+        // composite over every pin the helper draws, whatever the daemon's own
+        // order said.  On an output the helper could not take, this surface
+        // paints `image` -- already the pristine picture on a pin being edited,
+        // so its marks are never baked in twice -- and draws its own rim, and the
+        // stack is the SDR one it always was.
+        item.hdr = !pin.picture().isEmpty();
+        // The tag belongs to the capture, not to whichever surface is showing
+        // it: an HDR pin the helper could not take is still an HDR capture, and
+        // the tag is what says so -- in a muted ink, which is the visible
+        // difference between the two.
+        item.capturedHdr = !pin.hdrPath.isEmpty();
         return item;
     }
 
@@ -2058,6 +3046,28 @@ wl-clipboard package"));
             return;
         }
         const double next = std::clamp(pin->scale * factor, kMinScale, kMaxScale);
+        if (next == pin->scale) {
+            return;
+        }
+        const QRect previous(pin->origin, pin->displaySize());
+        const QPoint center = previous.center();
+        pin->scale = next;
+        const QSize resized = pin->displaySize();
+        pin->origin = clampOrigin(
+            *pin, center - QPoint(resized.width() / 2, resized.height() / 2));
+        syncAll();
+    }
+
+    // Back to the size the pin arrived at: one image pixel per logical pixel of
+    // an output with the pin's own density, which is what `addImage` set and
+    // what every wheel step since has multiplied.  Same center-keeping as a
+    // wheel step, so a pin that has been zoomed stays where the user put it.
+    void resetZoomPin(Pin *pin)
+    {
+        if (pin == nullptr) {
+            return;
+        }
+        const double next = 1.0 / std::max(1, pin->density);
         if (next == pin->scale) {
             return;
         }
@@ -2100,15 +3110,32 @@ wl-clipboard package"));
     // same style as the ones already up.
     PinSurface::Style style_;
     // The pin whose rim the helper should draw as the live one, 0 for none.
+    // The pin whose rim the helper should draw as the live one, 0 for none.
+    // Tracked here rather than inside the stack because it is what the pointer
+    // is doing: the surface that holds the keyboard is the only one that knows,
+    // and it reports every change.
     quint64 hdrActiveId_ = 0;
+    // The clients that asked to be told which pin is the live one, each with the
+    // answer it was last given.  Only the pin editor asks; keeping the last
+    // answer here is what makes a change a change, rather than a line written to
+    // every client on every sync of a drag.  Emptied with the connections it
+    // describes, on disconnect.
+    QHash<QLocalSocket *, quint64> reportedActive_;
     // The HDR half of the stack: the helper process that draws pinned HDR
     // images on surfaces of its own.  Started with the daemon, so it is always
     // under the Qt surfaces this daemon maps.
     PinHdr hdr_;
     quint64 nextId_ = 1;
-    Pin *editingPin_ = nullptr;
+    // The pin an edit session is open on, by id, or 0 for none.  An id rather
+    // than a pointer because the surfaces ask `itemFor` what to paint on every
+    // sync, and that question has to be answerable from a `const` daemon.
+    quint64 editingPinId_ = 0;
     bool allVisible_ = true;
     class QTimer *idleQuit_ = nullptr;
+    // Answers held until the frame that carries their change has been
+    // presented, and the backstop that releases them if it never is.
+    QVector<HeldReply> pendingReplies_;
+    class QTimer *frameDeadline_ = nullptr;
 };
 
 } // namespace

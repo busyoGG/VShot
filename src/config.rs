@@ -15,7 +15,25 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::model::PngCompression;
+use crate::model::{HdrDecision, PngCompression, ToneMap, ToneMapOptions};
+use crate::output::HdrFormat;
+
+/// Reads an optional number, treating a value of any other type as absent.
+///
+/// The file is one a user may edit by hand, and `serde`'s default answer to a
+/// string where a number belongs is to reject the whole document — which would
+/// take every other default in it down with the one mistyped key.  A wrong type
+/// is therefore "the file says nothing here", exactly like a missing key.
+fn de_optional_number<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .map(|number| number as f32))
+}
 
 /// The defaults a command-line flag falls back to when it is not given.
 ///
@@ -33,6 +51,29 @@ pub struct CliDefaults {
     /// `--png-compression`, one of `none` / `fastest` / `fast` / `balanced` /
     /// `high`.
     pub png_compression: Option<String>,
+    /// `--hdr-format`, one of `avif` / `hdr`: how the second file of an HDR
+    /// capture is written.
+    pub hdr_format: Option<String>,
+    /// `--tone-map`, one of `auto` / `fixed` / `normalize`: how the SDR copy of
+    /// an HDR capture is mapped down.
+    pub tone_map: Option<String>,
+    /// `--tone-map-white`, the fraction of the range SDR white lands on.
+    ///
+    /// Read through [`de_optional_number`] rather than as a plain `Option<f32>`
+    /// so that a value of the wrong type is "the file says nothing" instead of
+    /// a parse failure: `serde`'s own answer to a string where a number belongs
+    /// is to reject the document, which would silently drop every *other*
+    /// default in the file over one mistyped key.  The Qt side reads the same
+    /// key the same way (see `readFraction` in `ui/config.cpp`).
+    #[serde(default, deserialize_with = "de_optional_number")]
+    pub tone_map_white: Option<f32>,
+    /// `--hdr-area-test`: whether HDR content is judged by the share of the
+    /// capture brighter than SDR white rather than by any single pixel.
+    pub hdr_area_test: Option<bool>,
+    /// `--hdr-area-ratio`, the share that share has to reach.  Read through
+    /// [`de_optional_number`] for the same reason as `tone_map_white`.
+    #[serde(default, deserialize_with = "de_optional_number")]
+    pub hdr_area_ratio: Option<f32>,
     /// `monitor`'s output name when none is given; `current` means the output
     /// under the pointer.
     pub monitor: Option<String>,
@@ -350,6 +391,38 @@ fn parse_compression(name: &str) -> Option<PngCompression> {
     }
 }
 
+/// The HDR format the config file remembers, or `None` when it says nothing
+/// usable.  The caller keeps its own built-in default (AVIF).
+pub fn hdr_format_default() -> Option<HdrFormat> {
+    HdrFormat::parse(load().hdr_format.as_deref()?).ok()
+}
+
+/// The tone-map behaviour the config file remembers, or `None` when it says
+/// nothing usable.  The caller keeps its own built-in default (`auto`).
+pub fn tone_map_default() -> Option<ToneMap> {
+    ToneMap::parse(load().tone_map.as_deref()?)
+}
+
+/// The tone-map white level the config file remembers, already clamped to the
+/// range the map accepts, or `None` when it says nothing usable.  A value
+/// outside the range is clamped rather than dropped: it is a number the user
+/// meant, and the map has a defined answer for it.
+pub fn tone_map_white_default() -> Option<f32> {
+    load().tone_map_white.map(ToneMapOptions::clamp_white)
+}
+
+/// Whether the config file asks for the HDR area test, or `None` when it says
+/// nothing usable.  The caller keeps its own built-in default (on).
+pub fn hdr_area_test_default() -> Option<bool> {
+    load().hdr_area_test
+}
+
+/// The HDR area ratio the config file remembers, already clamped to 0..=1, or
+/// `None` when it says nothing usable.
+pub fn hdr_area_ratio_default() -> Option<f32> {
+    load().hdr_area_ratio.map(HdrDecision::clamp_ratio)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +435,80 @@ mod tests {
         // An unknown name is a typo in a hand-edited file: ignore it and let
         // the built-in default stand.
         assert!(parse_compression("slowest").is_none());
+    }
+
+    #[test]
+    fn the_tone_map_section_is_read_and_a_bad_name_is_ignored() {
+        // The two keys the settings window writes, read back the way the CLI
+        // reads them: a name the parser knows, and a level already clamped to
+        // the span the map accepts.
+        let file: ConfigFile =
+            serde_json::from_str(r#"{"cli":{"tone-map":"normalize","tone-map-white":0.72}}"#)
+                .expect("a tone-map section parses");
+        assert_eq!(file.cli.tone_map.as_deref(), Some("normalize"));
+        assert_eq!(
+            file.cli.tone_map.as_deref().and_then(ToneMap::parse),
+            Some(ToneMap::Normalize)
+        );
+        assert!(
+            (file.cli.tone_map_white.unwrap_or_default() - 0.72).abs() < 1e-6,
+            "{:?}",
+            file.cli.tone_map_white
+        );
+
+        // Absent is absent: the caller keeps its own defaults (`auto`, 0.8).
+        let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).expect("an empty cli parses");
+        assert!(bare.cli.tone_map.is_none());
+        assert!(bare.cli.tone_map_white.is_none());
+
+        // A name the parser does not know leaves the built-in default standing
+        // rather than failing the whole capture.
+        let wrong: ConfigFile = serde_json::from_str(r#"{"cli":{"tone-map":"soft-knee"}}"#)
+            .expect("an unknown name still parses as JSON");
+        assert!(ToneMap::parse(wrong.cli.tone_map.as_deref().unwrap()).is_none());
+
+        // A level outside the span is clamped rather than dropped, and one that
+        // is not a number at all falls back to the default rather than
+        // poisoning the map with a NaN.
+        for (given, expected) in [
+            ("0.2", ToneMapOptions::MIN_WHITE),
+            ("4", ToneMapOptions::MAX_WHITE),
+            ("\"high\"", ToneMapOptions::default().white),
+        ] {
+            let file: ConfigFile =
+                serde_json::from_str(&format!(r#"{{"cli":{{"tone-map-white":{given}}}}}"#))
+                    .expect("a level of any JSON type parses");
+            let clamped = file.cli.tone_map_white.map_or_else(
+                || ToneMapOptions::default().white,
+                ToneMapOptions::clamp_white,
+            );
+            assert!(
+                (clamped - expected).abs() < 1e-6,
+                "{given} became {clamped}, not {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hdr_format_section_is_read_and_a_bad_name_is_ignored() {
+        let file: ConfigFile = serde_json::from_str(r#"{"cli":{"hdr-format":"hdr"}}"#)
+            .expect("an hdr-format key parses");
+        assert_eq!(file.cli.hdr_format.as_deref(), Some("hdr"));
+        assert_eq!(
+            file.cli
+                .hdr_format
+                .as_deref()
+                .and_then(|name| HdrFormat::parse(name).ok()),
+            Some(HdrFormat::Radiance)
+        );
+        // Absent is absent: the caller keeps its own default (AVIF).
+        let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).expect("an empty cli parses");
+        assert!(bare.cli.hdr_format.is_none());
+        // A name the parser does not know leaves the built-in default standing
+        // rather than failing the whole capture.
+        let wrong: ConfigFile = serde_json::from_str(r#"{"cli":{"hdr-format":"webp"}}"#)
+            .expect("an unknown name still parses as JSON");
+        assert!(HdrFormat::parse(wrong.cli.hdr_format.as_deref().unwrap()).is_err());
     }
 
     #[test]

@@ -177,9 +177,10 @@ void checkCrampedCaptureKeepsTheButtonsStill()
         return;
     }
     // The remembered tool in the user's config can open the session on another
-    // tool, so pin Select before asserting on what Select's style row does.
-    controller.chooseTool(vshot::Tool::Select);
-    expect(!parts.style->isVisible(), "the Select tool starts with no style row");
+    // tool, so arm nothing before asserting on what an unarmed session's style
+    // row does.
+    controller.chooseTool(std::nullopt);
+    expect(!parts.style->isVisible(), "an unarmed session starts with no style row");
     const int before = globalTop(parts.command);
 
     controller.chooseTool(vshot::Tool::Rectangle);
@@ -472,17 +473,21 @@ void checkCommandBarIsTwoRows()
            QStringLiteral("%1 and %2 of them")
                .arg(inFirstRow)
                .arg(buttons.size() - inFirstRow));
-    // The twelve tools are the buttons that say which tool they select; the
+    // The drawing tools are the buttons that say which tool they select; the
     // rest are the actions.  Every one of them is in one of the two rows: the
     // history pair is in the grid in the corner and is not counted here.
+    //
+    // Eleven, not twelve: the Select tool is gone, so the ten drawing tools are
+    // joined by the eyedropper alone.
     int tools = 0;
     for (QAbstractButton *button : buttons) {
         if (!button->property("tool").toString().isEmpty()) {
             ++tools;
         }
     }
-    expect(tools == 12, "the drawing tools are among them",
+    expect(tools == 11, "the drawing tools are among them",
            QStringLiteral("%1 of them").arg(tools));
+
     auto *paste = parts.command->findChild<QToolButton *>(QStringLiteral("pasteButton"));
     expect(paste != nullptr && (first->indexOf(paste) >= 0 || second->indexOf(paste) >= 0),
            "and so are the actions that act on the capture");
@@ -568,9 +573,10 @@ void checkTheEndsArePinnedToTheRight()
     controller.beginPresetEdit();
     overlay->show();
     // The tool the user's config remembers can open the session with a style row
-    // up, which widens the card; this check measures what Select's card comes to
-    // and then what the widest style row does to it, so pin Select first.
-    controller.chooseTool(vshot::Tool::Select);
+    // up, which widens the card; this check measures what an unarmed session's
+    // card comes to and then what the widest style row does to it, so arm
+    // nothing first.
+    controller.chooseTool(std::nullopt);
     const ToolbarParts parts = toolbarParts(overlay);
     QGridLayout *grid = endsGrid(parts.command);
     expect(grid != nullptr && grid->count() == 4, "the four ends are one grid",
@@ -808,7 +814,7 @@ void checkTheEndsArePinnedToTheRight()
 //
 // The size is read from the style -- the widest label the row has to draw --
 // rather than picked by hand, so the promise worth locking down is not a number:
-// it is that the twelve tools share one box, that the actions which follow them
+// it is that the eleven tools share one box, that the actions which follow them
 // are as tall as that box, that the history pair and the two ends of the capture
 // are too, and that no button is narrower or shorter than its own size hint.
 // Undo and redo were 32x28 in a 46-tall row, which is what a floating box in the
@@ -883,7 +889,7 @@ void checkCommandBarButtonsShareOneSize()
            QStringLiteral("%1 of %2").arg(squeezed).arg(buttons.size()));
 
     // The tools are one column rather than one per row: the widest of their
-    // labels sets the width of all twelve, so a tool that lands in the lower row
+    // labels sets the width of all eleven, so a tool that lands in the lower row
     // is the same size as one in the upper and the rows read across rather than
     // stepping.  And the width it comes to is exactly the widest hint -- not
     // more: a size measured before the buttons were polished is measured in the
@@ -913,7 +919,7 @@ void checkCommandBarButtonsShareOneSize()
                              .arg(toolSize.height());
         }
     }
-    expect(toolCount == 12, "the twelve tools are on the bar",
+    expect(toolCount == 11, "the eleven tools are on the bar",
            QStringLiteral("%1 of them").arg(toolCount));
     expect(uniform == 0, "the drawing tools are all one size", toolDetail);
     expect(!toolSize.isEmpty() && toolSize.width() == widest,
@@ -1079,11 +1085,11 @@ void checkEveryToolDrawsItsOwnIcon()
             ++blank;
         }
     }
-    expect(counted == 12, "the two rows carry the twelve tools",
+    expect(counted == 11, "the two rows carry the eleven tools",
            QStringLiteral("%1 of them").arg(counted));
     // And the eyedropper is one of them, on a row of its own choosing: a tool
     // that never made it out of the list would be counted here as a hole in the
-    // twelve.
+    // eleven.
     expect(names.contains(QStringLiteral("picker")), "with the eyedropper among them");
     expect(blank == 0, "and every one of them draws an icon",
            QStringLiteral("%1 blank").arg(blank));

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 VShot contributors
 
 #include "config.hpp"
+#include "shortcuts.hpp"
 
 #include "text_size.hpp"
 
@@ -12,6 +13,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeySequence>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QStringList>
@@ -27,11 +29,11 @@ namespace {
 /// at the call sites because two readers depend on them: the loader below, and
 /// the settings window's combo boxes, which must offer exactly what the loader
 /// will accept.
-const QStringList kToolNames = {QStringLiteral("select"), QStringLiteral("rectangle"),
-                                QStringLiteral("ellipse"), QStringLiteral("arrow"),
-                                QStringLiteral("line"), QStringLiteral("wave"),
-                                QStringLiteral("bezier"), QStringLiteral("pen"),
-                                QStringLiteral("text"), QStringLiteral("mosaic")};
+const QStringList kToolNames = {QStringLiteral("rectangle"), QStringLiteral("ellipse"),
+                                QStringLiteral("arrow"), QStringLiteral("line"),
+                                QStringLiteral("wave"), QStringLiteral("bezier"),
+                                QStringLiteral("pen"), QStringLiteral("text"),
+                                QStringLiteral("mosaic")};
 const QStringList kSelectModeNames = {QStringLiteral("precise"), QStringLiteral("loose")};
 const QStringList kDashNames = {QStringLiteral("solid"), QStringLiteral("dashed"),
                                 QStringLiteral("dotted")};
@@ -41,6 +43,14 @@ const QStringList kMosaicShapeNames = {QStringLiteral("rect"), QStringLiteral("e
 const QStringList kCompressionNames = {QStringLiteral("none"), QStringLiteral("fastest"),
                                        QStringLiteral("fast"), QStringLiteral("balanced"),
                                        QStringLiteral("high")};
+// The HDR half's format.  The names are the file suffixes, which is also what
+// `--hdr-format` accepts.
+const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr")};
+// How the SDR half is mapped down from the HDR one.  The names are what
+// `--tone-map` accepts, in the order the settings window offers them: the
+// default first, then the two that read a level.
+const QStringList kToneMapNames = {QStringLiteral("auto"), QStringLiteral("fixed"),
+                                   QStringLiteral("normalize")};
 const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
 const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
@@ -48,12 +58,6 @@ const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"
 const QStringList kEncoderBackendNames = {QStringLiteral("auto"), QStringLiteral("vaapi"),
                                           QStringLiteral("vulkan"), QStringLiteral("nvenc")};
 
-constexpr int kMaxWidth = 64;
-// The text size is a pixel height, and its range comes from `ui/text_size.hpp`
-// (7 px, one glyph cell, to 448 px, the legacy scale's maximum).  It is not
-// repeated here as a literal so the two cannot drift.
-constexpr int kMaxArrowSize = 8;
-constexpr int kMaxMosaicStrength = 3;
 constexpr int kMaxDensity = 4;
 /// The frame rate `record --fps` accepts, `vshot record`'s own range.  A file
 /// that names a rate above it is read as saying nothing, the way the CLI reads
@@ -122,6 +126,27 @@ bool readFlag(const QJsonObject &object, const QString &key, bool fallback)
 {
     const QJsonValue value = object.value(key);
     return value.isBool() ? value.toBool() : fallback;
+}
+
+/// Reads a fraction, clamped into `[low, high]`; anything absent, of the wrong
+/// type, or not a number keeps `fallback`.
+///
+/// The tone-map white level is the reason it exists: it is the one setting in
+/// the `cli` section that is a real number rather than a count, and it is
+/// clamped rather than rejected because the map it feeds has a defined answer
+/// for a level out of range -- see `model::hdr::ToneMapOptions::clamp_white`.
+double readFraction(const QJsonObject &object, const QString &key, double fallback, double low,
+                    double high)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isDouble()) {
+        return fallback;
+    }
+    const double raw = value.toDouble();
+    if (!std::isfinite(raw)) {
+        return fallback;
+    }
+    return std::clamp(raw, low, high);
 }
 
 /// Reads an integer that may be negative, clamped into `[-max, max]`.
@@ -335,7 +360,9 @@ void dropRetiredEditorKeys(QJsonObject &root)
 /// still survives.  The `editor` section needs no such list: the editor always
 /// writes all of it.
 const std::pair<const char *, const char *> kOwnedCliKeys[] = {
-    {"", "png-compression"}, {"", "monitor"},
+    {"", "png-compression"}, {"", "hdr-format"}, {"", "monitor"},
+    {"", "tone-map"},        {"", "tone-map-white"},
+    {"", "hdr-area-test"},   {"", "hdr-area-ratio"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
@@ -403,8 +430,14 @@ void writeCliSection(QJsonObject &root, const QJsonObject &cli)
 EditorPreferences readEditor(const QJsonObject &editor)
 {
     EditorPreferences preferences;
-    preferences.tool =
-        readChoice(editor, QStringLiteral("tool"), preferences.tool, kToolNames);
+    // "select" is accepted as a synonym for nothing armed: it is the name the
+    // tool that went away was remembered under, and every config file written
+    // before then carries it.  Reading it as a typo would silently move the
+    // user onto the first tool in the list.
+    const QString remembered =
+        readChoice(editor, QStringLiteral("tool"), QStringLiteral("select"),
+                   QStringList(kToolNames) << QStringLiteral("select"));
+    preferences.tool = remembered == QStringLiteral("select") ? QString() : remembered;
     preferences.selectMode =
         readChoice(editor, QStringLiteral("selectMode"), preferences.selectMode,
                    kSelectModeNames);
@@ -451,6 +484,16 @@ CliPreferences readCli(const QJsonObject &cli)
     CliPreferences preferences;
     preferences.pngCompression =
         readChoice(cli, QStringLiteral("png-compression"), QString(), kCompressionNames);
+    preferences.hdrFormat =
+        readChoice(cli, QStringLiteral("hdr-format"), QString(), kHdrFormatNames);
+    preferences.toneMap = readChoice(cli, QStringLiteral("tone-map"), QString(), kToneMapNames);
+    preferences.toneMapWhite = readFraction(cli, QStringLiteral("tone-map-white"), 0.0,
+                                            kMinToneMapWhite, kMaxToneMapWhite);
+    preferences.hdrAreaTest =
+        readFlag(cli, QStringLiteral("hdr-area-test"), preferences.hdrAreaTest);
+    // Zero is a ratio here, not an absent key, so the reader has to be able to
+    // tell the two apart -- see `CliPreferences::hdrAreaRatio`.
+    preferences.hdrAreaRatio = readFraction(cli, QStringLiteral("hdr-area-ratio"), -1.0, 0.0, 1.0);
     preferences.monitor = readString(cli, QStringLiteral("monitor"), QString());
     const QJsonObject longSection = cli.value(QStringLiteral("long")).toObject();
     preferences.longInject =
@@ -562,6 +605,27 @@ QJsonObject cliJson(const CliPreferences &preferences)
     QJsonObject cli;
     if (!preferences.pngCompression.isEmpty()) {
         cli.insert(QStringLiteral("png-compression"), preferences.pngCompression);
+    }
+    if (!preferences.hdrFormat.isEmpty()) {
+        cli.insert(QStringLiteral("hdr-format"), preferences.hdrFormat);
+    }
+    if (!preferences.toneMap.isEmpty()) {
+        cli.insert(QStringLiteral("tone-map"), preferences.toneMap);
+    }
+    // A written zero is "the file says nothing": a white level of zero is not a
+    // level the map would ever use, so it cannot be a value the user meant.
+    if (preferences.toneMapWhite > 0.0) {
+        cli.insert(QStringLiteral("tone-map-white"), preferences.toneMapWhite);
+    }
+    // The area test is on when the key is absent, so only `false` is written --
+    // the same rule `record.notify` follows below.
+    if (!preferences.hdrAreaTest) {
+        cli.insert(QStringLiteral("hdr-area-test"), false);
+    }
+    // A negative ratio is "the file says nothing"; zero is the ratio that means
+    // "always HDR", so it is written like any other.
+    if (preferences.hdrAreaRatio >= 0.0) {
+        cli.insert(QStringLiteral("hdr-area-ratio"), preferences.hdrAreaRatio);
     }
     if (!preferences.monitor.isEmpty()) {
         cli.insert(QStringLiteral("monitor"), preferences.monitor);
@@ -881,6 +945,60 @@ Config loadConfig()
     return config;
 }
 
+ShortcutPreferences loadShortcutPreferences()
+{
+    ShortcutPreferences preferences;
+    // One key per action, every one of them optional: a file that says nothing
+    // leaves the built-in binding, and so does a file that names an action this
+    // build has never heard of -- which is what an older vshot's file looks
+    // like to a newer one reading it.
+    const QJsonObject shortcuts = readRoot().value(QStringLiteral("shortcuts")).toObject();
+    for (int index = 0; index < shortcutBindings().size(); ++index) {
+        const ShortcutBinding &binding = shortcutBindings().at(index);
+        const QJsonValue value = shortcuts.value(binding.id);
+        if (!value.isString()) {
+            continue;
+        }
+        preferences.setText(static_cast<ShortcutAction>(index), value.toString());
+    }
+    return preferences;
+}
+
+bool saveShortcutPreferences(const ShortcutPreferences &preferences)
+{
+    if (configFilePath().isEmpty()) {
+        return false;
+    }
+    QJsonObject root = readRoot();
+    QJsonObject shortcuts = root.value(QStringLiteral("shortcuts")).toObject();
+    const ShortcutPreferences defaults;
+    for (int index = 0; index < shortcutBindings().size(); ++index) {
+        const ShortcutBinding &binding = shortcutBindings().at(index);
+        const ShortcutAction action = static_cast<ShortcutAction>(index);
+        if (!preferences.hasKeys(action)) {
+            // Cleared: written as an empty string rather than omitted, because
+            // an absent key means "the default stands" -- and the user asked
+            // for no key at all, which is the opposite.
+            shortcuts.insert(binding.id, QString());
+            continue;
+        }
+        const QString text = preferences.textFor(action);
+        // The default is not written: an entry that spells what the built-in
+        // table already says is a promise the file keeps whether or not it is
+        // there, and a user rebinding one key should not find twenty-two lines
+        // of file they never asked for beside it.
+        if (text == defaults.textFor(action)) {
+            shortcuts.remove(binding.id);
+            continue;
+        }
+        shortcuts.insert(binding.id, text);
+    }
+    // Wholesale, like `editor`: an action the user put back to its default has
+    // to disappear from the file rather than be merged back in from it.
+    root.insert(QStringLiteral("shortcuts"), shortcuts);
+    return writeRoot(root);
+}
+
 bool saveConfig(const Config &config)
 {
     if (configFilePath().isEmpty()) {
@@ -999,6 +1117,16 @@ const QStringList &mosaicShapeNames()
 const QStringList &compressionNames()
 {
     return kCompressionNames;
+}
+
+const QStringList &hdrFormatNames()
+{
+    return kHdrFormatNames;
+}
+
+const QStringList &toneMapNames()
+{
+    return kToneMapNames;
 }
 
 const QStringList &injectNames()

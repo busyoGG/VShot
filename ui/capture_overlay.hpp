@@ -4,17 +4,21 @@
 #pragma once
 
 #include "session_protocol.hpp"
+#include "shortcuts.hpp"
 #include "text_layer.hpp"
 #include "translation_layer.hpp"
 
 #include <QByteArray>
 #include <QColor>
 #include <QElapsedTimer>
+#include <QEnterEvent>
 #include <QHash>
 #include <QImage>
 #include <QJsonDocument>
+#include <QObject>
 #include <QPointF>
 #include <QRect>
+#include <QRegion>
 #include <QString>
 #include <QVector>
 #include <QWidget>
@@ -166,6 +170,25 @@ struct Annotation {
     qreal rasterDeviceRatio() const;
 };
 
+// A numbered badge's diameter range, in logical pixels: floored at 18 so the
+// count stays legible and capped at 96 so it does not paint a billboard.  The
+// editor's own size control and the session reader both clamp to these, so a
+// badge that arrives from the daemon lands in the range the control can show.
+constexpr int kNumberMinDiameter = 18;
+constexpr int kNumberMaxDiameter = 96;
+
+// The diameter a badge's stored size means, clamped into that range.
+int numberDiameter(std::uint32_t size);
+
+// The four looks, read from the tag the wire carries.
+NumberStyle numberStyleForName(const QString &value);
+
+// Lays a badge's box out around `center` for the diameter it carries.  The box
+// is not decoration: the hit test, the drag clamp, the raster cache and the
+// bitmap the renderer is handed are all sized from it, so it is re-derived
+// wherever the diameter changes.
+void layoutNumberBox(Annotation &annotation, Point center);
+
 inline bool annotationEquals(const Annotation &first, const Annotation &second)
 {
     if (first.kind != second.kind || first.tool != second.tool || first.dash != second.dash ||
@@ -236,7 +259,11 @@ struct ToolStyle {
 };
 
 enum class Tool {
-    Select,
+    // There is no select tool.  Choosing a mark and adjusting the selection are
+    // not modes the user picks: a mark is picked by clicking it with any tool
+    // armed, and the selection is adjusted through its own border and handles,
+    // which are live whatever tool is up.  What used to be the Select tool is
+    // now the state a session is in when no drawing tool has been chosen.
     Rectangle,
     Ellipse,
     Arrow,
@@ -283,9 +310,9 @@ enum class TextOutcome {
     Failed,
 };
 
-class OverlayController final {
+class OverlayController final : public QObject {
 public:
-    explicit OverlayController(Session session);
+    explicit OverlayController(Session session, QObject *parent = nullptr);
     ~OverlayController();
 
     OverlayController(const OverlayController &) = delete;
@@ -302,6 +329,16 @@ public:
     // is the one that matters.
     QRect lastInteractiveUpdate() const;
 
+    /// The spelling of one action's binding, for a tooltip: "Ctrl+S", "Tab",
+    /// and so on.  A button that does something the keyboard also does has to
+    /// say which key that is, and the key is the user's to change.
+    QString shortcutText(ShortcutAction action) const;
+    /// `label` with the binding of `action` in parentheses after it, which is
+    /// what a toolbar button's tooltip reads.  `label` is already translated,
+    /// so the key -- which is not a word in any language -- is appended in the
+    /// form every other program spells it in.
+    QString shortcutHint(ShortcutAction action, const QString &label) const;
+
     void paint(CaptureOverlay *overlay, QPainter *painter);
     void press(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButton button,
                Qt::KeyboardModifiers modifiers);
@@ -312,7 +349,11 @@ public:
     void doubleClick(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButton button);
     void key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers);
 
-    void chooseTool(Tool tool);
+    // Arms `tool` for the next press, or disarms everything when it is empty.
+    void chooseTool(std::optional<Tool> tool);
+    // What a tool button does: arms the tool, or disarms it when that is the
+    // one already armed.
+    void toggleTool(Tool tool);
     void setCurrentColor(const QColor &color);
     void setCurrentFont(const QString &family);
     void setWidth(std::uint32_t width);
@@ -343,10 +384,13 @@ public:
     /// writes the target tool's `ToolStyle`; this is the same value kept where
     /// a caller can read it without knowing which tool that was.
     QColor pickedColor() const { return pickedColor_; }
-    /// The tool that is armed.  The eyedropper is what makes this worth reading:
-    /// it is the one tool whose press changes the armed tool by itself, handing
-    /// the session back to the tool the pick was for.
-    Tool currentTool() const { return tool_; }
+    /// The tool that is armed, or nothing while none is.  The eyedropper is
+    /// what makes this worth reading: it is the one tool whose press changes
+    /// the armed tool by itself, handing the session back to the tool the pick
+    /// was for.  An unarmed session is not a failure -- it is the state a
+    /// capture opens in, and the one a mark is picked up in -- so the empty
+    /// answer is a real one and is returned as such.
+    std::optional<Tool> currentTool() const { return tool_; }
     // The badge style the next numbered mark is placed with, and any number
     // already selected.
     void setNumberStyle(NumberStyle style);
@@ -426,6 +470,12 @@ public:
     // socket rather than drawing a second copy of the image. Call before the
     // overlay is shown.
     void setPinTarget(std::uint64_t pinId, const QString &socketPath);
+    // Pin-edit mode: where the editor may write a mark's pixels -- a pasted
+    // image is its pixels and travels as a path to a file rather than inline.
+    // Empty leaves it nowhere to put them, and the marks that need one are left
+    // out of the document rather than named by paths that will not resolve.
+    // Call before the overlay is shown.
+    void setMarkAssetDirectory(const QString &directory) { markAssetDirectory_ = directory; }
     // Enters editing state over the fixed canvas (shows the toolbar).
     void beginPinEdit();
     // The same editor, opened on the text rather than on the marks: it does
@@ -448,6 +498,30 @@ public:
     // never with a request already in flight.  A no-op unless the refresh was
     // enabled; the CLI may answer with nothing, which keeps the current list.
     void requestCandidateRefresh();
+    // Let the keyboard's cursor walk move the real pointer through the CLI.
+    // The walk itself is the editor's; the pointer the compositor draws is the
+    // CLI's to move, because only it holds an injection backend.  Call once,
+    // from the helper's startup, for a session that has a CLI behind it.
+    void enablePointerWarp();
+    // The editor has drawn everything it is going to draw and asks to be let
+    // go.  It writes the session's result and rendered pixels, asks the CLI to
+    // put them where they belong, and keeps its surface up -- showing the same
+    // picture -- until the CLI answers, so the caller's own copy of it is on
+    // the screen before this one goes and the user never sees the two blink
+    // past each other.
+    //
+    // Always ends the session -- on the CLI's answer, on a lost connection, or
+    // on a backstop -- so the process cannot outlive the request.  Called from
+    // `terminal` for a session that rendered a capture; a helper run by hand
+    // has no CLI to ask and quits outright.
+    void beginHandoff();
+    // Whether this session rendered a capture of its own that the caller has
+    // not been told about yet; see `beginHandoff`.
+    bool rendersCapture() const;
+    // Whether `beginHandoff` has already written the session's result and
+    // rendered pixels.  The caller then has nothing left to write: the pixels
+    // travel once, and a second `resultDocument` would send them again.
+    bool resultSent() const { return resultSent_; }
     bool hasValidSelection() const;
     // Whether the scrolling-capture action would do anything: the session
     // offers it, the selection is big enough, and it sits inside a single
@@ -467,9 +541,93 @@ public:
     // started.  Lets the offline check prove each segment is drawn once rather
     // than recomputed on every paint.
     int liveStrokeBakes() const;
-    QJsonDocument resultDocument(const QString &bitmapDirectory = QString(), QString *error = nullptr) const;
+    QJsonDocument resultDocument(QString *error = nullptr) const;
+    // The marks painted onto the session's own pixels, at the pixel size the
+    // result should be.  Qt is the only renderer: the CLI takes this image
+    // instead of rasterizing the marks a second time, which is what used to
+    // leave a committed mark half a pixel away from the preview.
+    //
+    // `pixels` is the capture the marks were placed on, already cropped to the
+    // selection, in the output's device pixels; `density` is its device pixels
+    // per logical pixel, which is what the marks were measured against.
+    // Draws the committed marks.  `canvas` is what they are painted onto and
+    // `source` is what a sampling mark reads: the two are the same image for
+    // the flattened result, and differ for the marks alone, which is painted
+    // onto transparency but must still pixelate the capture underneath it.
+    //
+    // `origin` is the global logical rect the crop was taken from and `density`
+    // the capture's device pixels per logical pixel, which is what the marks
+    // were measured against; together they are what maps a mark's own
+    // coordinates onto the crop.
+    QImage compositeAnnotations(const QImage &canvas, const QImage &source,
+                                const LogicalRect &origin, double density,
+                                QString *error = nullptr) const;
+    // The same thing for the session's own selection, as the two images the CLI
+    // needs.  `composite` is the capture with the marks drawn on it, which is
+    // the SDR result verbatim; `marks` is the marks alone on transparency, which
+    // is what composites onto the HDR half -- the flattened image would replace
+    // it rather than mark it, since it is opaque everywhere.
+    //
+    // False when there is nothing to render, which is not an error -- a
+    // cancelled session, or a route that never had a selection.
+    bool produceComposite(QImage *composite, QImage *marks, QString *error = nullptr) const;
+    // The marks as data, in the shape a session can hand straight back, so a
+    // daemon that keeps them can reopen this image for editing rather than only
+    // showing the flattened result.  The coordinates are relative to the
+    // selection, which is the canvas a re-edit hands back; an empty array when
+    // nothing is framed.  The pixels a label was rasterized into are left out:
+    // they are derived from the mark, not part of it, and a daemon holding only
+    // the marks can rebuild them.
+    //
+    // A pasted image and a placed translation are carried by their pixels and
+    // have no other form, so those are written out beside the session and named
+    // by path -- see `writeMarkAssets`.  A path rather than inline data because
+    // a pasted screenshot is megabytes, and this document travels in a
+    // newline-delimited JSON message to the daemon.
+    QJsonArray marksDocument() const;
+    // Writes the pixels of every mark that has any into `directory`, and returns
+    // the document naming them.  Separate from `marksDocument` because the
+    // document is also wanted where there is nowhere to write -- a check, a
+    // caller that only wants the geometry -- and there the marks without a
+    // carrier are simply left out, which is what this did for all of them
+    // before.  The bytes written are the mark's *original* pixels, not the copy
+    // scaled to fit the canvas: the scale is a placement, and a mark resized
+    // later has to go back to the source rather than to a copy of a copy.
+    QJsonArray writeMarkAssets(const QString &directory) const;
+
+    // The inverse: the marks a session carried, placed on `canvas` so they can
+    // be edited again.  A mark that cannot be rebuilt -- an unknown tool, a
+    // missing field, a rectangle off the canvas -- fails the whole session
+    // rather than being skipped, because an editor that opened with some of the
+    // user's marks silently missing is worse than one that says so.
+    bool parseMarks(const QJsonArray &marks, const LogicalRect &canvas,
+                    std::uint32_t deviceRatio, QString *error);
 
     void setTerminalCallback(std::function<void()> callback);
+
+    // The one pass behind `marksDocument` and `writeMarkAssets`: an asset is
+    // written for each mark that has pixels, but only when there is a directory
+    // to write into.  An empty `directory` is "document only", and a mark with no
+    // other form is then left out of it.
+    QJsonArray marksDocumentInto(const QString &directory) const;
+    // One mark's pixels into `directory`, named from `*counter`, or an empty
+    // string when there is nowhere to put them or nothing to write.
+    QString writeMarkAsset(const QString &directory, const Annotation &annotation,
+                           int *counter) const;
+
+    // Whether the magnifier in front of the user is the colour picker's, and
+    // whether any magnifier is up at all.  The two are a distinction the offline
+    // checks have to make and cannot read off the pixels: the picker's loupe and
+    // the drag loupe are the same widget drawn the same way, and the difference
+    // is only whether the pill under it says a colour or a coordinate.
+    bool colorPickerVisible() const;
+    bool magnifierVisible() const;
+    // The name of the tool a press would draw with, or an empty string when
+    // nothing is armed.  The same answer the style row reads, exposed because
+    // whether a session opens armed is a decision the offline checks have to
+    // make and cannot see in the pixels: an unarmed press re-frames and an
+    // armed one inks, and which happened is only visible in the marks.
+    QString armedToolName() const { return styleTargetTool(); }
 
 private:
     class FloatingToolbar;
@@ -539,6 +697,14 @@ private:
     QElapsedTimer candidateClock_;
     bool candidateRefreshEnabled_ = false;
     bool candidateRefreshPending_ = false;
+    /// Whether the CLI on the other end of this pipe moves the real pointer.
+    /// The keyboard walks a cursor of its own, and the pointer the compositor
+    /// draws is not it -- so the walk asks for a warp, and this says whether
+    /// there is anyone to ask.  Read from the session, which knows the output
+    /// geometry the request has to be expressed in; false for a helper driven
+    /// by hand or by a check, which is what keeps those from writing into a
+    /// pipe nobody is reading.
+    bool pointerWarpEnabled_ = false;
     QVector<QVector<Annotation>> undoStack_;
     QVector<QVector<Annotation>> redoStack_;
     std::optional<Annotation> cancelledText_;
@@ -555,13 +721,72 @@ private:
     std::uint32_t textEditPixels_ = 0;
     Point pointer_;
     int pointerOutput_ = -1;
-    Tool tool_ = Tool::Select;
+    // The tool the next press will draw with, or nothing while none is armed.
+    // An unarmed session is the state the old Select tool used to be: a press
+    // adjusts the selection and the marks rather than drawing a new one, and
+    // that is where a region capture starts -- its first step is framing, not
+    // inking.
+    std::optional<Tool> tool_;
     // The eyedropper's own state: the tool a pick will hand its colour to --
     // the one that was armed when the picker was chosen -- and the colour the
     // last pick took.  The colour itself is written into that tool's
     // `ToolStyle`, which is what a painter reads; this copy is for readouts.
+    //
+    // The target is the tool that was armed, and with no tool armed there is
+    // none to hand a colour to: a pick from that state goes to the pen, whose
+    // colour is the session's own ink -- the same fallback the old Select tool
+    // had, which is what an unarmed session is now.
     Tool pickerReturnTool_ = Tool::Pen;
     QColor pickedColor_;
+
+    // The right button held: the magnifier is up for as long as it is, and the
+    // pixel it shows can be copied (C) or taken as the current colour (A).
+    //
+    // Only the right button puts the colour picker in the magnifier: it is the
+    // button the user presses *because* they are aiming at a pixel, while the
+    // loupe a drag brings up is a coordinate readout for placing a mark, and a
+    // colour pill under it would be answering a question nobody asked.
+    bool magnifierHeld_ = false;
+    // Where the pointer was on the last motion, for the magnifier the right
+    // button holds: its own rect has to be invalidated on the way out as well
+    // as the one it is moving to, or a picker dragged across the screen leaves
+    // a trail of loupes behind it.
+    Point lastMagnifierPointer_{};
+    // The magnifier shown for a moment after the cursor was moved with the
+    // keyboard, with the timer that ends it.  A keypress is a deliberate act,
+    // and the pointer has not moved for it, so the user has nothing to aim
+    // with unless the magnifier says where the cursor went.
+    bool magnifierTyped_ = false;
+    QTimer *magnifierTimer_ = nullptr;
+    // Where the keyboard last put the cursor, in global logical pixels, or
+    // nothing while the pointer is the one in charge.  The arrow keys and WASD
+    // move it; any real pointer motion takes it over again.
+    std::optional<Point> keyboardCursor_;
+    /// When the last pointer-warp request went out, for the throttle in
+    /// `requestPointerWarp`.  Invalid until the first one.
+    QElapsedTimer pointerWarpClock_;
+    /// The newest position the throttle held back, sent when its timer fires.
+    /// Only the newest: the request carries an absolute position, so an older
+    /// one has nowhere to land that the newer one does not overwrite.
+    std::optional<Point> pointerWarpPending_;
+    /// The position the last warp asked for, and the clock that says how long
+    /// ago: together they identify the motion the compositor reports back, so a
+    /// step of a keyboard walk is not read as the user moving the mouse.  See
+    /// `isPointerWarpEcho`.
+    std::optional<Point> pointerWarpTarget_;
+    /// Parentless and deleted with the controller's other timers, like the
+    /// magnifier flash's.
+    QTimer *pointerWarpTimer_ = nullptr;
+    // The mark the pick-up modifier is holding the pointer over, or -1.  See
+    // `markUnderPointer`.
+    int markHovered_ = -1;
+    // The modifiers the last pointer event carried.  A move handler has them in
+    // hand; the painter, which runs from `paintEvent` with nothing but the
+    // widget, does not, and the hover frame it draws depends on whether the
+    // pick-up modifier is held.  There is no query for the live state that does
+    // not go through the window system, and the overlay is a layer surface with
+    // no focus of its own.
+    int lastModifiers_ = 0;
     QString currentFont_;
     // Per-tool colour and numeric parameters, keyed by `toolName`.  A painter
     // path reads the tool it is drawing with; the style row reads and writes
@@ -590,6 +815,13 @@ private:
     bool toolbarAnchorValid_ = false;
     // Selected annotation adjustment (move/resize under the Select tool).
     int selectedAnnotation_ = -1;
+    /// The mark list as it was before the run of keyboard nudges in progress,
+    /// so the whole run is one undo step.  Cleared by anything else that edits
+    /// or reselects.
+    std::optional<QVector<Annotation>> nudgeBase_;
+    /// Ctrl+A: every mark is picked up at once.  The style row and the delete
+    /// key then reach all of them, and any other selection clears it.
+    bool allSelected_ = false;
     /// `editor.selectMode == "loose"`: a press that is not on a handle or
     /// another mark is held back until it moves, and then moves the selected
     /// mark from wherever it started.  The point is the one the button went
@@ -616,12 +848,20 @@ private:
     QRect lastTouchLocal_;
     bool editing_ = false;
     bool pinEdit_ = false;
+    // Where a mark's pixels are written when the session gives somewhere to put
+    // them.  Empty means the document carries no mark that has no other form.
+    QString markAssetDirectory_;
     // Set by the Pin button and reported in the result document.
     bool pinResult_ = false;
     /// `region-only`: a finished drag ends the session with the rectangle
     /// instead of opening the editor.  Scrolling capture asks for this, since
     /// the pixels it will annotate do not exist until the stitch is done.
     bool selectOnly_ = false;
+    /// The keyboard bindings, read out of the config file once at start-up.
+    /// Every key the editor acts on is looked up here rather than compared
+    /// against a hard-coded `Qt::Key_`, so a binding the user has changed is
+    /// the one the editor honours.
+    ShortcutPreferences shortcuts_;
     bool finished_ = false;
     bool cancelled_ = false;
     std::function<void()> terminalCallback_;
@@ -635,16 +875,86 @@ private:
     // veil again.  `baseCompositeKey_` says when it has to be rebuilt.
     QImage baseComposite_;
     QByteArray baseCompositeKey_;
-    // Live pin window the editor drives in pin-edit mode. The daemon answers
-    // exactly one request per connection and then closes, so each move gets a
-    // fresh socket instead of a reconnected one.
+    // The magnifier's own view of the picture: the frozen frame with a band
+    // round it and the committed marks painted in, so the loupe reads what the
+    // user has actually made rather than the bare capture.  Kept apart from
+    // `baseComposite_`, which is the frame plus the veil and deliberately has
+    // no marks on it.  Rebuilt when the marks change, when the frame changes
+    // and when the pin's image is moved under them -- `loupeCompositeKey_`
+    // says which.
+    QImage loupeComposite_;
+    QByteArray loupeCompositeKey_;
+    int loupeCompositeOutput_ = -1;
+    // Live pin window the editor drives in pin-edit mode.  One connection
+    // serves the whole drag: opening a socket costs a connect, a server accept
+    // and a fresh object on both sides, and paying that per motion event was
+    // most of the drag's latency.  The protocol is newline-delimited, so a move
+    // is just a line on the connection the first one opened.
     std::uint64_t pinId_ = 0;
     QString pinSocketPath_;
+    // Whether the pin being edited is still the daemon's live one.  True at the
+    // open, where the editor has just brought it to the front, and set from
+    // `notePinActive` afterwards.  It gates the image's frame and nothing else:
+    // the marks, the input region and the drag all carry on either way, because
+    // the edit itself has not ended.
+    bool pinActive_ = true;
     QLocalSocket *pinSocket_ = nullptr;
     QByteArray pinReplyBuffer_;
-    // Moves are coalesced: while one request is in flight the newest position
-    // waits here, since a drag produces far more motion than the daemon needs.
+    // Positions waiting for a free slot and the number already written but not
+    // yet answered.  A few may be in flight at once -- the position is absolute
+    // and the newest wins, so a small queue only keeps the daemon busy instead
+    // of letting it idle between replies -- but bounded, so a stalled daemon
+    // cannot grow it without end.
     std::optional<Point> pendingPinOrigin_;
+    int pinMovesInFlight_ = 0;
+    // A raise asked for while the socket was down, sent as soon as it is up.
+    // The editor connects before the first drag now, so this is only ever the
+    // race between a press and the connect, but a dropped connection puts it
+    // back in play.
+    bool pinRaisePending_ = false;
+    // A pin-edit session's handoff: the wait between asking the CLI to be let
+    // go and being told the pin's own frame is on the screen.  The editor has
+    // stopped being useful but keeps drawing until then, so the pin's frame and
+    // the editor's copy of it overlap and the marks do not blink out between
+    // the two.  `handoffReader_` watches the CLI's answer on stdin;
+    // `handoffTimer_` is the backstop for a CLI that never answers at all,
+    // which is a hang rather than a gap.
+    QSocketNotifier *handoffReader_ = nullptr;
+    QTimer *handoffTimer_ = nullptr;
+    QElapsedTimer handoffClock_;
+    bool resultSent_ = false;
+    // Set from VSHOT_PIN_DEBUG: traces the drag's round trip to stderr.
+    bool pinDebug_ = false;
+    QElapsedTimer pinMoveClock_;
+    // Pin-edit: the coalescing timer behind `applyPinEditInputMask`.  The mask
+    // is a round trip to the compositor, and a drag would otherwise issue one
+    // per motion event.
+    QTimer *inputMaskTimer_ = nullptr;
+    // The position the marks are anchored to in pin-edit mode: the last
+    // confirmed reply from the daemon, not the optimistic cursor position.  The
+    // FP16 helper surface shows the image at this same position, so clipping
+    // marks to it keeps them in sync with the image rather than ahead of it.
+    std::optional<LogicalRect> marksOrigin_;
+    // Pin-edit mode: whether a point is on the pinned image itself, or on the
+    // band its own border occupies just outside it. The border is drawn by the
+    // daemon, centred on the image's edge, so half of it stands outside the
+    // image; both bands move the pin, but only the image takes ink. `inside`
+    // reports the image and `border` the band around it, and both are false
+    // everywhere else on the canvas.
+    bool insidePinImage(Point point) const;
+    bool onPinBorder(Point point) const;
+    // The band the pin's border occupies: the image grown by half the border's
+    // width. Zero-sized when the session named no border.
+    LogicalRect pinBorderBand() const;
+    // Pin-edit only: cuts the surface's input region down to the chrome the
+    // editor actually owns -- the pinned image, its border, the toolbar and
+    // anything open over them.  The surface covers the whole output so the
+    // toolbar has somewhere to sit, and without this every click on the rest of
+    // the screen would land on the editor instead of on the desktop behind it.
+    // A no-op outside pin-edit mode, where the surface is the capture itself
+    // and owning the whole output is the point.
+    void applyPinEditInputMask();
+    void scheduleInputMask();
 
     Point globalPoint(CaptureOverlay *overlay, const QPointF &local) const;
     Point unclampedGlobalPoint(CaptureOverlay *overlay, const QPointF &local) const;
@@ -656,10 +966,27 @@ private:
     void translateAnnotations(std::int32_t dx, std::int32_t dy);
     void applySelectionMove(LogicalRect origin, Point anchor, Point current);
     void requestPinMove(Point globalTopLeft);
+    // Asks the daemon to put the pin being edited back on top of the stack.  A
+    // click that would normally raise a pin cannot reach its surface while an
+    // edit is open -- the editor's layer surface covers the output -- so a press
+    // on the image asks on the user's behalf.
+    void requestPinRaise();
     void flushPinMove();
+    void openPinSocket();
+    void dropPinSocket();
+    void readPinReplies();
     void applyPinReply(QByteArray line);
-    void consumePinReply(QLocalSocket *socket);
     void applyPinRect(const LogicalRect &rect);
+    // The daemon's answer to "which pin is the live one", which decides whether
+    // the frame is drawn around the image being annotated.  The frame is Qt
+    // chrome and every other pin is painted by a Wayland surface one layer
+    // below, and the compositor orders a layer's surfaces by map time with no
+    // restack -- so a frame left up for a pin the user has moved on from would
+    // be drawn on top of every other pin on the screen.
+    void notePinActive(std::uint64_t pinId);
+    // Repaints exactly the overlays' part of `region` (global logical pixels),
+    // without touching the "last touch" bookkeeping a gesture's steps share.
+    void invalidateLogicalRegion(const LogicalRect &region);
     Point clampPoint(Point point) const;
     int candidateIndexAt(Point point) const;
     QString candidatePillText() const;
@@ -671,13 +998,22 @@ private:
     void readCandidateReplies();
     LogicalRect selectionBetween(Point first, Point second) const;
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;
-    LogicalRect resizeSelection(LogicalRect origin, int handle, Point current) const;
+    // Alt (`preserveAspect`) keeps the box's own width-to-height ratio while a
+    // handle drags it: the corner the handle is not on stays put and the other
+    // follows the pointer along the box's diagonal.
+    LogicalRect resizeSelection(LogicalRect origin, int handle, Point current,
+                                bool preserveAspect = false) const;
     int hitHandle(Point point) const;
-    // What a press on the Select tool does when it is not aimed at an
-    // annotation: resize the selection by its handle, move it from inside, or
-    // start a new one.  Shared with the loose drag's click path, which has to
-    // reach the same selection logic once it has let go of the mark.
-    void beginSelectionGesture(Point point);
+    // What a press on the bare canvas does: resize the selection by its handle,
+    // or start a new one.  The body of the selection is not a target -- dragging
+    // it is `beginSelectionMove`, which only the middle button reaches.  Shared
+    // with the loose drag's click path, which has to reach the same selection
+    // logic once it has let go of the mark.
+    void beginSelectionGesture(Point point, bool preserveAspect = false);
+    // Middle-drag: the selection is dragged whole, from wherever the press
+    // landed inside it.  The pin editor reaches it through the same call: a
+    // pin's image is moved, not resized, so its whole area is this target.
+    void beginSelectionMove(Point point);
     void startSelection(Point point);
     void updateSelection(Point point);
     void finishSelection(Point point);
@@ -708,7 +1044,43 @@ private:
     void finishText(bool accept);
     int annotationHitAt(Point point) const;
     int annotationHandleAt(Point point) const;
-    void beginAnnotationDrag(Point point, bool resize);
+    // The mark the pick-up modifier has put under the pointer, or -1.  This is
+    // what the *hover* frame is drawn around: holding the modifier is the user
+    // asking "what is under here?", and a mark that answers the press with a
+    // drag has to say so before the press -- the pointer's shape alone is not
+    // enough, because the shape says a drag is possible, not *which* mark.
+    // Remembered rather than recomputed so the frame can be erased again: the
+    // pointer's last position is not the same as the mark's rect.
+    int markUnderPointer() const;
+    // Repaints the hover frame where it has just moved, and nothing where it has
+    // not: the mark the pointer is over changes on a motion, and the modifier
+    // that decides whether there *is* one changes on a key.  Both call this.
+    void refreshMarkHover();
+    // One JSON request to the CLI, written to the pipe the session arrived on.
+    // False when it could not be written whole.
+    bool writeCliRequest(const QByteArray &request);
+    // Asks the CLI to put the real pointer at `point`, in global logical
+    // pixels.  See the definition for why this is not something the editor can
+    // do itself.
+    void requestPointerWarp(Point point);
+    // Whether a motion event at `point` is the compositor reporting the warp
+    // VShot asked for rather than the user moving the mouse.  Such a motion
+    // must not take the keyboard cursor back or end the magnifier flash, or a
+    // walk's own echo would blink the loupe on every step.
+    bool isPointerWarpEcho(Point point) const;
+    // Which way the selected mark's own border can be stretched at `point`, in
+    // the same handle numbering as `annotationHandleAt` but with the whole edge
+    // answering rather than only the eight handles.  0 where the pointer is not
+    // on the border at all.  Used for the pointer's shape.
+    int annotationBorderAt(Point point) const;
+    // The same question about a named mark rather than the selected one, which
+    // is what a *press* needs: it lands on a mark before that mark is selected,
+    // so a rim has to be recognisable on a mark that has no handles on screen.
+    // That is what makes a mark draggable by its border with a tool armed --
+    // there are no handles to aim at until it is picked up, and the border is
+    // the one part of it that cannot be read as "start a stroke here".
+    int annotationBorderOf(int index, Point point) const;
+    void beginAnnotationDrag(Point point, bool resize, bool preserveAspect = false);
     void updateAnnotationDrag(Point point);
     void finishAnnotationDrag(CaptureOverlay *overlay, Point point);
     Annotation translatedAnnotation(const Annotation &original, int dx, int dy) const;
@@ -748,6 +1120,10 @@ private:
     // The magnifier the editor draws around the pointer while a gesture drags
     // something, in session coordinates.
     LogicalRect pointerTouch() const;
+    // The same, around a point that is not the current pointer: the magnifier
+    // the right button holds follows the pointer, so a move has to name the
+    // rect the loupe has just left as well as the one it is about to cover.
+    LogicalRect pointerTouchAt(Point point) const;
     // True for the tools whose preview builds up through the incremental raster
     // rather than being redrawn whole from the anchor every step.
     bool drawsGrowingStroke() const;
@@ -776,6 +1152,76 @@ private:
     bool acceptTranslation(QString *error);
     void mutateAnnotations(QVector<Annotation> next);
     void drawLoupe(CaptureOverlay *overlay, QPainter *painter);
+    // The capture with the marks already on it, as the magnifier reads it: the
+    // frozen frame, a band of `kLoupeCompositeMargin` device pixels round it,
+    // and every committed mark painted in.  Returns null where there is
+    // nothing to read.
+    //
+    // It is a separate image from the frame on purpose.  The frame is the
+    // capture's own pixels and is what the marks are drawn *over* -- the result
+    // is composited from it, the mosaic samples it, and the pin's HDR half is
+    // built from it -- so painting marks into it would put them in the saved
+    // picture twice.  Rebuilt only when the marks, the frame or the frame's
+    // place have changed; see `loupeCompositeKey`.
+    const QImage *loupeFrame(const OutputSession &output);
+    // Everything the composite depends on.  A change to any of it is what
+    // makes the next magnifier paint rebuild rather than reuse the pixels.
+    QByteArray loupeCompositeKey(const OutputSession &output) const;
+    // Throws the composite away: the marks are about to change, or the frame
+    // has moved, so what is cached no longer describes the screen.
+    void invalidateLoupeComposite();
+    // The colour readout that hangs off the loupe: the pixel's code, on a
+    // ground of that pixel's own colour.  Drawn as its own pill rather than
+    // folded into the loupe's, because the two say different things -- one
+    // where the cursor is, one what is under it -- and a hint line under a
+    // swatch is unreadable on a swatch that happens to match it.
+    void drawColorPill(CaptureOverlay *overlay, QPainter *painter, const QPointF &anchor,
+                       const QColor &color);
+    // Puts the magnifier up for its moment after a keyboard move, restarting
+    // the countdown if it was already up.
+    void flashMagnifier();
+    void endMagnifierFlash();
+    // The image pixel under the cursor, as the magnifier reads it, or an
+    // invalid colour where there is no image under it.  `pixelIndex` receives
+    // the source pixel's coordinates, which is what the loupe's own pill shows.
+    QColor pixelUnderCursor(int *pixelIndexX, int *pixelIndexY) const;
+    // The frozen frame of an output, or null where it has none to read.
+    const QImage *outputFrame(const OutputSession &output) const;
+    // C copies the colour code, A takes it as the current tool's colour.  Both
+    // are bound while the magnifier is up and swallowed otherwise.
+    void copyColorUnderCursor();
+    void adoptColorUnderCursor();
+    // Walks the cursor by `dx`/`dy` logical pixels with the keyboard, which is
+    // how a start point is picked without the mouse: the magnifier comes up so
+    // the user can see where it landed.
+    void moveCursorBy(int dx, int dy);
+    // Walks the *stroke in progress* by `dx`/`dy` logical pixels, for the tools
+    // whose press picks a start and whose release picks an end: the button is
+    // held for the whole of it, so the keyboard is the only way to place the far
+    // end exactly.  The anchor the press set does not move.
+    void walkLiveGesture(int dx, int dy);
+    // The cursor the keyboard moves: where the last keyboard step left it, or
+    // where the pointer was if the keyboard has not been used yet.
+    Point cursorPoint() const;
+    // Moves the selected mark by `dx`/`dy` logical pixels.  A run of these is
+    // one undo step, so holding a key down does not bury the user's last edit.
+    void nudgeSelectedAnnotation(int dx, int dy);
+    // Moves the cursor to the next or previous mark, so the keyboard alone can
+    // walk the marks and the arrows can then nudge the one it stopped on.
+    void cycleAnnotationFocus(int step);
+    // Whether `modifiers` puts the editor in its selection state: what is on
+    // the screen is the target, and the armed tool waits.
+    //
+    // Shift is the modifier that answers to it: it is the state the removed
+    // Select tool left behind, and holding it must not change which tool is
+    // armed, so letting it go puts the user back exactly where they were.
+    bool pickingMarks(int modifiers) const;
+    // Ctrl+A: every mark is picked up at once, for a style change or a delete
+    // that reaches all of them.
+    void selectAllAnnotations();
+    // Ctrl+S: the capture with its marks on it goes to the clipboard as an
+    // image, through the same composite the Copy button would have made.
+    void copyToClipboard();
     // Draws the in-progress freehand stroke from a raster that only grows by the
     // points appended since the last paint.
     void paintLiveStroke(QPainter *painter, const OutputSession &output, const QSize &size,
@@ -792,10 +1238,31 @@ public:
     int outputIndex() const;
     const OutputSession &output() const;
     QPointF localFromGlobal(Point point) const;
+    // Restricts which parts of this surface take pointer input.  Wayland has no
+    // empty-region request -- Qt sends nothing for an empty mask, which the
+    // compositor reads as "the whole surface is interactive" -- so an empty
+    // region is turned into one parked outside the surface, which is the same
+    // click-through the pin daemon's own surfaces use.
+    void setInputMask(const QRegion &mask);
     bool showLayerSurface();
     // Floating layer surface carved to a specific global logical rect
     // (top-left anchored + margins): used by the pin editor.
     bool showLayerSurfaceAt(int globalX, int globalY, int width, int height);
+
+    // Called when the controller that drove this overlay is destroyed.  The
+    // overlay outlives it -- the caller owns the widget and deletes it -- and a
+    // window left painting through a dead controller is a crash waiting for the
+    // next turn of the event loop.
+    void detachController();
+
+    // Whether the magnifier in front of the user is the colour picker's, and
+    // whether any magnifier is up at all.  Public because the two are a
+    // distinction the offline checks have to make and cannot see from the
+    // pixels alone: the picker's loupe and the drag loupe are the same widget
+    // drawn the same way, and the only difference is whether the pill under it
+    // says a colour or a coordinate.
+    bool colorPickerVisible() const;
+    bool magnifierVisible() const;
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -805,13 +1272,38 @@ protected:
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
+    void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
 
 private:
+    // Takes the keyboard while the pointer is over the surface and gives it back
+    // when the pointer leaves.  The surface asks for exclusive interactivity --
+    // it is a full-output editor and every key belongs to it while the user is
+    // working in it -- but exclusive interactivity is not scoped to focus: the
+    // compositor routes every key to a mapped surface that holds it, so an
+    // editor left holding it swallows the keyboard of whatever the user switches
+    // to.  Following the pointer is what scopes it: on the surface the user is
+    // typing into the editor, off it they are typing into their own window.
+    //
+    // The same pair `PinSurface` uses, and for the same reason.
+    void wantKeyboard();
+    void offerKeyboardBack();
+
     int outputIndex_;
     OverlayController *controller_;
     QScreen *screen_;
     QWindow *layerWindow_ = nullptr;
+    // Whether this surface is the one currently holding the keyboard, so a
+    // repeated enter or leave does not re-send an interactivity the compositor
+    // already has.  It starts true because both layer surfaces are created with
+    // exclusive interactivity and `setActivateOnShow`: the surface has the
+    // keyboard from the moment it is shown, and a flag that started false would
+    // make the first leave a no-op -- the one leave that most needs to give it
+    // back.
+    bool keyboardWanted_ = true;
+    // The input region last handed to the window, so an unchanged one is not
+    // re-sent to the compositor on every frame of a pin drag.
+    QRegion inputMask_;
 };
 
 } // namespace vshot

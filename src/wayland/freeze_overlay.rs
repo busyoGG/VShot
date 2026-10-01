@@ -1216,7 +1216,10 @@ fn render_annotations(
                         pipeline = pipeline.ellipse_stroke(rect, color, width, dash);
                     }
                     EditorTool::Mosaic | EditorTool::Blur => {
-                        let block = crate::edit::mosaic_block_size(strength, scale);
+                        let block = crate::edit::mosaic_block_size(
+                            strength,
+                            crate::edit::Scale::whole(scale),
+                        );
                         pipeline = match mask {
                             crate::edit::ShapeMask::Rect => pipeline.mosaic(rect, block),
                             crate::edit::ShapeMask::Ellipse => pipeline.mosaic_ellipse(rect, block),

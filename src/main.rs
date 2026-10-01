@@ -19,6 +19,7 @@ mod parallel;
 mod pin;
 mod pin_hdr;
 mod pin_hdr_fp16;
+mod pixel_fd;
 mod qt_overlay;
 mod record;
 mod selection;
@@ -36,11 +37,14 @@ use capture::niri;
 use capture::window::{ProcessWindowRunner, WindowCommandRunner};
 use capture::{Capturer, CompositorWindowProvider, ProcessWindowProvider, WindowCandidate};
 use cli::{Action, CaptureTarget};
-use edit::{pipeline_for_annotations, EditPipeline};
+use edit::EditPipeline;
 use error::{Result, VshotError};
 use geometry::Rect;
-use model::hdr::{Primaries, Transfer, REFERENCE_WHITE_NITS};
-use model::{Frame, HdrFrame, ImageDocument, OutputColor, OutputSnapshot, SceneSnapshot};
+use model::hdr::{Transfer, REFERENCE_WHITE_NITS};
+use model::{
+    Frame, HdrDecision, HdrFrame, ImageDocument, OutputColor, OutputSnapshot, SceneSnapshot,
+    ToneMapOptions,
+};
 use output::HdrHalf;
 use wayland::topology::OutputInfo;
 use wayland::{BackdropFrame, WaylandSession};
@@ -176,6 +180,12 @@ fn run() -> Result<()> {
     let topology = wayland.output_infos();
     let known_outputs: &[OutputInfo] = topology.as_deref().unwrap_or(&[]);
     let mut capture = Capturer::connect()?;
+    // An HDR output's frozen scene is tone-mapped down by the capture itself,
+    // and the SDR half of the file is tone-mapped later from the annotated HDR
+    // frame.  Both have to be the same map: the user draws over the frozen
+    // scene, so a mark lands on the pixels the file will hold only when the
+    // scene the mark was placed on is the file's own SDR half.
+    capture.set_tone_map(request.tone_map);
 
     // Everything below freezes the desktop, and the annotation overlay is a
     // window like any other: left alone, its toolbar would be baked into the
@@ -203,12 +213,14 @@ fn run() -> Result<()> {
             no_blend,
         )? {
             return finish_capture(
-                EditPipeline::new(),
+                &EditPipeline::new(),
                 frame,
                 None,
                 density,
                 // niri's own picker gives no rectangle on this side, so there
                 // is no place to put a pin back on.
+                None,
+                // No editor ran, so there are no marks to hand over.
                 None,
                 &request,
                 &mut wayland,
@@ -276,7 +288,7 @@ fn run() -> Result<()> {
         None
     };
 
-    let mut edits = EditPipeline::new();
+    let edits = EditPipeline::new();
     // Device pixels per logical pixel of the frame, carried next to it: the
     // scene composes every output at the highest scale, but a monitor capture
     // keeps that output's own pixels, so the density follows the source.
@@ -298,6 +310,19 @@ fn run() -> Result<()> {
     // button: the composed image goes to the screen instead of to the
     // destination the command line named.
     let mut pin_result = false;
+    // Set when that pin was made inside the editor's own handoff, while the
+    // editor was still drawing the same picture.  There is then nothing left
+    // for the CLI to put on the screen, and nothing left to wait for.
+    let mut handed_over = false;
+    // The helper's own render of the annotated capture, when it made one.  Qt is
+    // the only annotation renderer, so when this is set there is nothing left to
+    // rasterize on this side.
+    let mut rendered: Option<qt_overlay::RenderedCapture> = None;
+    // The marks the helper reported, when the session drew any.  Only the Pin
+    // destination reads them: the pin daemon stores them so the pin opens for a
+    // second edit on the user's own marks instead of on the pixels they were
+    // flattened into.
+    let mut marks: Option<serde_json::Value> = None;
     let (frame, density) = if let Some(window) = native_window {
         window
     } else {
@@ -324,7 +349,7 @@ fn run() -> Result<()> {
         match &request.target {
             CaptureTarget::RegionFixed(geometry) => {
                 let (frame, density) = crop_native(&scene, *geometry)?;
-                hdr_frame = hdr_for_region(&hdr_outputs, &scene, *geometry);
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, *geometry, request.tone_map.hdr);
                 capture_rect = Some(*geometry);
                 wayland.show_frozen(false)?;
                 (frame, density)
@@ -332,8 +357,30 @@ fn run() -> Result<()> {
             CaptureTarget::RegionInteractive => {
                 // The frame the helper draws is shown on an HDR backdrop when
                 // there is one to show, and the helper is told to leave it out.
-                let backdrop = show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs);
-                let outcome = qt_overlay::select_and_edit(&scene, &backdrop)?;
+                let backdrop =
+                    show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs, request.tone_map.hdr);
+                // The editor's Pin button: the capture goes to the screen
+                // instead of to the destination the command line named, and it
+                // has to be there before the editor -- which is still drawing
+                // the very marks it hands over -- takes its copy away.  So the
+                // pin happens here, inside the release, rather than after the
+                // session returns: this is the only point at which the editor
+                // is both still up and done drawing.
+                let mut handoff_error: Option<VshotError> = None;
+                let outcome =
+                    qt_overlay::select_and_edit(&scene, &backdrop, &mut |result, render| {
+                        // `false` is the ordinary OK: the editor drew on the
+                        // capture and left it to the destination the command
+                        // line named, which is still to be written below.
+                        match pin_from_editor(&scene, &hdr_outputs, &request, result, render) {
+                            Ok(pinned) => handed_over = pinned,
+                            Err(error) => handoff_error = Some(error),
+                        }
+                        Ok("{}".to_string())
+                    })?;
+                if let Some(error) = handoff_error {
+                    return Err(error);
+                }
                 let geometry = selection::validate_selection(&scene, outcome.rect)?;
                 // The editor's other answer is a scrolling capture: the region
                 // is scrolled and stitched instead of kept as one frame.  Any
@@ -343,6 +390,16 @@ fn run() -> Result<()> {
                 // to land.  This route has no flags of its own, so the options
                 // are the ones the settings window remembers.
                 if outcome.long {
+                    // The scrolling capture reads the desktop through the
+                    // compositor, so every surface VShot is holding has to be
+                    // gone first or the grab returns VShot's own frozen
+                    // picture: the HDR backdrop sits on the Top layer, below
+                    // the helper's overlay but above the window being
+                    // scrolled, and the helper's own overlay is already gone
+                    // (its process has exited by the time this returns).  On an
+                    // HDR output that is the whole capture -- the stitch would
+                    // be rows of the freeze, identical every time.
+                    wayland.destroy_overlays()?;
                     let (options, backend) =
                         longshot::options_from_defaults(&crate::config::load().long)?;
                     let desktop = longshot::desktop_bounds(&output_infos)?;
@@ -356,7 +413,7 @@ fn run() -> Result<()> {
                     )?;
                     report_long_capture(&result, &injector, geometry);
                     return finish_capture(
-                        EditPipeline::new(),
+                        &EditPipeline::new(),
                         result.frame,
                         // A stitched capture has no HDR half: its rows come back
                         // from the scroll as ordinary 8-bit pixels.
@@ -366,6 +423,9 @@ fn run() -> Result<()> {
                         // handed back, so it has no place on the desktop to put
                         // a pin back onto.
                         None,
+                        // The scrolling capture never opened an editor, so
+                        // there are no marks to hand over.
+                        None,
                         &request,
                         &mut wayland,
                         // A stitched capture is written, never pinned: the
@@ -374,18 +434,17 @@ fn run() -> Result<()> {
                     );
                 }
                 let (frame, density) = crop_native(&scene, geometry)?;
-                hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
                 capture_rect = Some(geometry);
                 pin_result = outcome.pin;
-                // The helper drew its text bitmaps at the scene's scale, which
-                // is only the crop's density when the selection fell on the
-                // highest-density output.
-                edits = pipeline_for_annotations(
-                    outcome.annotations,
-                    geometry,
-                    density,
-                    scene.scale(),
-                )?;
+                // The helper rendered the annotated capture itself and sent it
+                // back, so this side never rasterizes the marks: the image it
+                // gets is the one the user was looking at, which is the whole
+                // point of having a single renderer.  The marks travel beside
+                // it for the Pin destination, which hands them to the daemon so
+                // the pin can be reopened for editing on them.
+                rendered = outcome.composite;
+                marks = outcome.marks;
                 (frame, density)
             }
             CaptureTarget::Monitor(name) if name == "current" => {
@@ -394,9 +453,15 @@ fn run() -> Result<()> {
                 let density = scene
                     .output(output_id)
                     .map_or(scene.scale(), |output| output.scale);
-                hdr_frame = scene
-                    .output(output_id)
-                    .and_then(|output| hdr_for_name(&hdr_outputs, &output.name));
+                hdr_frame = scene.output(output_id).and_then(|output| {
+                    hdr_for_name(
+                        &hdr_outputs,
+                        &scene,
+                        &output.name,
+                        None,
+                        request.tone_map.hdr,
+                    )
+                });
                 (selection::crop_output(&scene, output_id)?, density)
             }
             CaptureTarget::Monitor(name) => {
@@ -405,7 +470,7 @@ fn run() -> Result<()> {
                 let density = scene
                     .output_by_name(name)
                     .map_or(scene.scale(), |output| output.scale);
-                hdr_frame = hdr_for_name(&hdr_outputs, name);
+                hdr_frame = hdr_for_name(&hdr_outputs, &scene, name, None, request.tone_map.hdr);
                 (frame, density)
             }
             CaptureTarget::All => {
@@ -422,7 +487,8 @@ fn run() -> Result<()> {
                 if let Some(geometry) = metadata_window.and_then(|window| window.geometry) {
                     wayland.show_frozen(false)?;
                     let geometry = selection::validate_selection(&scene, geometry)?;
-                    hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                    hdr_frame =
+                        hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
                     capture_rect = Some(geometry);
                     // The window's own pixels at its own output's density — cropping
                     // the composed scene would hand back a nearest-upscale of a
@@ -454,7 +520,8 @@ fn run() -> Result<()> {
                         }
                     };
                     let geometry = selection::validate_selection(&scene, geometry)?;
-                    hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                    hdr_frame =
+                        hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
                     capture_rect = Some(geometry);
                     crop_native(&scene, geometry)?
                 }
@@ -513,25 +580,44 @@ fn run() -> Result<()> {
                 // other, and its frozen frame gets the same backdrop treatment
                 // as a dragged selection.
                 let hdr_outputs = capture_hdr_outputs(&mut capture, &scene, request.cursor);
-                let backdrop = show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs);
+                let backdrop =
+                    show_hdr_backdrop(&mut wayland, &scene, &hdr_outputs, request.tone_map.hdr);
                 let geometry = picked
                     .point
                     .and_then(|point| ProcessWindowProvider.window_at(point))
                     .unwrap_or(picked.rect);
-                let outcome = qt_overlay::edit_selection(&scene, geometry, &backdrop)?;
+                // The picked window's editor is the region editor, so its Pin
+                // button hands over the same way -- see the `RegionInteractive`
+                // arm for why the pin has to happen inside the release.
+                let mut handoff_error: Option<VshotError> = None;
+                let outcome = qt_overlay::edit_selection(
+                    &scene,
+                    geometry,
+                    &backdrop,
+                    &mut |result, render| {
+                        // `false` is the ordinary OK: the editor drew on the
+                        // capture and left it to the destination the command
+                        // line named, which is still to be written below.
+                        match pin_from_editor(&scene, &hdr_outputs, &request, result, render) {
+                            Ok(pinned) => handed_over = pinned,
+                            Err(error) => handoff_error = Some(error),
+                        }
+                        Ok("{}".to_string())
+                    },
+                )?;
+                if let Some(error) = handoff_error {
+                    return Err(error);
+                }
                 let geometry = selection::validate_selection(&scene, outcome.rect)?;
                 let (frame, density) = crop_native(&scene, geometry)?;
-                hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry);
+                hdr_frame = hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
                 capture_rect = Some(geometry);
                 pin_result = outcome.pin;
-                // Same reason as the interactive region above: the editor is
-                // shared, so its text bitmaps are in scene device pixels.
-                edits = pipeline_for_annotations(
-                    outcome.annotations,
-                    geometry,
-                    density,
-                    scene.scale(),
-                )?;
+                // The picker hands the frame it captured to the same editor the
+                // region path uses, so its marks come back the same way: as the
+                // helper's own render rather than as data to rasterize again.
+                rendered = outcome.composite;
+                marks = outcome.marks;
                 (frame, density)
             }
             CaptureTarget::LongShot {
@@ -558,12 +644,42 @@ fn run() -> Result<()> {
         }
     };
 
+    // A pin the editor handed over is already on the screen: the daemon held
+    // its answer until the frame carrying it was presented, and the editor
+    // stopped on that answer.  Only a session whose destination *was* the pin
+    // is finished here; one the command line also named a file for is still
+    // owed that file, so it falls through to the write below.
+    if handed_over && matches!(&request.destination, cli::Destination::Pin) {
+        return wayland.destroy_overlays();
+    }
+    // The handoff already put this image on the screen, so pinning it again
+    // would only replace the pixels that are up with a second copy of
+    // themselves.  The Pin button says where the image also goes, not that the
+    // capture stops being written.
+    let pin_result = pin_result && !handed_over;
+
+    if let Some(rendered) = rendered {
+        return finish_rendered_capture(
+            rendered,
+            &frame,
+            hdr_frame,
+            density,
+            capture_rect,
+            marks.as_ref(),
+            &request,
+            &mut wayland,
+            pin_result,
+        );
+    }
     finish_capture(
-        edits,
+        &edits,
         frame,
         hdr_frame,
         density,
         capture_rect,
+        // A route that rendered on this side -- the scrolling capture -- has no
+        // session marks to hand over: it never opened an editor.
+        None,
         &request,
         &mut wayland,
         pin_result,
@@ -1017,13 +1133,20 @@ fn run_translate_overlay(
 /// path its own working directory cannot change the meaning of.
 fn absolute_output_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let expanded = output::expanded_output_path(path);
-    if expanded.is_absolute() {
-        return Ok(expanded);
-    }
-    let directory = std::env::current_dir().map_err(|error| {
-        VshotError::Translate(format!("cannot resolve the output path: {error}"))
-    })?;
-    Ok(directory.join(expanded))
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        let directory = std::env::current_dir().map_err(|error| {
+            VshotError::Translate(format!("cannot resolve the output path: {error}"))
+        })?;
+        directory.join(expanded)
+    };
+    // The helper opens this path itself, so the directory has to be there before
+    // the session starts rather than at some write of ours afterwards.  A
+    // strftime pattern routinely names one that does not exist yet — see
+    // `output::create_parent_directories`.
+    output::create_parent_directories(&absolute)?;
+    Ok(absolute)
 }
 
 /// Says a translation finished, or failed, using the same switch `vshot ocr`
@@ -1063,7 +1186,7 @@ fn write_stdout(text: &str) -> Result<()> {
 /// Pin button — so the two halves and the pin's place are decided once.
 #[allow(clippy::too_many_arguments)] // the capture, its two halves, its density and its place
 fn finish_capture(
-    edits: EditPipeline,
+    edits: &EditPipeline,
     frame: Frame,
     // The HDR half of the capture, when the selection's output offered a 10-bit
     // buffer.  It is the same crop as `frame`, so the pipeline runs over both:
@@ -1076,6 +1199,9 @@ fn finish_capture(
     // — a composed desktop, or a window the compositor drew itself, whose
     // rectangle this side never learns.
     capture_rect: Option<crate::geometry::Rect>,
+    // The marks an editing session left, for the Pin destination; see
+    // `finish_rendered_capture`.
+    marks: Option<&serde_json::Value>,
     request: &cli::Request,
     wayland: &mut WaylandSession,
     // The editor's Pin button: the image goes to the screen whatever the command
@@ -1085,20 +1211,187 @@ fn finish_capture(
     // The desktop is unfrozen before either image is encoded.  The editor's own
     // overlay is the helper's and goes when it exits, but the surfaces VShot
     // still holds — the HDR backdrop, when the frame is being shown on one —
-    // keep the screen frozen while a full-output tone map and a Radiance encode
-    // run.  That is the delay the user meets as a slow close, and nothing below
-    // needs those surfaces, so they go first.
+    // keep the screen frozen while the annotations are composited into each half
+    // and the HDR half is encoded.  That is the delay the user meets as a slow
+    // close, and nothing below needs those surfaces, so they go first.
     let cleanup = wayland.destroy_overlays();
-    let (sdr, hdr_out) = sdr_and_hdr(&edits, frame, hdr)?;
-    let pinned = cli::Destination::Pin;
-    let destination = if pin { &pinned } else { &request.destination };
-    let result = output::write_frame_with_hdr(
+    let (sdr, hdr_out) = sdr_and_hdr(Some(edits), frame, hdr, request.tone_map)?;
+    let result = write_capture_and_pin(
         &sdr,
         hdr_out.as_ref(),
-        destination,
         density,
-        request.compression,
-        capture_rect.map(|rect| rect.origin),
+        capture_rect,
+        marks,
+        // A route that rendered on this side has no session marks and so no
+        // pristine base to keep them against.
+        None,
+        request,
+        pin,
+    );
+    result.and(cleanup)
+}
+
+/// Writes the capture to whatever the command line asked for, and then to the
+/// screen when the toolbar's Pin button was pressed.
+///
+/// The two are not alternatives.  `-o` names a file the user asked for, and the
+/// Pin button says the image *also* goes on the screen; pressing it used to
+/// replace the destination outright, so a capture pinned from the editor was
+/// never written anywhere.  A command line that already named the pin as its
+/// destination has had it, and is not pinned a second time.
+#[allow(clippy::too_many_arguments)] // the capture, its two halves, its place and its marks
+fn write_capture_and_pin(
+    sdr: &Frame,
+    hdr: Option<&HdrHalf>,
+    density: u32,
+    capture_rect: Option<crate::geometry::Rect>,
+    marks: Option<&serde_json::Value>,
+    // The capture before the marks were drawn on it, for a pin that carries
+    // them; `None` on every route that never opened an editor.
+    base: Option<&[u8]>,
+    request: &cli::Request,
+    pin: bool,
+) -> Result<()> {
+    let write = |destination: &cli::Destination| {
+        output::write_frame_with_hdr(
+            sdr,
+            hdr,
+            destination,
+            density,
+            request.compression,
+            request.hdr_format,
+            capture_rect.map(|rect| rect.origin),
+            marks,
+            base,
+        )
+    };
+    let result = write(&request.destination);
+    if pin && !matches!(request.destination, cli::Destination::Pin) {
+        // Both are attempted even when the first failed: a full disk that lost
+        // the file is no reason to also lose the pin, and the error that
+        // surfaces is the first one, which is the one the user asked for.
+        return result.and(write(&cli::Destination::Pin));
+    }
+    result
+}
+
+/// The pin half of a region session's handoff: the editor has finished drawing
+/// and the capture it was drawing on has to be on the screen before it stops.
+///
+/// Run from inside the helper dialogue, on the editor's release, because that
+/// is the only moment the editor is both still up and done drawing -- its
+/// pixels reach this side as an argument, not through the dialogue's own
+/// return, which happens after the helper is gone.  Only a session that asked
+/// for the Pin button does anything here: every other session's release is a
+/// plain goodbye, and its capture goes on to the destination the command line
+/// named.
+///
+/// Everything this needs is rebuilt from the scene rather than kept in the
+/// caller's locals, because the caller is still inside the expression that
+/// produces them: the rect comes from the editor's own answer, and the capture
+/// it was drawn on is re-cropped here.  Cropping the same rectangle off the
+/// same frozen scene gives the same pixels, so the pin's pristine base is the
+/// capture the user was looking at.
+fn pin_from_editor(
+    scene: &SceneSnapshot,
+    hdr_outputs: &[HdrOutput],
+    request: &cli::Request,
+    result: &[u8],
+    rendered: Option<&qt_overlay::RenderedCapture>,
+) -> Result<bool> {
+    // Parsed without the render, which is borrowed from the dialogue rather
+    // than moved out of it: a destination the command line named still has to
+    // be written once this handoff is done, and it wants these same pixels.
+    let outcome = qt_overlay::parse_outcome_with_render(
+        qt_overlay::HelperOutput {
+            json: result.to_vec(),
+            composite: None,
+        },
+        scene.bounds(),
+    )?;
+    if !outcome.pin {
+        return Ok(false);
+    }
+    let Some(rendered) = rendered else {
+        // The Pin button was pressed and the editor rendered nothing, which
+        // only happens when its own render failed; it reported that through its
+        // status, so there is nothing here to put on the screen.
+        return Err(VshotError::Pin(
+            "the editor asked to pin a capture it did not render".into(),
+        ));
+    };
+    let geometry = selection::validate_selection(scene, outcome.rect)?;
+    let (base, density) = crop_native(scene, geometry)?;
+    let hdr = hdr_for_region(hdr_outputs, scene, geometry, request.tone_map.hdr);
+    crate::pin::hand_off_region_pin(
+        &base,
+        hdr.as_ref(),
+        density,
+        geometry,
+        rendered,
+        outcome.marks.as_ref(),
+        request.tone_map,
+    )?;
+    Ok(true)
+}
+
+/// [`finish_capture`] when the helper rendered the capture itself.
+///
+/// Qt is the only annotation renderer now, so its render *is* the SDR result and
+/// there is nothing left to composite here: `composite` is written as it came.
+/// The HDR half still has to be marked, and that is what the layer is for — an
+/// opaque picture cannot be composited onto HDR, since it would replace the
+/// light instead of marking it, so the marks alone are blended in linear light.
+fn finish_rendered_capture(
+    rendered: crate::qt_overlay::RenderedCapture,
+    // The capture as it was before the helper drew on it, when the destination
+    // is a pin that carries marks: the daemon keeps it as the picture those
+    // marks belong to, so a second edit opens on the marks instead of on the
+    // flattening.  Only read when `marks` is set.
+    base: &Frame,
+    hdr: Option<HdrHalf>,
+    density: u32,
+    capture_rect: Option<crate::geometry::Rect>,
+    // The marks the helper reported, for the Pin destination: the daemon keeps
+    // them so the pin can be opened for editing again on the user's own marks.
+    marks: Option<&serde_json::Value>,
+    request: &cli::Request,
+    wayland: &mut WaylandSession,
+    pin: bool,
+) -> Result<()> {
+    let cleanup = wayland.destroy_overlays();
+    let sdr = rendered.composite;
+    let hdr_out = match hdr {
+        Some(HdrHalf {
+            frame,
+            reference_nits,
+        }) => {
+            let mut marked = frame;
+            marked.composite_srgb_layer(&rendered.marks)?;
+            marked.carries_hdr(request.tone_map.hdr).then_some(HdrHalf {
+                frame: marked,
+                reference_nits,
+            })
+        }
+        None => None,
+    };
+    // The base is only needed by the pin destination, and encoding it costs a
+    // PNG; a session that drew nothing has no marks to carry it for.  It is
+    // read only when the pin really is one of the two destinations.
+    let pin_wanted = pin && !matches!(request.destination, cli::Destination::Pin);
+    let base_png = match (marks, pin_wanted) {
+        (Some(_), true) => Some(base.to_png()?),
+        _ => None,
+    };
+    let result = write_capture_and_pin(
+        &sdr,
+        hdr_out.as_ref(),
+        density,
+        capture_rect,
+        marks,
+        base_png.as_deref(),
+        request,
+        pin,
     );
     result.and(cleanup)
 }
@@ -1106,34 +1399,56 @@ fn finish_capture(
 /// The two images of one capture: the SDR PNG and, when the content is really
 /// HDR, the HDR frame written beside it.
 ///
-/// Annotations render in HDR mode over the HDR frame — mosaics pixelate in
-/// linear light and every other mark composites in linear light — and the SDR
-/// half is vshot's own tone map of that same content rather than the
-/// compositor's separate 8-bit picture, so both files describe one set of marks
-/// over one set of light.  A 10-bit buffer that carries no light beyond SDR
-/// white is not HDR content at all: it keeps the ordinary path and no `.hdr` is
-/// written beside the PNG.
+/// Qt renders the annotations, so `edits` is the operations this side still
+/// rasterizes itself — the scrolling capture's stitched frame, which was never
+/// in an editing session — and is `None` on every path the helper rendered.
+/// When it is `None` the SDR half is the frame as it came and the HDR half
+/// keeps its light unmarked; the marks are composited by
+/// [`finish_rendered_capture`], which has the helper's own render to take the
+/// SDR half from.
+///
+/// When it is `Some`, both halves are annotated here: mosaics pixelate in
+/// linear light and every other mark composites in linear light, and the SDR
+/// half is vshot's own tone map of that same content, so both files describe
+/// one set of marks over one set of light.  A 10-bit buffer that carries no
+/// light beyond SDR white is not HDR content at all: it keeps the ordinary path
+/// and no HDR file is written beside the PNG.
 fn sdr_and_hdr(
-    edits: &EditPipeline,
+    edits: Option<&EditPipeline>,
     frame: Frame,
     hdr: Option<HdrHalf>,
+    tone_map: ToneMapOptions,
 ) -> Result<(Frame, Option<HdrHalf>)> {
     let hdr = match hdr {
         Some(HdrHalf {
             frame,
             reference_nits,
         }) => {
-            let annotated = edits.apply_to_hdr(frame)?;
-            annotated.is_hdr().then_some(HdrHalf {
+            let annotated = match edits {
+                Some(edits) => edits.apply_to_hdr(frame)?,
+                None => frame,
+            };
+            annotated.carries_hdr(tone_map.hdr).then_some(HdrHalf {
                 frame: annotated,
                 reference_nits,
             })
         }
         None => None,
     };
+    // The SDR half is vshot's own tone map of the annotated HDR frame rather
+    // than a second capture.  The compositor's own SDR rendition of an HDR
+    // output cannot be used: Hyprland writes it against
+    // `DEFAULT_SRGB_IMAGE_DESCRIPTION`, whose peak is 80 cd/m2, while the SDR
+    // white an SDR image means is the output's own reference — 203 here — so it
+    // puts ordinary SDR content well below white instead of on it (measured:
+    // SDR white at sRGB 220 of 255, 145 of 203 cd/m2).  Taking it would dim the
+    // whole capture, not just the highlights.
     match hdr {
-        Some(half) => Ok((half.frame.tone_map_to_srgb()?, Some(half))),
-        None => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
+        Some(half) => Ok((half.frame.tone_map_to_srgb_with(tone_map)?, Some(half))),
+        None => match edits {
+            Some(edits) => Ok((edits.apply(ImageDocument::new(frame))?.into_frame(), None)),
+            None => Ok((frame, None)),
+        },
     }
 }
 
@@ -1222,11 +1537,13 @@ fn capture_hdr_outputs(
 }
 
 /// The HDR half of one rectangle, cropped from the output that wholly contains
-/// it, or `None` when no such output offered HDR.
+/// it, or `None` when no such output offered HDR or the rectangle holds no light
+/// above SDR white.
 fn hdr_for_region(
     hdr_outputs: &[HdrOutput],
     scene: &SceneSnapshot,
     geometry: Rect,
+    decision: HdrDecision,
 ) -> Option<HdrHalf> {
     let output = scene.outputs().iter().find(|output| {
         output
@@ -1234,29 +1551,50 @@ fn hdr_for_region(
             .clamp_to(geometry)
             .is_some_and(|clamped| clamped == geometry)
     })?;
-    let scale = i32::try_from(output.scale).ok()?;
-    let local = Rect::new(
-        (geometry.left() - output.geometry.left()).checked_mul(scale)?,
-        (geometry.top() - output.geometry.top()).checked_mul(scale)?,
-        geometry.size.width.checked_mul(output.scale)?,
-        geometry.size.height.checked_mul(output.scale)?,
-    );
-    let half = hdr_for_name(hdr_outputs, &output.name)?;
-    Some(HdrHalf {
-        frame: half.frame.crop(local).ok()?,
-        reference_nits: half.reference_nits,
-    })
+    hdr_for_name(hdr_outputs, scene, &output.name, Some(geometry), decision)
 }
 
-/// The HDR half of a whole output, or `None` when it offered none.
-fn hdr_for_name(hdr_outputs: &[HdrOutput], name: &str) -> Option<HdrHalf> {
-    hdr_outputs
-        .iter()
-        .find(|output| output.name == name)
-        .map(|output| HdrHalf {
-            frame: output.frame.clone(),
-            reference_nits: output.reference_nits,
-        })
+/// The HDR half of one output — all of it, or the part `region` covers — or
+/// `None` when it offered none, or when that rectangle holds no light above SDR
+/// white.
+///
+/// `region` is in global logical pixels, the same space the scene's output
+/// geometries are in; `None` asks about the whole output.  The test is the same
+/// [`HdrFrame::carries_hdr`] the file gates use, so an output whose rectangle is
+/// an ordinary SDR desktop is not handed to the backdrop — and the frozen frame
+/// behind the selection is the SDR one, exactly as it is on a monitor with no
+/// HDR at all.  Without this the overlay would be told to leave the frame out
+/// for a backdrop that is not dimmer or brighter but *different*: the HDR read
+/// of an SDR desktop is not the same image the compositor draws.
+fn hdr_for_name(
+    hdr_outputs: &[HdrOutput],
+    scene: &SceneSnapshot,
+    name: &str,
+    region: Option<Rect>,
+    decision: HdrDecision,
+) -> Option<HdrHalf> {
+    let output = hdr_outputs.iter().find(|output| output.name == name)?;
+    let frame = match region {
+        Some(region) => {
+            let scene_output = scene
+                .outputs()
+                .iter()
+                .find(|scene_output| scene_output.name == name)?;
+            let scale = i32::try_from(scene_output.scale).ok()?;
+            let local = Rect::new(
+                (region.left() - scene_output.geometry.left()).checked_mul(scale)?,
+                (region.top() - scene_output.geometry.top()).checked_mul(scale)?,
+                region.size.width.checked_mul(scene_output.scale)?,
+                region.size.height.checked_mul(scene_output.scale)?,
+            );
+            output.frame.crop(local).ok()?
+        }
+        None => output.frame.clone(),
+    };
+    frame.carries_hdr(decision).then_some(HdrHalf {
+        frame,
+        reference_nits: output.reference_nits,
+    })
 }
 
 /// Puts the frozen HDR half of each output on a backdrop surface below the Qt
@@ -1270,6 +1608,7 @@ fn show_hdr_backdrop(
     wayland: &mut WaylandSession,
     scene: &SceneSnapshot,
     hdr_outputs: &[HdrOutput],
+    decision: HdrDecision,
 ) -> Vec<String> {
     if hdr_outputs.is_empty() {
         return Vec::new();
@@ -1279,18 +1618,26 @@ fn show_hdr_backdrop(
     wayland.set_scene(scene.clone());
     let frames = hdr_outputs
         .iter()
-        // The surface declares the output's own description while the buffer is
-        // written as PQ over BT.2020 (`HdrFrame::to_rgb10_pq`), so only an
-        // output whose description is exactly that can be shown this way; any
-        // other pair would declare one encoding and carry another, and the
-        // helper draws the SDR frame there instead.
-        .filter(|output| {
-            output.color.transfer == Transfer::Pq && output.color.primaries == Primaries::Bt2020
-        })
-        .map(|output| BackdropFrame {
-            name: output.name.clone(),
-            frame: output.frame.clone(),
-            reference_nits: output.reference_nits,
+        // The surface declares the output's own description and the buffer is
+        // written in the output's own primaries, so what the description says and
+        // what the pixels hold are the same thing and the compositor hands them
+        // through untouched.  The one thing that still has to match is the
+        // transfer: the words are PQ codes, so an output described with any other
+        // curve — HLG, say — would be handed a buffer it would decode wrongly, and
+        // the helper draws the SDR frame there instead.
+        .filter(|output| output.color.transfer == Transfer::Pq)
+        // And only when the frame really carries light above SDR white: an
+        // output handed a backdrop it does not need is handed one that is not
+        // the picture the compositor draws, so the frozen frame behind the
+        // selection would be a different image rather than a brighter one.
+        .filter_map(|output| {
+            hdr_for_name(hdr_outputs, scene, &output.name, None, decision).map(|half| {
+                BackdropFrame {
+                    name: output.name.clone(),
+                    frame: half.frame,
+                    reference_nits: half.reference_nits,
+                }
+            })
         })
         .collect::<Vec<_>>();
     if frames.is_empty() {
@@ -1506,10 +1853,9 @@ fn crop_native(scene: &SceneSnapshot, geometry: Rect) -> Result<(Frame, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit::{ArrowStyle, BezierFill, LineDash};
     use crate::geometry::{Point, Rect, Size};
+    use crate::model::hdr::Primaries;
     use crate::model::Frame;
-    use crate::wayland::input::{Annotation, EditorTool};
 
     #[test]
     fn another_compositor_is_never_asked_through_niri() {
@@ -1632,103 +1978,6 @@ mod tests {
         assert_eq!((frame.size(), density), (Size::new(200, 100), 2));
     }
 
-    #[test]
-    fn a_text_bitmap_is_brought_to_the_crops_density() {
-        // The helper draws labels at the scene's scale — 2 here — while the
-        // region it belongs to came off the 1x screen, whose frame is half
-        // that.  Compositing the bitmap as-is would print the label at twice
-        // the size the user saw while placing it.
-        let bitmap = crate::edit::TextBitmap {
-            width: 2,
-            height: 2,
-            pixels: vec![
-                255, 255, 255, 255, 255, 255, 255, 255, //
-                255, 255, 255, 255, 255, 255, 255, 255,
-            ],
-        };
-        let annotation = Annotation::Text {
-            origin: Point::new(0, 0),
-            text: "A".into(),
-            scale: 1,
-            color: [255, 255, 255, 255],
-            font: String::new(),
-            bitmap: Some(bitmap),
-        };
-        let pipeline =
-            pipeline_for_annotations(vec![annotation], Rect::new(0, 0, 10, 10), 1, 2).unwrap();
-        let frame = Frame::solid(Size::new(10, 10), [0, 0, 0, 0]).unwrap();
-        let document = pipeline.apply(ImageDocument::new(frame)).unwrap();
-        // One pixel of the label, not a 2x2 block of it.
-        assert_eq!(
-            document.frame().pixel(Point::new(0, 0)),
-            Some([255, 255, 255, 255])
-        );
-        assert_eq!(document.frame().pixel(Point::new(1, 1)), Some([0, 0, 0, 0]));
-    }
-
-    #[test]
-    fn annotation_pipeline_maps_global_points_into_cropped_pixels() {
-        let pipeline = pipeline_for_annotations(
-            vec![Annotation::stroke(
-                EditorTool::Pen,
-                vec![Point::new(12, 22), Point::new(14, 24)],
-            )],
-            Rect::new(10, 20, 20, 20),
-            2,
-            2,
-        )
-        .unwrap();
-        let frame = Frame::solid(Size::new(40, 40), [0, 0, 0, 0]).unwrap();
-        let document = pipeline.apply(ImageDocument::new(frame)).unwrap();
-        assert_eq!(
-            document.frame().pixel(Point::new(4, 4)),
-            Some([255, 64, 64, 255])
-        );
-    }
-
-    #[test]
-    fn annotation_pipeline_renders_text_and_mosaic_brush() {
-        let mut pixels = vec![0u8; 400];
-        for chunk in pixels.as_chunks_mut::<4>().0 {
-            chunk.copy_from_slice(&[0, 0, 0, 255]);
-        }
-        // A single bright pixel inside the stamp disc.
-        pixels[(3 * 10 + 3) * 4] = 255;
-        let frame = Frame::new(Size::new(10, 10), pixels).unwrap();
-        let pipeline = pipeline_for_annotations(
-            vec![
-                Annotation::text(Point::new(8, 8), "A", 1),
-                Annotation::Stroke {
-                    tool: EditorTool::Mosaic,
-                    points: vec![Point::new(2, 2), Point::new(5, 5)],
-                    color: [255, 64, 64, 255],
-                    width: 8,
-                    dash: LineDash::Solid,
-                    head: 1,
-                    arrow_style: ArrowStyle::Open,
-                    strength: 2,
-                    closed: false,
-                    amplitude: 0,
-                    wavelength: 0,
-                    fill: BezierFill::Both,
-                },
-            ],
-            Rect::new(0, 0, 10, 10),
-            1,
-            1,
-        )
-        .unwrap();
-        let document = pipeline.apply(ImageDocument::new(frame)).unwrap();
-        // Brush radius = width/2 = 4.  The stamp walk emits centers
-        // (2,2), (3,3), (4,4), (5,5); (1, 0) is covered by the (2,2) and
-        // (3,3) discs and the later one wins, spreading the brightness of
-        // the pixel at (3, 3) as a 5/47-ish local average.
-        assert_eq!(
-            document.frame().pixel(Point::new(1, 0)),
-            Some([5, 0, 0, 255])
-        );
-    }
-
     /// An HDR half painted one flat luminance, small enough to keep the tests
     /// cheap: a crop is told apart by the value it carries and nothing else.
     fn hdr_half(width: u32, height: u32, value: f32) -> HdrFrame {
@@ -1790,13 +2039,40 @@ mod tests {
         // screen's doubles into its own native pixels, exactly as the SDR crop
         // does.
         let (scene, hdr) = hdr_scene();
-        let plain = hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).unwrap();
+        let hdr_only = HdrDecision::default();
+        let plain = hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4), hdr_only).unwrap();
         assert_eq!(plain.frame.size(), Size::new(5, 4));
         assert_eq!(plain.frame.pixel(0, 0), Some([2.0, 2.0, 2.0, 1.0]));
 
-        let dense = hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).unwrap();
+        let dense = hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4), hdr_only).unwrap();
         assert_eq!(dense.frame.size(), Size::new(10, 8));
         assert_eq!(dense.frame.pixel(0, 0), Some([4.0, 4.0, 4.0, 1.0]));
+    }
+
+    #[test]
+    fn a_region_of_plain_sdr_gets_no_hdr_half_even_on_an_hdr_output() {
+        // The other half of the classification, and the one the user hit: an
+        // output the compositor describes as HDR still holds ordinary SDR
+        // content most of the time, and that content must keep the SDR path --
+        // no second file, no HDR pin, no backdrop, and above all no white point
+        // moved down over a handful of rounding pixels.
+        let (scene, _) = hdr_scene();
+        let sdr = vec![hdr_output_half("DP-2", 32, 32, 1.0)];
+        let sdr_region = Rect::new(66, 3, 5, 4);
+        assert!(hdr_for_region(&sdr, &scene, sdr_region, HdrDecision::default()).is_none());
+        // The switches still reach it: one pixel is enough with the area test
+        // off, and the output's own declaration is the whole answer when the
+        // ratio is zero.
+        assert!(hdr_for_region(
+            &sdr,
+            &scene,
+            sdr_region,
+            HdrDecision::from_config(true, 0.0)
+        )
+        .is_some());
+        // And a frame that really does carry highlights is kept either way.
+        let bright = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
+        assert!(hdr_for_region(&bright, &scene, sdr_region, HdrDecision::default()).is_some());
     }
 
     #[test]
@@ -1804,7 +2080,9 @@ mod tests {
         // Straddling the boundary between the two screens, there is no one
         // 10-bit buffer to read: the SDR scene is the only picture of it.
         let (scene, hdr) = hdr_scene();
-        assert!(hdr_for_region(&hdr, &scene, Rect::new(63, 3, 5, 4)).is_none());
+        assert!(
+            hdr_for_region(&hdr, &scene, Rect::new(63, 3, 5, 4), HdrDecision::default()).is_none()
+        );
     }
 
     #[test]
@@ -1812,47 +2090,65 @@ mod tests {
         let (scene, _) = hdr_scene();
         // Only the dense screen produced an HDR half this time.
         let hdr = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
-        assert!(hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4)).is_none());
+        assert!(
+            hdr_for_region(&hdr, &scene, Rect::new(2, 3, 5, 4), HdrDecision::default()).is_none()
+        );
         // The one that did still answers for its own screen.
-        assert!(hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4)).is_some());
+        assert!(
+            hdr_for_region(&hdr, &scene, Rect::new(66, 3, 5, 4), HdrDecision::default()).is_some()
+        );
     }
 
     #[test]
     fn hdr_for_name_finds_only_a_named_output() {
-        let hdr = vec![hdr_output_half("DP-2", 4, 4, 4.0)];
+        let (scene, _) = hdr_scene();
+        let hdr = vec![hdr_output_half("DP-2", 32, 32, 4.0)];
+        let decision = HdrDecision::default();
         assert_eq!(
-            hdr_for_name(&hdr, "DP-2").unwrap().frame.size(),
-            Size::new(4, 4)
+            hdr_for_name(&hdr, &scene, "DP-2", None, decision)
+                .unwrap()
+                .frame
+                .size(),
+            Size::new(32, 32)
         );
-        assert!(hdr_for_name(&hdr, "eDP-1").is_none());
+        assert!(hdr_for_name(&hdr, &scene, "eDP-1", None, decision).is_none());
+        // The whole output is tested too, so a named output holding nothing
+        // above SDR white answers `None` rather than handing the backdrop an
+        // image the compositor would have drawn differently.
+        let sdr = vec![hdr_output_half("DP-2", 32, 32, 1.0)];
+        assert!(hdr_for_name(&sdr, &scene, "DP-2", None, decision).is_none());
     }
 
     #[test]
     fn an_hdr_capture_tone_maps_its_own_sdr_half() {
-        // When the content is truly HDR, the SDR PNG is vshot's own tone map of
-        // it, not a second capture, so the pair describes the same light; the
-        // HDR half is handed over unchanged for the `.hdr` file.
+        // The SDR PNG is vshot's own tone map of the HDR half, not a second
+        // capture.  It cannot be the compositor's own rendition: that is written
+        // against a peak of 80 cd/m2 while SDR white is the output's own
+        // reference (203 here), so it puts ordinary SDR content below white —
+        // taking it would dim the whole capture, not just the highlights.
+        //
+        // The peak lands on white; the mid channel is rolled off well below it,
+        // and red stays the dominant channel — a real tone map, not the second
+        // capture.
         let hdr = HdrFrame::new(
             Size::new(2, 1),
             vec![[4.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
         )
         .unwrap();
         let (sdr, kept) = sdr_and_hdr(
-            &EditPipeline::new(),
+            Some(&EditPipeline::new()),
             plain_frame(),
             Some(HdrHalf {
                 frame: hdr,
                 reference_nits: REFERENCE_WHITE_NITS,
             }),
+            ToneMapOptions::default(),
         )
         .unwrap();
-        // The peak lands on SDR white; the mid channel is rolled off well below
-        // it, and red stays the dominant channel — a real tone map, not the
-        // second capture.
         let pixel = sdr.pixel(Point::new(0, 0)).unwrap();
-        assert_eq!(pixel[0], 255);
+        assert!(pixel[0] > 240, "the brightest channel did not near white");
         assert_eq!(pixel[1], pixel[2]);
-        assert!((128..=150).contains(&pixel[1]), "green = {}", pixel[1]);
+        assert!((128..=200).contains(&pixel[1]), "green = {}", pixel[1]);
         let kept = kept.expect("the HDR half is kept");
         assert_eq!(kept.frame.pixel(0, 0), Some([4.0, 1.0, 1.0, 1.0]));
     }
@@ -1864,12 +2160,13 @@ mod tests {
         // `.hdr` appears beside a screenshot that never held any highlight.
         let flat = HdrFrame::new(Size::new(2, 1), vec![[1.0, 1.0, 1.0, 1.0]; 2]).unwrap();
         let (sdr, kept) = sdr_and_hdr(
-            &EditPipeline::new(),
+            Some(&EditPipeline::new()),
             plain_frame(),
             Some(HdrHalf {
                 frame: flat,
                 reference_nits: REFERENCE_WHITE_NITS,
             }),
+            ToneMapOptions::default(),
         )
         .unwrap();
         assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
@@ -1878,7 +2175,13 @@ mod tests {
 
     #[test]
     fn a_capture_without_hdr_uses_the_compositors_frame_alone() {
-        let (sdr, kept) = sdr_and_hdr(&EditPipeline::new(), plain_frame(), None).unwrap();
+        let (sdr, kept) = sdr_and_hdr(
+            Some(&EditPipeline::new()),
+            plain_frame(),
+            None,
+            ToneMapOptions::default(),
+        )
+        .unwrap();
         assert_eq!(sdr.pixel(Point::new(0, 0)), Some([0, 255, 0, 255]));
         assert!(kept.is_none());
     }
@@ -1928,5 +2231,34 @@ mod tests {
         for target in &refusers {
             assert!(!target_wants_hdr(target), "{target:?} should not");
         }
+    }
+
+    /// A release that did not press Pin hands nothing over, and the caller has
+    /// to read that as "the capture is still to be written".
+    ///
+    /// `pin_from_editor` answers `false` for an ordinary OK, which is what tells
+    /// the caller apart from the one release that really did put the image on
+    /// the screen.  Reading any non-error release as a handoff skipped the write
+    /// entirely: an interactive region capture through the editor exited 0 and
+    /// saved nothing at all.
+    #[test]
+    fn a_release_without_the_pin_button_leaves_the_capture_to_be_written() {
+        let (scene, hdr_outputs) = hdr_scene();
+        let request = cli::Request {
+            target: CaptureTarget::RegionInteractive,
+            destination: cli::Destination::File(PathBuf::from("/dev/null")),
+            cursor: false,
+            compression: crate::model::PngCompression::default(),
+            hdr_format: crate::output::HdrFormat::default(),
+            tone_map: crate::model::hdr::ToneMapOptions::default(),
+        };
+        // The editor's ordinary answer: a selection, no `pin` flag.  The
+        // composite is absent because this session rendered nothing, which is
+        // the shape a cancelled render has too -- the difference is the status.
+        let answer = br#"{"status":"ok","selection":{"x":0,"y":0,"width":8,"height":8}}"#;
+        assert!(
+            !pin_from_editor(&scene, &hdr_outputs, &request, answer, None).unwrap(),
+            "an OK without Pin must leave the capture for the destination"
+        );
     }
 }

@@ -3,15 +3,13 @@
 
 // Offline check for pasting an image into the annotation editor.
 //
-// A pasted image travels over the same file-and-JSON channel a text label's
-// bitmap does: the helper writes a raw RGBA8888 file beside the session JSON
-// and the Rust side reads it back by path. That channel has two ends in two
-// languages, so the properties worth pinning are the wire ones the Rust reader
-// actually enforces -- the channel order of the bytes, that the declared
-// dimensions agree with the file length, and that the rect the JSON carries is
-// the one the pixels were rasterized for. A bug in any of them is invisible
-// here and only shows up as a distorted or colour-swapped paste in the output
-// PNG.
+// A pasted image is drawn by the helper and nowhere else: it has no wire form,
+// because the marks document a daemon keeps describes a mark by its numbers and
+// a paste's content is its pixels. So the properties worth pinning are the
+// render ones -- that the pixels reach the canvas in the source's own order,
+// and that the rect they land in is the rect the annotation carries. A bug in
+// either is invisible here and only shows up as a distorted or colour-swapped
+// paste in the output PNG.
 //
 // The placement rules are checked too: an image larger than the canvas is
 // shrunk to fit and centred, a smaller one keeps its own size, and the paste
@@ -40,11 +38,8 @@
 #include <QBoxLayout>
 #include <QByteArray>
 #include <QColor>
-#include <QDir>
-#include <QFile>
 #include <QFrame>
 #include <QImage>
-#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
@@ -53,7 +48,6 @@
 #include <QPushButton>
 #include <QScreen>
 #include <QString>
-#include <QTemporaryDir>
 #include <QToolButton>
 
 #include <cstdio>
@@ -114,47 +108,59 @@ QImage quadrants()
     return image;
 }
 
-QByteArray readAll(const QString &path)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return QByteArray();
-    }
-    return file.readAll();
-}
-
 QString hex(const QByteArray &bytes)
 {
     return QString::fromLatin1(bytes.toHex(' '));
 }
 
-// The first annotation of a result document, or an empty object when the
-// document carries none.
-QJsonObject firstAnnotation(const QJsonDocument &document)
+// A frame under the selection, so the session can render at all: a paste draws
+// its own pixels, but `produceComposite` refuses without a capture to crop.
+QImage capturedFrame()
 {
-    const QJsonArray annotations = document.object().value(QStringLiteral("annotations")).toArray();
-    if (annotations.isEmpty()) {
-        return QJsonObject();
-    }
-    return annotations.at(0).toObject();
+    QImage image(400, 400, QImage::Format_ARGB32);
+    image.fill(QColor(128, 128, 128));
+    return image;
 }
 
-// The rect the helper says a pasted image occupies on the canvas.
-bool rectOf(const QJsonObject &annotation, vshot::LogicalRect *rect)
+// The helper's own render of the session, with the selection's own top-left as
+// the origin -- the same crop the CLI hands to the daemon.  Both layers, since
+// a paste has to land on both; an empty `marks` means the render refused, which
+// the caller reports.
+bool renderSelection(const vshot::OverlayController &controller, QImage *composite, QImage *marks)
 {
-    const QJsonObject value = annotation.value(QStringLiteral("rect")).toObject();
-    if (value.isEmpty()) {
-        return false;
-    }
-    rect->x = static_cast<std::int32_t>(value.value(QStringLiteral("x")).toInt());
-    rect->y = static_cast<std::int32_t>(value.value(QStringLiteral("y")).toInt());
-    rect->width = static_cast<std::uint32_t>(value.value(QStringLiteral("width")).toInt());
-    rect->height = static_cast<std::uint32_t>(value.value(QStringLiteral("height")).toInt());
-    return true;
+    QString error;
+    return controller.produceComposite(composite, marks, &error);
 }
 
-/// The bytes the Rust reader has to see for `quadrants()`, in RGBA order.
-QByteArray expectedQuadrantBytes()
+// One pixel of the marks layer at a point in the selection's logical
+// coordinates, as straight-alpha RGBA -- the order a pasted image has to come
+// back in.  The marks layer is read rather than the flattened capture because
+// it is the canvas the paste actually lands on with nothing under it: over the
+// capture a translucent corner would come back blended with whatever the
+// screenshot happened to hold there.
+QByteArray markPixel(const vshot::OverlayController &controller, int x, int y)
+{
+    QImage composite;
+    QImage marks;
+    if (!renderSelection(controller, &composite, &marks)) {
+        return QByteArray();
+    }
+    const vshot::LogicalRect &selection = *controller.selection();
+    const QPoint at(x - selection.x, y - selection.y);
+    if (!marks.rect().contains(at)) {
+        return QByteArray();
+    }
+    const QColor pixel = marks.pixelColor(at);
+    QByteArray bytes;
+    bytes.append(static_cast<char>(pixel.red()));
+    bytes.append(static_cast<char>(pixel.green()));
+    bytes.append(static_cast<char>(pixel.blue()));
+    bytes.append(static_cast<char>(pixel.alpha()));
+    return bytes;
+}
+
+/// One pixel of `quadrants()`, in the order the source image holds it.
+QByteArray expectedQuadrantPixel(int index)
 {
     const int pixels[4][4] = {
         {255, 0, 0, 255},
@@ -162,22 +168,20 @@ QByteArray expectedQuadrantBytes()
         {0, 0, 255, 255},
         {255, 255, 0, 200},
     };
+    const int *pixel = pixels[index];
     QByteArray bytes;
-    bytes.reserve(16);
-    for (const auto &pixel : pixels) {
-        for (const int channel : pixel) {
-            bytes.append(static_cast<char>(channel));
-        }
+    for (int channel = 0; channel < 4; ++channel) {
+        bytes.append(static_cast<char>(pixel[channel]));
     }
     return bytes;
 }
 
 // Small images keep their own size and land centred on the canvas, and the
-// exported file is exactly the source in RGBA8888.
+// pixels that reach the canvas are the source's, unswapped.
 void checkWireFormat()
 {
     const vshot::LogicalRect canvas{40, 50, 60, 40};
-    vshot::OverlayController controller(editingSession(1, canvas));
+    vshot::OverlayController controller(editingSession(1, canvas, capturedFrame()));
     controller.beginPresetEdit();
     expect(controller.canPaste(), "a region session with a selection can paste");
 
@@ -198,49 +202,40 @@ void checkWireFormat()
                .arg(annotation.rect.width)
                .arg(annotation.rect.height));
 
-    QTemporaryDir directory;
-    expect(directory.isValid(), "a temporary directory for the bitmaps");
-    if (!directory.isValid()) {
-        return;
+    // The render is the only place a paste exists, so the four corners are
+    // read back off the marks layer: a swapped row, a swapped column or a
+    // swapped channel each moves a corner's colour to a corner that has
+    // another one, and the translucent corner proves the alpha is not
+    // premultiplied on the way out.
+    const QByteArray expected[4] = {
+        expectedQuadrantPixel(0), expectedQuadrantPixel(1),
+        expectedQuadrantPixel(2), expectedQuadrantPixel(3),
+    };
+    const int at[4][2] = {{69, 69}, {70, 69}, {69, 70}, {70, 70}};
+    const char *corner[4] = {"top-left", "top-right", "bottom-left", "bottom-right"};
+    for (int i = 0; i < 4; ++i) {
+        const QByteArray got = markPixel(controller, at[i][0], at[i][1]);
+        expect(!got.isEmpty(), "the paste reaches the marks layer");
+        expect(got == expected[i],
+               QStringLiteral("the paste's %1 pixel is the source's, in order")
+                   .arg(QLatin1String(corner[i]))
+                   .toUtf8()
+                   .constData(),
+               QStringLiteral("got [%1] wanted [%2]").arg(hex(got), hex(expected[i])));
     }
-    QString error;
-    const QJsonDocument document = controller.resultDocument(directory.path(), &error);
-    expect(error.isEmpty(), "the export reports no error", error);
-    const QJsonObject annotationObject = firstAnnotation(document);
-    expect(annotationObject.value(QStringLiteral("kind")).toString() == QStringLiteral("image"),
-           "the JSON marks the annotation as an image");
-
-    vshot::LogicalRect rect;
-    expect(rectOf(annotationObject, &rect), "the JSON carries the image's rect");
-    expect(rect.x == 69 && rect.y == 69 && rect.width == 2 && rect.height == 2,
-           "the rect in the JSON is the one the annotation carries");
-
-    const QString path = annotationObject.value(QStringLiteral("bitmap")).toString();
-    const QByteArray bytes = readAll(path);
-    const QByteArray expected = expectedQuadrantBytes();
-    expect(!bytes.isEmpty(), "the pixels were written to the path the JSON names", path);
-    expect(bytes == expected, "the pixels are the source in straight-alpha RGBA8888 order",
-           QStringLiteral("got [%1] wanted [%2]").arg(hex(bytes), hex(expected)));
-    expect(annotationObject.value(QStringLiteral("bitmap_width")).toInt() == 2
-               && annotationObject.value(QStringLiteral("bitmap_height")).toInt() == 2,
-           "the declared dimensions are the image's own");
-    expect(annotationObject.value(QStringLiteral("bitmap_width")).toInt()
-                   * annotationObject.value(QStringLiteral("bitmap_height")).toInt() * 4
-               == bytes.size(),
-           "the declared dimensions match the file length",
-           QStringLiteral("%1 bytes").arg(bytes.size()));
 }
 
-// An image bigger than the canvas is shrunk to fit and centred, and the file
-// is rasterized at the size it occupies on the canvas in device pixels -- the
-// contract the Rust reader's dimension check runs against.
+// An image bigger than the canvas is shrunk to fit and centred, and the shrink
+// is what the render shows: the corners it lands on are the source's corners,
+// and the canvas's own corners are untouched.
 void checkShrinkToFit()
 {
     const vshot::LogicalRect canvas{40, 50, 60, 40};
-    vshot::OverlayController controller(editingSession(2, canvas));
+    vshot::OverlayController controller(editingSession(2, canvas, capturedFrame()));
     controller.beginPresetEdit();
-    expect(controller.pasteImage(QImage(200, 300, QImage::Format_ARGB32)),
-           "a 200x300 image pastes into a 60x40 canvas");
+    QImage source(200, 300, QImage::Format_ARGB32);
+    source.fill(QColor(255, 0, 0));
+    expect(controller.pasteImage(source), "a 200x300 image pastes into a 60x40 canvas");
 
     const vshot::LogicalRect expected{56, 50, 27, 40};
     const vshot::Annotation &annotation = controller.annotations().at(0);
@@ -254,49 +249,53 @@ void checkShrinkToFit()
                .arg(annotation.rect.width)
                .arg(annotation.rect.height));
 
-    QTemporaryDir directory;
-    if (!directory.isValid()) {
-        expect(false, "a temporary directory for the bitmaps");
+    QImage composite;
+    QImage marks;
+    expect(renderSelection(controller, &composite, &marks), "the session renders");
+    if (marks.isNull()) {
         return;
     }
-    const QJsonDocument document = controller.resultDocument(directory.path());
-    const QJsonObject annotationObject = firstAnnotation(document);
-    const int width = annotationObject.value(QStringLiteral("bitmap_width")).toInt();
-    const int height = annotationObject.value(QStringLiteral("bitmap_height")).toInt();
-    expect(width == 54 && height == 80,
-           "the bitmap is the rect at the scene's 2x density",
-           QStringLiteral("got %1x%2").arg(width).arg(height));
-    const QByteArray bytes =
-        readAll(annotationObject.value(QStringLiteral("bitmap")).toString());
-    expect(bytes.size() == width * height * 4,
-           "the shrunk bitmap's file length matches its dimensions",
-           QStringLiteral("%1 bytes for %2x%3").arg(bytes.size()).arg(width).arg(height));
+    // The canvas is 60x40 logical at 2x, so the render is 120x80 device pixels
+    // and the shrunk image covers x=32..86, y=0..80 of it.
+    expect(marks.size() == QSize(120, 80), "the render is the selection at 2x",
+           QStringLiteral("got %1x%2").arg(marks.width()).arg(marks.height()));
+    const QColor inside = marks.pixelColor(60, 40);
+    expect(inside.red() == 255 && inside.green() == 0 && inside.blue() == 0
+               && inside.alpha() == 255,
+           "the shrunk image covers the middle of the canvas",
+           QStringLiteral("got %1,%2,%3,%4")
+               .arg(inside.red())
+               .arg(inside.green())
+               .arg(inside.blue())
+               .arg(inside.alpha()));
+    const QColor outside = marks.pixelColor(4, 4);
+    expect(outside.alpha() == 0, "the canvas beside the shrunk image is untouched",
+           QStringLiteral("alpha=%1").arg(outside.alpha()));
 }
 
-// What a paste has to refuse: nothing to paste onto, nothing to paste, and an
-// export with nowhere to put the pixels.
+// What a paste has to refuse: nothing to paste onto, and nothing to paste.
 void checkRefusals()
 {
     // No selection made yet: the editor has nothing to centre a paste on.
-    vshot::Session session = editingSession(1, vshot::LogicalRect{40, 50, 60, 40});
+    vshot::Session session = editingSession(1, vshot::LogicalRect{40, 50, 60, 40}, capturedFrame());
     session.selection.reset();
     vshot::OverlayController fresh(session);
     expect(!fresh.canPaste(), "a session with no selection cannot paste");
     expect(!fresh.pasteImage(quadrants()), "pasting with no selection is refused");
 
-    vshot::OverlayController controller(editingSession(1, vshot::LogicalRect{40, 50, 60, 40}));
+    vshot::OverlayController controller(
+        editingSession(1, vshot::LogicalRect{40, 50, 60, 40}, capturedFrame()));
     controller.beginPresetEdit();
     expect(!controller.pasteImage(QImage()), "a null image is refused");
     expect(controller.annotations().isEmpty(), "a refused paste leaves no annotation");
 
-    // Without a directory to write into the annotation cannot be handed over,
-    // so it is dropped rather than reported as a mark the renderer would then
-    // fail to find on disk.
-    expect(controller.pasteImage(quadrants()), "the same session still pastes a real image");
-    const QJsonDocument document = controller.resultDocument(QString());
-    const QJsonArray annotations = document.object().value(QStringLiteral("annotations")).toArray();
-    expect(annotations.isEmpty(),
-           "an image annotation is dropped when there is nowhere to write its pixels");
+    // A refused paste must not have disturbed the render: the session still
+    // exports, and it exports nothing but the capture.
+    QString error;
+    const QJsonDocument document = controller.resultDocument(&error);
+    expect(error.isEmpty(), "a session with no marks still exports", error);
+    expect(document.object().value(QStringLiteral("marks")).toArray().isEmpty(),
+           "a refused paste leaves no mark in the export");
 }
 
 // A pasted image has to be selectable and draggable, which means the hit test

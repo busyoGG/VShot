@@ -10,21 +10,13 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::capture::WindowCandidate;
-use crate::edit::{
-    ArrowStyle, BezierFill, LineDash, ShapeMask, TextBitmap, DEFAULT_MOSAIC_STRENGTH,
-};
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect};
 use crate::model::SceneSnapshot;
-use crate::wayland::input::{
-    Annotation, EditorTool, DEFAULT_ANNOTATION_COLOR, DEFAULT_ANNOTATION_WIDTH, DEFAULT_TEXT_COLOR,
-};
 use crate::wayland::topology::OutputInfo;
 
 const MAX_HELPER_ERROR_BYTES: usize = 512;
 const HELPER_NAME: &str = "vshot-qt-ui";
-/// What the picker asks for on its stdout when it wants a fresh candidate list.
-const CANDIDATE_REQUEST: &str = "candidates";
 
 /// Where the helper may live relative to the `vshot` executable: next to it
 /// (installed layouts) or in `build-qt/` one and two levels up (in-tree
@@ -148,48 +140,125 @@ pub(crate) fn run_settings() -> Result<()> {
     Ok(())
 }
 
-fn run_helper(helper: &HelperLookup, session_path: &Path) -> Result<Vec<u8>> {
-    let child = Command::new(&helper.path)
-        .arg("--session")
-        .arg(session_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| helper_spawn_error(helper, error))?;
-
-    let output = child.wait_with_output().map_err(|error| {
-        VshotError::Selection(format!("failed to collect Qt helper output: {error}"))
-    })?;
-    if !output.status.success() {
-        return Err(helper_exit_error(output.status, &output.stderr));
-    }
-    Ok(output.stdout)
+/// What a helper run handed back: its result JSON, and the rendered capture
+/// when it sent one.
+pub(crate) struct HelperOutput {
+    pub(crate) json: Vec<u8>,
+    pub(crate) composite: Option<RenderedCapture>,
 }
 
-/// Dialogue with a picking session: the helper writes one JSON object per line
-/// to its stdout — `{"request":"candidates"}` when it wants the windows it
-/// should highlight, and the session's own result at the end — and this
-/// answers on its stdin.  A picking session is the only one that talks back,
-/// because it is the only one running against a live desktop.
+/// The helper's render: the capture with the marks on it, and the marks alone.
 ///
-/// The answer to a refresh is the fresh window list, or nothing at all (`{}`)
-/// when there is no source for one: the pixel fallback has no window list to
-/// re-read, and keeping the picker's own list beats replacing it with
-/// something the user did not ask for.
-fn run_pick_helper(
+/// Two images rather than one because the HDR half cannot take a flattened
+/// picture -- it is opaque everywhere, so compositing it would replace the light
+/// instead of marking it.  The layer is what goes onto the HDR half; the
+/// flattened one is the SDR result verbatim.
+pub(crate) struct RenderedCapture {
+    pub(crate) composite: crate::model::Frame,
+    pub(crate) marks: crate::model::Frame,
+}
+
+/// What a caller does when the editor asks to be let go: the session's result
+/// JSON and the capture it rendered, for the caller to put where it belongs
+/// before the editor's surface comes down.  See [`HelperRequest::Release`].
+///
+/// The render is borrowed rather than moved: a caller whose destination the
+/// command line named still has to write it after the handoff has put the pin
+/// on the screen, and the two need the same pixels.
+pub(crate) type ReleaseHandler<'a> =
+    dyn FnMut(&[u8], Option<&RenderedCapture>) -> Result<String> + 'a;
+
+/// A request the helper makes of the CLI while a session is open, as one line
+/// of JSON on the helper's stdout.  Anything that is not one of these is the
+/// session's own result, which ends the dialogue.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "request", rename_all = "lowercase")]
+enum HelperRequest {
+    /// The picker wants the windows it should highlight, again.
+    Candidates,
+    /// The keyboard walked its cursor and wants the real pointer moved there,
+    /// in global logical pixels.
+    Pointer { x: i32, y: i32 },
+    /// The pin editor has drawn everything it is going to draw and is asking to
+    /// be let go.  It does not stop on its own when its work is finished: it
+    /// keeps its surface mapped -- showing the same picture the pin is about to
+    /// show -- until this is answered, which happens only after the pin daemon
+    /// has said the pin's own frame is on the screen.  Without the wait the two
+    /// pictures would not overlap and the marks would blink out between them.
+    ///
+    /// The CLI answers with the pin's answer once it has one, so the editor
+    /// exits knowing the handoff landed; see `run_helper_dialogue`.
+    Release,
+}
+
+/// Runs the Qt helper for an interactive session — one that may ask the CLI for
+/// things while it is open — and collects its answer.
+///
+/// The helper talks back on its stdout, one JSON object per line: a request
+/// (see [`HelperRequest`]) or, at the end, the session's own result.  The CLI
+/// answers on the helper's stdin.  Only the sessions that run against a live
+/// desktop need this — picking, which re-reads the window list as the pointer
+/// travels, and any session whose keyboard cursor walks the real pointer — but
+/// they all come through here, so a request added later needs no second runner.
+fn run_interactive_helper(
     helper: &HelperLookup,
     session_path: &Path,
+    scene: &SceneSnapshot,
     refresh: &impl Fn() -> Option<Vec<WindowCandidate>>,
-) -> Result<Vec<u8>> {
-    let mut child = Command::new(&helper.path)
-        .arg("--session")
+    // Run when the helper asks to be let go; see [`HelperRequest::Release`].
+    // The caller's own handoff, because it is the caller that knows what the
+    // editor was drawing over and what has to be on the screen before it stops.
+    release: &mut ReleaseHandler<'_>,
+) -> Result<HelperOutput> {
+    let frames: Vec<&crate::model::Frame> =
+        scene.outputs().iter().map(|output| &output.frame).collect();
+    run_helper_dialogue(
+        helper,
+        "--session",
+        session_path,
+        &frames,
+        Some(scene.bounds()),
+        refresh,
+        release,
+    )
+}
+
+/// One helper session, start to answer.
+///
+/// `sources` are the frames the helper reads before it starts — one per output
+/// for a capture, the pinned image alone for the pin editor — and they travel
+/// over the pixel channel rather than as files beside the session, because they
+/// are the bulk of it.  `desktop` is the logical rect a pointer request is
+/// expressed in, and `refresh` is what the picker re-reads as its pointer
+/// travels.  `release` is run when the helper asks to be let go and its answer
+/// is what the helper is told; see [`HelperRequest::Release`].
+fn run_helper_dialogue(
+    helper: &HelperLookup,
+    flag: &str,
+    session_path: &Path,
+    sources: &[&crate::model::Frame],
+    desktop: Option<crate::geometry::Rect>,
+    refresh: &dyn Fn() -> Option<Vec<WindowCandidate>>,
+    release: &mut ReleaseHandler<'_>,
+) -> Result<HelperOutput> {
+    let (parent, child_end) = crate::pixel_fd::PixelChannel::spawn_pair()?;
+    let mut command = Command::new(&helper.path);
+    command
+        .arg(flag)
         .arg(session_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::pixel_fd::with_channel(&mut command, &child_end);
+    command.env(
+        crate::pixel_fd::CHANNEL_ENV,
+        crate::pixel_fd::CHILD_FD.to_string(),
+    );
+    let mut child = command
         .spawn()
         .map_err(|error| helper_spawn_error(helper, error))?;
+    child_end.close();
+    send_source_frames(&parent, sources)?;
     let mut requests = child
         .stdin
         .take()
@@ -200,7 +269,14 @@ fn run_pick_helper(
         .ok_or_else(|| VshotError::Selection("the Qt helper has no answer pipe".into()))?;
     let mut responses = BufReader::new(responses);
 
-    let mut result = None;
+    // The pointer mover is opened lazily, on the first request that needs one:
+    // a session where the user never touches the keyboard cursor must not pay
+    // for a virtual-pointer connection, and on a compositor with no injection
+    // backend at all the walk simply moves the editor's own cursor.
+    let mut pointer: Option<crate::inject::Injector> = None;
+    let mut json: Option<Vec<u8>> = None;
+    let mut composite: Option<RenderedCapture> = None;
+    let mut handoff: Option<VshotError> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -208,29 +284,79 @@ fn run_pick_helper(
             VshotError::Selection(format!("failed to read the Qt helper's answer: {error}"))
         })?;
         if read == 0 {
-            // The helper went away without answering.
+            // The helper went away.  That is how every session ends: the ones
+            // with nothing to hand over write their result and exit, and a pin
+            // edit closes its stdout once the release below has been answered.
             break;
         }
         let text = line.trim();
         if text.is_empty() {
             continue;
         }
-        let request: serde_json::Value = match serde_json::from_str(text) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let request: HelperRequest = match serde_json::from_str(text) {
+            Ok(request) => request,
+            // Not a request: the session's own result.  It is not the end of
+            // the dialogue any more -- an editor writes it and then asks to be
+            // let go -- so it is kept and the loop goes on.
+            Err(_) => {
+                let bytes = text.as_bytes().to_vec();
+                // Read the render now rather than after the loop: the helper
+                // sends the pixels before this line, and the handoff below
+                // needs them while the helper is still on the screen.  A
+                // session whose caller has already taken them off the channel
+                // has nothing left here -- the pixels travel once.
+                if composite.is_none() && json.is_none() {
+                    composite = read_composite(&bytes, &parent)?;
+                }
+                json = Some(bytes);
+                continue;
+            }
         };
-        if request.get("request").and_then(serde_json::Value::as_str) != Some(CANDIDATE_REQUEST) {
-            result = Some(text.as_bytes().to_vec());
-            break;
-        }
-        let reply = CandidateReply {
-            candidates: refresh()
-                .map(|candidates| candidates.iter().map(QtCandidate::from).collect()),
+        let reply = match request {
+            HelperRequest::Candidates => {
+                let reply = CandidateReply {
+                    candidates: refresh()
+                        .map(|candidates| candidates.iter().map(QtCandidate::from).collect()),
+                };
+                serde_json::to_string(&reply).map_err(|error| {
+                    VshotError::Selection(format!("failed to encode the candidate reply: {error}"))
+                })?
+            }
+            HelperRequest::Pointer { x, y } => {
+                if pointer.is_none() {
+                    pointer = desktop.and_then(open_pointer_mover);
+                }
+                if let Some(injector) = pointer.as_mut() {
+                    // Best effort: a pointer that cannot be moved is not a
+                    // reason to abandon the capture the user is in the middle
+                    // of, and the editor's own cursor has already moved.
+                    let _ = injector.move_pointer(Point { x, y });
+                }
+                "{}".to_string()
+            }
+            HelperRequest::Release => {
+                let result = json.as_deref().ok_or_else(|| {
+                    VshotError::Selection(
+                        "the Qt helper asked to be let go before it reported a result".into(),
+                    )
+                })?;
+                // The render goes with it: the handoff is what puts these
+                // pixels in the pin, and the editor is holding them up on the
+                // screen until it is told they landed.
+                match release(result, composite.as_ref()) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        // The handoff could not be made, but the helper is
+                        // still told to stop: it has drawn everything it is
+                        // going to draw and the session is over either way.
+                        // The failure travels to the caller below.
+                        handoff = Some(error);
+                        "{}".to_string()
+                    }
+                }
+            }
         };
-        let encoded = serde_json::to_string(&reply).map_err(|error| {
-            VshotError::Selection(format!("failed to encode the candidate reply: {error}"))
-        })?;
-        writeln!(requests, "{encoded}")
+        writeln!(requests, "{reply}")
             .and_then(|()| requests.flush())
             .map_err(|error| {
                 VshotError::Selection(format!("failed to answer the Qt helper: {error}"))
@@ -240,10 +366,125 @@ fn run_pick_helper(
     let output = child.wait_with_output().map_err(|error| {
         VshotError::Selection(format!("failed to collect Qt helper output: {error}"))
     })?;
+    // A handoff that failed is reported before the exit status: the editor
+    // stopped because it was told to, so its status says nothing about whether
+    // the pin took the pixels.
+    if let Some(error) = handoff {
+        return Err(error);
+    }
     if !output.status.success() {
         return Err(helper_exit_error(output.status, &output.stderr));
     }
-    result.ok_or_else(|| VshotError::Selection("the Qt helper closed without a result".into()))
+    let json =
+        json.ok_or_else(|| VshotError::Selection("the Qt helper closed without a result".into()))?;
+    Ok(HelperOutput { json, composite })
+}
+
+/// A pointer mover for the desktop `desktop`, or `None` when this session has
+/// no way to move one.
+///
+/// The compositor's own virtual-pointer protocol only.  The scrolling capture
+/// prefers `Auto`, which falls back to the remote-desktop portal and then to
+/// `/dev/uinput` — and the portal is wrong here in a way it is not wrong there:
+/// opening it puts up a permission dialog, and a scroll is a thing the user
+/// asked for by pressing the button that starts it, while a nudge of the
+/// keyboard cursor is a keystroke.  A dialog appearing because an arrow key was
+/// tapped, on a compositor that has no virtual pointer to offer, is worse than
+/// the pointer not moving: the editor's own cursor has already moved, and the
+/// loupe says where it went.
+fn open_pointer_mover(desktop: crate::geometry::Rect) -> Option<crate::inject::Injector> {
+    crate::inject::Injector::open(desktop, crate::inject::Prefer::Wlr).ok()
+}
+
+fn run_helper(
+    helper: &HelperLookup,
+    session_path: &Path,
+    scene: &SceneSnapshot,
+    release: &mut ReleaseHandler<'_>,
+) -> Result<HelperOutput> {
+    run_interactive_helper(helper, session_path, scene, &|| None, release)
+}
+
+/// Hands the helper every source frame over the pixel channel.
+///
+/// They are sent in the session's own output order, which is how the helper
+/// pairs them with the outputs it parsed, and the header's kind keeps them from
+/// being mistaken for a result.
+fn send_source_frames(
+    channel: &crate::pixel_fd::PixelChannel,
+    sources: &[&crate::model::Frame],
+) -> Result<()> {
+    for frame in sources {
+        let size = frame.size();
+        channel.send(
+            crate::pixel_fd::KIND_SOURCE,
+            crate::pixel_fd::FORMAT_RGBA8888,
+            size.width,
+            size.height,
+            frame.pixels(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_outcome_with_render(
+    output: HelperOutput,
+    bounds: Rect,
+) -> Result<SelectionOutcome> {
+    let mut outcome = parse_outcome(output.json, bounds)?;
+    outcome.composite = output.composite;
+    Ok(outcome)
+}
+
+fn read_frame(channel: &crate::pixel_fd::PixelChannel, what: &str) -> Result<crate::model::Frame> {
+    let received = channel.receive()?;
+    if received.kind != crate::pixel_fd::KIND_RESULT {
+        return Err(VshotError::Selection(format!(
+            "the Qt helper sent {what} as something other than a rendered image"
+        )));
+    }
+    if received.format != crate::pixel_fd::FORMAT_RGBA8888 {
+        return Err(VshotError::Selection(format!(
+            "{what} arrived in format {} where RGBA8 was expected",
+            received.format
+        )));
+    }
+    crate::model::Frame::new(
+        crate::geometry::Size::new(received.width, received.height),
+        received.pixels().to_vec(),
+    )
+    .map_err(|error| VshotError::Selection(error.to_string()))
+}
+
+/// Reads the helper's render back when its answer says it sent one.
+///
+/// The flag in the JSON is what decides, rather than the channel's own
+/// readability: a session that rendered nothing (a cancelled one, a picker)
+/// leaves the channel silent, and blocking on it would hang the CLI.
+fn read_composite(
+    json: &[u8],
+    channel: &crate::pixel_fd::PixelChannel,
+) -> Result<Option<RenderedCapture>> {
+    let result: QtResult = serde_json::from_slice(json).map_err(|error| {
+        VshotError::Selection(format!("Qt helper returned invalid result JSON: {error}"))
+    })?;
+    if !result.composite {
+        return Ok(None);
+    }
+    // The order the helper sends them in: the marks, then the flattened
+    // capture.  Fixed, so no second header field is needed to tell them apart.
+    let marks = read_frame(channel, "the marks")?;
+    let composite = read_frame(channel, "the rendered capture")?;
+    if marks.size() != composite.size() {
+        return Err(VshotError::Selection(format!(
+            "the helper sent marks of {}x{} over a capture of {}x{}",
+            marks.size().width,
+            marks.size().height,
+            composite.size().width,
+            composite.size().height
+        )));
+    }
+    Ok(Some(RenderedCapture { composite, marks }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -308,6 +549,13 @@ struct QtSession<'a> {
     // Pin-edit only: id of the pinned image inside the daemon.
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
+    // Pin-edit only: how wide the pin's own border is drawn, in logical pixels.
+    // The border is centred on the image's edge, so it reaches half this far
+    // outside the image on every side; the editor counts that band as part of
+    // the pin, so a drag that starts on the rim moves the pin rather than
+    // landing on the bare canvas beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border_width: Option<u32>,
     // Pin-edit only: which part of the editor to open on, absent for the
     // ordinary annotation editor.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,6 +573,17 @@ struct QtSession<'a> {
     // nothing to scroll, so it leaves this out and the action stays away.
     #[serde(skip_serializing_if = "Option::is_none")]
     long_allowed: Option<bool>,
+    // Marks already drawn on this frame, in the shape the helper itself emits
+    // them, so re-entering an editing session opens on them instead of on a
+    // blank canvas.  The session a first edit runs under has none; the one a
+    // pin's second edit runs under carries the marks the first one committed,
+    // which is what makes them editable again rather than merely visible.
+    //
+    // Opaque here on purpose: the daemon holds what the helper wrote verbatim
+    // and hands it straight back, so the two ends of one protocol cannot drift
+    // apart by this side re-spelling the marks it was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<serde_json::Value>,
     // Translate mode only: the language pair and provider the helper hands to
     // `vshot translate --stdin-ocr` while it works, so the overlay and the CLI
     // translate the same way.
@@ -335,6 +594,13 @@ struct QtSession<'a> {
     // it and a newer one without it falls back to a temp file of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     result_path: Option<String>,
+    // Pin-edit only: the bounding box of every output, which is the coordinate
+    // space the CLI's injection backend expresses an absolute pointer position
+    // in.  The session's own `bounds` is the pin, which is not the screen, so
+    // the editor's keyboard-cursor walk would have the pointer land a fraction
+    // of the way to where it belongs without this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desktop: Option<WireRect>,
     outputs: Vec<QtOutput<'a>>,
 }
 
@@ -392,7 +658,11 @@ struct QtOutput<'a> {
     // region capture, the whole output for pin editing (so the toolbar can
     // float on the canvas beside the pinned image).
     surface: WireRect,
-    scale: u32,
+    // Device pixels per logical pixel of this output.  A real output's density
+    // is a whole number; the pin editor's virtual output carries the zoom its
+    // image is shown at, which is not (a 160-pixel pin across 176 logical
+    // pixels is 0.909), so it is serialized as the number it is.
+    scale: f64,
     pixel_width: u32,
     pixel_height: u32,
     path: String,
@@ -411,7 +681,14 @@ struct QtResult {
     // Window-pick only: where the pointer was when the click committed, so the
     // caller can resolve the click against the windows that exist by then.
     point: Option<WirePoint>,
-    annotations: Option<Vec<QtAnnotation>>,
+    // The marks, in the shape a later session can hand straight back: the
+    // editor builds them without the transient parts of a render (a label's
+    // bitmap, a translation's pixels), so a daemon that stores them can reopen
+    // the pin for editing instead of only showing the flattened result.  This
+    // side never reads into them -- it stores them and hands them back -- so
+    // they stay the wire's own JSON.
+    #[serde(default)]
+    marks: Option<serde_json::Value>,
     // Region editing only: the user pressed the toolbar's scrolling-capture
     // action, so the selection names a region to scroll and stitch rather
     // than a still to keep.
@@ -425,69 +702,50 @@ struct QtResult {
     // Set when the user finished with the toolbar's Pin button: the image goes
     // to the screen instead of to the destination the command line asked for.
     pin: Option<bool>,
+    // Set when the helper rendered the capture and sent it back over the pixel
+    // channel.  The rendered image *is* the result -- Qt is the only renderer --
+    // so a session that says this has its pixels waiting to be read.
+    #[serde(default)]
+    composite: bool,
 }
 
-/// What an editing session reported: the region to keep, the marks drawn on it,
-/// and the session's two other answers — a scrolling capture instead of a still,
-/// an image to pin instead of to save.
+/// What an editing session reported: the region to keep, and the session's two
+/// other answers — a scrolling capture instead of a still, an image to pin
+/// instead of to save.
 ///
 /// Neither answer decides what the image *is*: they come back with the rest of
 /// the session rather than as destinations of their own, so the CLI composes the
 /// image once and only then chooses what to do with it.
 pub(crate) struct SelectionOutcome {
     pub(crate) rect: Rect,
-    pub(crate) annotations: Vec<Annotation>,
-    /// True when the toolbar's scrolling-capture action was pressed.  The
-    /// marks are still carried, but the caller drops them: the picture the
-    /// stitch is made of does not exist yet, so a mark has nowhere to land.
+    /// True when the toolbar's scrolling-capture action was pressed: the
+    /// region names something to scroll and stitch rather than a still, and the
+    /// picture the stitch is made of does not exist yet.
     pub(crate) long: bool,
     /// True when the toolbar's Pin button was pressed.
     pub(crate) pin: bool,
+    /// The helper's render, when it sent one over the pixel channel.  This is
+    /// the image the CLI writes: it is not rebuilt from a description of the
+    /// marks, because a second renderer is exactly what used to leave a
+    /// committed mark half a pixel from its preview.
+    pub(crate) composite: Option<RenderedCapture>,
+    /// The marks as data, in the shape a later session can hand straight back.
+    /// Carried only so the Pin destination can give them to the daemon, which
+    /// stores them and reopens the pin for editing on them; every other
+    /// destination flattens the render and is done.  `None` when the session
+    /// drew nothing.
+    pub(crate) marks: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct QtAnnotation {
-    kind: String,
-    tool: Option<String>,
-    rect: Option<WireRect>,
-    points: Option<Vec<WirePoint>>,
-    origin: Option<WirePoint>,
-    text: Option<String>,
-    scale: Option<u32>,
-    color: Option<String>,
-    width: Option<u32>,
-    dash: Option<String>,
-    size: Option<u32>,
-    mask: Option<String>,
-    arrow_style: Option<String>,
-    strength: Option<u32>,
-    // Pen-tool strokes only: whether the path closes back onto its first
-    // anchor. Missing means an open path.
-    closed: Option<bool>,
-    // Pen-tool strokes only: which parts of the path get painted, one of
-    // "stroke" / "fill" / "both". Missing or unknown means "both", the
-    // historical fill-and-stroke behaviour.
-    fill: Option<String>,
-    // Wave strokes only: the peak deviation from the centre line and the length
-    // of one full period, both in logical pixels. Zero or missing means the
-    // renderer derives them from the stroke width.
-    amplitude: Option<u32>,
-    wavelength: Option<u32>,
-    // Font family used by the helper to rasterize the text label; empty or
-    // missing means the helper's application default font.
-    font: Option<String>,
-    bitmap_width: Option<u32>,
-    bitmap_height: Option<u32>,
-    // Path to a raw RGBA8888 file next to the session JSON, mirroring how
-    // the frozen output frames are handed over.
-    bitmap: Option<String>,
-}
-
-pub fn select_and_edit(scene: &SceneSnapshot, backdrop: &[String]) -> Result<SelectionOutcome> {
+pub fn select_and_edit(
+    scene: &SceneSnapshot,
+    backdrop: &[String],
+    release: &mut ReleaseHandler<'_>,
+) -> Result<SelectionOutcome> {
     let (_directory, session_path) = write_session(scene, "region", &[], None, true, backdrop)?;
     let helper = helper_program()?;
-    let output = run_helper(&helper, &session_path)?;
-    parse_outcome(output, scene.bounds())
+    let output = run_helper(&helper, &session_path, scene, release)?;
+    parse_outcome_with_render(output, scene.bounds())
 }
 
 /// What a picking session reported: the window the click landed on, as the
@@ -515,8 +773,10 @@ pub fn pick_window(
     let (_directory, session_path) =
         write_session(scene, "window-pick", candidates, None, false, &[])?;
     let helper = helper_program()?;
-    let output = run_pick_helper(&helper, &session_path, &refresh)?;
-    parse_picked_window(output, scene.bounds())
+    let output = run_interactive_helper(&helper, &session_path, scene, &refresh, &mut |_, _| {
+        Ok("{}".to_string())
+    })?;
+    parse_picked_window(output.json, scene.bounds())
 }
 
 /// Re-opens a captured scene for annotation with `selection` already made, so
@@ -526,6 +786,7 @@ pub fn edit_selection(
     scene: &SceneSnapshot,
     selection: Rect,
     backdrop: &[String],
+    release: &mut ReleaseHandler<'_>,
 ) -> Result<SelectionOutcome> {
     let (_directory, session_path) = write_session(
         scene,
@@ -536,8 +797,8 @@ pub fn edit_selection(
         backdrop,
     )?;
     let helper = helper_program()?;
-    let output = run_helper(&helper, &session_path)?;
-    parse_outcome(output, scene.bounds())
+    let output = run_helper(&helper, &session_path, scene, release)?;
+    parse_outcome_with_render(output, scene.bounds())
 }
 
 /// Asks for a region without offering to annotate it.  Scrolling capture is
@@ -546,8 +807,10 @@ pub fn edit_selection(
 pub fn select_region(scene: &SceneSnapshot) -> Result<Rect> {
     let (_directory, session_path) = write_session(scene, "region-only", &[], None, false, &[])?;
     let helper = helper_program()?;
-    let output = run_helper(&helper, &session_path)?;
-    Ok(parse_outcome(output, scene.bounds())?.rect)
+    let output = run_helper(&helper, &session_path, scene, &mut |_, _| {
+        Ok("{}".to_string())
+    })?;
+    Ok(parse_outcome_with_render(output, scene.bounds())?.rect)
 }
 
 /// What a translate session reported: the finished translation, which the
@@ -584,8 +847,10 @@ pub(crate) fn translate_overlay(
         &[],
     )?;
     let helper = helper_program()?;
-    let output = run_helper(&helper, &session_path)?;
-    parse_translate_result(output)
+    let output = run_helper(&helper, &session_path, scene, &mut |_, _| {
+        Ok("{}".to_string())
+    })?;
+    parse_translate_result(output.json)
 }
 
 /// Reads a translate session's answer: the translated text a `status: "ok"`
@@ -820,9 +1085,11 @@ pub(crate) struct PinEditSpec<'a> {
     pub(crate) output_name: &'a str,
     /// Global logical rect of the pinned image.
     pub(crate) window: Rect,
-    /// Device pixels per logical pixel between `frame` and `window`: 1 for
-    /// plain pins, the output's density for HiDPI-rendered text cards.
-    pub(crate) scale: u32,
+    /// Device pixels per logical pixel between `frame` and `window`: 1 for a
+    /// plain pin, the output's density for a HiDPI-rendered text card, and the
+    /// zoom the image is shown at for a pin the user has zoomed.  The last is
+    /// not a whole number, which is why it is a ratio rather than a density.
+    pub(crate) scale: crate::edit::Scale,
     /// Daemon socket the editor uses to move the pin live.
     pub(crate) socket: &'a Path,
     /// Id of this pin inside the daemon, echoed back in session JSON.
@@ -830,6 +1097,23 @@ pub(crate) struct PinEditSpec<'a> {
     /// Which part of the editor to open on, empty for the ordinary annotation
     /// editor the Space key opens. `"text"` opens it on the recognized text.
     pub(crate) action: &'a str,
+    /// The marks already on the pin, exactly as the helper last reported them,
+    /// so a second edit opens on them and they stay editable instead of having
+    /// been baked into the pixels the first one committed.  `None` on a pin
+    /// that has never been annotated.
+    pub(crate) annotations: Option<&'a serde_json::Value>,
+    /// How wide the pin's border is drawn, in logical pixels, so the editor can
+    /// count the rim as part of the pin: the stroke is centred on the image's
+    /// edge and reaches half this far outside it, and a drag there should move
+    /// the pin rather than read as a click on the bare canvas.
+    pub(crate) border_width: u32,
+    /// Bounding box of every output, or `None` when the caller has no way to
+    /// ask.  The editor's keyboard-cursor walk asks the CLI to move the real
+    /// pointer, and a pointer position is expressed in this space; `window` is
+    /// not it, because the pin is not the screen.  Left out, the pointer simply
+    /// is not moved, which is what happens on a compositor with no injection
+    /// backend anyway.
+    pub(crate) desktop: Option<Rect>,
 }
 
 /// Serializes a pin-edit session: one virtual output whose geometry is the
@@ -844,9 +1128,6 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
                 "failed to create pin-edit session directory: {error}"
             ))
         })?;
-    let raw_path = directory.path().join("pin.rgba");
-    write_private_file(&raw_path, spec.frame.pixels())?;
-
     let session = QtSession {
         version: 1,
         mode: "pin-edit",
@@ -854,12 +1135,15 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
         window: Some(spec.window.into()),
         socket: Some(spec.socket.to_string_lossy().into_owned()),
         id: Some(spec.pin_id),
+        border_width: Some(spec.border_width),
         action: (!spec.action.is_empty()).then_some(spec.action),
         candidates: None,
         selection: None,
         long_allowed: None,
+        annotations: spec.annotations.cloned(),
         translate: None,
         result_path: None,
+        desktop: spec.desktop.map(WireRect::from),
         outputs: vec![QtOutput {
             id: 0,
             name: spec.output_name,
@@ -871,10 +1155,13 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
             // helper widens it to the screen the pin sits on so the toolbar
             // lives on the canvas beside the image.
             surface: spec.window.into(),
-            scale: spec.scale,
+            scale: spec.scale.factor(),
             pixel_width: spec.frame.size().width,
             pixel_height: spec.frame.size().height,
-            path: raw_path.to_string_lossy().into_owned(),
+            // The image travels over the pixel channel, not as a file beside
+            // the session: it is a screenful of pixels, and the channel is what
+            // the two sides already share for exactly that.
+            path: String::new(),
             // A pinned image is its own SDR picture, with no frozen screen
             // behind it to show better.
             backdrop: false,
@@ -888,51 +1175,110 @@ pub(crate) fn write_pin_edit_session(spec: &PinEditSpec<'_>) -> Result<(TempDir,
     Ok((directory, session_path))
 }
 
-/// Runs the Qt helper against a session file and collects its stdout result.
-pub(crate) fn run_session(session_path: &Path) -> Result<Vec<u8>> {
+/// Runs the Qt helper against a session file and collects its answer: the
+/// result JSON and, when the helper rendered one, the capture it sent back.
+///
+/// The pin editor goes through here rather than [`run_helper`] because it is
+/// started with a different flag, but it is the same dialogue: the editor walks
+/// the real pointer with its keyboard cursor like any other session, so it asks
+/// for a warp the same way, and it needs a stdin to be answered on.  Only the
+/// scene differs -- a pinned image is not a frozen screen, so the desktop the
+/// pointer request is expressed in is read from the session rather than from a
+/// capture.
+pub(crate) fn run_session(
+    session_path: &Path,
+    pin: &crate::model::Frame,
+    handoff: &mut ReleaseHandler<'_>,
+) -> Result<HelperOutput> {
     let helper = helper_program()?;
-    let child = Command::new(&helper.path)
-        .arg("--pin-edit")
-        .arg(session_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                VshotError::Pin(format!(
-                    "Qt helper `{}` was not found; build it with `cmake -S . -B build-qt && \
-                     cmake --build build-qt` or point VSHOT_QT_HELPER at the executable",
-                    helper.path.display()
-                ))
-            } else {
-                VshotError::Pin(format!(
-                    "failed to start Qt helper `{}`: {error}",
-                    helper.path.display()
-                ))
-            }
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| VshotError::Pin(format!("failed to collect Qt helper output: {error}")))?;
-    if !output.status.success() {
-        let detail = compact_error(&output.stderr);
-        return Err(VshotError::Pin(if detail.is_empty() {
-            format!("Qt helper exited with {}", output.status)
-        } else {
-            format!("Qt helper exited with {}: {detail}", output.status)
-        }));
-    }
-    Ok(output.stdout)
+    run_pin_session(&helper, session_path, pin, handoff)
 }
 
-/// Parses a pin-edit helper result: the selection (the pin image, where the
-/// user left it) and the annotations drawn on it. The status `cancelled` maps
-/// to `Ok(None)`.
-pub(crate) fn parse_edit_result(
-    bytes: Vec<u8>,
-    window: Rect,
-) -> Result<Option<(Rect, Vec<Annotation>)>> {
+/// [`run_session`] against a helper that is already located, so the dialogue
+/// itself can be driven by a stub.
+///
+/// `handoff` is what the editor's release is answered with.  It is the one part
+/// of a pin edit that cannot happen inside the dialogue: the daemon is only told
+/// the new pixels after the dialogue has returned, because it is the same
+/// conversation -- and the same helper process -- that produces them.
+fn run_pin_session(
+    helper: &HelperLookup,
+    session_path: &Path,
+    pin: &crate::model::Frame,
+    handoff: &mut ReleaseHandler<'_>,
+) -> Result<HelperOutput> {
+    // The desktop a pointer request is expressed in: the CLI subtracts this
+    // origin and scales to its size.  Read from the session, which is the only
+    // place that knows the layout -- the pin image itself is not the screen.
+    // An unreadable one means the pointer simply is not moved, which is what
+    // happens on a compositor with no injection backend anyway.
+    let desktop = session_desktop(session_path).ok();
+    run_helper_dialogue(
+        helper,
+        "--pin-edit",
+        session_path,
+        &[pin],
+        desktop,
+        &|| None,
+        handoff,
+    )
+    .map_err(|error| match error {
+        // The pin editor is the pin's own editor, so its failures are the
+        // pin's: the message a user sees should name what they asked for.
+        VshotError::Selection(message) => VshotError::Pin(message),
+        other => other,
+    })
+}
+
+/// The desktop rect a pin-edit session's pointer requests are expressed in.
+///
+/// The session's own `bounds` is the pin, which is not the screen; the daemon
+/// writes the layout's bounding box as `desktop` for exactly this.  A session
+/// without one is left with no pointer mover rather than a wrong rectangle: a
+/// pointer moved to the wrong place is worse than one that did not move.
+fn session_desktop(session_path: &Path) -> Result<crate::geometry::Rect> {
+    let payload = std::fs::read(session_path).map_err(|source| {
+        VshotError::Pin(format!(
+            "failed to read pin-edit session {}: {source}",
+            session_path.display()
+        ))
+    })?;
+    let session: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|error| VshotError::Pin(format!("invalid pin-edit session JSON: {error}")))?;
+    let desktop = session
+        .get("desktop")
+        .ok_or_else(|| VshotError::Pin("pin-edit session has no desktop rect".into()))?;
+    let as_i64 = |key: &str| -> Result<i64> {
+        desktop
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| VshotError::Pin(format!("pin-edit desktop field `{key}` is missing")))
+    };
+    let x = i32::try_from(as_i64("x")?)
+        .map_err(|_| VshotError::Pin("pin-edit desktop x is out of range".into()))?;
+    let y = i32::try_from(as_i64("y")?)
+        .map_err(|_| VshotError::Pin("pin-edit desktop y is out of range".into()))?;
+    let width = u32::try_from(as_i64("width")?)
+        .map_err(|_| VshotError::Pin("pin-edit desktop width is out of range".into()))?;
+    let height = u32::try_from(as_i64("height")?)
+        .map_err(|_| VshotError::Pin("pin-edit desktop height is out of range".into()))?;
+    Ok(crate::geometry::Rect::new(x, y, width, height))
+}
+
+/// Parses a pin-edit helper result: where the user left the image, and the
+/// marks on it in the shape the daemon stores them.  The status `cancelled`
+/// maps to `Ok(None)`.
+pub(crate) struct EditedPin {
+    pub(crate) selection: Rect,
+    /// The marks as the session handed them over and the editor handed them
+    /// back, verbatim.  This is what the daemon keeps, and what it hands to the
+    /// next session: re-spelling them here would be a second place for the wire
+    /// shape to drift, and the render form the helper also emits is not what a
+    /// re-edit needs.
+    pub(crate) marks: serde_json::Value,
+}
+
+pub(crate) fn parse_edit_result(bytes: Vec<u8>, window: Rect) -> Result<Option<EditedPin>> {
     let result: QtResult = serde_json::from_slice(&bytes).map_err(|error| {
         VshotError::Pin(format!("Qt helper returned invalid result JSON: {error}"))
     })?;
@@ -955,13 +1301,10 @@ pub(crate) fn parse_edit_result(
                     "Qt helper returned a pin selection smaller than 5x5".into(),
                 ));
             }
-            let annotations = result
-                .annotations
-                .unwrap_or_default()
-                .into_iter()
-                .map(parse_annotation)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some((selection, annotations)))
+            let marks = result
+                .marks
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+            Ok(Some(EditedPin { selection, marks }))
         }
         status => Err(VshotError::Pin(format!(
             "Qt helper returned unknown status `{status}`"
@@ -1002,10 +1345,6 @@ fn write_session_full(
 
     let mut outputs = Vec::with_capacity(scene.outputs().len());
     for output in scene.outputs() {
-        let raw_path = directory
-            .path()
-            .join(format!("output-{}.rgba", output.global_id));
-        write_private_file(&raw_path, output.frame.pixels())?;
         outputs.push(QtOutput {
             id: output.global_id,
             name: &output.name,
@@ -1014,10 +1353,13 @@ fn write_session_full(
             width: output.geometry.size.width,
             height: output.geometry.size.height,
             surface: output.geometry.into(),
-            scale: output.scale,
+            scale: f64::from(output.scale),
             pixel_width: output.frame.size().width,
             pixel_height: output.frame.size().height,
-            path: raw_path.to_string_lossy().into_owned(),
+            // The frame itself travels over the pixel channel rather than as a
+            // file beside the session: it is a screenful of pixels, and the
+            // channel carries exactly that.
+            path: String::new(),
             backdrop: backdrop.iter().any(|name| name == &output.name),
         });
     }
@@ -1029,13 +1371,18 @@ fn write_session_full(
         window: None,
         socket: None,
         id: None,
+        border_width: None,
         action: None,
         candidates: (!candidates.is_empty())
             .then(|| candidates.iter().map(QtCandidate::from).collect()),
         selection,
         long_allowed: long_allowed.then_some(true),
+        annotations: None,
         translate,
         result_path,
+        // A region session's bounds *are* the desktop's, so the walk's pointer
+        // requests are already expressed in the space the CLI converts against.
+        desktop: None,
         outputs,
     };
     let session_path = directory.path().join("session.json");
@@ -1126,17 +1473,22 @@ fn parse_outcome(bytes: Vec<u8>, bounds: Rect) -> Result<SelectionOutcome> {
                     "Qt helper returned a selection smaller than 5x5".into(),
                 ));
             }
-            let annotations = result
-                .annotations
-                .unwrap_or_default()
-                .into_iter()
-                .map(parse_annotation)
-                .collect::<Result<Vec<_>>>()?;
             Ok(SelectionOutcome {
                 rect: selection,
-                annotations,
                 long: result.long,
                 pin: result.pin.unwrap_or(false),
+                // Read off the channel by the caller, which is where the pixels
+                // arrive: parsing the answer and reading the buffers are two
+                // steps, and this one never blocks.
+                composite: None,
+                // An empty array is "nothing was drawn", the same as an absent
+                // field: a pin made from an untouched capture has no marks to
+                // reopen on, and handing the daemon an empty list would only
+                // make it store one.
+                marks: result.marks.filter(|marks| match marks {
+                    serde_json::Value::Array(items) => !items.is_empty(),
+                    _ => true,
+                }),
             })
         }
         status => Err(VshotError::Selection(format!(
@@ -1171,243 +1523,7 @@ fn parse_picked_window(bytes: Vec<u8>, bounds: Rect) -> Result<PickedWindow> {
     }
 }
 
-fn parse_annotation(annotation: QtAnnotation) -> Result<Annotation> {
-    let tool_name = annotation.tool.as_deref().unwrap_or_default();
-    match annotation.kind.as_str() {
-        "shape" => {
-            let tool = parse_shape_tool(tool_name)?;
-            let rect = annotation
-                .rect
-                .ok_or_else(|| VshotError::Selection("shape annotation has no rect".into()))?
-                .into_rect("shape annotation rect")?;
-            Ok(Annotation::Shape {
-                tool,
-                rect,
-                color: parse_color(annotation.color.as_deref(), DEFAULT_ANNOTATION_COLOR)?,
-                width: parse_width(annotation.width)?,
-                dash: parse_dash(annotation.dash.as_deref())?,
-                mask: parse_mask(annotation.mask.as_deref())?,
-                strength: parse_strength(annotation.strength)?,
-            })
-        }
-        "stroke" => {
-            let tool = parse_stroke_tool(tool_name)?;
-            let points = annotation
-                .points
-                .ok_or_else(|| VshotError::Selection("stroke annotation has no points".into()))?
-                .into_iter()
-                .map(|point| parse_point(point, "annotation point"))
-                .collect::<Result<Vec<_>>>()?;
-            if points.is_empty() {
-                return Err(VshotError::Selection(
-                    "stroke annotation must contain points".into(),
-                ));
-            }
-            Ok(Annotation::Stroke {
-                tool,
-                points,
-                color: parse_color(annotation.color.as_deref(), DEFAULT_ANNOTATION_COLOR)?,
-                width: parse_width(annotation.width)?,
-                dash: parse_dash(annotation.dash.as_deref())?,
-                head: parse_head(annotation.size)?,
-                arrow_style: parse_arrow_style(annotation.arrow_style.as_deref())?,
-                strength: parse_strength(annotation.strength)?,
-                closed: annotation.closed.unwrap_or(false),
-                amplitude: parse_wave_size(annotation.amplitude),
-                wavelength: parse_wave_size(annotation.wavelength),
-                fill: parse_fill(annotation.fill.as_deref()),
-            })
-        }
-        "text" => {
-            let origin = annotation
-                .origin
-                .ok_or_else(|| VshotError::Selection("text annotation has no origin".into()))?;
-            let text = annotation
-                .text
-                .ok_or_else(|| VshotError::Selection("text annotation has no text".into()))?;
-            let scale = parse_text_scale(annotation.scale)?;
-            let bitmap = match (
-                annotation.bitmap_width,
-                annotation.bitmap_height,
-                annotation.bitmap.as_deref(),
-            ) {
-                (None, None, None) => None,
-                (Some(width), Some(height), Some(path)) => {
-                    Some(read_text_bitmap(path, width, height)?)
-                }
-                _ => {
-                    return Err(VshotError::Selection(
-                        "text bitmap fields must be provided together".into(),
-                    ))
-                }
-            };
-            Ok(Annotation::Text {
-                origin: parse_point(origin, "annotation origin")?,
-                text,
-                scale,
-                color: parse_color(annotation.color.as_deref(), DEFAULT_TEXT_COLOR)?,
-                font: annotation.font.unwrap_or_default(),
-                bitmap,
-            })
-        }
-        "image" => {
-            let rect = annotation
-                .rect
-                .ok_or_else(|| VshotError::Selection("image annotation has no rect".into()))?
-                .into_rect("image annotation rect")?;
-            // The pixels are mandatory: an image annotation with nothing to
-            // draw would be a silent no-op, and the helper only emits one when
-            // it has written the file.
-            let pixels = match (
-                annotation.bitmap_width,
-                annotation.bitmap_height,
-                annotation.bitmap.as_deref(),
-            ) {
-                (Some(width), Some(height), Some(path)) => read_text_bitmap(path, width, height)?,
-                _ => {
-                    return Err(VshotError::Selection(
-                        "image annotation must carry its pixels".into(),
-                    ))
-                }
-            };
-            Ok(Annotation::Image { rect, pixels })
-        }
-        kind => Err(VshotError::Selection(format!(
-            "Qt helper returned unknown annotation kind `{kind}`"
-        ))),
-    }
-}
-
-/// Parses a `#RRGGBB` or `#RRGGBBAA` helper color into RGBA8.
-///
-/// The eight-digit form spells alpha last, the CSS order that `ui/config.cpp`'s
-/// `readColor` writes and re-reads by hand. Qt's own `QColor(QString)` reads
-/// eight hex digits as `#AARRGGBB` instead, so `#ff8800ff` would come out as
-/// purple; parsing the pairs here keeps the Rust side on the same convention.
-fn parse_color(value: Option<&str>, default: [u8; 4]) -> Result<[u8; 4]> {
-    let Some(hex) = value else {
-        return Ok(default);
-    };
-    let hex = hex.strip_prefix('#').unwrap_or(hex);
-    // With the `#` off, six digits are `rrggbb` and eight are `rrggbbaa`.
-    if (hex.len() != 6 && hex.len() != 8) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(VshotError::Selection(format!(
-            "Qt annotation color `{value:?}` is not a #RRGGBB or #RRGGBBAA value"
-        )));
-    }
-    let channel = |range: std::ops::Range<usize>| {
-        u8::from_str_radix(&hex[range], 16)
-            .map_err(|_| VshotError::Selection("Qt annotation color is invalid".into()))
-    };
-    // Eight digits append the alpha pair; six keep the old opaque default.
-    let alpha = if hex.len() == 8 { channel(6..8)? } else { 255 };
-    Ok([channel(0..2)?, channel(2..4)?, channel(4..6)?, alpha])
-}
-
-/// Clamps a helper stroke width into a sane logical-pixel range.
-fn parse_width(value: Option<u32>) -> Result<u32> {
-    Ok(value.unwrap_or(DEFAULT_ANNOTATION_WIDTH).clamp(1, 64))
-}
-
-/// Parses the optional line style; missing fields mean a solid stroke.
-fn parse_dash(value: Option<&str>) -> Result<LineDash> {
-    let Some(value) = value else {
-        return Ok(LineDash::Solid);
-    };
-    LineDash::parse(value).ok_or_else(|| {
-        VshotError::Selection(format!(
-            "Qt annotation dash `{value}` is not a known line style"
-        ))
-    })
-}
-
-/// Clamps the optional arrow head size multiplier.
-fn parse_head(value: Option<u32>) -> Result<u32> {
-    Ok(value.unwrap_or(1).clamp(1, 8))
-}
-
-/// Clamps the optional text scale to the helper's supported 1..=64 range.
-fn parse_text_scale(value: Option<u32>) -> Result<u32> {
-    Ok(value.unwrap_or(2).clamp(1, 64))
-}
-
-/// Loads a helper-rendered text bitmap and validates its pixel payload.
-fn read_text_bitmap(path: &str, width: u32, height: u32) -> Result<TextBitmap> {
-    const MAX_TEXT_BITMAP_PIXELS: u64 = 16 * 1024 * 1024;
-    if width == 0 || height == 0 {
-        return Err(VshotError::Selection(
-            "text bitmap dimensions must be greater than zero".into(),
-        ));
-    }
-    if u64::from(width) * u64::from(height) > MAX_TEXT_BITMAP_PIXELS {
-        return Err(VshotError::Selection("text bitmap is too large".into()));
-    }
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| VshotError::Selection("text bitmap is too large".into()))?;
-    let pixels = std::fs::read(path).map_err(|error| {
-        VshotError::Selection(format!("failed to read text bitmap `{path}`: {error}"))
-    })?;
-    if pixels.len() != expected {
-        return Err(VshotError::Selection(format!(
-            "text bitmap `{path}` has {} bytes but {}x{} RGBA needs {expected}",
-            pixels.len(),
-            width,
-            height
-        )));
-    }
-    Ok(TextBitmap {
-        width,
-        height,
-        pixels,
-    })
-}
-
-/// Parses the optional arrow head shape; missing fields mean an open head.
-fn parse_arrow_style(value: Option<&str>) -> Result<ArrowStyle> {
-    let Some(value) = value else {
-        return Ok(ArrowStyle::Open);
-    };
-    ArrowStyle::parse(value).ok_or_else(|| {
-        VshotError::Selection(format!(
-            "Qt annotation arrow_style `{value}` is not a known arrow style"
-        ))
-    })
-}
-
-/// Clamps the optional mosaic strength level; missing fields mean standard.
-fn parse_strength(value: Option<u32>) -> Result<u32> {
-    Ok(value.unwrap_or(DEFAULT_MOSAIC_STRENGTH).clamp(1, 3))
-}
-
-/// Parses the optional mosaic area shape; missing fields mean a rectangle.
-fn parse_mask(value: Option<&str>) -> Result<ShapeMask> {
-    let Some(value) = value else {
-        return Ok(ShapeMask::Rect);
-    };
-    ShapeMask::parse(value).ok_or_else(|| {
-        VshotError::Selection(format!(
-            "Qt annotation mask `{value}` is not a known area shape"
-        ))
-    })
-}
-
-/// Clamps an explicit wave amplitude or wavelength, in logical pixels.
-///
-/// Zero is not clamped up to one: it is the helper's way of saying "derive it
-/// from the stroke width", and the renderer's derivation floors the value well
-/// above one anyway.
-fn parse_wave_size(value: Option<u32>) -> u32 {
-    value.unwrap_or(0).min(4096)
-}
-
-/// Parses the optional pen fill mode; a missing or unknown value means the
-/// historical fill-and-stroke behaviour.
-fn parse_fill(value: Option<&str>) -> BezierFill {
-    value.and_then(BezierFill::parse).unwrap_or_default()
-}
-
+/// One `{x,y}` pair of the wire, as the point type the geometry uses.
 fn parse_point(point: WirePoint, label: &str) -> Result<Point> {
     Ok(Point::new(
         i32::try_from(point.x)
@@ -1417,36 +1533,271 @@ fn parse_point(point: WirePoint, label: &str) -> Result<Point> {
     ))
 }
 
-fn parse_shape_tool(name: &str) -> Result<EditorTool> {
-    match name {
-        "rectangle" => Ok(EditorTool::Rectangle),
-        "ellipse" => Ok(EditorTool::Ellipse),
-        "mosaic" => Ok(EditorTool::Mosaic),
-        _ => Err(VshotError::Selection(format!(
-            "unknown shape annotation tool `{name}`"
-        ))),
-    }
-}
-
-fn parse_stroke_tool(name: &str) -> Result<EditorTool> {
-    match name {
-        "arrow" => Ok(EditorTool::Arrow),
-        "pen" => Ok(EditorTool::Pen),
-        "draw" => Ok(EditorTool::Draw),
-        "line" => Ok(EditorTool::Line),
-        "wave" => Ok(EditorTool::Wave),
-        "bezier" => Ok(EditorTool::Bezier),
-        "mosaic" => Ok(EditorTool::Mosaic),
-        "blur" => Ok(EditorTool::Blur),
-        _ => Err(VshotError::Selection(format!(
-            "unknown stroke annotation tool `{name}`"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The helper talks to the CLI in one JSON object per line, and the session's
+    // own result is whatever is left over.  So the split between "a request" and
+    // "the result" is the whole protocol, and getting it wrong in either
+    // direction is silent: a request read as a result ends the session early,
+    // and a result read as a request leaves the CLI answering something that
+    // was never asked.
+    #[test]
+    fn a_helpers_line_is_either_a_request_or_the_result() {
+        let pointer: HelperRequest = serde_json::from_str(r#"{"request":"pointer","x":12,"y":34}"#)
+            .expect("a pointer request");
+        match pointer {
+            HelperRequest::Pointer { x, y } => assert_eq!((x, y), (12, 34)),
+            other => panic!("read as {other:?}"),
+        }
+        assert!(matches!(
+            serde_json::from_str::<HelperRequest>(r#"{"request":"candidates"}"#).unwrap(),
+            HelperRequest::Candidates
+        ));
+
+        // A result is not a request: it has no `request` field, or one this
+        // build does not know, and either way it ends the dialogue rather than
+        // being answered.
+        for result in [
+            r#"{"rect":{"x":0,"y":0,"width":10,"height":10}}"#,
+            r#"{"request":"something-newer"}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<HelperRequest>(result).is_err(),
+                "{result} was taken for a request"
+            );
+        }
+    }
+
+    // The whole dialogue, against a stub helper that plays the Qt side: it asks
+    // the CLI for a pointer move and then reports a result, and what is asserted
+    // is that the CLI answered the request on the helper's stdin *and* still
+    // read the result that followed it.  Answering is the easy half; the half
+    // that breaks is the loop ending on the request instead of on the result,
+    // or the answer never being flushed and the helper waiting for it forever.
+    #[test]
+    fn the_cli_answers_a_pointer_request_and_still_reads_the_result() {
+        // The stub answers nothing, so an EOF here means the CLI never
+        // replied: it exits non-zero and the test fails on the helper's exit
+        // status, which is the assertion that the request was answered rather
+        // than merely received.
+        let script = r#"
+printf '%s\n' '{"request":"pointer","x":7,"y":9}'
+read -r answer
+[ "$answer" = "{}" ] || { printf 'unanswered: %s\n' "$answer" >&2; exit 1; }
+printf '%s\n' '{"status":"ok","selection":{"x":1,"y":2,"width":30,"height":40}}'
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("vshot-qt-ui");
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let session_path = directory.path().join("session.json");
+        std::fs::write(&session_path, "{}").unwrap();
+
+        let scene = test_scene();
+        let helper_lookup = HelperLookup {
+            path: helper,
+            searched: Vec::new(),
+        };
+        let output = run_interactive_helper(
+            &helper_lookup,
+            &session_path,
+            &scene,
+            &|| None,
+            &mut |_, _| Ok("{}".to_string()),
+        )
+        .expect("the dialogue runs to the end");
+        let parsed = parse_outcome(output.json, scene.bounds()).expect("a result");
+        assert_eq!(parsed.rect, Rect::new(1, 2, 30, 40));
+    }
+
+    // The pin editor walks the same keyboard cursor the region editor does, so
+    // it asks for a pointer warp the same way -- which means its helper has to
+    // be run with a stdin to be answered on, not the null the pin path used to
+    // give it.  A stub that never gets an answer writes a short result and
+    // exits non-zero, so the CLI's own error is the assertion.
+    #[test]
+    fn the_pin_editor_is_answered_on_its_request_pipe_too() {
+        let script = r#"
+printf '%s\n' '{"request":"pointer","x":41,"y":17}'
+read -r answer
+[ "$answer" = "{}" ] || { printf 'unanswered: %s\n' "$answer" >&2; exit 1; }
+printf '%s\n' '{"status":"ok","selection":{"x":0,"y":0,"width":40,"height":40}}'
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("vshot-qt-ui");
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        // The daemon's own session shape, with the desktop it stamps for the
+        // pointer request: `bounds` is the pin and is deliberately not it.
+        let session_path = directory.path().join("session.json");
+        std::fs::write(
+            &session_path,
+            br#"{"version":1,"mode":"pin-edit",
+                 "bounds":{"x":900,"y":40,"width":40,"height":40},
+                 "desktop":{"x":0,"y":0,"width":1920,"height":1080}}"#,
+        )
+        .unwrap();
+
+        let pin =
+            crate::model::Frame::new(crate::geometry::Size::new(40, 40), vec![0u8; 40 * 40 * 4])
+                .unwrap();
+        let helper_lookup = HelperLookup {
+            path: helper,
+            searched: Vec::new(),
+        };
+        let output = run_pin_session(&helper_lookup, &session_path, &pin, &mut |_, _| {
+            Ok("{}".to_string())
+        })
+        .expect("the pin dialogue runs to the end");
+        let edited = parse_edit_result(output.json, Rect::new(900, 40, 40, 40))
+            .expect("a result")
+            .expect("not cancelled");
+        assert_eq!(edited.selection, Rect::new(0, 0, 40, 40));
+    }
+
+    // The release is the whole handoff in one exchange: the editor writes its
+    // result and then asks to be let go, and the CLI runs the caller's handoff
+    // with that result before answering.  Two things have to hold for the
+    // marks not to blink out -- the result is read *before* the answer goes
+    // back, and the answer goes back at all, or the editor waits on a line that
+    // never comes and only its own backstop ends it.
+    #[test]
+    fn the_editor_is_let_go_only_after_its_result_was_taken() {
+        let script = r#"
+printf '%s\n' '{"status":"ok","selection":{"x":0,"y":0,"width":40,"height":40}}'
+printf '%s\n' '{"request":"release"}'
+read -r answer
+[ "$answer" = "{}" ] || { printf 'unanswered: %s\n' "$answer" >&2; exit 1; }
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("vshot-qt-ui");
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let session_path = directory.path().join("session.json");
+        std::fs::write(
+            &session_path,
+            br#"{"version":1,"mode":"pin-edit",
+                 "bounds":{"x":900,"y":40,"width":40,"height":40},
+                 "desktop":{"x":0,"y":0,"width":1920,"height":1080}}"#,
+        )
+        .unwrap();
+        let pin =
+            crate::model::Frame::new(crate::geometry::Size::new(40, 40), vec![0u8; 40 * 40 * 4])
+                .unwrap();
+        let helper_lookup = HelperLookup {
+            path: helper,
+            searched: Vec::new(),
+        };
+        // What the handoff was given, and how many times: a session has one
+        // release, and a second would mean the CLI answered twice.
+        let mut taken: Vec<Vec<u8>> = Vec::new();
+        let output = run_pin_session(&helper_lookup, &session_path, &pin, &mut |result, _| {
+            taken.push(result.to_vec());
+            Ok("{}".to_string())
+        })
+        .expect("the pin dialogue runs to the end");
+        assert_eq!(taken.len(), 1, "the handoff ran once");
+        assert_eq!(
+            taken[0], output.json,
+            "the handoff saw the very bytes the dialogue collected"
+        );
+        assert!(parse_edit_result(output.json, Rect::new(900, 40, 40, 40))
+            .expect("a result")
+            .is_some());
+    }
+
+    // A handoff that fails still lets the editor go: it has drawn everything it
+    // is going to draw, and leaving it up would be a surface nobody will ever
+    // take down.  The failure travels to the caller instead, which is the side
+    // that can say what went wrong.
+    #[test]
+    fn a_failed_handoff_still_ends_the_editor() {
+        let script = r#"
+printf '%s\n' '{"status":"ok","selection":{"x":0,"y":0,"width":40,"height":40}}'
+printf '%s\n' '{"request":"release"}'
+read -r answer
+[ "$answer" = "{}" ] || { printf 'unanswered: %s\n' "$answer" >&2; exit 1; }
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("vshot-qt-ui");
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let session_path = directory.path().join("session.json");
+        std::fs::write(
+            &session_path,
+            br#"{"bounds":{"x":900,"y":40,"width":40,"height":40},
+                 "desktop":{"x":0,"y":0,"width":1920,"height":1080}}"#,
+        )
+        .unwrap();
+        let pin =
+            crate::model::Frame::new(crate::geometry::Size::new(40, 40), vec![0u8; 40 * 40 * 4])
+                .unwrap();
+        let helper_lookup = HelperLookup {
+            path: helper,
+            searched: Vec::new(),
+        };
+        let error = match run_pin_session(&helper_lookup, &session_path, &pin, &mut |_, _| {
+            Err(VshotError::Pin("the pin daemon refused the frame".into()))
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("a failed handoff is not reported as a finished session"),
+        };
+        assert!(
+            matches!(&error, VshotError::Pin(message) if message.contains("refused the frame")),
+            "reported as {error}"
+        );
+    }
+
+    // The desktop a warp is expressed in is the layout's, and the session's own
+    // `bounds` is the pin: reading the wrong one would put the pointer at a
+    // fraction of where it belongs whenever the pin is not at the origin.
+    #[test]
+    fn the_pin_edit_desktop_is_read_apart_from_the_pin_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("session.json");
+        std::fs::write(
+            &session_path,
+            br#"{"bounds":{"x":900,"y":40,"width":40,"height":40},
+                 "desktop":{"x":-1920,"y":0,"width":3840,"height":1080}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session_desktop(&session_path).unwrap(),
+            Rect::new(-1920, 0, 3840, 1080)
+        );
+
+        // A session without one has no desktop, and that is what keeps a warp
+        // from being sent against a rectangle that is really the pin.
+        std::fs::write(
+            &session_path,
+            br#"{"bounds":{"x":900,"y":40,"width":40,"height":40}}"#,
+        )
+        .unwrap();
+        assert!(session_desktop(&session_path).is_err());
+    }
+
+    /// One small output, enough for a session to be written about it.
+    fn test_scene() -> SceneSnapshot {
+        let frame =
+            crate::model::Frame::new(crate::geometry::Size::new(64, 64), vec![0u8; 64 * 64 * 4])
+                .unwrap();
+        SceneSnapshot::from_outputs(vec![crate::model::OutputSnapshot::new(
+            1,
+            "TEST-1",
+            Rect::new(0, 0, 64, 64),
+            1,
+            frame,
+        )
+        .unwrap()])
+        .unwrap()
+    }
 
     #[test]
     fn helper_candidates_cover_sibling_and_buildqt_layouts() {
@@ -1462,420 +1813,107 @@ mod tests {
         assert!(helper_candidates(None).is_empty());
     }
 
+    // A pin the user has zoomed is annotated on an image that is not a whole
+    // number of device pixels per logical pixel.  The session has to declare
+    // that ratio and the frame's own pixel size together, or the editor's
+    // dimension check refuses it and the pin cannot be edited at all.
     #[test]
-    fn parses_qt_result_with_annotations() {
-        let bytes = br#"{"status":"ok","selection":{"x":-2,"y":3,"width":10,"height":8},"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":1,"width":3,"height":4}},{"kind":"stroke","tool":"arrow","points":[{"x":0,"y":0},{"x":5,"y":6}]},{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2}]}"#.to_vec();
-        let SelectionOutcome {
-            rect: selection,
-            annotations,
-            ..
-        } = parse_outcome(bytes, Rect::new(-10, -10, 100, 100)).unwrap();
-        assert_eq!(selection, Rect::new(-2, 3, 10, 8));
-        assert_eq!(annotations.len(), 3);
-        assert_eq!(annotations[0].tool(), EditorTool::Rectangle);
-        assert_eq!(annotations[0].color(), DEFAULT_ANNOTATION_COLOR);
-        assert_eq!(annotations[0].width(), DEFAULT_ANNOTATION_WIDTH);
-        assert_eq!(annotations[1].tool(), EditorTool::Arrow);
-        assert_eq!(annotations[1].arrow_style(), ArrowStyle::Open);
-        assert_eq!(
-            annotations[2].text_content().map(|value| value.0),
-            Some("A")
-        );
-        assert_eq!(annotations[2].color(), DEFAULT_TEXT_COLOR);
-    }
-
-    #[test]
-    fn parses_the_scrolling_capture_intent_from_the_result() {
-        // The toolbar's scrolling-capture action ends the session like a
-        // confirmation, so the answer travels in the same document as the
-        // selection and the marks.  `parse_outcome` carries it; `parse_result`,
-        // which predates it, keeps its old shape for the callers that never ask.
-        let bytes = br#"{"status":"ok","selection":{"x":1,"y":2,"width":10,"height":8},"long":true,"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":1,"width":3,"height":4}}]}"#.to_vec();
-        let outcome = parse_outcome(bytes.clone(), Rect::new(0, 0, 100, 100)).unwrap();
-        assert!(outcome.long);
-        assert!(!outcome.pin);
-        assert_eq!(outcome.rect, Rect::new(1, 2, 10, 8));
-        assert_eq!(outcome.annotations.len(), 1);
-        let SelectionOutcome {
-            rect: selection,
-            annotations,
-            ..
-        } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(selection, Rect::new(1, 2, 10, 8));
-        assert_eq!(annotations.len(), 1);
-        // A document without the key -- window editing never sends it -- reads
-        // as an ordinary capture.
-        let plain = br#"{"status":"ok","selection":{"x":0,"y":0,"width":10,"height":8}}"#.to_vec();
-        let plain = parse_outcome(plain, Rect::new(0, 0, 100, 100)).unwrap();
-        assert!(!plain.long);
-        assert!(!plain.pin);
-    }
-
-    #[test]
-    fn a_result_can_ask_for_the_image_to_be_pinned() {
-        // The toolbar's Pin button: the session is a kept one like OK's, and the
-        // flag is what says the image goes to the screen.  A helper too old to
-        // send it is read as "no", which is the ordinary save.
-        let pinned =
-            br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"pin":true}"#
-                .to_vec();
-        assert!(
-            parse_outcome(pinned, Rect::new(0, 0, 100, 100))
-                .unwrap()
-                .pin
-        );
-        let saved = br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50}}"#.to_vec();
-        assert!(!parse_outcome(saved, Rect::new(0, 0, 100, 100)).unwrap().pin);
-    }
-
-    #[test]
-    fn parses_annotation_styles_from_wire() {
-        let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"pen","color":"#00FF88","width":4,"dash":"dotted","points":[{"x":0,"y":0},{"x":9,"y":9}]},{"kind":"stroke","tool":"arrow","arrow_style":"filled","points":[{"x":0,"y":0},{"x":9,"y":9}]},{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":3,"color":"#112233"}]}"##.to_vec();
-        let SelectionOutcome {
-            rect: selection,
-            annotations,
-            ..
-        } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(selection, Rect::new(0, 0, 50, 50));
-        assert_eq!(annotations[0].color(), [0, 255, 136, 255]);
-        assert_eq!(annotations[0].width(), 4);
-        assert_eq!(annotations[0].dash(), LineDash::Dotted);
-        assert_eq!(annotations[1].arrow_style(), ArrowStyle::Filled);
-        assert_eq!(annotations[2].color(), [17, 34, 51, 255]);
-        assert!(matches!(
-            parse_annotation(
-                serde_json::from_value(serde_json::json!({
-                    "kind": "stroke", "tool": "pen", "color": "nothex",
-                    "points": [{"x": 0, "y": 0}]
-                }))
-                .unwrap()
-            ),
-            Err(VshotError::Selection(_))
-        ));
-        assert!(matches!(
-            parse_annotation(
-                serde_json::from_value(serde_json::json!({
-                    "kind": "stroke", "tool": "pen",
-                    "dash": "zigzag",
-                    "points": [{"x": 0, "y": 0}]
-                }))
-                .unwrap()
-            ),
-            Err(VshotError::Selection(_))
-        ));
-    }
-
-    #[test]
-    fn parses_wave_sizes_and_pen_fill_from_wire() {
-        let wave = |extra: &str| {
-            let json = format!(
-                r#"{{"kind":"stroke","tool":"wave","points":[{{"x":0,"y":0}},{{"x":9,"y":0}}]{extra}}}"#
-            );
-            parse_annotation(serde_json::from_str(&json).unwrap()).unwrap()
-        };
-        // Explicit sizes travel as logical pixels.
-        let sized = wave(r#","amplitude":12,"wavelength":48"#);
-        assert_eq!(sized.amplitude(), 12);
-        assert_eq!(sized.wavelength(), 48);
-        // A missing key and an explicit zero both mean "derive it from the
-        // stroke width"; an absurd value is clamped rather than passed on.
-        let derived = wave("");
-        assert_eq!(derived.amplitude(), 0);
-        assert_eq!(derived.wavelength(), 0);
-        assert_eq!(wave(r#","amplitude":0,"wavelength":0"#).amplitude(), 0);
-        assert_eq!(wave(r#","amplitude":99999"#).amplitude(), 4096);
-
-        let pen = |extra: &str| {
-            let json = format!(
-                r#"{{"kind":"stroke","tool":"bezier","points":[{{"x":0,"y":0}},{{"x":1,"y":1}}]{extra}}}"#
-            );
-            parse_annotation(serde_json::from_str(&json).unwrap()).unwrap()
-        };
-        assert_eq!(pen(r#","fill":"stroke""#).fill(), BezierFill::Stroke);
-        assert_eq!(pen(r#","fill":"fill""#).fill(), BezierFill::Fill);
-        assert_eq!(pen(r#","fill":"both""#).fill(), BezierFill::Both);
-        // A missing key and an unknown spelling both fall back to the
-        // historical fill-and-stroke behaviour.
-        assert_eq!(pen("").fill(), BezierFill::Both);
-        assert_eq!(pen(r#","fill":"hollow""#).fill(), BezierFill::Both);
-    }
-
-    #[test]
-    fn parses_six_digit_colors_as_opaque() {
-        // The old spelling keeps its exact behaviour: six digits, full alpha.
-        assert_eq!(
-            parse_color(Some("#ff8800"), [0, 0, 0, 255]).unwrap(),
-            [255, 136, 0, 255]
-        );
-        assert_eq!(
-            parse_color(Some("112233"), [0, 0, 0, 255]).unwrap(),
-            [17, 34, 51, 255]
-        );
-        assert_eq!(parse_color(None, [9, 8, 7, 6]).unwrap(), [9, 8, 7, 6]);
-    }
-
-    #[test]
-    fn parses_eight_digit_colors_with_alpha_last() {
-        // `#RRGGBBAA`, the CSS order `ui/config.cpp` writes: alpha is the last
-        // pair. `#ff880080` is orange `#ff8800` at half alpha; its blue pair is
-        // `00`, so the third channel is 0, not 128.
-        assert_eq!(
-            parse_color(Some("#ff880080"), [0, 0, 0, 255]).unwrap(),
-            [255, 136, 0, 128]
-        );
-        // The four-tuple `#ff888080` -- `ff 88 80 80` -- is the other spelling
-        // of the same shape, with blue 0x80 and alpha 0x80.
-        assert_eq!(
-            parse_color(Some("#ff888080"), [0, 0, 0, 255]).unwrap(),
-            [255, 136, 128, 128]
-        );
-        // All four pairs differ, so a Qt `#AARRGGBB` reading -- which would
-        // return [128, 255, 64, 17] here -- cannot slip through.
-        assert_eq!(
-            parse_color(Some("#1180ff40"), [0, 0, 0, 255]).unwrap(),
-            [17, 128, 255, 64]
-        );
-        assert_eq!(
-            parse_color(Some("#00000000"), [1, 2, 3, 4]).unwrap(),
-            [0, 0, 0, 0]
-        );
-        // A fully transparent eight-digit also works without the leading `#`.
-        assert_eq!(
-            parse_color(Some("11223344"), [0, 0, 0, 255]).unwrap(),
-            [17, 34, 51, 68]
-        );
-    }
-
-    #[test]
-    fn rejects_colors_that_are_not_six_or_eight_digits() {
-        for bad in [
-            "#ff880",     // five digits
-            "#ff88008",   // seven digits
-            "#ff8800880", // nine digits
-            "#ff88zz",    // six digits, not hex
-            "#112233zz",  // eight digits, not hex
-            "#",          // no digits
-        ] {
-            assert!(
-                matches!(
-                    parse_color(Some(bad), [0, 0, 0, 255]),
-                    Err(VshotError::Selection(_))
-                ),
-                "`{bad}` should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn parses_shape_styles_and_mosaic_masks_from_wire() {
-        let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"shape","tool":"rectangle","rect":{"x":0,"y":0,"width":8,"height":6},"dash":"dashed"},{"kind":"stroke","tool":"arrow","points":[{"x":0,"y":0},{"x":5,"y":6}],"size":3},{"kind":"shape","tool":"mosaic","rect":{"x":0,"y":0,"width":8,"height":6},"mask":"ellipse","strength":1}]}"##.to_vec();
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(annotations.len(), 3);
-        assert_eq!(annotations[0].dash(), LineDash::Dashed);
-        assert_eq!(annotations[0].head(), 1);
-        assert_eq!(annotations[0].strength(), DEFAULT_MOSAIC_STRENGTH);
-        assert_eq!(annotations[1].head(), 3);
-        assert_eq!(annotations[1].dash(), LineDash::Solid);
-        assert_eq!(annotations[2].tool(), EditorTool::Mosaic);
-        assert_eq!(annotations[2].mask(), ShapeMask::Ellipse);
-        assert_eq!(annotations[2].strength(), 1);
-        assert!(matches!(
-            parse_annotation(
-                serde_json::from_value(serde_json::json!({
-                    "kind": "shape", "tool": "mosaic",
-                    "rect": {"x": 0, "y": 0, "width": 2, "height": 2},
-                    "mask": "triangle"
-                }))
-                .unwrap()
-            ),
-            Err(VshotError::Selection(_))
-        ));
-    }
-
-    #[test]
-    fn parses_a_bezier_stroke_with_its_closed_flag() {
-        let bytes = br##"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"bezier","points":[{"x":1,"y":2},{"x":3,"y":4},{"x":5,"y":6},{"x":7,"y":8}],"closed":true,"color":"#11223380"},{"kind":"stroke","tool":"bezier","points":[{"x":0,"y":0},{"x":1,"y":1}]}]}"##.to_vec();
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(annotations[0].tool(), EditorTool::Bezier);
-        assert!(annotations[0].closed());
-        assert_eq!(annotations[0].color(), [0x11, 0x22, 0x33, 0x80]);
-        assert_eq!(annotations[0].points().len(), 4);
-        // A missing flag means an open path.
-        assert!(!annotations[1].closed());
-    }
-
-    #[test]
-    fn parses_arrow_style_and_clamps_text_scale() {
-        let bytes = br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"stroke","tool":"arrow","arrow_style":"filled","points":[{"x":0,"y":0},{"x":5,"y":5}]},{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":99},{"kind":"text","origin":{"x":3,"y":4},"text":"B","scale":0}]}"#.to_vec();
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(annotations[0].arrow_style(), ArrowStyle::Filled);
-        assert_eq!(annotations[1].text_content().map(|value| value.2), Some(64));
-        assert_eq!(annotations[2].text_content().map(|value| value.2), Some(1));
-        assert_eq!(parse_text_scale(None).unwrap(), 2);
-        assert!(parse_arrow_style(Some("double")).is_err());
-    }
-
-    #[test]
-    fn parses_text_font_from_wire() {
-        let bytes = serde_json::json!({
-            "status": "ok",
-            "selection": {"x": 0, "y": 0, "width": 50, "height": 50},
-            "annotations": [{
-                "kind": "text",
-                "origin": {"x": 1, "y": 2},
-                "text": "Hi",
-                "scale": 3,
-                "color": "#ffffff",
-                "font": "Noto Sans"
-            }]
+    fn a_zoomed_pin_edit_session_declares_the_ratio_and_the_frames_own_size() {
+        let frame =
+            crate::model::Frame::new(crate::geometry::Size::new(160, 90), vec![0u8; 160 * 90 * 4])
+                .unwrap();
+        let window = Rect::new(300, 200, 176, 99);
+        let scale = crate::edit::Scale::ratio(frame.size().width, window.size.width);
+        let (_directory, path) = write_pin_edit_session(&PinEditSpec {
+            frame: &frame,
+            output_name: "DP-1",
+            window,
+            scale,
+            socket: Path::new("/tmp/vshot-test.sock"),
+            pin_id: 7,
+            action: "",
+            annotations: None,
+            border_width: 0,
+            desktop: Some(Rect::new(0, 0, 1920, 1080)),
         })
-        .to_string()
-        .into_bytes();
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(
-            annotations[0].text_content().map(|value| value.0),
-            Some("Hi")
-        );
-        match &annotations[0] {
-            Annotation::Text { font, .. } => assert_eq!(font, "Noto Sans"),
-            other => panic!("expected text annotation, got {other:?}"),
-        }
-        // Missing font keeps the empty default.
-        let legacy = br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2}]}"#;
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(legacy.to_vec(), Rect::new(0, 0, 100, 100)).unwrap();
-        match &annotations[0] {
-            Annotation::Text { font, .. } => assert!(font.is_empty()),
-            other => panic!("expected text annotation, got {other:?}"),
-        }
+        .unwrap();
+
+        let session: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let output = &session["outputs"][0];
+        // The desktop the pointer walk converts against is written apart from
+        // the pin's own bounds, because the pin is not the screen.
+        assert_eq!(session["desktop"]["width"].as_u64(), Some(1920));
+        assert_eq!(session["bounds"]["width"].as_u64(), Some(176));
+        // 160 pixels across a 176-logical-pixel window is the 1.1x zoom the
+        // wheel's first notch gives -- 0.909, not a whole number.
+        let declared = output["scale"].as_f64().unwrap();
+        assert!((declared - 160.0 / 176.0).abs() < 1e-12, "{declared}");
+        // The frame is written at its own size, and the product of that size
+        // and the ratio is the logical rect, so the editor's check passes.
+        assert_eq!(output["pixel_width"].as_u64(), Some(160));
+        assert_eq!(output["pixel_height"].as_u64(), Some(90));
+        assert_eq!(output["width"].as_u64(), Some(176));
+        assert_eq!(output["height"].as_u64(), Some(99));
+        assert!((declared * 176.0 - 160.0).abs() < 1e-9);
+        assert!((declared * 99.0 - 90.0).abs() < 1e-9);
     }
 
+    // The daemon keeps the marks and the border width and hands both back on a
+    // re-edit, so the session the helper reads has to carry them.  The marks
+    // travel as the wire's own JSON, untouched, because re-spelling them here
+    // would be a second place for that shape to drift; the border width is a
+    // number the editor needs to know the pin's rim is part of the pin.
     #[test]
-    fn parses_text_bitmap_from_session_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("text-0.rgba");
-        std::fs::write(&path, [10u8, 20, 30, 255, 0, 0, 0, 0]).unwrap();
-        let bytes = format!(
-            r##"{{"status":"ok","selection":{{"x":0,"y":0,"width":50,"height":50}},"annotations":[{{"kind":"text","origin":{{"x":1,"y":2}},"text":"Hi","scale":3,"color":"#ffffff","bitmap_width":2,"bitmap_height":1,"bitmap":"{}"}}]}}"##,
-            path.display()
-        )
-        .into_bytes();
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        let bitmap = annotations[0].text_bitmap().unwrap();
-        assert_eq!((bitmap.width, bitmap.height), (2, 1));
-        assert_eq!(bitmap.pixels, vec![10, 20, 30, 255, 0, 0, 0, 0]);
-        // Legacy helpers without bitmaps still parse into the fallback path.
-        let SelectionOutcome { annotations: legacy, .. } = parse_outcome(
-            br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2}]}"#
-                .to_vec(),
-            Rect::new(0, 0, 100, 100),
+    fn a_pin_edit_session_carries_the_marks_and_the_border_width() {
+        let frame = crate::model::Frame::new(
+            crate::geometry::Size::new(240, 180),
+            vec![0u8; 240 * 180 * 4],
         )
         .unwrap();
-        assert!(legacy[0].text_bitmap().is_none());
-        // Payload/dimension mismatches and partial fields are rejected.
-        assert!(read_text_bitmap(path.to_str().unwrap(), 3, 1).is_err());
-        assert!(
-            parse_outcome(
-                br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"text","origin":{"x":1,"y":2},"text":"A","scale":2,"bitmap_width":2}]}"#
-                    .to_vec(),
-                Rect::new(0, 0, 100, 100),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn parses_image_annotation_from_session_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("image-0.rgba");
-        std::fs::write(&path, [255u8, 0, 0, 255, 0, 0, 255, 255]).unwrap();
-        let bytes = format!(
-            r##"{{"status":"ok","selection":{{"x":10,"y":20,"width":50,"height":50}},"annotations":[{{"kind":"image","rect":{{"x":12,"y":24,"width":4,"height":6}},"bitmap_width":2,"bitmap_height":1,"bitmap":"{}"}}]}}"##,
-            path.display()
-        )
-        .into_bytes();
-        let SelectionOutcome { annotations, .. } =
-            parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        match &annotations[0] {
-            Annotation::Image { rect, pixels } => {
-                assert_eq!(*rect, Rect::new(12, 24, 4, 6));
-                assert_eq!((pixels.width, pixels.height), (2, 1));
-                assert_eq!(pixels.pixels, vec![255, 0, 0, 255, 0, 0, 255, 255]);
-            }
-            other => panic!("expected image annotation, got {other:?}"),
-        }
-        // A pasted image selects nothing, so the editor's tool follows it.
-        assert_eq!(annotations[0].tool(), EditorTool::Select);
-        // Pixels are mandatory: a rect alone would draw nothing at all.
-        assert!(
-            parse_outcome(
-                br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"image","rect":{"x":1,"y":2,"width":4,"height":6}}]}"#
-                    .to_vec(),
-                Rect::new(0, 0, 100, 100),
-            )
-            .is_err()
-        );
-        // So is the rect: without one the pasted image has nowhere to go.
-        assert!(
-            parse_outcome(
-                br#"{"status":"ok","selection":{"x":0,"y":0,"width":50,"height":50},"annotations":[{"kind":"image","bitmap_width":2,"bitmap_height":1,"bitmap":"/nonexistent"}]}"#
-                    .to_vec(),
-                Rect::new(0, 0, 100, 100),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn a_pasted_image_round_trips_from_the_helpers_result_document() {
-        // The paste path exactly as the two processes exchange it: the helper
-        // writes the image beside its JSON, and vshot has to parse both and
-        // composite the pixels into the crop.
-        use crate::geometry::Size;
-        use crate::model::{Frame, ImageDocument};
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("image-0.rgba");
-        std::fs::write(
-            &path,
-            [
-                255, 0, 0, 255, 0, 255, 0, 255, //
-                0, 0, 255, 255, 255, 255, 0, 255,
-            ],
-        )
+        let window = Rect::new(150, 150, 240, 180);
+        let marks = serde_json::json!([
+            {"kind": "shape", "tool": "rectangle", "rect": {"x": 10, "y": 12, "width": 40, "height": 30}},
+        ]);
+        let (_directory, path) = write_pin_edit_session(&PinEditSpec {
+            frame: &frame,
+            output_name: "DP-1",
+            window,
+            scale: crate::edit::Scale::ratio(240, 240),
+            socket: Path::new("/tmp/vshot-test.sock"),
+            pin_id: 3,
+            action: "",
+            annotations: Some(&marks),
+            border_width: 6,
+            desktop: None,
+        })
         .unwrap();
-        let bytes = format!(
-            r##"{{"status":"ok","selection":{{"x":10,"y":20,"width":8,"height":8}},"annotations":[{{"kind":"image","rect":{{"x":12,"y":22,"width":4,"height":4}},"bitmap_width":2,"bitmap_height":2,"bitmap":"{}"}}]}}"##,
-            path.display()
-        )
-        .into_bytes();
-        let SelectionOutcome {
-            rect: selection,
-            annotations,
-            ..
-        } = parse_outcome(bytes, Rect::new(0, 0, 100, 100)).unwrap();
-        assert_eq!(selection, Rect::new(10, 20, 8, 8));
-        let pipeline = crate::edit::pipeline_for_annotations(annotations, selection, 1, 1).unwrap();
-        let document = pipeline
-            .apply(ImageDocument::new(
-                Frame::solid(Size::new(8, 8), [0, 0, 0, 255]).unwrap(),
-            ))
-            .unwrap()
-            .into_frame();
-        // Global (12, 22) is local (2, 2) of the crop; the 2x2 source covers
-        // the 4x4 rect from there, one source pixel per 2x2 block.
-        assert_eq!(document.pixel(Point::new(2, 2)), Some([255, 0, 0, 255]));
-        assert_eq!(document.pixel(Point::new(3, 3)), Some([255, 0, 0, 255]));
-        assert_eq!(document.pixel(Point::new(4, 2)), Some([0, 255, 0, 255]));
-        assert_eq!(document.pixel(Point::new(5, 5)), Some([255, 255, 0, 255]));
-        // Nothing outside the rect is touched.
-        assert_eq!(document.pixel(Point::new(1, 1)), Some([0, 0, 0, 255]));
-        assert_eq!(document.pixel(Point::new(6, 6)), Some([0, 0, 0, 255]));
+
+        let session: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(session["annotations"], marks);
+        assert_eq!(session["border_width"].as_u64(), Some(6));
+
+        // A first edit has neither, and the fields are left out rather than
+        // written as nulls: the helper reads an absent field as "no marks" and
+        // "no border", which is what a pin nobody has annotated wants.
+        let (_directory, bare) = write_pin_edit_session(&PinEditSpec {
+            frame: &frame,
+            output_name: "DP-1",
+            window,
+            scale: crate::edit::Scale::ratio(240, 240),
+            socket: Path::new("/tmp/vshot-test.sock"),
+            pin_id: 3,
+            action: "",
+            annotations: None,
+            border_width: 0,
+            desktop: None,
+        })
+        .unwrap();
+        let session: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bare).unwrap()).unwrap();
+        assert!(session.get("annotations").is_none());
+        assert_eq!(session["border_width"].as_u64(), Some(0));
     }
 
     #[test]
@@ -1944,12 +1982,15 @@ mod tests {
                 window: None,
                 socket: None,
                 id: None,
+                border_width: None,
                 action: None,
                 candidates: None,
                 selection: None,
                 long_allowed: None,
+                annotations: None,
                 translate,
                 result_path,
+                desktop: None,
                 outputs: Vec::new(),
             }
         }

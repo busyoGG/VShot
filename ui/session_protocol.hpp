@@ -4,11 +4,15 @@
 #pragma once
 
 #include <QImage>
+#include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QString>
 #include <QVector>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace vshot {
@@ -33,7 +37,12 @@ struct OutputSession {
     // editor widens it to the whole output so the toolbar can float beside the
     // pinned image instead of on top of it.
     LogicalRect surface;
-    std::uint32_t scale = 0;
+    // Device pixels per logical pixel of this output: a whole number for a real
+    // output (1, 2, ...), but not for the pin editor's virtual one, where it is
+    // the zoom the pinned image is shown at -- 160 pixels across a 176-logical-
+    // pixel window is 0.909. Rounding that to a whole number is what made the
+    // editor refuse a zoomed pin's session, so the ratio is carried as it is.
+    double scale = 0.0;
     std::uint32_t pixelWidth = 0;
     std::uint32_t pixelHeight = 0;
     QString path;
@@ -78,6 +87,13 @@ struct Session {
     // socket instead of drawing a second copy of the image.
     std::uint64_t pinId = 0;
     QString pinSocket;
+    // Pin-edit only: how wide the pin's own border is drawn, in logical pixels.
+    // The stroke is centred on the image's edge, so it reaches half this far
+    // outside the image; the editor counts that band as part of the pin, so a
+    // drag that starts on the rim moves the pin instead of reading as a click
+    // on the bare canvas beside it. Zero when the session says nothing, which
+    // is also what a pin with no border wants.
+    std::uint32_t pinBorderWidth = 0;
     // Pin-edit only: which part of the editor to open on, absent for the
     // ordinary annotation editor. `"text"` opens it in the text-selection mode.
     QString action;
@@ -93,7 +109,90 @@ struct Session {
     // `translate` only, optional: the absolute path the composited PNG is
     // written to once the user accepts.
     QString resultPath;
+    // Pin-edit only, optional: the marks already on the pinned image, in the
+    // shape the editor itself reports them, so a re-edit opens on them and they
+    // stay editable. The CLI sends them on every edit after the first; a first
+    // edit has none and the editor opens blank.
+    //
+    // Kept as the wire's own JSON rather than parsed here: an `Annotation`
+    // carries Qt types a session header has no business naming, and the editor
+    // is the only place that knows how to read one.
+    QJsonArray annotations;
 };
+
+// The little vocabulary the wire's JSON is read with: every number in a session
+// or a mark arrives as a `double`, so a reader that wants an integer has to say
+// so and check the range, and a value the editor cannot reproduce exactly is
+// refused rather than silently rounded.  They live in the header because two
+// readers share them -- the session loader and the editor's own mark parser --
+// and a mark the loader accepts but the editor cannot place would be a session
+// that opens with marks missing.
+inline bool jsonFail(QString *error, const QString &message)
+{
+    if (error != nullptr) {
+        *error = message;
+    }
+    return false;
+}
+
+inline bool jsonInteger(const QJsonValue &value, std::int64_t minimum, std::int64_t maximum,
+                        std::int64_t *result)
+{
+    if (!value.isDouble()) {
+        return false;
+    }
+    const double number = value.toDouble();
+    if (!std::isfinite(number) || std::floor(number) != number ||
+        number < static_cast<double>(minimum) || number > static_cast<double>(maximum)) {
+        return false;
+    }
+    const auto converted = static_cast<std::int64_t>(number);
+    if (converted < minimum || converted > maximum) {
+        return false;
+    }
+    *result = converted;
+    return true;
+}
+
+inline bool jsonSigned32(const QJsonObject &object, const char *key, std::int32_t *result)
+{
+    std::int64_t value = 0;
+    if (!jsonInteger(object.value(QLatin1String(key)), std::numeric_limits<std::int32_t>::min(),
+                     std::numeric_limits<std::int32_t>::max(), &value)) {
+        return false;
+    }
+    *result = static_cast<std::int32_t>(value);
+    return true;
+}
+
+inline bool jsonUnsigned32(const QJsonObject &object, const char *key, std::uint32_t *result,
+                           bool requirePositive = false)
+{
+    std::int64_t value = 0;
+    if (!jsonInteger(object.value(QLatin1String(key)), 0,
+                     std::numeric_limits<std::uint32_t>::max(), &value) ||
+        (requirePositive && value == 0)) {
+        return false;
+    }
+    *result = static_cast<std::uint32_t>(value);
+    return true;
+}
+
+inline bool jsonRect(const QJsonObject &object, LogicalRect *rect, const QString &label,
+                     QString *error)
+{
+    if (!jsonSigned32(object, "x", &rect->x) || !jsonSigned32(object, "y", &rect->y) ||
+        !jsonUnsigned32(object, "width", &rect->width, true) ||
+        !jsonUnsigned32(object, "height", &rect->height, true)) {
+        return jsonFail(error, label +
+                                   QStringLiteral(" must contain integer x/y and positive width/height"));
+    }
+    if (rect->right() > std::numeric_limits<std::int32_t>::max() ||
+        rect->bottom() > std::numeric_limits<std::int32_t>::max()) {
+        return jsonFail(error, label + QStringLiteral(" edge overflows int32"));
+    }
+    return true;
+}
 
 bool loadSession(const QString &sessionPath, Session *session, QString *error);
 

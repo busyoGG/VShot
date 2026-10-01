@@ -27,8 +27,23 @@ pub enum VshotError {
     PngDecode { origin: String, message: String },
     #[error("failed to encode PNG: {0}")]
     PngEncode(String),
+    /// The AVIF encoder: a configuration rav1e refused, or a frame it could not
+    /// encode.  AVIF is one of the two formats an HDR capture's second file can
+    /// be written in (see `output::HdrFormat`).
+    #[error("failed to encode AVIF: {0}")]
+    AvifEncode(String),
     #[error("failed to write {path}: {source}")]
     WriteFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Making the directory an `--output` path names.  Separate from
+    /// [`VshotError::WriteFile`] because the path that failed is a directory
+    /// rather than the file, and saying so is the difference between "your
+    /// output path is wrong" and "the write went wrong".
+    #[error("failed to create the output directory {path}: {source}")]
+    CreateOutputDirectory {
         path: PathBuf,
         #[source]
         source: std::io::Error,

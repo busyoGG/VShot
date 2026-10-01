@@ -140,15 +140,14 @@ double pointSegmentDistance(const QPointF &p, const QPointF &a, const QPointF &b
     return std::hypot(p.x() - projection.x(), p.y() - projection.y());
 }
 
-// Two pi, spelled out rather than read from a platform's `M_PI`: the wave here
-// and the one the Rust renderer bakes into the PNG have to be the same curve,
-// and the constant is the one place that could silently differ.
+// Two pi, spelled out rather than read from a platform's `M_PI`: the wave's
+// shape must not depend on which libm the build landed on, and the constant is
+// the one place that could silently differ.
 constexpr double kTau = 6.283185307179586476925286766559;
 
-// The peak deviation of a wave stroke from its centre line, in logical pixels.
-// The floor of `max(width * 2, 4)` applies to the logical width, exactly as the
-// Rust renderer's `wave_amplitude` does it, so a wave is as tall as the pen is
-// thick and never flatter than four pixels.
+// The peak deviation of a wave stroke from its centre line, in logical pixels:
+// `max(width * 2, 4)`, so a wave is as tall as the pen is thick and never
+// flatter than four pixels.
 double waveAmplitude(int width)
 {
     return std::max(width * 2, 4);
@@ -174,8 +173,7 @@ double waveWavelength(int width)
 // wavelength))` and the wavelength actually used is `L / cycles`.  That is the
 // step that puts both ends back on the line the user dragged -- without it the
 // far end is left wherever the phase happened to be, smeared off to one side,
-// and the wave no longer reads as one drawn from A to B.  The Rust renderer's
-// `wave_polyline` rounds the same way, so the preview and the baked PNG agree.
+// and the wave no longer reads as one drawn from A to B.
 QVector<QPointF> wavePolyline(const QPointF &start, const QPointF &end, double amplitude,
                               double wavelength, double step)
 {
@@ -642,8 +640,8 @@ void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector
         break;
     case AnnotateSurface::Tool::Line:
         if (points.size() >= 2) {
-            // Round caps, as the Rust capsule stroke has: the two ends are
-            // half-discs, not the pen's square corners.
+            // Round caps, so the two ends are half-discs rather than the pen's
+            // square corners.
             painter.drawLine(points.constFirst(), points.constLast());
         } else if (points.size() == 1) {
             painter.drawPoint(points.constFirst());
@@ -674,10 +672,11 @@ void paintStrokeInk(QPainter &painter, AnnotateSurface::Tool tool, const QVector
         {
             const QPainterPath path = bezierPath(points, closed);
             if (closed) {
-                // Fill first and stroke second, the order the Rust renderer
-                // bakes in.  The fill is the stroke's own colour at half its
-                // alpha, floored: that is what "a translucent fill under a solid
-                // outline" means for a colour the user picked an opacity for.
+                // Fill first and stroke second, so the outline is not tinted
+                // by the translucent fill it sits on.  The fill is the stroke's
+                // own colour at half its alpha, floored: that is what "a
+                // translucent fill under a solid outline" means for a colour
+                // the user picked an opacity for.
                 QColor fill = color;
                 fill.setAlpha(color.alpha() / 2);
                 painter.fillPath(path, fill);

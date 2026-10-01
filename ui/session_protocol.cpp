@@ -3,6 +3,8 @@
 
 #include "session_protocol.hpp"
 
+#include "pixel_fd.hpp"
+
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -24,60 +26,21 @@ bool fail(QString *error, const QString &message)
     return false;
 }
 
-bool jsonInteger(const QJsonValue &value, std::int64_t minimum, std::int64_t maximum,
-                std::int64_t *result)
+// Device pixels per logical pixel. A real output's density is a whole number,
+// but the pin editor's virtual output carries the zoom its image is shown at,
+// which is not: the value is read as the number it is rather than rounded to a
+// whole one, or a zoomed pin's session would be refused.
+bool jsonPositiveNumber(const QJsonObject &object, const char *key, double *result)
 {
+    const QJsonValue value = object.value(QLatin1String(key));
     if (!value.isDouble()) {
         return false;
     }
     const double number = value.toDouble();
-    if (!std::isfinite(number) || std::floor(number) != number ||
-        number < static_cast<double>(minimum) || number > static_cast<double>(maximum)) {
+    if (!std::isfinite(number) || number <= 0.0) {
         return false;
     }
-    const auto converted = static_cast<std::int64_t>(number);
-    if (converted < minimum || converted > maximum) {
-        return false;
-    }
-    *result = converted;
-    return true;
-}
-
-bool jsonSigned32(const QJsonObject &object, const char *key, std::int32_t *result)
-{
-    std::int64_t value = 0;
-    if (!jsonInteger(object.value(QLatin1String(key)), std::numeric_limits<std::int32_t>::min(),
-                     std::numeric_limits<std::int32_t>::max(), &value)) {
-        return false;
-    }
-    *result = static_cast<std::int32_t>(value);
-    return true;
-}
-
-bool jsonUnsigned32(const QJsonObject &object, const char *key, std::uint32_t *result,
-                    bool requirePositive)
-{
-    std::int64_t value = 0;
-    if (!jsonInteger(object.value(QLatin1String(key)), 0,
-                     std::numeric_limits<std::uint32_t>::max(), &value) ||
-        (requirePositive && value == 0)) {
-        return false;
-    }
-    *result = static_cast<std::uint32_t>(value);
-    return true;
-}
-
-bool jsonRect(const QJsonObject &object, LogicalRect *rect, const QString &label, QString *error)
-{
-    if (!jsonSigned32(object, "x", &rect->x) || !jsonSigned32(object, "y", &rect->y) ||
-        !jsonUnsigned32(object, "width", &rect->width, true) ||
-        !jsonUnsigned32(object, "height", &rect->height, true)) {
-        return fail(error, label + QStringLiteral(" must contain integer x/y and positive width/height"));
-    }
-    if (rect->right() > std::numeric_limits<std::int32_t>::max() ||
-        rect->bottom() > std::numeric_limits<std::int32_t>::max()) {
-        return fail(error, label + QStringLiteral(" edge overflows int32"));
-    }
+    *result = number;
     return true;
 }
 
@@ -96,6 +59,33 @@ bool loadRawImage(OutputSession *output, QString *error)
         return fail(error, QStringLiteral("output %1 raw dimensions are too large").arg(output->name));
     }
     const std::uint64_t expected = pixels * 4U;
+
+    // The pixels come over the pixel channel when there is one -- a shared
+    // mapping rather than a file -- and the frame is the size of a screen, so
+    // that is the path every real session takes.  The file is the fallback for
+    // a helper started by hand against a session someone wrote out.
+    if (pixelChannelAvailable()) {
+        PixelBuffer buffer;
+        if (!receivePixelBuffer(kPixelKindSource, &buffer, error)) {
+            return false;
+        }
+        if (!buffer.isValid() || buffer.width != output->pixelWidth ||
+            buffer.height != output->pixelHeight) {
+            return fail(error,
+                        QStringLiteral("output %1 received %2x%3 pixels of an unusable format, "
+                                       "expected %4x%5 RGBA8")
+                            .arg(output->name)
+                            .arg(buffer.width)
+                            .arg(buffer.height)
+                            .arg(output->pixelWidth)
+                            .arg(output->pixelHeight));
+        }
+        output->image = buffer.toImage();
+        if (output->image.isNull()) {
+            return fail(error, QStringLiteral("cannot build an image for output %1").arg(output->name));
+        }
+        return true;
+    }
 
     QFile file(output->path);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -221,6 +211,18 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         if (!parsed.pinSocket.startsWith(QLatin1Char('/'))) {
             return fail(error, QStringLiteral("pin-edit session `socket` must be an absolute path"));
         }
+        // Optional: how wide the pin's border is drawn. Absent means zero, which
+        // is the right answer both for a pin with no border and for a session
+        // from a helper that does not carry the field yet.
+        const QJsonValue borderValue = root.value(QStringLiteral("border_width"));
+        if (!borderValue.isUndefined() && !borderValue.isNull()) {
+            std::int64_t border = 0;
+            if (!jsonInteger(borderValue, 0, 64, &border)) {
+                return fail(error, QStringLiteral("pin-edit session `border_width` must be an "
+                                                  "integer between 0 and 64"));
+            }
+            parsed.pinBorderWidth = static_cast<std::uint32_t>(border);
+        }
         // Optional: which part of the editor to open on. Absent for the
         // ordinary annotation editor; unknown values are left for the editor to
         // fall back on, so they do not fail the session here.
@@ -231,6 +233,18 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
                             QStringLiteral("pin-edit session `action` must be a string"));
             }
             parsed.action = actionValue.toString();
+        }
+        // Optional: the marks already on the pinned image, so a re-edit opens on
+        // them. Carried as they arrived -- the editor is the only place that
+        // knows how to read one -- but their shape is checked here, because a
+        // session whose marks are not a list is one the editor cannot use.
+        const QJsonValue marksValue = root.value(QStringLiteral("annotations"));
+        if (!marksValue.isUndefined() && !marksValue.isNull()) {
+            if (!marksValue.isArray()) {
+                return fail(error,
+                            QStringLiteral("pin-edit session `annotations` must be an array"));
+            }
+            parsed.annotations = marksValue.toArray();
         }
     }
 
@@ -379,16 +393,23 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         // pixel dimensions to agree with: scale and path stay optional there.
         // Every other session draws the frozen frame it was handed.
         if (!hintSession) {
-            if (!jsonUnsigned32(object, "scale", &output.scale, true) ||
+            if (!jsonPositiveNumber(object, "scale", &output.scale) ||
                 !jsonUnsigned32(object, "pixel_width", &output.pixelWidth, true) ||
                 !jsonUnsigned32(object, "pixel_height", &output.pixelHeight, true)) {
                 return fail(error, QStringLiteral("output %1 scale/pixel dimensions are invalid").arg(index));
             }
-            if (!object.value(QStringLiteral("path")).isString() ||
-                object.value(QStringLiteral("path")).toString().isEmpty()) {
-                return fail(error, QStringLiteral("output %1 path must be a non-empty string").arg(index));
+            // A path is what a hand-written session uses to name its raw file;
+            // a session the CLI built carries the pixels over the channel
+            // instead, and then there is no file to name.
+            const QJsonValue pathValue = object.value(QStringLiteral("path"));
+            if (!pixelChannelAvailable()) {
+                if (!pathValue.isString() || pathValue.toString().isEmpty()) {
+                    return fail(error, QStringLiteral("output %1 path must be a non-empty string").arg(index));
+                }
+                output.path = pathValue.toString();
+            } else if (pathValue.isString()) {
+                output.path = pathValue.toString();
             }
-            output.path = object.value(QStringLiteral("path")).toString();
             // Optional, and only ever set on a frozen-screen session: the frame
             // is already on screen underneath, shown by VShot's own HDR
             // backdrop surface, so this overlay leaves it out and veils the
@@ -396,9 +417,22 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
             // previewed from its pixels.
             output.backdrop = object.value(QStringLiteral("backdrop")).toBool(false);
 
-            const std::uint64_t expectedWidth = static_cast<std::uint64_t>(output.geometry.width) * output.scale;
-            const std::uint64_t expectedHeight = static_cast<std::uint64_t>(output.geometry.height) * output.scale;
-            if (expectedWidth != output.pixelWidth || expectedHeight != output.pixelHeight) {
+            // The dimensions have to be the rect times the scale, so a session
+            // that describes a frame of the wrong size is refused rather than
+            // drawn against the wrong pixels.  The product is exact for every
+            // scale -- a whole number's is exact by construction, and the pin
+            // editor's ratio is the quotient the pixel size and the rect were
+            // formed from -- so the comparison is against a rounding epsilon
+            // rather than a whole pixel, which a wrong frame could hide inside.
+            constexpr double kDimensionEpsilon = 1e-6;
+            const double expectedWidth =
+                static_cast<double>(output.geometry.width) * output.scale;
+            const double expectedHeight =
+                static_cast<double>(output.geometry.height) * output.scale;
+            if (std::abs(expectedWidth - static_cast<double>(output.pixelWidth)) >
+                    kDimensionEpsilon ||
+                std::abs(expectedHeight - static_cast<double>(output.pixelHeight)) >
+                    kDimensionEpsilon) {
                 return fail(error, QStringLiteral("output %1 pixel dimensions do not match logical size and scale")
                                       .arg(index));
             }

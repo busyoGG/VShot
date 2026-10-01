@@ -78,14 +78,122 @@ const QHash<QString, QString> &chineseTable()
         // every pin has, and what the badge says once something has happened to
         // the pin.
         {QStringLiteral("Copy"), QString::fromUtf8("复制")},
+        // The action rows every pin's menu ends with. `Copy image` copies the
+        // pin's pixels rather than a format string, so it gets a wording of its
+        // own; `Copied image` is the badge it leaves behind.
+        {QStringLiteral("Copy image"), QString::fromUtf8("复制图像")},
+        {QStringLiteral("Copied image"), QString::fromUtf8("已复制图像")},
         {QStringLiteral("Copied"), QString::fromUtf8("已复制")},
         {QStringLiteral("Copy failed"), QString::fromUtf8("复制失败")},
         {QStringLiteral("Save as…"), QString::fromUtf8("另存为…")},
         {QStringLiteral("Recognize text…"), QString::fromUtf8("取字…")},
+        {QStringLiteral("Edit"), QString::fromUtf8("编辑")},
+        {QStringLiteral("Reset zoom"), QString::fromUtf8("重置缩放")},
+        {QStringLiteral("Close"), QString::fromUtf8("关闭")},
         {QStringLiteral("Save pinned image"), QString::fromUtf8("保存浮层图片")},
         {QStringLiteral("PNG image (*.png)"), QString::fromUtf8("PNG 图片 (*.png)")},
         {QStringLiteral("Saved %1"), QString::fromUtf8("已保存 %1")},
         {QStringLiteral("Could not save the image"), QString::fromUtf8("图片保存失败")},
+
+        // The editor's keyboard actions, as the settings page lists them: the
+        // name of each and the one line that says what it does. A key the user
+        // can rebind has to be findable by what it does, not by the id the file
+        // stores it under.
+        {QStringLiteral("Keyboard"), QString::fromUtf8("键盘")},
+        // The sub-headings a settings card is split into. Short on purpose: a
+        // group is a signpost between rows, not a setting of its own, and a
+        // heading long enough to need wrapping reads as one more row.
+        {QStringLiteral("Tool"), QString::fromUtf8("工具")},
+        {QStringLiteral("PNG"), QString::fromUtf8("PNG")},
+        {QStringLiteral("HDR"), QString::fromUtf8("HDR")},
+        {QStringLiteral("Which output"), QString::fromUtf8("用哪个输出")},
+        {QStringLiteral("Scrolling"), QString::fromUtf8("滚动")},
+        {QStringLiteral("Stitching"), QString::fromUtf8("拼接")},
+        {QStringLiteral("What is recorded"), QString::fromUtf8("录什么")},
+        {QStringLiteral("Notification"), QString::fromUtf8("通知")},
+        {QStringLiteral("Ring"), QString::fromUtf8("环形缓冲")},
+        {QStringLiteral("Confirm the capture"), QString::fromUtf8("确认截图")},
+        {QStringLiteral("Accepts the capture and writes it out"),
+         QString::fromUtf8("接受这次截图并把它写出来")},
+        {QStringLiteral("Discard the capture"), QString::fromUtf8("取消截图")},
+        {QStringLiteral("Throws the capture away"), QString::fromUtf8("丢掉这次截图")},
+        {QStringLiteral("Undo"), QString::fromUtf8("撤销")},
+        {QStringLiteral("Takes back the last change to the marks"),
+         QString::fromUtf8("收回对标注的最后一次改动")},
+        {QStringLiteral("Redo"), QString::fromUtf8("重做")},
+        {QStringLiteral("Puts the last undone change back"),
+         QString::fromUtf8("把刚收回的那次改动放回去")},
+        {QStringLiteral("Copy the result"), QString::fromUtf8("复制成品")},
+        {QStringLiteral("Puts the capture and its marks on the clipboard"),
+         QString::fromUtf8("把截图和它的标注放进剪贴板")},
+        {QStringLiteral("Copy the selected text"), QString::fromUtf8("复制选中的文字")},
+        {QStringLiteral("Copies the text the text-selection mode or a translation picked"),
+         QString::fromUtf8("复制取字模式或翻译选中的那部分文字")},
+        {QStringLiteral("Paste an image"), QString::fromUtf8("粘贴图片")},
+        {QStringLiteral("Pastes an image from the clipboard into the selection"),
+         QString::fromUtf8("把剪贴板里的图片贴进选区")},
+        {QStringLiteral("Select every mark"), QString::fromUtf8("选中所有标注")},
+        {QStringLiteral("Picks up every mark at once"), QString::fromUtf8("一次选中所有标注")},
+        {QStringLiteral("Select no mark"), QString::fromUtf8("不选标注")},
+        {QStringLiteral("Puts every mark down"), QString::fromUtf8("放开所有标注")},
+        {QStringLiteral("Next mark"), QString::fromUtf8("下一个标注")},
+        {QStringLiteral("Moves the focus to the next mark"),
+         QString::fromUtf8("把焦点移到下一个标注")},
+        {QStringLiteral("Previous mark"), QString::fromUtf8("上一个标注")},
+        {QStringLiteral("Moves the focus to the previous mark"),
+         QString::fromUtf8("把焦点移到上一个标注")},
+        {QStringLiteral("Delete the mark"), QString::fromUtf8("删除标注")},
+        {QStringLiteral("Deletes the mark the focus is on"),
+         QString::fromUtf8("删掉焦点所在的那个标注")},
+        {QStringLiteral("Copy the colour under the cursor"),
+         QString::fromUtf8("复制光标下的颜色")},
+        {QStringLiteral("While the magnifier is up: copies that pixel's colour code"),
+         QString::fromUtf8("放大镜显示时：复制那个像素的颜色代码")},
+        {QStringLiteral("Use the colour under the cursor"),
+         QString::fromUtf8("用光标下的颜色")},
+        {QStringLiteral("While the magnifier is up: makes that colour the current tool's"),
+         QString::fromUtf8("放大镜显示时：把那个颜色设为当前工具的")},
+        {QStringLiteral("Show the magnifier"), QString::fromUtf8("显示放大镜")},
+        {QStringLiteral("Shows the magnifier for two seconds, without dragging"),
+         QString::fromUtf8("不拖拽也显示两秒放大镜")},
+        {QStringLiteral("Keep the aspect ratio"), QString::fromUtf8("保持比例")},
+        {QStringLiteral("Hold while resizing: the shape keeps its proportions"),
+         QString::fromUtf8("缩放时按住：形状保持原有比例")},
+        {QStringLiteral("Take a bigger step"), QString::fromUtf8("加大步长")},
+        {QStringLiteral("Hold while walking the cursor: ten pixels at a time"),
+         QString::fromUtf8("移动光标时按住：一次走十像素")},
+        {QStringLiteral("Pick a mark up"), QString::fromUtf8("选中已有标注")},
+        {QStringLiteral("Hold to move a mark under the pointer, rather than drawing "
+                        "with the armed tool"),
+         QString::fromUtf8("按住后，指针下的标注被拖动，而不是用当前工具作画")},
+        {QStringLiteral("Cursor left"), QString::fromUtf8("光标左移")},
+        {QStringLiteral("Moves the cursor one pixel left"), QString::fromUtf8("光标左移一像素")},
+        {QStringLiteral("Cursor right"), QString::fromUtf8("光标右移")},
+        {QStringLiteral("Moves the cursor one pixel right"), QString::fromUtf8("光标右移一像素")},
+        {QStringLiteral("Cursor up"), QString::fromUtf8("光标上移")},
+        {QStringLiteral("Moves the cursor one pixel up"), QString::fromUtf8("光标上移一像素")},
+        {QStringLiteral("Cursor down"), QString::fromUtf8("光标下移")},
+        {QStringLiteral("Moves the cursor one pixel down"), QString::fromUtf8("光标下移一像素")},
+        {QStringLiteral("Press the keys for this action"),
+         QString::fromUtf8("按下这个动作用的键")},
+        {QStringLiteral("Click, then press the key"), QString::fromUtf8("点一下，再按键")},
+        {QStringLiteral("Click to see and change this action's keys"),
+         QString::fromUtf8("点开查看并修改这个动作的按键")},
+        {QStringLiteral("Key already in use"), QString::fromUtf8("按键已被占用")},
+        {QStringLiteral("%1 is already bound to \"%2\". Move it to \"%3\"?"),
+         QString::fromUtf8("%1 已经绑给了「%2」。要把它移给「%3」吗？")},
+        {QStringLiteral("Remove"), QString::fromUtf8("移除")},
+        {QStringLiteral("Done"), QString::fromUtf8("完成")},
+        // The two halves of the colour readout's hint line, which name the keys
+        // that act on the pixel under the picker.
+        {QStringLiteral("copy"), QString::fromUtf8("复制")},
+        {QStringLiteral("use"), QString::fromUtf8("使用")},
+        {QStringLiteral("None"), QString::fromUtf8("无")},
+        {QStringLiteral("Which key does what, while a capture is on the screen. Every "
+                        "action here is also a toolbar button, so a key that is in the "
+                        "way can be cleared instead of moved."),
+         QString::fromUtf8("截图在屏幕上时，每个键做什么。这里的每个动作在工具栏上也有按钮，"
+                           "所以碍事的键可以直接清掉，不必挪到别处。")},
 
         // Pasting an image into the annotation editor, and reading the text
         // off a capture.
@@ -303,6 +411,54 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("PNG compression"), QString::fromUtf8("PNG 压缩")},
         {QStringLiteral("All levels are lossless; slower ones buy a smaller file"),
          QString::fromUtf8("各档全部无损；越慢换来越小的文件")},
+        {QStringLiteral("HDR format"), QString::fromUtf8("HDR 格式")},
+        {QStringLiteral("The second file of a capture that carries HDR content, written "
+                        "beside the PNG with the same name. AVIF is ten-bit BT.2020 PQ and "
+                        "says so in the file, so every reader shows it right, but it is "
+                        "lossy; Radiance RGBE is the light exactly as captured, and is read "
+                        "by few"),
+         QString::fromUtf8("截图带 HDR 内容时，与 PNG 同名并排写出的第二个文件。"
+                           "AVIF 是 10 位 BT.2020 PQ 并在文件里声明，所有读取器都能正确"
+                           "显示，但为有损；Radiance RGBE 是原样记录的光，但读取器很少")},
+        {QStringLiteral("HDR to SDR"), QString::fromUtf8("HDR 转 SDR")},
+        {QStringLiteral("How the SDR half of an HDR capture is made from the HDR one. "
+                        "Auto reads each capture: an SDR picture comes out exactly as it "
+                        "was, and one with highlights makes room for them. Fixed always "
+                        "maps SDR white to the level below, so a pixel's value does not "
+                        "depend on what else is in the picture. Normalize scales the "
+                        "capture so its brightest point becomes white"),
+         QString::fromUtf8("一次 HDR 截图的 SDR 那一半怎么由 HDR 那一半得到。"
+                           "自动会逐张判断：本来就是 SDR 的画面原样输出，带高光的才腾出空间。"
+                           "固定则总是把 SDR 白映射到下面那个档位，"
+                           "一个像素的值不取决于画面里还有什么。"
+                           "归一化把整张截图缩放到最亮处即白")},
+        {QStringLiteral("SDR white level"), QString::fromUtf8("SDR 白电平")},
+        {QStringLiteral("Where SDR white lands in the range, as a percentage. The rest is "
+                        "spent on light above white, so a lower level keeps highlights more "
+                        "apart and makes the picture dimmer. Used by Auto (only for a "
+                        "capture that has highlights) and by Fixed"),
+         QString::fromUtf8("SDR 白落在整个范围的百分之多少处。剩下的留给比白更亮的光，"
+                           "所以档位越低，高光之间分得越开，画面也越暗。"
+                           "自动（仅对带高光的截图）和固定会读它")},
+        {QStringLiteral("Judge HDR by area"), QString::fromUtf8("按面积判定 HDR")},
+        {QStringLiteral("Whether a capture counts as HDR content by how much of it is brighter "
+                        "than SDR white rather than by any single pixel. A ten-bit PQ screen "
+                        "rounds ordinary SDR white a few thousandths over, so with this off a "
+                        "handful of rounding pixels can pass a whole desktop off as HDR and dim "
+                        "it. Only outputs the compositor describes as HDR are asked at all"),
+         QString::fromUtf8("一张截图算不算 HDR 内容，看的是有多大面积比 SDR 白更亮，"
+                           "而不是有没有任何一个像素超过。十位 PQ 屏幕会把普通的 SDR 白"
+                           "舍入得高出千分之几，所以关掉它时，几个舍入出来的像素就能把"
+                           "整个桌面判成 HDR 并把它压暗。"
+                           "只有合成器声明为 HDR 的输出才会被问到")},
+        {QStringLiteral("HDR area"), QString::fromUtf8("HDR 面积")},
+        {QStringLiteral("How much of the capture has to be brighter than SDR white to count as "
+                        "HDR content, as a percentage of it. Zero means every capture of an HDR "
+                        "output is HDR content, with no test at all"),
+         QString::fromUtf8("截图里有多大比例比 SDR 白更亮才算 HDR 内容。"
+                           "零表示 HDR 输出上的每次截图都算，完全不做检测")},
+        {QStringLiteral("Off: one bright pixel is enough. On: the ratio below has to be met"),
+         QString::fromUtf8("关：一个亮像素就够。开：要达到下面那个比例")},
         {QStringLiteral("Default monitor"), QString::fromUtf8("默认输出")},
         {QStringLiteral("Which output a capture takes when the command line names none. Leave it "
                         "empty to use whichever output the pointer is on -- `current` says the "
