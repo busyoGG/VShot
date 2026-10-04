@@ -51,6 +51,9 @@ const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr
 // default first, then the two that read a level.
 const QStringList kToneMapNames = {QStringLiteral("auto"), QStringLiteral("fixed"),
                                    QStringLiteral("normalize")};
+// `--element-fallback` accepts, in the order the settings window offers them:
+// the default first.  The two name the pixel readers -- see `src/element/mod.rs`.
+const QStringList kElementFallbackNames = {QStringLiteral("lines"), QStringLiteral("components")};
 const QStringList kInjectNames = {QStringLiteral("auto"), QStringLiteral("wlr"),
                                   QStringLiteral("portal"), QStringLiteral("uinput")};
 const QStringList kEncoderNames = {QStringLiteral("h264"), QStringLiteral("hevc"),
@@ -390,6 +393,11 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"", "png-compression"}, {"", "hdr-format"}, {"", "monitor"},
     {"", "tone-map"},        {"", "tone-map-white"},
     {"", "hdr-area-test"},   {"", "hdr-area-ratio"},
+    // The pixel reader is written only when it is not the default `lines`, so a
+    // remembered `components` has to be cleared out on the way back: without
+    // this line the merge below puts the old value back, and `lines` can never
+    // be selected again.
+    {"", "element-fallback"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
@@ -523,6 +531,8 @@ CliPreferences readCli(const QJsonObject &cli)
                                             kMinToneMapWhite, kMaxToneMapWhite);
     preferences.hdrAreaTest =
         readFlag(cli, QStringLiteral("hdr-area-test"), preferences.hdrAreaTest);
+    preferences.elementFallback = readChoice(cli, QStringLiteral("element-fallback"),
+                                             preferences.elementFallback, kElementFallbackNames);
     // Zero is a ratio here, not an absent key, so the reader has to be able to
     // tell the two apart -- see `CliPreferences::hdrAreaRatio`.
     preferences.hdrAreaRatio = readFraction(cli, QStringLiteral("hdr-area-ratio"), -1.0, 0.0, 1.0);
@@ -661,6 +671,11 @@ QJsonObject cliJson(const CliPreferences &preferences)
     // the same rule `record.notify` follows below.
     if (!preferences.hdrAreaTest) {
         cli.insert(QStringLiteral("hdr-area-test"), false);
+    }
+    // `lines` is the default, so only the other choice is written -- the same
+    // rule the area test above follows.
+    if (preferences.elementFallback != QStringLiteral("lines")) {
+        cli.insert(QStringLiteral("element-fallback"), preferences.elementFallback);
     }
     // A negative ratio is "the file says nothing"; zero is the ratio that means
     // "always HDR", so it is written like any other.
@@ -1188,6 +1203,11 @@ const QStringList &hdrFormatNames()
 const QStringList &toneMapNames()
 {
     return kToneMapNames;
+}
+
+const QStringList &elementFallbackNames()
+{
+    return kElementFallbackNames;
 }
 
 const QStringList &injectNames()

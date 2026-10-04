@@ -503,6 +503,20 @@ const QHash<QString, QString> &chineseTable()
                            "需要通知服务")},
         {QStringLiteral("Shown with the result once recognition ends"),
          QString::fromUtf8("识别结束时随结果一起显示")},
+        {QStringLiteral("Element picking"), QString::fromUtf8("元素识别")},
+        {QStringLiteral("When the accessibility tree is unavailable"),
+         QString::fromUtf8("无障碍树用不了时")},
+        {QStringLiteral("How the picker reads a window's elements when the application exposes "
+                        "no accessibility tree. Lines finds the dividers the interface draws "
+                        "and the panes they enclose, which suits editors and terminals. Colour "
+                        "regions finds the areas of one colour instead, which suits an "
+                        "interface that draws no dividers and separates its panes by colour "
+                        "alone. Neither reads every window, which is why both are here"),
+         QString::fromUtf8("应用不暴露无障碍树时，选择器怎么读一个窗口里的元素。"
+                           "「分隔线」找界面自己画的分隔线以及被它们围出的面板，"
+                           "适合编辑器和终端；「颜色区块」改为找同一种颜色的区域，"
+                           "适合不画分隔线、只靠颜色区分面板的界面。"
+                           "两者都读不了所有窗口，所以两个都留着")},
         {QStringLiteral("Recording"), QString::fromUtf8("录制")},
         {QStringLiteral("Encoder"), QString::fromUtf8("编码器")},
         {QStringLiteral("All three encode on the GPU's media engine"),

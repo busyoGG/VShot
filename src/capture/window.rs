@@ -65,6 +65,16 @@ pub struct WindowCandidate {
     pub app_id: String,
     /// The window's title, as the compositor reports it.  May be empty.
     pub title: String,
+    /// The process behind the window, as the compositor reports it, or 0 when
+    /// it reports none.
+    ///
+    /// Picking's element level needs it: an accessibility frame and a
+    /// compositor window are the same window because the same process owns
+    /// them, and a title is not a reliable way to say so — a browser renames
+    /// its toplevel between the two (`… - 已固定 - Chromium` to one,
+    /// `… - Chromium` to the other).  Only Hyprland fills this in today;
+    /// elsewhere it stays 0 and the title is the fallback.
+    pub pid: i32,
     /// The compositor's own opaque name for this window, where one exists that
     /// a capture request can be aimed at — KWin's `QUuid`, the value
     /// `ScreenShot2.CaptureWindow` takes.  `None` elsewhere; a window capture
@@ -82,6 +92,7 @@ impl WindowCandidate {
             label,
             app_id: String::new(),
             title: String::new(),
+            pid: 0,
             handle: None,
         }
     }
@@ -1042,6 +1053,11 @@ pub fn parse_hyprland_windows(clients: &[u8], monitors: &[u8]) -> Result<Vec<Win
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
+                pid: client
+                    .get("pid")
+                    .and_then(Value::as_i64)
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .unwrap_or(0),
                 handle: None,
             },
         ));
@@ -1212,6 +1228,14 @@ fn collect_sway_windows(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned(),
+            // Sway reports it at the top level for native windows and under
+            // `window_properties` for X11 ones.
+            pid: node
+                .get("pid")
+                .or_else(|| node.get("window_properties").and_then(|p| p.get("pid")))
+                .and_then(Value::as_i64)
+                .and_then(|pid| i32::try_from(pid).ok())
+                .unwrap_or(0),
             handle: None,
         };
         if is_floating {
@@ -1249,6 +1273,7 @@ pub fn parse_kwin_windows(bytes: &[u8]) -> Result<Vec<WindowCandidate>> {
             label: join_label(&row.app_id, &row.title),
             app_id: row.app_id,
             title: row.title,
+            pid: row.pid,
             handle: (!row.handle.is_empty()).then_some(row.handle),
         });
     }
@@ -1886,3 +1911,4 @@ mod tests {
         assert!(runner.asked().is_empty(), "no command should have run");
     }
 }
+

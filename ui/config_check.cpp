@@ -476,6 +476,7 @@ void checkClearingAValueRemovesIt()
     std::printf("--- clearing a value actually clears it ----------------------------\n");
     writeConfig(QStringLiteral(R"({
         "cli": {"png-compression": "high", "monitor": "DP-2",
+                "element-fallback": "components",
                 "long": {"notches": 2, "max-height": 9000, "timeout": 30},
                 "pin": {"density": 2},
                 "record": {"encoder": "hevc", "encoder-backend": "nvenc", "fps": 30,
@@ -493,7 +494,9 @@ void checkClearingAValueRemovesIt()
     expect(!root.contains(QStringLiteral("cli")),
            "clearing everything leaves no empty cli section behind");
     const vshot::Config reread = vshot::loadConfig();
-    expect(reread.cli.pngCompression.isEmpty() && reread.cli.longNotches == 0 &&
+    expect(reread.cli.pngCompression.isEmpty() &&
+               reread.cli.elementFallback == QStringLiteral("lines") &&
+               reread.cli.longNotches == 0 &&
                reread.cli.pinDensity == 0 && reread.cli.recordEncoder.isEmpty() &&
                reread.cli.recordFps == 0 && !reread.cli.recordPortal &&
                !reread.cli.recordMicEnabled && reread.cli.recordFollow.isEmpty() &&
@@ -584,6 +587,7 @@ void checkRoundTripOfEveryField()
     written.editor.mosaicShape = QStringLiteral("brush");
     written.editor.mosaicStrength = 3;
     written.cli.pngCompression = QStringLiteral("fastest");
+    written.cli.elementFallback = QStringLiteral("components");
     written.cli.monitor = QStringLiteral("HDMI-A-1");
     written.cli.longNotches = 4;
     written.cli.longMaxHeight = 12345;
@@ -648,6 +652,8 @@ void checkRoundTripOfEveryField()
     expect(read.editor.mosaicStrength == written.editor.mosaicStrength,
            "editor.mosaicStrength round-trips");
     expect(read.cli.pngCompression == written.cli.pngCompression, "cli.png-compression round-trips");
+    expect(read.cli.elementFallback == written.cli.elementFallback,
+           "cli.element-fallback round-trips", read.cli.elementFallback);
     expect(read.cli.monitor == written.cli.monitor, "cli.monitor round-trips");
     expect(read.cli.longNotches == written.cli.longNotches, "cli.long.notches round-trips");
     expect(read.cli.longMaxHeight == written.cli.longMaxHeight, "cli.long.max-height round-trips");
@@ -829,6 +835,13 @@ void checkRoundTripOfEveryField()
         vshot::saveConfig(probe);
         expect(vshot::loadConfig().cli.toneMap == value,
                "the settings window's tone-map names all load back", value);
+    }
+    for (const QString &value : vshot::elementFallbackNames()) {
+        vshot::Config probe = written;
+        probe.cli.elementFallback = value;
+        vshot::saveConfig(probe);
+        expect(vshot::loadConfig().cli.elementFallback == value,
+               "the settings window's element readers all load back", value);
     }
     for (const QString &value : vshot::toolNames()) {
         vshot::Config probe = written;

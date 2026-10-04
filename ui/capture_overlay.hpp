@@ -355,6 +355,10 @@ public:
                  Qt::KeyboardModifiers modifiers);
     void doubleClick(CaptureOverlay *overlay, const QPointF &local, Qt::MouseButton button);
     void key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers);
+    // One wheel step while picking, `up` towards the whole window.  Steps
+    // through a window's UI elements when there is a tree to step through; does
+    // nothing otherwise, which is what every other session gets.
+    void wheel(bool up);
 
     // Arms `tool` for the next press, or disarms everything when it is empty.
     void chooseTool(std::optional<Tool> tool);
@@ -716,6 +720,29 @@ private:
     std::function<void(TextOutcome outcome, const QString &error)> translateResultCallback_;
     QVector<WindowCandidate> candidates_;
     int hoveredCandidate_ = -1;
+
+    // UI-element picking: the window under the pointer is level one and its
+    // widgets are level two, and the wheel steps between them.  The tree the
+    // CLI sends is flat, with each node naming its parent by index, so both
+    // gestures are array lookups -- up is `parent[node]`, down is the child
+    // that was last climbed out of.
+    //
+    // The tree belongs to one window, so it is re-fetched when the hovered
+    // window changes and dropped when the pointer leaves every window.  Walking
+    // it costs a D-Bus round trip per node on the CLI side, which is why the
+    // request happens on a window change rather than on every pointer move.
+    ElementTree elements_;
+    /// The window the elements belong to, -1 when there is none.  A window that
+    /// exposes no tree still counts as known: it is asked once and remembered
+    /// as empty, so the pointer moving within it does not ask again.
+    int elementsForWindow_ = -1;
+    /// The element the pointer itself is over, which is not always the one the
+    /// highlight is on: a wheel gesture moves the highlight off it on purpose,
+    /// and a pointer that then twitches within the same element must not drag
+    /// it back.  Only a pointer that reaches a *different* element re-aims.
+    int pointerElement_ = -1;
+    bool elementPending_ = false;
+
     // Live candidate refresh: the picker's stdin carries fresh lists from the
     // CLI, and one request may be in flight at a time.
     QSocketNotifier *candidateReader_ = nullptr;
@@ -1039,6 +1066,22 @@ private:
     // whatever the (unmoved) pointer is over now.
     void applyCandidates(QVector<WindowCandidate> candidates);
     void readCandidateReplies();
+
+    // UI-element picking, alongside the window level.
+    /// Asks the CLI for the elements of the window the pointer is on.  Called on
+    /// a change of hovered window rather than on a move within one: the walk is
+    /// a D-Bus round trip per node and would otherwise run for every pixel the
+    /// pointer crosses.
+    void requestElements(int windowIndex);
+    /// Reads one answer to that request, from the same pipe the candidate
+    /// lists arrive on.
+    void readElementReplies(const QJsonObject &object);
+    /// Puts the selection on the element the tree says is under the pointer,
+    /// or on the whole window when there is none.
+    void applyElementHover(int index);
+    /// Drops the element tree, when the pointer leaves the window it belonged
+    /// to or the window list changed under it.
+    void clearElements();
     LogicalRect selectionBetween(Point first, Point second) const;
     LogicalRect moveSelection(LogicalRect origin, Point anchor, Point current) const;
     // The aspect key (`preserveAspect`) keeps the box's own width-to-height
@@ -1384,6 +1427,10 @@ protected:
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    // The wheel is the picker's level control: up climbs out of an element
+    // towards the whole window, down retraces the way back in.  Nothing else in
+    // the overlay uses the wheel, so a step outside picking is left to Qt.
+    void wheelEvent(QWheelEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     // Tab never reaches `keyPressEvent`: `QWidget::event` reads it as focus
     // traversal and acts on it first, so the key the editor binds to "next mark"

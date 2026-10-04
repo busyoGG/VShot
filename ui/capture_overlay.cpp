@@ -5704,13 +5704,32 @@ bool OverlayController::applyCandidateHover(Point point, CaptureOverlay *overlay
     const int index = candidateIndexAt(point);
     overlay->setCursor(index >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
     if (index == hoveredCandidate_ && selection_.has_value() == (index >= 0)) {
+        // The window did not change.  Follow the pointer only when it has
+        // actually landed on a *different* element: a wheel gesture set the
+        // level deliberately, and re-deriving it from every pointer move
+        // within the same element would undo it on the smallest twitch.
+        if (index >= 0 && !elements_.isEmpty()) {
+            const int element = elements_.indexAt(point.x, point.y);
+            if (element != pointerElement_) {
+                pointerElement_ = element;
+                applyElementHover(element);
+                return true;
+            }
+        }
         return false;
     }
     hoveredCandidate_ = index;
     if (index >= 0) {
         selection_ = candidates_.at(index).rect;
+        // The tree belongs to one window, so a move onto a different window
+        // throws it away and asks for the new one's.
+        if (elementsForWindow_ != index) {
+            clearElements();
+        }
+        requestElements(index);
     } else {
         selection_.reset();
+        clearElements();
     }
     return true;
 }
@@ -5741,6 +5760,18 @@ void OverlayController::enableCandidateRefresh()
         requestCandidateRefresh();
     });
     candidateTimer_->start();
+    // The pointer may already be resting on a window when the session opens, and
+    // the element request otherwise only happens on a move -- so a picker the
+    // user opened without jiggling the mouse would never offer an element
+    // level.  Now that the pipe exists, ask once for whatever is under the
+    // pointer already.
+    if (hoveredCandidate_ < 0) {
+        hoveredCandidate_ = candidateIndexAt(pointer_);
+        if (hoveredCandidate_ >= 0) {
+            selection_ = candidates_.at(hoveredCandidate_).rect;
+        }
+    }
+    requestElements(hoveredCandidate_);
 }
 
 void OverlayController::enablePointerWarp()
@@ -5853,6 +5884,83 @@ void OverlayController::requestCandidateRefresh()
     candidateRefreshPending_ = true;
 }
 
+/// Asks the CLI for one window's UI elements.
+///
+/// One request may be in flight and one tree is held at a time, so a window is
+/// asked once when the pointer arrives and not again while it stays: the walk
+/// behind the answer is a D-Bus round trip per node, and asking per pointer
+/// move would put a tree walk between the cursor and the highlight.
+void OverlayController::requestElements(int windowIndex)
+{
+    if (!pickMode_ || finished_ || cancelled_ || windowIndex < 0) {
+        return;
+    }
+    if (elementPending_ || elementsForWindow_ == windowIndex) {
+        return;
+    }
+    // An unanswered request leaves the window unasked-for, so a pointer that
+    // leaves and comes back asks again rather than waiting on a reply that is
+    // never coming.
+    elementsForWindow_ = windowIndex;
+    elementPending_ = true;
+    const QByteArray request =
+        "{\"request\":\"elements\",\"index\":" + QByteArray::number(windowIndex) + "}\n";
+    if (!writeCliRequest(request)) {
+        elementPending_ = false;
+    }
+}
+
+/// Reads the CLI's answer to an element request.
+///
+/// An `elements` array replaces what the picker holds; an absent one means the
+/// CLI has no answer for this window (no accessibility bus, no matching frame,
+/// no tree under it) and the picker keeps offering the whole window.  The two
+/// are different: a window asked and answered with nothing must not be asked
+/// again on the next pointer move, so `elementsForWindow_` stays set.
+void OverlayController::readElementReplies(const QJsonObject &object)
+{
+    if (!object.contains(QStringLiteral("elements"))) {
+        return;
+    }
+    elementPending_ = false;
+    elements_.load(object.value(QStringLiteral("elements")).toArray());
+    // Point the highlight at what is under the pointer now, which is the
+    // element the user was already aiming at before the answer arrived.
+    pointerElement_ = elements_.indexAt(pointer_.x, pointer_.y);
+    applyElementHover(pointerElement_);
+    updateAll();
+}
+
+/// Puts the selection on `index`, or on the whole window for -1.
+///
+/// The tree rebuilds its own descent from the node's parents rather than
+/// keeping one across moves: a pointer that moved is aiming at something else,
+/// and retracing a path taken from a different element would climb out of the
+/// one now under the cursor.
+void OverlayController::applyElementHover(int index)
+{
+    elements_.select(index);
+    const ElementTree::Node *node = elements_.node(index);
+    if (node != nullptr) {
+        selection_ = node->rect;
+    } else if (hoveredCandidate_ >= 0 && hoveredCandidate_ < candidates_.size()) {
+        selection_ = candidates_.at(hoveredCandidate_).rect;
+    }
+}
+
+/// Forgets the tree, because the window it described is no longer the one the
+/// pointer is on.
+void OverlayController::clearElements()
+{
+    if (elements_.isEmpty() && elementsForWindow_ < 0) {
+        return;
+    }
+    elements_.clear();
+    elementsForWindow_ = -1;
+    pointerElement_ = -1;
+    elementPending_ = false;
+}
+
 /// Reads whatever the CLI has answered so far: one JSON object per line, a
 /// `candidates` array being a fresh list.  Anything without one (an empty
 /// object, or a CLI that has no window list to offer) leaves the current list
@@ -5892,7 +6000,15 @@ void OverlayController::readCandidateReplies()
         if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
             continue;
         }
-        const QJsonValue value = document.object().value(QStringLiteral("candidates"));
+        const QJsonObject object = document.object();
+        // The element answer travels on the same pipe, and carries no
+        // `candidates`, so it is read here rather than waited for separately:
+        // one reader, one socket notifier, both replies.
+        if (object.contains(QStringLiteral("elements"))) {
+            readElementReplies(object);
+            continue;
+        }
+        const QJsonValue value = object.value(QStringLiteral("candidates"));
         if (!value.isArray()) {
             continue;
         }
@@ -5942,6 +6058,11 @@ void OverlayController::applyCandidates(QVector<WindowCandidate> candidates)
     hoveredCandidate_ = candidateIndexAt(pointer_);
     if (hoveredCandidate_ >= 0) {
         selection_ = candidates_.at(hoveredCandidate_).rect;
+        // Ask for this window's elements here as well as on a pointer move: the
+        // pointer may already be sitting on a window when the session opens, and
+        // a picker that only asked on a move would offer no element level until
+        // the user happened to jiggle the mouse.
+        requestElements(hoveredCandidate_);
     } else {
         selection_.reset();
     }
@@ -7334,7 +7455,15 @@ void OverlayController::press(CaptureOverlay *overlay, const QPointF &local,
         const int index = candidateIndexAt(point);
         if (index >= 0) {
             hoveredCandidate_ = index;
-            selection_ = candidates_.at(index).rect;
+            // The click takes what the highlight is on, which is an element when
+            // the wheel brought the picker down into one.  Re-deriving it from
+            // the window would undo the level the user chose.
+            const ElementTree::Node *element = elements_.node(elements_.current());
+            if (element != nullptr) {
+                selection_ = element->rect;
+            } else {
+                selection_ = candidates_.at(index).rect;
+            }
             pointer_ = point;
             // Take the highlight off the screen first: the compositor destroys
             // these surfaces asynchronously, and a lingering copy of the
@@ -8071,6 +8200,27 @@ void OverlayController::doubleClick(CaptureOverlay *overlay, const QPointF &loca
     if (selection_.has_value() && !pinEdit_ && hitHandle(point) != 0) {
         confirm();
     }
+}
+
+void OverlayController::wheel(bool up)
+{
+    // Only picking has levels to move through, and only a window with a tree has
+    // anything below the window itself.  Every other session -- and every window
+    // that exposes no accessibility tree -- leaves the wheel alone.
+    if (!pickMode_ || editing_ || elements_.isEmpty()) {
+        return;
+    }
+    if (!elements_.step(up)) {
+        return;
+    }
+    const ElementTree::Node *node = elements_.node(elements_.current());
+    if (node != nullptr) {
+        selection_ = node->rect;
+    } else if (hoveredCandidate_ >= 0 && hoveredCandidate_ < candidates_.size()) {
+        // Climbed off the top: the whole window, which is where picking began.
+        selection_ = candidates_.at(hoveredCandidate_).rect;
+    }
+    updateAll();
 }
 
 void OverlayController::key(CaptureOverlay *overlay, int key, Qt::KeyboardModifiers modifiers)
@@ -11212,8 +11362,14 @@ QJsonDocument OverlayController::resultDocument(QString *error) const
     }
     // Picking reports the click position as well: it runs on a live desktop,
     // so the caller re-resolves there which window the click actually landed
-    // on before it captures the frame.
-    if (pickMode_) {
+    // on before it captures the frame -- a window may have moved or the user
+    // may have switched workspace under it between the click and the capture.
+    //
+    // Not, though, when the click took an *element*: re-resolving a point
+    // against the window list would give back the whole window and undo the
+    // level the wheel had just chosen, so an element-level pick reports no
+    // point and the caller keeps the rectangle as it stands.
+    if (pickMode_ && elements_.node(elements_.current()) == nullptr) {
         QJsonObject point;
         point.insert(QStringLiteral("x"), static_cast<qint64>(pointer_.x));
         point.insert(QStringLiteral("y"), static_cast<qint64>(pointer_.y));
@@ -14132,6 +14288,20 @@ void CaptureOverlay::mouseReleaseEvent(QMouseEvent *event)
     if (controller_ != nullptr) {
         controller_->release(this, event->position(), event->button(), event->modifiers());
     }
+    event->accept();
+}
+
+void CaptureOverlay::wheelEvent(QWheelEvent *event)
+{
+    if (controller_ != nullptr) {
+        // Away from the user is "up", towards them "down" -- the direction the
+        // page moves, which is the direction the level moves here: scrolling
+        // the way that reads as "back out of this" climbs towards the window.
+        controller_->wheel(event->angleDelta().y() > 0);
+    }
+    // Only consumed when picking and there is a tree to step through; the
+    // controller says which, and anything else is left to Qt so a wheel during
+    // editing keeps doing whatever the base class does with it.
     event->accept();
 }
 

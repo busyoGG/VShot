@@ -74,6 +74,16 @@ pub struct CliDefaults {
     /// [`de_optional_number`] for the same reason as `tone_map_white`.
     #[serde(default, deserialize_with = "de_optional_number")]
     pub hdr_area_ratio: Option<f32>,
+    /// `--element-fallback`, one of `lines` / `components`: which way the
+    /// picker reads a window's elements when the accessibility tree cannot
+    /// answer for it.
+    ///
+    /// `lines` finds the structure the interface *draws* — the dividers between
+    /// its panes — and is the default.  `components` finds the areas of one
+    /// colour instead, which is what an interface that draws no dividers needs.
+    /// Neither is a superset of the other, which is why it is a choice rather
+    /// than a replacement.
+    pub element_fallback: Option<String>,
     /// `monitor`'s output name when none is given; `current` means the output
     /// under the pointer.
     pub monitor: Option<String>,
@@ -429,6 +439,12 @@ pub fn tone_map_white_default() -> Option<f32> {
 /// nothing usable.  The caller keeps its own built-in default (on).
 pub fn hdr_area_test_default() -> Option<bool> {
     load().hdr_area_test
+}
+
+/// The element fallback the config file remembers, or `None` when it says
+/// nothing usable.
+pub fn element_fallback_default() -> Option<String> {
+    load().element_fallback
 }
 
 /// The HDR area ratio the config file remembers, already clamped to 0..=1, or

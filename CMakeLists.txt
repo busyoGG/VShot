@@ -304,6 +304,24 @@ if(VSHOT_BUILD_CHECKS)
     # (drawing the SDR frame over the better picture) looks like a slightly
     # dimmer selection rather than a broken one.  Needs Widgets and the
     # offscreen platform plugin, no compositor: no layer surface is shown.
+    # The element-pick check: the picker's second level.  Wheel up has to climb
+    # out of an element to the whole window and wheel down has to return along
+    # the way it came, which is the whole of the gesture and is arithmetic the
+    # overlay's paint cannot show.  Drives `ElementTree` directly, so it needs
+    # only the protocol and no compositor.
+    add_executable(vshot-element-pick-check
+        ui/element_pick_check.cpp
+        ui/session_protocol.cpp
+        ui/session_protocol.hpp
+        ui/pixel_fd.cpp
+        ui/pixel_fd.hpp
+    )
+    target_link_libraries(vshot-element-pick-check PRIVATE Qt6::Core Qt6::Gui)
+    target_compile_features(vshot-element-pick-check PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(vshot-element-pick-check PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
     add_executable(vshot-backdrop-check
         ui/backdrop_check.cpp
         ui/capture_overlay.cpp

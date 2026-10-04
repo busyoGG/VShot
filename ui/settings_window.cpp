@@ -131,6 +131,9 @@ constexpr int kDefaultReplayFps = 30;
 constexpr const char *kDefaultPngCompression = "fast";
 constexpr const char *kDefaultHdrFormat = "avif";
 constexpr const char *kDefaultToneMap = "auto";
+// The pixel reader the picker falls back to: `lines`, which reads the dividers
+// the interface draws.  See `src/element/mod.rs` for the other.
+constexpr const char *kDefaultElementFallback = "lines";
 constexpr const char *kDefaultEncoder = "h264";
 constexpr const char *kDefaultEncoderBackend = "auto";
 constexpr const char *kDefaultLongInject = "auto";
@@ -2126,6 +2129,26 @@ private:
                     "needs a notification daemon"),
                ocrNotifySwitch_, true);
 
+        // How the picker reads a window when the accessibility tree cannot
+        // answer for it -- a program that draws its own interface exposes no
+        // tree at all.  Two ways of reading are built, and they fail on
+        // different interfaces, so this is a choice rather than a fallback
+        // order.
+        QWidget *elements = addCard(page, uiTr("Element picking"));
+        elementFallbackBox_ = choiceBox(elements, elementFallbackNames(),
+                                        QString::fromLatin1(kDefaultElementFallback));
+        elementFallbackBox_->setObjectName(QStringLiteral("elementFallback"));
+        elementFallbackBox_->setMinimumWidth(200);
+        selectChoice(elementFallbackBox_, config_.cli.elementFallback);
+        addRow(elements, uiTr("When the accessibility tree is unavailable"),
+               uiTr("How the picker reads a window's elements when the application exposes "
+                    "no accessibility tree. Lines finds the dividers the interface draws "
+                    "and the panes they enclose, which suits editors and terminals. Colour "
+                    "regions finds the areas of one colour instead, which suits an interface "
+                    "that draws no dividers and separates its panes by colour alone. Neither "
+                    "reads every window, which is why both are here"),
+               elementFallbackBox_, true);
+
         return scroll;
     }
 
@@ -2796,6 +2819,7 @@ private:
         cli.hdrAreaRatio =
             std::abs(ratio - kDefaultHdrAreaRatio) < 1e-9 ? -1.0 : ratio;
         cli.monitor = monitorEdit_->text().trimmed();
+        cli.elementFallback = elementFallbackBox_->currentData().toString();
         // Every spin box is read back with the built-in default it opened on: a
         // value still sitting there is written as the sentinel, which is what
         // keeps an untouched default out of the file and lets a later version's
@@ -2927,6 +2951,7 @@ private:
     QComboBox *compressionBox_ = nullptr;
     QComboBox *hdrFormatBox_ = nullptr;
     QComboBox *toneMapBox_ = nullptr;
+    QComboBox *elementFallbackBox_ = nullptr;
     QDoubleSpinBox *toneMapWhiteSpin_ = nullptr;
     ModernSwitch *hdrAreaSwitch_ = nullptr;
     QDoubleSpinBox *hdrAreaRatioSpin_ = nullptr;

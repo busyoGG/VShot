@@ -142,6 +142,14 @@ pub struct Cli {
     /// test at all. Ignored when the area test is off.
     #[arg(long = "hdr-area-ratio", global = true, value_name = "SHARE")]
     pub hdr_area_ratio: Option<f32>,
+    /// How the picker reads a window's elements when the accessibility tree
+    /// cannot answer for it: `lines` (default) finds the dividers the interface
+    /// draws and the panes they enclose, `components` finds the areas of one
+    /// colour instead. The two fail on different interfaces -- `lines` needs
+    /// dividers to exist, `components` needs the panes to differ in colour --
+    /// so neither replaces the other.
+    #[arg(long = "element-fallback", global = true, value_name = "KIND")]
+    pub element_fallback: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -995,6 +1003,9 @@ pub struct Request {
     /// How the SDR half is mapped down from that HDR content: which behaviour,
     /// and where SDR white lands for the two that take a level.
     pub tone_map: ToneMapOptions,
+    /// How the picker reads a window's elements when the accessibility tree
+    /// cannot answer for it.
+    pub element_fallback: crate::element::Fallback,
 }
 
 /// What `vshot` was asked to do.  Only the capture arm touches the Wayland
@@ -1896,6 +1907,16 @@ impl Cli {
             .hdr_area_ratio
             .or_else(crate::config::hdr_area_ratio_default)
             .map_or_else(|| HdrDecision::default().ratio, HdrDecision::clamp_ratio);
+        let element_fallback = self
+            .element_fallback
+            .as_deref()
+            .and_then(crate::element::Fallback::parse)
+            .or_else(|| {
+                crate::config::element_fallback_default()
+                    .as_deref()
+                    .and_then(crate::element::Fallback::parse)
+            })
+            .unwrap_or_default();
         let destination = match (self.output, self.clipboard, self.pin) {
             (Some(path), false, false) if path.as_os_str() == "-" => Destination::Stdout,
             (Some(path), false, false) => Destination::File(path),
@@ -2021,6 +2042,7 @@ impl Cli {
                 white: tone_map_white,
                 hdr: HdrDecision::from_config(hdr_area_test, hdr_area_ratio),
             },
+            element_fallback,
         })
     }
 
@@ -2657,6 +2679,7 @@ mod tests {
                     no_blend: false,
                 },
                 destination: Destination::Clipboard,
+                element_fallback: crate::element::Fallback::Lines,
                 cursor: false,
                 compression: PngCompression::Fast,
                 hdr_format: HdrFormat::default(),

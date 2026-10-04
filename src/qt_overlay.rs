@@ -176,6 +176,11 @@ pub(crate) type ReleaseHandler<'a> =
 enum HelperRequest {
     /// The picker wants the windows it should highlight, again.
     Candidates,
+    /// The picker wants the UI elements of one window: `index` is the position
+    /// in the window list it already has, and the pointer has settled on that
+    /// window.  Answering costs a walk of the accessibility tree, so the helper
+    /// asks only when the hovered window changes.
+    Elements { index: usize },
     /// The keyboard walked its cursor and wants the real pointer moved there,
     /// in global logical pixels.
     Pointer { x: i32, y: i32 },
@@ -205,6 +210,9 @@ fn run_interactive_helper(
     session_path: &Path,
     scene: &SceneSnapshot,
     refresh: &impl Fn() -> Option<Vec<WindowCandidate>>,
+    // One window's UI elements, by its index in the window list.  `None` turns
+    // element picking off; see `run_helper_dialogue`.
+    elements: Option<&dyn Fn(usize) -> Option<Vec<crate::selection_region::RegionNode>>>,
     // Run when the helper asks to be let go; see [`HelperRequest::Release`].
     // The caller's own handoff, because it is the caller that knows what the
     // editor was drawing over and what has to be on the screen before it stops.
@@ -219,6 +227,7 @@ fn run_interactive_helper(
         &frames,
         Some(scene.bounds()),
         refresh,
+        elements,
         release,
     )
 }
@@ -239,6 +248,10 @@ fn run_helper_dialogue(
     sources: &[&crate::model::Frame],
     desktop: Option<crate::geometry::Rect>,
     refresh: &dyn Fn() -> Option<Vec<WindowCandidate>>,
+    // What the picker is told when it asks for one window's UI elements.
+    // `None` disables element picking entirely, which is what a build or a
+    // desktop without accessibility gets.
+    elements: Option<&dyn Fn(usize) -> Option<Vec<crate::selection_region::RegionNode>>>,
     release: &mut ReleaseHandler<'_>,
 ) -> Result<HelperOutput> {
     let (parent, child_end) = crate::pixel_fd::PixelChannel::spawn_pair()?;
@@ -322,6 +335,21 @@ fn run_helper_dialogue(
                     VshotError::Selection(format!("failed to encode the candidate reply: {error}"))
                 })?
             }
+            HelperRequest::Elements { index } => {
+
+                // Asked once per hovered window, not once per pointer move: a
+                // tree walk is a D-Bus round trip per node.  `None` means this
+                // window has no accessibility tree, which leaves the picker
+                // offering the whole window — the behaviour it already had.
+                let elements = elements
+                    .as_ref()
+                    .and_then(|elements| elements(index))
+                    .map(|nodes| flatten_elements(&nodes));
+                let reply = ElementReply { elements };
+                serde_json::to_string(&reply).map_err(|error| {
+                    VshotError::Selection(format!("failed to encode the element reply: {error}"))
+                })?
+            }
             HelperRequest::Pointer { x, y } => {
                 if pointer.is_none() {
                     pointer = desktop.and_then(open_pointer_mover);
@@ -402,7 +430,7 @@ fn run_helper(
     scene: &SceneSnapshot,
     release: &mut ReleaseHandler<'_>,
 ) -> Result<HelperOutput> {
-    run_interactive_helper(helper, session_path, scene, &|| None, release)
+    run_interactive_helper(helper, session_path, scene, &|| None, None, release)
 }
 
 /// Hands the helper every source frame over the pixel channel.
@@ -634,6 +662,70 @@ struct CandidateReply {
     candidates: Option<Vec<QtCandidate>>,
 }
 
+/// One pickable UI element inside a window.
+///
+/// The tree travels flat and each node names its parent by index, so the
+/// picker's two gestures are array lookups rather than tree walks: wheel up is
+/// `parent[node]`, wheel down is the child whose parent is `node`.  `parent` is
+/// absent for a node whose parent is the window itself.
+#[derive(Debug, Serialize)]
+struct QtElement {
+    x: i64,
+    y: i64,
+    width: u64,
+    height: u64,
+    /// Index of this element's parent, absent at the top of the window's tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<usize>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    label: String,
+}
+
+/// The answer to the picker's element request: one window's elements, or an
+/// empty object when that window has none.
+///
+/// An empty `elements` is not an error and must not read as one: most windows
+/// expose no accessibility tree at all, and picking has to keep offering the
+/// whole window rather than failing.
+#[derive(Debug, Serialize)]
+struct ElementReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elements: Option<Vec<QtElement>>,
+}
+
+/// Flattens one window's element tree into the wire's shape.
+///
+/// The order is a pre-order walk, so a parent always lands before its children
+/// and `parent` always points backwards — which is what lets the helper build
+/// the tree with one pass and no fixups.
+fn flatten_elements(nodes: &[crate::selection_region::RegionNode]) -> Vec<QtElement> {
+    let mut flat = Vec::new();
+    // Pre-order, written recursively rather than with a stack: a stack pops the
+    // last sibling pushed and would therefore walk the tree back to front,
+    // which puts a node's children before its next sibling and makes the flat
+    // order nothing the helper can reason about.
+    fn walk(
+        nodes: &[crate::selection_region::RegionNode],
+        parent: Option<usize>,
+        flat: &mut Vec<QtElement>,
+    ) {
+        for node in nodes {
+            let index = flat.len();
+            flat.push(QtElement {
+                x: i64::from(node.rect.left()),
+                y: i64::from(node.rect.top()),
+                width: u64::from(node.rect.size.width),
+                height: u64::from(node.rect.size.height),
+                parent,
+                label: node.label.clone(),
+            });
+            walk(&node.children, Some(index), flat);
+        }
+    }
+    walk(nodes, None, &mut flat);
+    flat
+}
+
 impl From<&WindowCandidate> for QtCandidate {
     fn from(candidate: &WindowCandidate) -> Self {
         Self {
@@ -769,13 +861,46 @@ pub fn pick_window(
     scene: &SceneSnapshot,
     candidates: &[WindowCandidate],
     refresh: impl Fn() -> Option<Vec<WindowCandidate>>,
+    // The UI elements of one window, by its index in the window list the
+    // picker currently holds.  `None` leaves picking offering whole windows,
+    // exactly as it did before elements existed.
+    elements: Option<&dyn Fn(&WindowCandidate) -> Option<Vec<crate::selection_region::RegionNode>>>,
 ) -> Result<PickedWindow> {
     let (_directory, session_path) =
         write_session(scene, "window-pick", candidates, None, false, &[])?;
     let helper = helper_program()?;
-    let output = run_interactive_helper(&helper, &session_path, scene, &refresh, &mut |_, _| {
-        Ok("{}".to_string())
-    })?;
+    // The helper names a window by its index in the list it holds, and that
+    // list is re-read as the pointer travels.  So the index has to be resolved
+    // against the same list the helper was last given: a window that moved
+    // between the request and the answer would otherwise have a neighbour's
+    // elements loaded for it.  `Cell::replace` hands the closure the latest
+    // list without borrowing anything across the two closures.
+    let held = std::cell::RefCell::new(candidates.to_vec());
+    let refresh = {
+        let held = &held;
+        move || {
+            let fresh = refresh()?;
+            *held.borrow_mut() = fresh.clone();
+            Some(fresh)
+        }
+    };
+    let indexed = elements.map(|source| {
+        let held = &held;
+        move |index: usize| -> Option<Vec<crate::selection_region::RegionNode>> {
+            let windows = held.borrow();
+            source(windows.get(index)?)
+        }
+    });
+    let output = run_interactive_helper(
+        &helper,
+        &session_path,
+        scene,
+        &refresh,
+        indexed.as_ref().map(|indexed| {
+            indexed as &dyn Fn(usize) -> Option<Vec<crate::selection_region::RegionNode>>
+        }),
+        &mut |_, _| Ok("{}".to_string()),
+    )?;
     parse_picked_window(output.json, scene.bounds())
 }
 
@@ -1220,6 +1345,8 @@ fn run_pin_session(
         &[pin],
         desktop,
         &|| None,
+        // A pin edit has no window list and therefore no elements to ask for.
+        None,
         handoff,
     )
     .map_err(|error| match error {
@@ -1555,6 +1682,12 @@ mod tests {
             serde_json::from_str::<HelperRequest>(r#"{"request":"candidates"}"#).unwrap(),
             HelperRequest::Candidates
         ));
+        let elements: HelperRequest =
+            serde_json::from_str(r#"{"request":"elements","index":3}"#).expect("an element request");
+        match elements {
+            HelperRequest::Elements { index } => assert_eq!(index, 3),
+            other => panic!("read as {other:?}"),
+        }
 
         // A result is not a request: it has no `request` field, or one this
         // build does not know, and either way it ends the dialogue rather than
@@ -1569,6 +1702,65 @@ mod tests {
                 "{result} was taken for a request"
             );
         }
+    }
+
+    // The element tree travels flat with each node naming its parent by index,
+    // which is only safe if a parent is always written before its children: a
+    // helper building the tree in one pass would otherwise meet a `parent`
+    // pointing at a node it has not seen yet.
+    #[test]
+    fn a_flattened_element_tree_writes_every_parent_before_its_children() {
+        use crate::selection_region::{RegionKind, RegionNode};
+
+        let leaf = |label: &str, x: i32| {
+            RegionNode::leaf(RegionKind::Element, Rect::new(x, 0, 10, 10), label)
+        };
+        let tree = vec![
+            leaf("a", 0).with_children(vec![
+                leaf("a1", 1).with_children(vec![leaf("a1x", 2)]),
+                leaf("a2", 3),
+            ]),
+            leaf("b", 4),
+        ];
+
+        let flat = flatten_elements(&tree);
+        assert_eq!(flat.len(), 5, "every node travels");
+        for (index, element) in flat.iter().enumerate() {
+            if let Some(parent) = element.parent {
+                assert!(
+                    parent < index,
+                    "{} at {index} names its parent {parent}, which comes later",
+                    element.label
+                );
+            }
+        }
+        // The top of the window's tree has no parent, and a child's is the node
+        // it sits under.
+        assert_eq!(flat[0].parent, None);
+        assert_eq!(flat[4].parent, None);
+        assert_eq!(flat[1].parent, Some(0));
+        assert_eq!(flat[2].parent, Some(1));
+        assert_eq!(flat[3].parent, Some(0));
+    }
+
+    // A window with no accessibility tree gets an answer that says so, rather
+    // than an error: most windows expose nothing, and picking has to keep
+    // offering the whole window.
+    #[test]
+    fn a_window_with_no_elements_is_answered_with_an_empty_list_not_an_absence() {
+        let reply = ElementReply { elements: None };
+        // Absent means "do not change what you have"; present-but-empty means
+        // "this window has none".  The picker has to be able to tell them
+        // apart, so the field is named either way and `null` is distinct.
+        let encoded = serde_json::to_string(&reply).unwrap();
+        assert_eq!(encoded, "{}");
+        assert_eq!(
+            serde_json::to_string(&ElementReply {
+                elements: Some(Vec::new())
+            })
+            .unwrap(),
+            r#"{"elements":[]}"#
+        );
     }
 
     // The whole dialogue, against a stub helper that plays the Qt side: it asks
@@ -1607,6 +1799,7 @@ printf '%s\n' '{"status":"ok","selection":{"x":1,"y":2,"width":30,"height":40}}'
             &session_path,
             &scene,
             &|| None,
+            None,
             &mut |_, _| Ok("{}".to_string()),
         )
         .expect("the dialogue runs to the end");
@@ -2016,5 +2209,35 @@ read -r answer
             serde_json::from_str(&serde_json::to_string(&without).unwrap()).unwrap();
         assert!(parsed.get("translate").is_none());
         assert!(parsed.get("result_path").is_none());
+    }
+}
+
+#[cfg(test)]
+mod regress {
+    use super::*;
+
+    /// A picked element's rectangle has to survive: the caller re-resolves the
+    /// click against the window list when the helper reports a *point*, and
+    /// that re-resolution gives back the whole window -- which is exactly what
+    /// an element-level pick must not end up with.  So an element pick
+    /// reports no point, and the rectangle is taken as it stands.
+    #[test]
+    fn a_result_with_no_point_keeps_its_own_rectangle() {
+        let bytes = br#"{"status":"ok","selection":{"x":10,"y":20,"width":30,"height":40}}"#;
+        let picked = parse_picked_window(bytes.to_vec(), Rect::new(0, 0, 1000, 1000))
+            .expect("a pick with no point");
+        assert_eq!(picked.rect, Rect::new(10, 20, 30, 40));
+        assert!(picked.point.is_none(), "no point means no re-resolution");
+    }
+
+    /// The window-level case, unchanged: the point is reported so the caller
+    /// can re-resolve a window that moved between the click and the capture.
+    #[test]
+    fn a_result_with_a_point_carries_it_for_re_resolution() {
+        let bytes = br#"{"status":"ok","selection":{"x":10,"y":20,"width":30,"height":40},
+                         "point":{"x":15,"y":25}}"#;
+        let picked = parse_picked_window(bytes.to_vec(), Rect::new(0, 0, 1000, 1000))
+            .expect("a pick with a point");
+        assert_eq!(picked.point, Some(Point::new(15, 25)));
     }
 }

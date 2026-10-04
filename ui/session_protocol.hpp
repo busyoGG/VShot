@@ -62,6 +62,67 @@ struct WindowCandidate {
     QString label;
 };
 
+// The UI elements of one window, and the level the picker is on in them.
+//
+// A window is the first level of picking and its widgets are the second, so
+// this is the whole of the second level: the tree the CLI sent, which node the
+// highlight is on, and the two wheel gestures that move it.  It is separate
+// from the controller because the gestures are the part worth pinning down --
+// climbing out of an element has to reach the whole window, and descending has
+// to return along the way it came rather than to some other child.
+//
+// The tree is flat, with each node naming its parent by index, and the CLI
+// writes it pre-order so a parent always arrives before its children.
+class ElementTree {
+public:
+    struct Node {
+        LogicalRect rect;
+        QString label;
+        // Index of the parent, -1 at the top of the window's tree.
+        int parent = -1;
+    };
+
+    // Reads the CLI's `elements` array.  A node with no usable rect is dropped
+    // rather than kept: it cannot be pointed at, and a degenerate extent would
+    // be drawn across the screen.
+    void load(const QJsonArray &array);
+    void clear();
+
+    bool isEmpty() const { return nodes_.isEmpty(); }
+    int size() const { return nodes_.size(); }
+
+    // The deepest node containing `point`, -1 when the point is in the window
+    // but in no element.  The last node containing the point wins, so one drawn
+    // over a sibling later in the list is the one picked -- the same rule the
+    // window level uses for overlapping windows.
+    int indexAt(std::int32_t x, std::int32_t y) const;
+
+    // The node the highlight is on, -1 for the whole window.
+    int current() const { return current_; }
+    const Node *node(int index) const
+    {
+        return index >= 0 && index < nodes_.size() ? &nodes_.at(index) : nullptr;
+    }
+
+    // Puts the highlight on `index` and forgets the descent: a pointer that
+    // moved is aiming at something else, and retracing a path taken from a
+    // different element would climb out of the one now under the cursor.
+    void select(int index);
+
+    // One wheel step.  `up` climbs towards the window -- repeatedly, until the
+    // whole window is selected, which is the level picking started at.
+    // `down` replays the descent, so it returns to the node the user left
+    // rather than to some other child of it.  False when there was nowhere to
+    // go, which is how the caller knows not to repaint.
+    bool step(bool up);
+
+private:
+    QVector<Node> nodes_;
+    int current_ = -1;
+    // How the wheel got here, as node indices, deepest last.
+    QVector<int> descent_;
+};
+
 // The `translate` session object: how a `vshot translate` call is to be made.
 // Every field is optional, and an absent one means "use the CLI's own config
 // default", which is exactly what an absent whole object means too.

@@ -80,6 +80,11 @@ struct CliPreferences {
     /// the file says nothing, which is what the built-in default is, so only
     /// "off" is ever written.
     bool hdrAreaTest = true;
+    // Which way the picker reads a window's elements when the accessibility
+    // tree cannot answer for it.  `lines` finds the dividers the interface
+    // draws, `components` finds the areas of one colour; the two fail on
+    // different interfaces, so it is a choice rather than a replacement.
+    QString elementFallback = QStringLiteral("lines");
     /// The share that share has to reach (`cli.hdr-area-ratio`), in [0, 1].
     ///
     /// Negative means the file says nothing and the built-in default stands.
@@ -400,6 +405,10 @@ const QStringList &hdrFormatNames();
 /// How the SDR half is mapped down from the HDR one: `auto`, `fixed`,
 /// `normalize`.  The names are the ones `--tone-map` accepts.
 const QStringList &toneMapNames();
+
+/// The `--element-fallback` values, in the order the settings window offers
+/// them: `lines` first, because it is the default.
+const QStringList &elementFallbackNames();
 /// The span a tone-map white level may take, as a fraction of the range: the
 /// same numbers `model::hdr::ToneMapOptions` clamps to, repeated here because
 /// the settings window has to bound its number box by them.

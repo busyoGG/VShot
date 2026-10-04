@@ -13,6 +13,7 @@
 #include <QJsonValue>
 
 #include <cmath>
+#include <functional>
 #include <limits>
 
 namespace vshot {
@@ -456,6 +457,173 @@ bool loadSession(const QString &sessionPath, Session *session, QString *error)
         }
     }
     *session = std::move(parsed);
+    return true;
+}
+
+// --- ElementTree -----------------------------------------------------------
+
+void ElementTree::clear()
+{
+    nodes_.clear();
+    current_ = -1;
+    descent_.clear();
+}
+
+void ElementTree::load(const QJsonArray &array)
+{
+    // Built as a real tree first, because collapsing a wrapper changes which
+    // node a child hangs off and therefore the parent index every later node
+    // carries -- which cannot be patched up in the flat form.
+    struct Branch {
+        LogicalRect rect;
+        QString label;
+        QVector<int> children;
+    };
+    QVector<Branch> branches;
+    QVector<int> roots;
+    branches.reserve(array.size());
+    for (int index = 0; index < array.size(); ++index) {
+        const QJsonObject node = array.at(index).toObject();
+        const std::int32_t x = static_cast<std::int32_t>(node.value(QStringLiteral("x")).toDouble());
+        const std::int32_t y = static_cast<std::int32_t>(node.value(QStringLiteral("y")).toDouble());
+        const std::uint32_t width =
+            static_cast<std::uint32_t>(node.value(QStringLiteral("width")).toDouble());
+        const std::uint32_t height =
+            static_cast<std::uint32_t>(node.value(QStringLiteral("height")).toDouble());
+        // A node with no extent cannot be pointed at.  Real trees carry a
+        // tenth of these -- zero-sized containers, and hidden pages whose size
+        // is uninitialized memory -- and drawing one would put a box across the
+        // screen, so they are dropped instead.
+        if (width == 0 || height == 0) {
+            continue;
+        }
+        Branch branch;
+        branch.rect = LogicalRect{x, y, width, height};
+        branch.label = node.value(QStringLiteral("label")).toString();
+        branches.push_back(std::move(branch));
+        const int parent = node.contains(QStringLiteral("parent"))
+                               ? node.value(QStringLiteral("parent")).toInt(-1)
+                               : -1;
+        if (parent >= 0 && parent < branches.size() - 1) {
+            branches[parent].children.push_back(branches.size() - 1);
+        } else {
+            roots.push_back(branches.size() - 1);
+        }
+    }
+
+    // A wrapper is a node whose only visible child covers exactly the same
+    // rectangle -- a filler, or a plain container a toolkit nests for layout.
+    // Offering it as a level of its own makes the wheel stop on a box
+    // identical to the one under it, which reads as a gesture that did
+    // nothing, so the two are one node.  Repeated, because a toolkit nests
+    // several in a row.
+    auto wrapper = [](const Branch &branch, const QVector<Branch> &all) {
+        if (branch.children.size() != 1) {
+            return -1;
+        }
+        const Branch &child = all.at(branch.children.first());
+        const bool same = child.rect.x == branch.rect.x && child.rect.y == branch.rect.y &&
+                          child.rect.width == branch.rect.width &&
+                          child.rect.height == branch.rect.height;
+        return same ? branch.children.first() : -1;
+    };
+
+    QVector<Node> nodes;
+    // Pre-order, so a parent is written before its children.
+    std::function<void(int, int)> write = [&](int index, int parent) {
+        int taken = index;
+        // A named wrapper would lose its name to an anonymous child, so the
+        // child inherits it: the name is what the user recognises the level by.
+        for (int child = wrapper(branches.at(taken), branches); child >= 0;
+             child = wrapper(branches.at(taken), branches)) {
+            if (!branches.at(taken).label.isEmpty() && branches.at(child).label.isEmpty()) {
+                branches[child].label = branches.at(taken).label;
+            }
+            taken = child;
+        }
+        const Branch &branch = branches.at(taken);
+        Node node;
+        node.rect = branch.rect;
+        node.label = branch.label;
+        node.parent = parent;
+        nodes.push_back(node);
+        const int here = nodes.size() - 1;
+        for (int child : branch.children) {
+            write(child, here);
+        }
+    };
+    for (int root : roots) {
+        write(root, -1);
+    }
+
+    nodes_ = std::move(nodes);
+    current_ = -1;
+    descent_.clear();
+}
+
+int ElementTree::indexAt(std::int32_t x, std::int32_t y) const
+{
+    int best = -1;
+    for (int index = 0; index < nodes_.size(); ++index) {
+        const LogicalRect &rect = nodes_.at(index).rect;
+        if (x < rect.x || y < rect.y || x >= rect.right() || y >= rect.bottom()) {
+            continue;
+        }
+        if (best < 0) {
+            best = index;
+            continue;
+        }
+        // The *smallest* hit, not the last one.  This is the opposite of the
+        // rule the window level uses, and deliberately so: an element tree is
+        // full of containers that cover the whole window -- the web-content
+        // area, a layout panel -- and a browser's toolbar buttons sit declared
+        // after them in pre-order, so "last one wins" picks a full-window box
+        // instead of the button under the pointer.
+        //
+        // Equal areas keep the later one, which is what makes a sibling drawn
+        // over another win.
+        const LogicalRect &chosen = nodes_.at(best).rect;
+        const std::int64_t mine = static_cast<std::int64_t>(rect.width) * rect.height;
+        const std::int64_t theirs = static_cast<std::int64_t>(chosen.width) * chosen.height;
+        if (mine < theirs || (mine == theirs && index > best)) {
+            best = index;
+        }
+    }
+    return best;
+}
+
+void ElementTree::select(int index)
+{
+    current_ = index;
+    // Deliberately *not* the node's whole ancestry.  The descent is what the
+    // wheel has travelled, and a highlight placed by a pointer move has not
+    // travelled at all -- so there is nothing to retrace, and wheeling down
+    // does nothing until the user has climbed.  Seeding it with the ancestry
+    // would make a descent from a freshly pointed-at node walk all the way back
+    // to it, which is no gesture the user made.
+    descent_.clear();
+}
+
+bool ElementTree::step(bool up)
+{
+    if (nodes_.isEmpty()) {
+        return false;
+    }
+    if (up) {
+        // Remembered so wheeling back down returns to this node rather than to
+        // some other child of the parent.
+        if (current_ >= 0) {
+            descent_.push_back(current_);
+            current_ = nodes_.at(current_).parent;
+        } else {
+            return false;
+        }
+    } else {
+        if (descent_.isEmpty()) {
+            return false;
+        }
+        current_ = descent_.takeLast();
+    }
     return true;
 }
 

@@ -978,9 +978,13 @@ fn pick(names: &[&Name]) -> Result<usize> {
     // window to record, a picture of each output is enough, and it is what
     // `vshot window pick` hands over as well.
     let scene = picker_scene_standalone()?;
-    let picked = crate::qt_overlay::pick_window(&scene, &candidates, || {
-        ProcessWindowProvider.windows().ok()
-    })?;
+    let picked = crate::qt_overlay::pick_window(
+        &scene,
+        &candidates,
+        || ProcessWindowProvider.windows().ok(),
+        // Recording names a window, never an element inside one.
+        None,
+    )?;
     let candidate = picked
         .point
         .and_then(|point| ProcessWindowProvider.candidate_at(point))
