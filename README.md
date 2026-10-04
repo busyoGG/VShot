@@ -98,6 +98,9 @@ vshot annotate quit                         # 退出 daemon（连标注一起）
 
 vshot settings                              # 设置：开窗口改编辑器样式与命令行默认值（写进 config.json）
 
+vshot formats                               # 格式：本构建编译进来的文件格式，各自能调什么
+vshot formats --json                        # 同上，输出成 JSON（设置窗口读的就是它）
+
 vshot ocr                                   # OCR：框选，文字到 stdout
 vshot ocr --json                            # OCR：框选，文字与每个字的位置输出成 JSON
 vshot ocr --clipboard                       # 同上，进剪贴板
@@ -135,12 +138,14 @@ vshot replay stop                               # 结束回录会话
 | `--clipboard` | 把 PNG 数据复制进剪贴板 |
 | `--pin` | 把图像 pin 到屏幕，不落盘（daemon 读入内存后立即删除临时文件） |
 | `-c, --cursor` | 请求合成器把光标画进每个输出帧。**`long` 不支持**（见[「已知不稳定点」](#已知不稳定点)）；截图里没有光标最常见的原因见[「光标（`--cursor`）」](#光标--cursor) |
-| `--png-compression LEVEL` | `none` / `fastest` / `fast`（默认）/ `balanced` / `high`，全部无损，区别只在耗时与体积 |
-| `--hdr-format FORMAT` | 截图带 HDR 内容时 PNG 旁第二份的格式：`avif`（默认）或 `hdr`。见 [HDR](#hdr) |
+| `--sdr-format FORMAT` | SDR 那一份写成什么格式，默认 `png`（本构建唯一的格式）。可用的格式与各自的参数见 `vshot formats` |
+| `--hdr-format FORMAT` | 截图带 HDR 内容时 SDR 那份旁第二份的格式：`avif`（默认）或 `hdr`。见 [HDR](#hdr) |
+| `--format-param FORMAT.NAME=VALUE` | 某个格式的某个编码参数，可重复，例如 `--format-param png.compression=high --format-param avif.quality=40`。名字与取值范围由格式自己声明，`vshot formats` 列出；超出范围的值会被**夹到边界**，不认识的名字用该格式的默认值 |
 | `--tone-map MODE` | SDR 那一份怎么从 HDR 内容映射下来：`auto`（默认）/ `fixed` / `normalize`。见 [HDR](#hdr) |
 | `--tone-map-white LEVEL` | SDR 白落在输出范围的哪个位置，0.5–0.95，默认 0.8。`fixed` 与 `auto` 使用 |
 | `--hdr-area-test BOOL` | 是否按**面积**判定 HDR 内容（默认 `true`）。关掉退回「有一个像素超过就算」 |
 | `--hdr-area-ratio SHARE` | 超过 SDR 白的像素要占画面的多少才算 HDR 内容，0–1，默认 0.0005。`0` 表示总是 HDR。只在开关打开时读取 |
+| `--hdr-reference-white NITS` | HDR 文件里 `1.0` 代表多少 cd/m²，默认 203（BT.2408）。**只对文件自己没说的情况生效**：别人写的 Radiance 文件，或没有 VShot 私有 box 的 AVIF。自己截的图总是读那块输出的参考白 |
 
 每次捕获必须且只能给一个输出目标。`region --geometry` 与 `--interactive` 互斥，不给 geometry 时默认交互选择（`--interactive` 用于显式声明这一意图）。路径格式示例：
 
@@ -555,7 +560,11 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 
 **「画面里有超过 SDR 白的东西」怎么判定**：判定发生在程序内部，看的是 daemon 手里那份帧本身，而不是任何一个外部文件，所以标签、第二份文件、pin 的走法三者永远同进同退。外层的闸门是**输出的声明**：只有合成器把这块输出描述成 PQ 或 HLG 才会拿到 10-bit 缓冲区，SDR 输出上根本不存在第二份可写。声明之后要答的是另一个问题——**这个矩形里有没有超过白的光**——而声明答不了它：同一块 HDR 输出上的一个 SDR 窗口和一段 HDR 视频，声明完全一样。于是按**面积**判定：超过 SDR 白 `HDR_WHITE_EPSILON` 的像素占画面的比例达到 `--hdr-area-ratio`（默认 0.0005，万分之五）才算 HDR 内容。为什么不看最亮的那一个像素：10-bit PQ 会把**普通的 SDR 白**落在略高于 1.0 的码上（203 cd/m² 参考白下，码 594/595/596/597 解出 0.99958/1.00897/1.01845/1.02801），所以一张再普通不过的 SDR 桌面也散着几千个「超过白」的像素——实测一幅 3.7 MP 的桌面有 17 489 个像素超过 1.02；老判据是「峰值超过 1.02 就算 HDR」，只要有**一个**这样的像素，整幅画面就被判成 HDR，白点随之下移，**整幅截图暗约 18 %**（实测均值 49573 对 60606）。把阈值抬到 0.05 也救不了：同一幅画面仍有约 37 个像素在它之上（实测占比 0.00001），照样超过任何「有就行」的判据。真正的 HDR 是一块**成片**的高光，量化噪声是**散落**的，所以判据是占比而不是峰值。两个开关可以把它调回原样：`--hdr-area-test false` 退回「有一个像素超过就算」（老行为）；`--hdr-area-test true --hdr-area-ratio 0` 则是「只要是 HDR 输出就一律按 HDR 处理」，不做任何区域判定。阈值本身（`HDR_WHITE_EPSILON`，0.05）不是配置项：它要跨过 10-bit PQ 的量化台阶，而 1.5 倍白的高光解出来就是 1.5，离它很远。
 
-第二份的格式由 `--hdr-format`（或配置文件里的 `cli.hdr-format`）决定，默认 `avif`：10-bit、BT.2020 + PQ，AV1 序列头与容器的 `colr` box 声明同一个 CICP 三元组，所以任何懂 AVIF 的读取器都能正确显示，代价是**有损**。`hdr` 则是 Radiance RGBE，**原样保留截取时的色域**（不做任何转换，广色域留给它），色域写在 `PRIMARIES=` 头里——RGBE 本身没有色度字段，而 ffmpeg 与 ImageMagick 都会忽略这一行、按 Rec.709 解读，所以用这类工具看广色域内容会偏艳；为它们转换过的是旁边的 SDR 那一份。要无损归档就选它。AVIF 走 `rav1e` + `avif-serialize`：`image` 自带的 AVIF 编码器写不了 HDR（它固定 8-bit，且色彩描述固定为 sRGB / BT.709），详见 `src/model/avif.rs`。
+第二份的格式由 `--hdr-format`（或配置文件里的 `cli.hdr-format`）决定，默认 `avif`：10-bit、BT.2020 + PQ，AV1 序列头与容器的 `colr` box 声明同一个 CICP 三元组，所以任何懂 AVIF 的读取器都能正确显示，代价是**有损**。`hdr` 则是 Radiance RGBE，**原样保留截取时的色域**（不做任何转换，广色域留给它），色域写在 `PRIMARIES=` 头里——RGBE 本身没有色度字段，而 ffmpeg 与 ImageMagick 都会忽略这一行、按 Rec.709 解读，所以用这类工具看广色域内容会偏艳；为它们转换过的是旁边的 SDR 那一份。要无损归档就选它。AVIF 走 `rav1e` + `avif-serialize`：`image` 自带的 AVIF 编码器写不了 HDR（它固定 8-bit，且色彩描述固定为 sRGB / BT.709），详见 `src/model/codec/avif.rs`。
+
+**读回来和写出去走同一层**：每种格式是 `src/model/codec/` 下的一个模块，实现同一个 `HdrCodec`（`encode`/`decode` 一对，路径形式有默认实现），都读写同一个中间值 `HdrImage`（线性光帧 + 它的参考白）。所以「编码再解码」是一次往返而不是两套换算，`pin` 读回磁盘上的第二份文件时用的就是写它的那个 codec。每种格式是一个 **cargo feature**（`avif`、`radiance`，默认全开），关掉哪个就不注册哪个——`avif` 是唯一有构建代价的（`rav1e` + `avif-serialize` 写、`dav1d` + `mp4parse` 读，`dav1d` 链接系统的 `libdav1d`）；`avif-asm` 再打开 rav1e 的手写 SIMD（需要 `nasm`）。至少留一个格式，一个都不留会在编译期报错而不是留到第一次截图才 panic。颜色换算（传递函数、YCbCr 矩阵、full/limited range、位深）在 `src/model/color.rs`，codec 只声明自己的字节是哪条曲线、哪个矩阵。
+
+**参考白**：一帧的 `1.0` 是「截它时那块输出的 SDR 白」，所以一份 HDR 文件必须能说出它的白是多少 cd/m²。AVIF 没有这个字段，本程序写一个 `vshot.refwhite01` 私有 `uuid` box 进 `meta`（不认识的读取器跳过它，按 BT.2408 的 203 显示）；Radiance 写在非标准的 `REFERENCE_NITS=` 头里。读一个**没有**这个答案的文件（别人写的 Radiance、别的程序产的 AVIF）时用 `--hdr-reference-white`（或 `cli.hdr-reference-white`），默认 203。自己截的图永远读那块输出自己报的参考白，不读这个设置——它只回答「文件没说」的情况。
 
 颜色一律问显示器，不猜像素：10-bit 缓冲区在 HDR 输出上就是那块输出自己的像素，按它宣告的传递函数与参考白解码（`wp_color_manager_v1` 的输出描述，参考白即该输出的 SDR 白）。Hyprland 上这是 `misc:screencopy_hdr` 打开时**才**成立的约定——关掉时合成器只交 8-bit sRGB，此时不会写第二份。
 
@@ -565,7 +574,7 @@ bind = SUPER SHIFT, A, exec, vshot annotate quit
 - **`fixed`**——白点永远是 `--tone-map-white`（默认 0.8），不看画面。代价是 HDR 输出上**每一次** SDR 截图都会略暗（白落在 sRGB 231），换来的是**同一个像素的码值不随画面里还有什么而变**——pin 出来的一份因此和它截自的内容一致。
 - **`normalize`**——按画面自己的峰值归一，即 SDR 白落在 `1/峰值`，最亮的那一点正好落在白上。高光之间**仍有先后，但没有间隔**：白以上的一切都被压进这个倒数腾出来的空间里，一条亮渐变会摊平。只在画面峰值确实是一个值得归一的高光时才合适。
 
-`--tone-map-white` 是 SDR 白在输出范围里落点，0.5 到 0.95，超出这个范围会被**夹到边界**而不是报错（它是用户写下的数字，映射对它有一个明确的答案）。它被 `fixed`（永远用）和 `auto`（只在画面确实有高光时用）读取，`normalize` 自己算，忽略它。设置窗口里这一项是一个百分数输入框（默认 80 %），选中 `normalize` 时置灰。
+`--tone-map-white` 是 SDR 白在输出范围里落点，0.5 到 0.95，超出这个范围会被**夹到边界**而不是报错（它是用户写下的数字，映射对它有一个明确的答案）。它被 `fixed`（永远用）和 `auto`（只在画面确实有高光时用）读取，`normalize` 自己算，忽略它。设置窗口里这一项是一个百分数输入框（默认 80 %），选中 `normalize` 时置灰。`--hdr-reference-white` 同理被夹到 1–1000 cd/m²。
 
 冻结帧在交互界面上也按原样显示：VShot 在 overlay 下面另起一层 surface，挂的是**那块输出自己的 image description**（不是照着它造一个像的），所以合成器既不转换也不做色调映射，选中的区域就是屏幕上原本的光；overlay 自己只画遮罩（选区挖空）、标注与工具条。别的路线是造一份“像”的描述，那不够：compositor 会把它当成另一个空间，往面板自己的范围里做一次色调映射，整幅画面会一起变暗。
 
@@ -639,7 +648,7 @@ vshot 自己从不画光标，`--cursor` 只是给合成器的捕获请求置一
 vshot settings
 ```
 
-窗口只是普通窗口，不截图、不需要任何合成器协议，所以在一个 vshot 本来截不了图的合成器上也能用；装包后也可以直接从**应用菜单**里的「VShot Settings」打开（见[「应用菜单入口」](#应用菜单入口)）。`cli` 段的数值留空/留 0 表示「不设，用内置默认」，而不是把 0 存进去，**设置窗口里这些框直接显示内置默认值**（默认值留在原处不动、保存时照样不写进文件，所以哪天内置默认改了，没动过它的人会自动跟上），`editor` 段则总是整段写出；保存是**合并写入**，本版不认识的键原样保留，不会因为存一次就被抹掉。窗口分八页，左边栏切换，**一页一个功能**：**标注编辑器**、**输出**、**滚动截图**、**文本识别**、**录制**（`record` 与 `replay` 的全部默认值）、**文件对话框**、**Pin 浮层**与 **键盘**；除**录制**页外，各页在默认窗口尺寸下都**不需要滚动**。一页里的设置按**主题**再分小组，卡片内用一条细分隔线加一行小标题隔开（比如「输出」页分成 PNG、HDR 与「用哪个输出」），顺序按**用户碰到它们的频率**排：常改的在前，设一次就不动的在后。麦克风那一行**不阻塞窗口打开**——它要起一个 `vshot record mics` 子进程去问 PipeWire（约一秒），所以窗口先带着「不录音 / 会话的默认输入设备」两个答案开出来，设备列表拿到了再填进去；「检测」按钮重新问一次。保存之后窗口不关，左下角显示「已保存。」；关窗口按「取消」——那时它的意思就只剩「关闭」。
+窗口只是普通窗口，不截图、不需要任何合成器协议，所以在一个 vshot 本来截不了图的合成器上也能用；装包后也可以直接从**应用菜单**里的「VShot Settings」打开（见[「应用菜单入口」](#应用菜单入口)）。`cli` 段的数值留空/留 0 表示「不设，用内置默认」，而不是把 0 存进去，**设置窗口里这些框直接显示内置默认值**（默认值留在原处不动、保存时照样不写进文件，所以哪天内置默认改了，没动过它的人会自动跟上），`editor` 段则总是整段写出；保存是**合并写入**，本版不认识的键原样保留，不会因为存一次就被抹掉。窗口分十页，左边栏切换，**一页一个功能**：**标注编辑器**、**输出**、**格式设置**、**HDR**、**滚动截图**、**文本识别**、**录制**（`record` 与 `replay` 的全部默认值）、**文件对话框**、**Pin 浮层**与 **键盘**；除**录制**页外，各页在默认窗口尺寸下都**不需要滚动**。一页里的设置按**主题**再分小组，卡片内用一条细分隔线加一行小标题隔开（比如「HDR」页分成「第二份文件」、「SDR 那一份」与「什么算 HDR」），顺序按**用户碰到它们的频率**排：常改的在前，设一次就不动的在后。**「输出」页放两个格式选择器**（SDR 格式与 HDR 格式），**「格式设置」页的卡片是按编译进来的格式生成的**：本构建有几种格式就有几张卡，每张卡里的行来自该格式自己声明的参数——在 Rust 侧给一个编码器加一个参数，这一页自动多一行，设置窗口不用改；反过来，`--no-default-features` 去掉某个格式，这一页也就不会出现它。它和麦克风那一行一样**不阻塞窗口打开**：格式清单是起一个 `vshot formats --json` 子进程问出来的，窗口先开出来，答案到了再填。HDR 那五项原来挤在「输出」页的一张卡里，单独成页是因为它们本来就是同一个主题，而不截 HDR 的人不该为了改输出设置滚过它们。麦克风那一行**不阻塞窗口打开**——它要起一个 `vshot record mics` 子进程去问 PipeWire（约一秒），所以窗口先带着「不录音 / 会话的默认输入设备」两个答案开出来，设备列表拿到了再填进去；「检测」按钮重新问一次。保存之后窗口不关，左下角显示「已保存。」；关窗口按「取消」——那时它的意思就只剩「关闭」。
 
 ```json
 {
@@ -650,11 +659,16 @@ vshot settings
     "selectMode": "loose"
   },
   "cli": {
-    "png-compression": "high",
+    "sdr-format": "png",
     "hdr-format": "hdr",
+    "format": {
+      "png": { "compression": "high" },
+      "avif": { "quality": 40, "speed": 4 }
+    },
     "tone-map": "fixed",
     "tone-map-white": 0.75,
     "hdr-area-test": false,
+    "hdr-reference-white": 250,
     "monitor": "DP-2",
     "long": { "notches": 2, "max-height": 20000, "timeout": 60 },
     "pin": { "density": 2 },
@@ -701,12 +715,14 @@ vshot settings
 
 | 键 | 对应参数 | 内置默认 |
 | --- | --- | --- |
-| `png-compression` | `--png-compression` | `fast` |
+| `sdr-format` | `--sdr-format` | `png` |
 | `hdr-format` | `--hdr-format` | `avif` |
+| `format.<格式>.<参数>` | `--format-param <格式>.<参数>=<值>` | 各格式自己声明，见 `vshot formats` |
 | `tone-map` | `--tone-map` | `auto` |
 | `tone-map-white` | `--tone-map-white` | `0.8` |
 | `hdr-area-test` | `--hdr-area-test` | `true` |
 | `hdr-area-ratio` | `--hdr-area-ratio` | `0.0005` |
+| `hdr-reference-white` | `--hdr-reference-white` | `203` |
 | `monitor` | `monitor [NAME]` 的输出名 | `current` |
 | `long.notches` | `long --notches` | `1` |
 | `long.max-height` | `long --max-height` | `30000` |
@@ -749,9 +765,11 @@ vshot settings
 | `translate.external.command` / `timeout` | 外部翻译程序（数组）与超时（秒） | 无 / `30` |
 | `translate.lingocloud.token` | 彩云（lingocloud）的 token；不填则用内置借来的那个 | 内置借用值 |
 
+`format` 那一段是**每种格式自己的编码参数**，一层格式名、一层参数名：`format.png.compression`、`format.avif.quality`、`format.avif.speed`。哪些格式、每个格式有哪些参数，都由**编解码层自己声明**——加一个参数不用改设置窗口，加一种格式只要在 `Cargo.toml` 里打开对应的 feature（`avif` / `radiance` / `png`，默认三个都开），`vshot formats` 与设置窗口的「格式设置」页就跟着变。**`png-compression` 这个旧键已废弃**，不再被读取，改用 `format.png.compression`（取值不变）。`sdr-format` 与 `hdr-format` 仍然留在 `cli` 顶层：它们选的是**哪个格式**，不是格式的参数。
+
 `google`、`microsoft`、`volcengine`、`transmart` 四个免密钥 provider 没有任何配置键，把名字写进 `translate.provider` 即可使用；`lingocloud` 同样免配，唯一可选的键是 `translate.lingocloud.token`（不填就用内置借来的 token）。
 
-`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件；`cli` 段里不认识的键会被忽略，不会让整个文件失效。`ocr.engine` 只认 `builtin` 与 `external` 两个值，写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了（`engine: "external"` 而没有 `command`、或命令跑不起来，同样明确报错，详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项、`ocr.notify` 这个开关，以及 `record` 与 `replay` 两段；`ocr.engine`、`ocr.external` 与整个 `cli.translate` 段要手改文件（`translate.provider` 认那九个名字再加 `auto`，写错会报错）。**两个 `notify` 开关只写「关」**，因为键不存在就是「开」；`translate.notify` 相反——它默认就是「关」，所以手改文件时才需要写出来。麦克风那两项是**从当前会话检测出来的**；`follow` 那两项在窗口里是**一行逗号分隔的窗口名**，在文件里是一个数组——手改时写成 `["game", "chat"]`。
+`pin.density` 的优先级同样是 `--density` > `VSHOT_PIN_DENSITY` > 配置文件；`cli` 段里不认识的键会被忽略，不会让整个文件失效。`ocr.engine` 只认 `builtin` 与 `external` 两个值，写了别的名字会**报错**而不是当默认值处理，因为把 `external` 拼错会让人以为自己配的 GPU 引擎生效了（`engine: "external"` 而没有 `command`、或命令跑不起来，同样明确报错，详见[「用 GPU：外接引擎」](#用-gpu外接引擎)）。设置窗口覆盖 `editor`、常用的 `cli` 项（含 `format` 段）、`ocr.notify` 这个开关，以及 `record` 与 `replay` 两段；`ocr.engine`、`ocr.external` 与整个 `cli.translate` 段要手改文件（`translate.provider` 认那九个名字再加 `auto`，写错会报错）。**两个 `notify` 开关只写「关」**，因为键不存在就是「开」；`translate.notify` 相反——它默认就是「关」，所以手改文件时才需要写出来。麦克风那两项是**从当前会话检测出来的**；`follow` 那两项在窗口里是**一行逗号分隔的窗口名**，在文件里是一个数组——手改时写成 `["game", "chat"]`。
 
 `record.follow` / `replay.follow` 只在**不带窗口名、也不给 `--pick`** 的 `record window` / `replay start window` 上生效；其它目标（`monitor`、`all`、`region`，或命令行上点了名的窗口）会**忽略**记着的跟随列表，而不是因为它在而报错。`--no-follow` 是对那一次录制/回录把记着的列表关掉，正如 `--no-mic` 对记着的麦克风那样。`color` 用的是 CSS 那套写法：`#rrggbb`，带透明度时写 `#rrggbbaa`（alpha 在**最后**）——注意这跟 Qt 自己的八位写法 `#aarrggbb` 不同，`vshot settings` 与配置文件都按 CSS 那套来。
 

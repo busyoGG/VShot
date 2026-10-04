@@ -40,9 +40,13 @@ const QStringList kDashNames = {QStringLiteral("solid"), QStringLiteral("dashed"
 const QStringList kArrowStyleNames = {QStringLiteral("open"), QStringLiteral("filled")};
 const QStringList kMosaicShapeNames = {QStringLiteral("rect"), QStringLiteral("ellipse"),
                                        QStringLiteral("brush")};
-const QStringList kCompressionNames = {QStringLiteral("none"), QStringLiteral("fastest"),
-                                       QStringLiteral("fast"), QStringLiteral("balanced"),
-                                       QStringLiteral("high")};
+// The SDR half's format.  The names are the file suffixes, which is also what
+// `--sdr-format` accepts -- and the list the settings window offers comes from
+// the codec registry instead, since which formats exist is a build-time
+// question.  This is what the *loader* accepts, so a name written by a build
+// with a codec this one lacks is dropped rather than kept as a value nothing
+// can write.
+const QStringList kSdrFormatNames = {QStringLiteral("png")};
 // The HDR half's format.  The names are the file suffixes, which is also what
 // `--hdr-format` accepts.
 const QStringList kHdrFormatNames = {QStringLiteral("avif"), QStringLiteral("hdr")};
@@ -377,7 +381,8 @@ void dropRetiredEditorKeys(QJsonObject &root)
 }
 
 /// The `cli` leaves this build owns, as `(section, key)` pairs; `section` is
-/// empty for a key directly under `cli`.
+/// empty for a key directly under `cli`, and may be a dotted path for a leaf
+/// nested deeper than one level -- `format.png` is `cli.format.png`.
 ///
 /// A plain merge cannot express "the user cleared this": the value the window
 /// left empty is simply absent from the incoming object, and merging would put
@@ -386,10 +391,17 @@ void dropRetiredEditorKeys(QJsonObject &root)
 /// key *not* listed here (a newer vshot's, or one added by hand, at any depth)
 /// still survives.  The `editor` section needs no such list: the editor always
 /// writes all of it.
+///
+/// The encoding parameters are listed one leaf at a time rather than by
+/// dropping `cli.format.<format>` whole, so a parameter this build does not
+/// know — one a newer vshot wrote, or one added by hand — survives a save.
 const std::pair<const char *, const char *> kOwnedCliKeys[] = {
-    {"", "png-compression"}, {"", "hdr-format"}, {"", "monitor"},
+    {"", "sdr-format"},      {"", "hdr-format"},   {"", "monitor"},
     {"", "tone-map"},        {"", "tone-map-white"},
     {"", "hdr-area-test"},   {"", "hdr-area-ratio"},
+    {"", "hdr-reference-white"},
+    {"format.png", "compression"},
+    {"format.avif", "quality"}, {"format.avif", "speed"},
     {"long", "notches"},     {"long", "max-height"},
     {"long", "max-frames"},  {"long", "timeout"},
     {"long", "ignore-top"},  {"long", "inject"},
@@ -407,11 +419,41 @@ const std::pair<const char *, const char *> kOwnedCliKeys[] = {
     {"replay", "save-dir"},  {"replay", "notify"},
 };
 
-/// Removes `key` from `object`, leaving `object` possibly empty for the caller
-/// to prune.
-void removeLeaf(QJsonObject &object, const QString &key)
+/// Removes the leaf at `path` (a dotted section, possibly empty) and prunes the
+/// objects the removal emptied, so a section whose last leaf went does not stay
+/// behind as `{}`.  Returns whether `object` itself is now empty, which is what
+/// lets the caller prune its parent in turn.
+bool removeLeafAt(QJsonObject &object, const QStringList &path, const QString &key)
 {
-    object.remove(key);
+    if (path.isEmpty()) {
+        object.remove(key);
+        return object.isEmpty();
+    }
+    const QString head = path.first();
+    QJsonObject nested = object.value(head).toObject();
+    if (removeLeafAt(nested, path.mid(1), key)) {
+        object.remove(head);
+    } else {
+        object.insert(head, nested);
+    }
+    return object.isEmpty();
+}
+
+/// Merges `incoming` into `base` key by key, recursing into objects at every
+/// depth.  A one-level merge would replace a whole nested section -- replacing
+/// `cli.format.png` would take a parameter this build does not know with it --
+/// which is the same loss the owned-key list exists to prevent.
+void mergeCliInto(QJsonObject &base, const QJsonObject &incoming)
+{
+    for (auto entry = incoming.constBegin(); entry != incoming.constEnd(); ++entry) {
+        if (entry.value().isObject() && base.value(entry.key()).isObject()) {
+            QJsonObject nested = base.value(entry.key()).toObject();
+            mergeCliInto(nested, entry.value().toObject());
+            base.insert(entry.key(), nested);
+        } else {
+            base.insert(entry.key(), entry.value());
+        }
+    }
 }
 
 /// Writes the `cli` section: this build's leaves replaced, everything else —
@@ -420,35 +462,11 @@ void writeCliSection(QJsonObject &root, const QJsonObject &cli)
 {
     QJsonObject merged = root.value(QStringLiteral("cli")).toObject();
     for (const auto &[section, key] : kOwnedCliKeys) {
-        const QString leaf = QString::fromLatin1(key);
-        if (section[0] == '\0') {
-            removeLeaf(merged, leaf);
-            continue;
-        }
-        const QString parent = QString::fromLatin1(section);
-        QJsonObject nested = merged.value(parent).toObject();
-        nested.remove(leaf);
-        if (nested.isEmpty()) {
-            merged.remove(parent);
-        } else {
-            merged.insert(parent, nested);
-        }
+        const QStringList path =
+            QString::fromLatin1(section).split(QLatin1Char('.'), Qt::SkipEmptyParts);
+        removeLeafAt(merged, path, QString::fromLatin1(key));
     }
-    for (auto entry = cli.constBegin(); entry != cli.constEnd(); ++entry) {
-        // A nested section merges into whatever survived above rather than
-        // replacing it, so `long.future-key` is not lost to a save.
-        if (entry.value().isObject()) {
-            QJsonObject nested = merged.value(entry.key()).toObject();
-            const QJsonObject incoming = entry.value().toObject();
-            for (auto nestedEntry = incoming.constBegin(); nestedEntry != incoming.constEnd();
-                 ++nestedEntry) {
-                nested.insert(nestedEntry.key(), nestedEntry.value());
-            }
-            merged.insert(entry.key(), nested);
-        } else {
-            merged.insert(entry.key(), entry.value());
-        }
-    }
+    mergeCliInto(merged, cli);
     if (merged.isEmpty()) {
         root.remove(QStringLiteral("cli"));
     } else {
@@ -514,10 +532,21 @@ EditorPreferences readEditor(const QJsonObject &editor)
 CliPreferences readCli(const QJsonObject &cli)
 {
     CliPreferences preferences;
-    preferences.pngCompression =
-        readChoice(cli, QStringLiteral("png-compression"), QString(), kCompressionNames);
+    preferences.sdrFormat =
+        readChoice(cli, QStringLiteral("sdr-format"), QString(), kSdrFormatNames);
     preferences.hdrFormat =
         readChoice(cli, QStringLiteral("hdr-format"), QString(), kHdrFormatNames);
+    // The format parameters are read as they stand rather than through a
+    // per-kind reader: which names exist and what each one takes is the codec
+    // registry's answer, and this side is not the one that knows it.  A value
+    // the format does not accept is the codec layer's to drop, the same way a
+    // hand-edited file's bad value is.
+    const QJsonObject formatSection = cli.value(QStringLiteral("format")).toObject();
+    for (auto entry = formatSection.constBegin(); entry != formatSection.constEnd(); ++entry) {
+        if (entry.value().isObject()) {
+            preferences.format.insert(entry.key(), entry.value().toObject());
+        }
+    }
     preferences.toneMap = readChoice(cli, QStringLiteral("tone-map"), QString(), kToneMapNames);
     preferences.toneMapWhite = readFraction(cli, QStringLiteral("tone-map-white"), 0.0,
                                             kMinToneMapWhite, kMaxToneMapWhite);
@@ -526,6 +555,12 @@ CliPreferences readCli(const QJsonObject &cli)
     // Zero is a ratio here, not an absent key, so the reader has to be able to
     // tell the two apart -- see `CliPreferences::hdrAreaRatio`.
     preferences.hdrAreaRatio = readFraction(cli, QStringLiteral("hdr-area-ratio"), -1.0, 0.0, 1.0);
+    // A reference white of zero is "the file says nothing", so the same reader
+    // is used with a floor that is not zero -- see
+    // `CliPreferences::hdrReferenceWhite`.
+    preferences.hdrReferenceWhite =
+        readFraction(cli, QStringLiteral("hdr-reference-white"), 0.0, kMinHdrReferenceWhite,
+                     kMaxHdrReferenceWhite);
     preferences.monitor = readString(cli, QStringLiteral("monitor"), QString());
     const QJsonObject longSection = cli.value(QStringLiteral("long")).toObject();
     preferences.longInject =
@@ -643,8 +678,24 @@ QJsonArray followArray(const QStringList &names)
 QJsonObject cliJson(const CliPreferences &preferences)
 {
     QJsonObject cli;
-    if (!preferences.pngCompression.isEmpty()) {
-        cli.insert(QStringLiteral("png-compression"), preferences.pngCompression);
+    if (!preferences.sdrFormat.isEmpty()) {
+        cli.insert(QStringLiteral("sdr-format"), preferences.sdrFormat);
+    }
+    // The encoding parameters, one object per format.  What is written is
+    // whatever the window put in the map: the window builds those rows from the
+    // registry, so a value present here is one the format itself declared, and
+    // a parameter left at its declared default was never put in the map at all.
+    if (!preferences.format.isEmpty()) {
+        QJsonObject formatSection;
+        for (auto entry = preferences.format.constBegin(); entry != preferences.format.constEnd();
+             ++entry) {
+            if (!entry.value().isEmpty()) {
+                formatSection.insert(entry.key(), entry.value());
+            }
+        }
+        if (!formatSection.isEmpty()) {
+            cli.insert(QStringLiteral("format"), formatSection);
+        }
     }
     if (!preferences.hdrFormat.isEmpty()) {
         cli.insert(QStringLiteral("hdr-format"), preferences.hdrFormat);
@@ -666,6 +717,12 @@ QJsonObject cliJson(const CliPreferences &preferences)
     // "always HDR", so it is written like any other.
     if (preferences.hdrAreaRatio >= 0.0) {
         cli.insert(QStringLiteral("hdr-area-ratio"), preferences.hdrAreaRatio);
+    }
+    // A written zero is "the file says nothing" here too: a reference white of
+    // zero is not a level any output is described with, so it cannot be a value
+    // the user meant.
+    if (preferences.hdrReferenceWhite > 0.0) {
+        cli.insert(QStringLiteral("hdr-reference-white"), preferences.hdrReferenceWhite);
     }
     if (!preferences.monitor.isEmpty()) {
         cli.insert(QStringLiteral("monitor"), preferences.monitor);
@@ -1175,9 +1232,9 @@ const QStringList &mosaicShapeNames()
     return kMosaicShapeNames;
 }
 
-const QStringList &compressionNames()
+const QStringList &sdrFormatNames()
 {
-    return kCompressionNames;
+    return kSdrFormatNames;
 }
 
 const QStringList &hdrFormatNames()

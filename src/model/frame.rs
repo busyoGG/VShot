@@ -1154,7 +1154,8 @@ pub enum PngCompression {
 }
 
 impl PngCompression {
-    /// Parses the `--png-compression` value.
+    /// Parses the `compression` value PNG's codec declares — the one
+    /// `--format-param png.compression` and `cli.format.png.compression` carry.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "none" => Ok(Self::None),
@@ -1163,7 +1164,8 @@ impl PngCompression {
             "balanced" => Ok(Self::Balanced),
             "high" => Ok(Self::High),
             other => Err(VshotError::InvalidDestination(format!(
-                "`--png-compression {other}` is not one of none, fastest, fast, balanced, high"
+                "`{other}` is not a PNG compression level: expected one of \
+                 none, fastest, fast, balanced, high"
             ))),
         }
     }
@@ -2268,7 +2270,10 @@ mod tests {
         assert_eq!(PngCompression::parse("fast").unwrap(), PngCompression::Fast);
         assert_eq!(PngCompression::parse("high").unwrap(), PngCompression::High);
         let error = PngCompression::parse("slowest").unwrap_err();
-        assert!(error.to_string().contains("is not one of"), "{error}");
+        assert!(
+            error.to_string().contains("not a PNG compression level"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ use crate::error::{Result, VshotError};
 use crate::geometry::{parse_geometry, Rect};
 use crate::inject::Prefer;
 use crate::longshot::LongShotOptions;
-use crate::model::{HdrDecision, PngCompression, ToneMap, ToneMapOptions};
-use crate::output::HdrFormat;
+use crate::model::{codec, HdrDecision, ToneMap, ToneMapOptions};
+use crate::output::{HdrFormat, SdrFormat};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,9 +40,15 @@ Destination (every capture above goes to exactly one)
 
 Shared modifiers
   -c, --cursor        draw the compositor cursor into the capture
-  --png-compression   none|fastest|fast (default)|balanced|high, lossless
-  --hdr-format        avif (default)|hdr, the file beside the PNG when the
+  --sdr-format        png (default), the format the SDR half is written in
+  --hdr-format        avif (default)|hdr, the file beside the SDR one when the
                       capture carries HDR content
+  --format-param      FORMAT.NAME=VALUE, one encoding parameter of one format;
+                      repeatable, e.g. --format-param png.compression=high
+                      --format-param avif.quality=40
+
+Run `vshot formats` for the formats this build has and what each one lets you
+tune.
 
 Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) through
 wlr-screencopy; KWin/Plasma through org.kde.KWin.ScreenShot2, granted only to a
@@ -100,11 +106,12 @@ pub struct Cli {
         conflicts_with_all = ["output", "clipboard"]
     )]
     pub pin: bool,
-    /// PNG compression level for images written to a file, stdout or the
-    /// clipboard: `none`, `fastest`, `fast` (the default), `balanced` or `high`,
-    /// all lossless. `--pin` writes nothing to disk.
-    #[arg(long = "png-compression", global = true, value_name = "LEVEL")]
-    pub png_compression: Option<String>,
+    /// Which format the SDR half is written in: `png` (the default), or
+    /// whatever else this build was compiled with. `vshot formats` lists them.
+    /// `--pin` writes no SDR file, and the clipboard and stdout always carry
+    /// PNG whatever this says.
+    #[arg(long = "sdr-format", global = true, value_name = "FORMAT")]
+    pub sdr_format: Option<String>,
     /// Format of the HDR file written beside the PNG when the capture carries
     /// HDR content: `avif` (the default) or `hdr` (Radiance RGBE). `avif` is
     /// ten-bit BT.2020 PQ and states its colour in the file, but is lossy;
@@ -112,6 +119,23 @@ pub struct Cli {
     /// Neither affects a capture without HDR content.
     #[arg(long = "hdr-format", global = true, value_name = "FORMAT")]
     pub hdr_format: Option<String>,
+    /// One encoding parameter of one format, as `FORMAT.NAME=VALUE`, repeatable.
+    ///
+    /// Which parameters exist is the codec's own business, so none of them is
+    /// named here: `vshot formats` prints what this build was compiled with,
+    /// each parameter with its range. A parameter the named format does not
+    /// declare is refused, and a number outside its range is clamped rather
+    /// than rejected.
+    ///
+    ///     --format-param png.compression=high
+    ///     --format-param avif.quality=40 --format-param avif.speed=4
+    #[arg(
+        long = "format-param",
+        global = true,
+        value_name = "FORMAT.NAME=VALUE",
+        allow_hyphen_values = true
+    )]
+    pub format_params: Vec<String>,
     /// How the SDR PNG of an HDR capture is mapped down from the HDR light:
     /// `auto` (the default) reads the white level from the frame, so an SDR
     /// capture comes out exactly as it looked and only a frame with highlights
@@ -142,6 +166,13 @@ pub struct Cli {
     /// test at all. Ignored when the area test is off.
     #[arg(long = "hdr-area-ratio", global = true, value_name = "SHARE")]
     pub hdr_area_ratio: Option<f32>,
+    /// The light in cd/m² an HDR file's `1.0` stands for, used only for a file
+    /// that does not say itself: a Radiance file written by another program, or
+    /// an AVIF with no VShot box naming one. A capture always reads the white
+    /// off the output it came from, so this is the answer for the files that
+    /// have no answer of their own. Default 203 (BT.2408's reference white).
+    #[arg(long = "hdr-reference-white", global = true, value_name = "NITS")]
+    pub hdr_reference_white: Option<f32>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -335,6 +366,25 @@ style and the chosen defaults for flags that are not given. Nothing is captured,
 and no compositor protocol beyond showing a window is needed."#
     )]
     Settings,
+
+    /// List the image formats this build can write, and what each one lets you
+    /// tune.
+    #[command(
+        after_help = r#"Which formats exist is decided at build time: each codec is a cargo feature,
+and the registry offers exactly what was compiled in. This prints that list, so
+a script (or the settings window) can see what this particular binary has
+without knowing anything about the codecs themselves.
+
+--json writes `{"sdr":[...],"hdr":[...]}`, one entry per format with its name,
+file extension and declared parameters -- each parameter's name, label, hint,
+kind, range and default. That is the shape the settings window builds its
+format rows from."#
+    )]
+    Formats {
+        /// Write the registry as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Record the screen to an MP4, on the GPU.
     #[command(
@@ -989,9 +1039,14 @@ pub struct Request {
     pub target: CaptureTarget,
     pub destination: Destination,
     pub cursor: bool,
-    pub compression: PngCompression,
-    /// How the HDR half is written when the capture carries HDR content.
+    /// Which format the SDR half is written in, and at which of that format's
+    /// own settings.
+    pub sdr_format: SdrFormat,
+    pub sdr_params: codec::ParamValues,
+    /// How the HDR half is written when the capture carries HDR content, and at
+    /// which of that format's own settings.
     pub hdr_format: HdrFormat,
+    pub hdr_params: codec::ParamValues,
     /// How the SDR half is mapped down from that HDR content: which behaviour,
     /// and where SDR white lands for the two that take a level.
     pub tone_map: ToneMapOptions,
@@ -1011,6 +1066,11 @@ pub enum Action {
     Annotate(crate::annotate::AnnotateAction),
     /// Show the settings window and wait for it to close.
     Settings,
+    /// Print the formats this build can write; `json` asks for the machine
+    /// readable form the settings window reads.
+    Formats {
+        json: bool,
+    },
     /// Read the text out of a region, to stdout or the clipboard.
     Ocr {
         /// Fixed region, `None` to frame it interactively, or a file to read.
@@ -1116,6 +1176,58 @@ pub enum TranslateDestination {
 pub enum OcrDestination {
     Stdout,
     Clipboard,
+}
+
+/// One format's parameters, resolved from the three places they can come from.
+///
+/// The order is the program's usual one: what the command line says beats what
+/// the config file remembers, which beats what the codec itself declares.  The
+/// starting point is always the codec's own defaults, so a format with nothing
+/// configured still hands its encoder a complete set.
+fn resolve_params(
+    format: &str,
+    specs: &'static [codec::ParamSpec],
+    config: std::collections::HashMap<String, codec::ParamValue>,
+    flags: &[String],
+) -> Result<codec::ParamValues> {
+    let mut values = codec::ParamValues::defaults(specs);
+    for (name, value) in config {
+        values.set(specs, &name, value);
+    }
+    for flag in flags {
+        let (target, name, value) = parse_format_param(flag)?;
+        // A flag for a format this capture is not writing is not an error: the
+        // same `--format-param avif.quality=40` has to be usable on a run whose
+        // SDR format is PNG, and one command line naming both halves of a
+        // capture is the ordinary case rather than the exception.
+        if target != format {
+            continue;
+        }
+        values.set(specs, name, codec::ParamValue::Text(value.to_owned()));
+    }
+    Ok(values)
+}
+
+/// Splits `--format-param`'s `FORMAT.NAME=VALUE` into its three parts.
+fn parse_format_param(flag: &str) -> Result<(&str, &str, &str)> {
+    let (path, value) = flag.split_once('=').ok_or_else(|| {
+        VshotError::InvalidDestination(format!(
+            "--format-param `{flag}` has no `=`: it takes FORMAT.NAME=VALUE, as in \
+             `--format-param avif.quality=40`"
+        ))
+    })?;
+    let (format, name) = path.split_once('.').ok_or_else(|| {
+        VshotError::InvalidDestination(format!(
+            "--format-param `{flag}` names no parameter: it takes FORMAT.NAME=VALUE, as in \
+             `--format-param avif.quality=40`"
+        ))
+    })?;
+    if format.is_empty() || name.is_empty() {
+        return Err(VshotError::InvalidDestination(format!(
+            "--format-param `{flag}` has an empty format or parameter name"
+        )));
+    }
+    Ok((format, name, value))
 }
 
 /// Refuses the options that only shape a session when one of the one-line
@@ -1714,6 +1826,16 @@ impl Cli {
             }
             return Ok(Action::Settings);
         }
+        if let Command::Formats { json } = &self.command {
+            // This subcommand only describes the build; it captures nothing,
+            // so every destination flag is a misunderstanding worth naming.
+            if self.output.is_some() || self.pin || self.clipboard {
+                return Err(VshotError::InvalidDestination(
+                    "--output, --clipboard and --pin do not apply to the formats subcommand".into(),
+                ));
+            }
+            return Ok(Action::Formats { json: *json });
+        }
         if let Command::Ocr {
             geometry,
             interactive: _,
@@ -1853,6 +1975,7 @@ impl Cli {
                 *quit,
                 *list,
                 *density,
+                self.hdr_reference_white,
             )?));
         }
         Ok(Action::Capture(self.parse_request()?))
@@ -1860,14 +1983,32 @@ impl Cli {
 
     pub fn parse_request(self) -> Result<Request> {
         // The flag wins, then the config file, then the built-in default.
-        let compression = match self.png_compression.as_deref() {
-            Some(name) => PngCompression::parse(name)?,
-            None => crate::config::compression_default().unwrap_or_default(),
+        let sdr_format = match self.sdr_format.as_deref() {
+            Some(name) => SdrFormat::parse(name)?,
+            None => crate::config::sdr_format_default().unwrap_or_default(),
         };
         let hdr_format = match self.hdr_format.as_deref() {
             Some(name) => HdrFormat::parse(name)?,
             None => crate::config::hdr_format_default().unwrap_or_default(),
         };
+        // The parameters of those two formats.  Both start from the format's
+        // own declared defaults, then take the config file's values, then the
+        // command line's: the codec is what knows which names exist and what
+        // range each one lives in, so a key no format declares is dropped here
+        // rather than reaching the encoder.
+        let config = crate::config::load();
+        let sdr_params = resolve_params(
+            sdr_format.name(),
+            sdr_format.specs(),
+            crate::config::format_params(sdr_format.name()),
+            &self.format_params,
+        )?;
+        let hdr_params = resolve_params(
+            hdr_format.name(),
+            hdr_format.specs(),
+            crate::config::format_params(hdr_format.name()),
+            &self.format_params,
+        )?;
         // The flag wins, then the config file, then the built-in default.  A
         // white level outside the range the map accepts is clamped rather than
         // refused: it is a number the user meant, and the map has a defined
@@ -1924,7 +2065,7 @@ impl Cli {
             Command::Monitor { name } => {
                 // The flag wins, then the config file, then `current`.
                 let name = name
-                    .or_else(|| crate::config::load().monitor)
+                    .or_else(|| config.monitor.clone())
                     .unwrap_or_else(|| "current".to_owned());
                 if name.trim().is_empty() {
                     return Err(VshotError::InvalidDestination(
@@ -1956,9 +2097,10 @@ impl Cli {
                 inject,
             } => {
                 // Each value falls back flag → config file → built-in default.
-                let defaults = crate::config::load().long;
+                let defaults = &config.long;
                 let inject = inject
-                    .or(defaults.inject)
+                    .clone()
+                    .or_else(|| defaults.inject.clone())
                     .unwrap_or_else(|| "auto".to_owned());
                 CaptureTarget::LongShot {
                     region: geometry.as_deref().map(parse_geometry).transpose()?,
@@ -1982,6 +2124,11 @@ impl Cli {
             Command::Settings => {
                 return Err(VshotError::InvalidDestination(
                     "the settings subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Formats { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the formats subcommand is not a capture target".into(),
                 ))
             }
             Command::Annotate { .. } => {
@@ -2014,8 +2161,10 @@ impl Cli {
             target,
             destination,
             cursor: self.cursor,
-            compression,
+            sdr_format,
+            sdr_params,
             hdr_format,
+            hdr_params,
             tone_map: ToneMapOptions {
                 mode: tone_map,
                 white: tone_map_white,
@@ -2534,6 +2683,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `cli.format.<format>.<parameter>` is what a `--format-param` falls back
+    /// to, and a flag always wins.  The keys are the registry's own names, so
+    /// the file can only configure a parameter its format declares.
+    #[test]
+    fn the_format_section_is_what_a_parameter_flag_falls_back_to() {
+        let dir = std::env::temp_dir().join("vshot-cli-format-defaults");
+        let path = dir.join("vshot").join("config.json");
+        std::fs::create_dir_all(path.parent().expect("a parent directory")).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"cli":{"sdr-format":"png","format":{
+                 "png":{"compression":"high"},
+                 "avif":{"quality":40,"speed":4,"sharpness":9}}}}"#,
+        )
+        .unwrap();
+        // SAFETY: the variable is put back below.  A test in another thread
+        // that parses a capture while this one runs reads whatever config the
+        // variable points at; none of them asserts a remembered format
+        // parameter, so the worst a stray read can do is parse a different
+        // quality than the file this test wrote.
+        let saved = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let capture = |argv: &[&str]| match Cli::try_parse_action_from(argv) {
+            Ok(Action::Capture(request)) => request,
+            other => panic!("{argv:?} is a capture: {other:?}"),
+        };
+
+        // Nothing on the command line: the file decides, per format.
+        let request = capture(&["vshot", "region", "--clipboard"]);
+        assert_eq!(request.sdr_format.name(), "png");
+        assert_eq!(request.sdr_params.text("compression", "?"), "high");
+        #[cfg(feature = "avif")]
+        {
+            assert_eq!(request.hdr_params.integer("quality", -1), 40);
+            assert_eq!(request.hdr_params.integer("speed", -1), 4);
+            // `sharpness` is not a parameter AVIF declares, so the file cannot
+            // put one there.
+            assert_eq!(request.hdr_params.integer("sharpness", -1), -1);
+        }
+
+        // A flag wins over the file, for its own format only.
+        let request = capture(&[
+            "vshot",
+            "region",
+            "--clipboard",
+            "--format-param",
+            "png.compression=fastest",
+        ]);
+        assert_eq!(request.sdr_params.text("compression", "?"), "fastest");
+        #[cfg(feature = "avif")]
+        assert_eq!(
+            request.hdr_params.integer("quality", -1),
+            40,
+            "the other half keeps the file's value"
+        );
+
+        match saved {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// `--follow` and `--no-follow` contradict each other; clap is what sees
     /// it, on both subcommands.
     #[test]
@@ -2658,8 +2870,10 @@ mod tests {
                 },
                 destination: Destination::Clipboard,
                 cursor: false,
-                compression: PngCompression::Fast,
+                sdr_format: SdrFormat::default(),
+                sdr_params: codec::ParamValues::defaults(SdrFormat::default().specs()),
                 hdr_format: HdrFormat::default(),
+                hdr_params: codec::ParamValues::defaults(HdrFormat::default().specs()),
                 tone_map: ToneMapOptions::default(),
             })
         );
@@ -2676,6 +2890,113 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A parameter flag reaches the format it names, and one naming a format
+    /// this capture is not writing is ignored rather than refused: a command
+    /// line that configures both halves of a capture is the ordinary case.
+    #[test]
+    fn a_format_parameter_reaches_only_the_format_it_names() {
+        let Action::Capture(request) = Cli::try_parse_action_from([
+            "vshot",
+            "region",
+            "--clipboard",
+            "--format-param",
+            "png.compression=high",
+            "--format-param",
+            "avif.quality=40",
+        ])
+        .unwrap() else {
+            panic!("`region` is a capture");
+        };
+        assert_eq!(request.sdr_params.text("compression", "?"), "high");
+        #[cfg(feature = "avif")]
+        assert_eq!(request.hdr_params.integer("quality", -1), 40);
+        // The SDR half was told nothing about quality, and PNG has no such
+        // parameter, so the value is simply not there.
+        assert_eq!(request.sdr_params.integer("quality", -1), -1);
+    }
+
+    /// A value outside the parameter's range is clamped rather than refused: it
+    /// is a value the user meant, and the codec has a defined answer for it.
+    #[test]
+    fn a_parameter_out_of_range_is_clamped() {
+        let Action::Capture(request) = Cli::try_parse_action_from([
+            "vshot",
+            "region",
+            "--clipboard",
+            "--format-param",
+            "png.compression=slowest",
+        ])
+        .unwrap() else {
+            panic!("`region` is a capture");
+        };
+        assert_eq!(
+            request.sdr_params.text("compression", "?"),
+            "fast",
+            "a name the format does not offer reads as its default"
+        );
+    }
+
+    /// A malformed `--format-param` says what it wanted instead of quietly
+    /// doing nothing.
+    #[test]
+    fn a_malformed_format_parameter_says_what_it_wanted() {
+        for malformed in ["png.compression", "compression=high", ".compression=high"] {
+            let error = Cli::try_parse_action_from([
+                "vshot",
+                "region",
+                "--clipboard",
+                "--format-param",
+                malformed,
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("--format-param"),
+                "`{malformed}` is named in the refusal: {error}"
+            );
+            assert!(
+                error.contains("FORMAT.NAME=VALUE") || error.contains("empty"),
+                "`{malformed}`: {error}"
+            );
+        }
+    }
+
+    /// `--sdr-format` names the SDR half the way `--hdr-format` names the HDR
+    /// one, and a name no codec has is refused with the list of what there is.
+    #[test]
+    fn the_sdr_format_flag_selects_the_registry_entry() {
+        let Action::Capture(request) =
+            Cli::try_parse_action_from(["vshot", "region", "--clipboard", "--sdr-format", "png"])
+                .unwrap()
+        else {
+            panic!("`region` is a capture");
+        };
+        assert_eq!(request.sdr_format.name(), "png");
+
+        let error =
+            Cli::try_parse_action_from(["vshot", "region", "--clipboard", "--sdr-format", "jpeg"])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("--sdr-format"), "{error}");
+        assert!(error.contains("png"), "{error}");
+    }
+
+    /// `vshot formats` describes the build and captures nothing, so the
+    /// destination flags are refused rather than ignored.
+    #[test]
+    fn the_formats_subcommand_takes_no_destination() {
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "formats"]).unwrap(),
+            Action::Formats { json: false }
+        );
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "formats", "--json"]).unwrap(),
+            Action::Formats { json: true }
+        );
+        let error = Cli::try_parse_action_from(["vshot", "formats", "--clipboard"]).unwrap_err();
+        assert!(error.to_string().contains("--clipboard"), "{error}");
     }
 
     #[test]
@@ -2754,6 +3075,7 @@ mod tests {
                 clipboard: false,
                 command: Some(crate::pin::PinCommand::Toggle),
                 density: None,
+                reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
             })
         );
         let action = Cli::try_parse_action_from(["vshot", "pin", "a.png", "b.png"]).unwrap();
@@ -2779,6 +3101,7 @@ mod tests {
                 clipboard: true,
                 command: None,
                 density: None,
+                reference_nits: crate::model::hdr::REFERENCE_WHITE_NITS,
             })
         );
         let action = Cli::try_parse_action_from(["vshot", "pin", "--clipboard", "a.png"]).unwrap();

@@ -92,7 +92,9 @@ const COMMANDS: &[(&str, &str, &str)] = &[
 
 共用修饰
   -c, --cursor        把合成器光标画进捕获
-  --png-compression   none|fastest|fast（默认）|balanced|high，全部无损
+  --sdr-format        png（默认），写到 --output 的文件用哪种格式
+  --hdr-format        avif（默认）|hdr，捕获带 HDR 内容时写在 PNG 旁边的那个文件
+  --format-param      格式.参数名=值，编码参数，可重复；`vshot formats` 列出可用的
 
 合成器：wlroots 会话（Hyprland、Sway、labwc、niri）走 wlr-screencopy；KWin/Plasma 走
 org.kde.KWin.ScreenShot2，只授给「已安装的 desktop 文件声明了
@@ -451,8 +453,12 @@ const ARGS: &[(&str, &str)] = &[
     ("clipboard", "把结果复制进剪贴板：截图是 PNG 字节，`vshot ocr` 是识别出的文字，`vshot translate` 是合成好的图片或译文。"),
     ("pin", "把截到的图像 pin 到屏幕上，而不是写到任何地方。"),
     (
-        "png_compression",
-        "写到文件、stdout 或剪贴板的 PNG 压缩级别：`none`、`fastest`、`fast`（默认）、`balanced` 或 `high`，全部无损。`--pin` 不落盘。",
+        "sdr_format",
+        "SDR 那一半写成哪种格式：`png`（默认），或这个 build 还编译进了哪些。`vshot formats` 会列出来。`--pin` 不写 SDR 文件，剪贴板与 stdout 无论这里怎么写都还是 PNG。",
+    ),
+    (
+        "format_params",
+        "某个格式的某个编码参数，写作 `格式.参数名=值`，可重复。有哪些参数是编解码器自己的事，所以这里一个都不列：`vshot formats` 会打印这个 build 编译进的格式，连同每个参数的取值范围。格式没有声明的参数名会被拒绝，超出范围的数值会被夹到范围内而不是报错。",
     ),
     ("geometry", "固定的全局矩形，格式为 `x,y 宽x高`。"),
     ("interactive", "明确要求用指针选区；不给 --geometry 时这就是默认行为。"),

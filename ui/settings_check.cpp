@@ -126,6 +126,31 @@ QColor colorOf(QDialog *dialog, const char *name)
     return button == nullptr ? QColor() : vshot::parseColorText(button->text());
 }
 
+/// Waits for the format registry to land, so a check can drive the rows it
+/// grew.
+///
+/// The page is built from `vshot formats --json`, which the window asks for in
+/// the background -- the same way it asks for the microphone listing, and for
+/// the same reason.  A check that looked for the rows straight after building
+/// the dialog would find an empty page and report every one of them missing, so
+/// it spins the event loop here until the answer arrives.  Returns false on the
+/// timeout, which is a failure of the probe rather than of the rows.
+bool waitForFormats(QDialog *dialog)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        // The property is only ever set by the format page's own fill, so a
+        // widget carrying it means the answer landed.
+        for (QWidget *widget : dialog->findChildren<QWidget *>()) {
+            if (widget->property("formatsLanded").toBool()) {
+                return true;
+            }
+        }
+        QApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    return false;
+}
+
 void checkEveryFieldReachesTheFile()
 {
     std::printf("--- every field the window shows reaches the file ---------------\n");
@@ -157,8 +182,8 @@ void checkEveryFieldReachesTheFile()
            "the mosaic-shape list offers brush");
     find<QSpinBox>(dialog.get(), "mosaicStrength")->setValue(3);
 
-    expect(choose(find<QComboBox>(dialog.get(), "pngCompression"), QStringLiteral("balanced")),
-           "the compression list offers balanced");
+    expect(choose(find<QComboBox>(dialog.get(), "sdrFormat"), QStringLiteral("png")),
+           "the SDR format list offers png");
     expect(choose(find<QComboBox>(dialog.get(), "hdrFormat"), QStringLiteral("hdr")),
            "the HDR format list offers hdr");
     expect(choose(find<QComboBox>(dialog.get(), "toneMap"), QStringLiteral("fixed")),
@@ -166,6 +191,9 @@ void checkEveryFieldReachesTheFile()
     // A level of 0.72 is neither the default nor a whole percentage, so a round
     // trip that snapped or ignored it would show up below.
     find<QDoubleSpinBox>(dialog.get(), "toneMapWhite")->setValue(72.0);
+    // A reference white of 250 is neither the built-in default nor a value any
+    // other row carries, so a box wired to the wrong member would show up here.
+    find<QDoubleSpinBox>(dialog.get(), "hdrReferenceWhite")->setValue(250.0);
     // The box is a percentage and the map works in fractions, so its span is
     // the map's own scaled -- a range left in fractions would cap the value
     // just typed at 0.95 and the round trip below would read that back.
@@ -277,6 +305,27 @@ void checkEveryFieldReachesTheFile()
     find<QSpinBox>(dialog.get(), "dialogShadowOffset")->setValue(4);
     find<QSpinBox>(dialog.get(), "dialogShadowOpacity")->setValue(90);
 
+    // The encoding parameters, which the window grew from the registry rather
+    // than from a list of its own -- so this is also the check that the page is
+    // built from `vshot formats --json` at all.  Each one is set to a value
+    // that is neither the format's default nor any other row's, so a crossed
+    // wire cannot pass.
+    expect(waitForFormats(dialog.get()),
+           "the format registry reached the window");
+    QComboBox *pngCompression = find<QComboBox>(dialog.get(), "format_png_compression");
+    if (pngCompression != nullptr) {
+        expect(choose(pngCompression, QStringLiteral("balanced")),
+               "the PNG compression list offers balanced");
+    }
+    QSpinBox *avifQuality = find<QSpinBox>(dialog.get(), "format_avif_quality");
+    if (avifQuality != nullptr) {
+        avifQuality->setValue(40);
+    }
+    QSpinBox *avifSpeed = find<QSpinBox>(dialog.get(), "format_avif_speed");
+    if (avifSpeed != nullptr) {
+        avifSpeed->setValue(4);
+    }
+
     QPushButton *save = find<QPushButton>(dialog.get(), "saveButton");
     if (save != nullptr) {
         save->click();
@@ -293,8 +342,22 @@ void checkEveryFieldReachesTheFile()
     expect(saved.editor.textSize == 31, "the text size reached the file");
     expect(saved.editor.mosaicShape == QStringLiteral("brush"), "the mosaic shape reached the file");
     expect(saved.editor.mosaicStrength == 3, "the mosaic strength reached the file");
-    expect(saved.cli.pngCompression == QStringLiteral("balanced"),
-           "the compression default reached the file", saved.cli.pngCompression);
+    expect(saved.cli.sdrFormat == QStringLiteral("png"),
+           "the SDR format default reached the file", saved.cli.sdrFormat);
+    expect(saved.cli.format.value(QStringLiteral("png")).value(QStringLiteral("compression"))
+               .toString() == QStringLiteral("balanced"),
+           "the PNG compression reached the file",
+           saved.cli.format.value(QStringLiteral("png"))
+               .value(QStringLiteral("compression"))
+               .toString());
+    expect(saved.cli.format.value(QStringLiteral("avif")).value(QStringLiteral("quality")).toInt() ==
+               40,
+           "the AVIF quality reached the file",
+           QString::number(saved.cli.format.value(QStringLiteral("avif"))
+                               .value(QStringLiteral("quality"))
+                               .toInt()));
+    expect(saved.cli.format.value(QStringLiteral("avif")).value(QStringLiteral("speed")).toInt() == 4,
+           "the AVIF speed reached the file");
     expect(saved.cli.hdrFormat == QStringLiteral("hdr"),
            "the HDR format default reached the file", saved.cli.hdrFormat);
     expect(saved.cli.toneMap == QStringLiteral("fixed"),
@@ -310,6 +373,11 @@ void checkEveryFieldReachesTheFile()
     expect(!saved.cli.hdrAreaTest, "the area-test switch reached the file");
     expect(std::abs(saved.cli.hdrAreaRatio - 0.0025) < 1e-9,
            "the HDR area ratio reached the file", QString::number(saved.cli.hdrAreaRatio));
+    // The reference white is a real number in cd/m², not a fraction, so it
+    // crosses the file as it stands.
+    expect(std::abs(saved.cli.hdrReferenceWhite - 250.0) < 1e-6,
+           "the HDR reference white reached the file",
+           QString::number(saved.cli.hdrReferenceWhite));
     // Whitespace around a hand-typed monitor name is trimmed rather than saved.
     expect(saved.cli.monitor == QStringLiteral("HDMI-A-1"),
            "the monitor default reached the file", saved.cli.monitor);
@@ -461,7 +529,8 @@ void checkTheWindowOpensOnTheStoredValues()
         "editor": {"tool": "ellipse", "selectMode": "loose", "width": 12, "dash": "dashed",
                    "arrowStyle": "filled",
                    "mosaicShape": "ellipse", "mosaicStrength": 1, "arrowSize": 2, "textPixels": 28},
-        "cli": {"png-compression": "fastest", "monitor": "DP-3",
+        "cli": {"sdr-format": "png", "monitor": "DP-3",
+                "format": {"png": {"compression": "fastest"}, "avif": {"quality": 40}},
                 "long": {"notches": 3, "inject": "portal", "timeout": 45},
                 "pin": {"density": 2}, "ocr": {"notify": false},
                 "record": {"encoder": "av1", "encoder-backend": "nvenc", "fps": 30,
@@ -496,8 +565,12 @@ void checkTheWindowOpensOnTheStoredValues()
     expect(find<QComboBox>(dialog.get(), "mosaicShape")->currentData().toString() == QStringLiteral("ellipse"),
            "the mosaic shape box is right");
     expect(find<QSpinBox>(dialog.get(), "mosaicStrength")->value() == 1, "the mosaic strength box is right");
-    expect(find<QComboBox>(dialog.get(), "pngCompression")->currentData().toString() == QStringLiteral("fastest"),
+    expect(waitForFormats(dialog.get()), "the format registry reached the window");
+    expect(find<QComboBox>(dialog.get(), "format_png_compression")->currentData().toString() ==
+               QStringLiteral("fastest"),
            "the compression box shows the stored default");
+    expect(find<QSpinBox>(dialog.get(), "format_avif_quality")->value() == 40,
+           "the AVIF quality box shows the stored value");
     expect(find<QLineEdit>(dialog.get(), "monitor")->text() == QStringLiteral("DP-3"),
            "the monitor field shows the stored default");
     expect(find<QSpinBox>(dialog.get(), "longNotches")->value() == 3, "the notches box is right");
@@ -602,10 +675,10 @@ void checkTheWindowOpensOnTheStoredValues()
     expect(find<QSpinBox>(dialog.get(), "pinDensity")->value() == 2,
            "the pin density the file sets is shown as itself",
            QString::number(find<QSpinBox>(dialog.get(), "pinDensity")->value()));
-    expect(find<QComboBox>(dialog.get(), "pngCompression")->currentText() ==
+    expect(find<QComboBox>(dialog.get(), "format_png_compression")->currentText() ==
                QStringLiteral("fastest"),
            "the compression the file sets is shown as itself",
-           find<QComboBox>(dialog.get(), "pngCompression")->currentText());
+           find<QComboBox>(dialog.get(), "format_png_compression")->currentText());
     expect(find<QComboBox>(dialog.get(), "recordEncoder")->currentText() ==
                QStringLiteral("av1"),
            "the encoder the file sets is shown as itself",
@@ -799,6 +872,9 @@ void checkEverySettingIsOnThePageTheSidebarNames()
     if (sidebar == nullptr || pages == nullptr) {
         return;
     }
+    // The format rows are grown from the registry, so the answer has to have
+    // landed before any of them can be looked for.
+    waitForFormats(dialog.get());
 
     expect(sidebar->count() == pages->count(),
            "there is one sidebar entry per page",
@@ -814,8 +890,25 @@ void checkEverySettingIsOnThePageTheSidebarNames()
         const char *widget;
         const char *section;
     } expected[] = {
-        {"pngCompression", "Output"},
+        // *Which* format each half is written in is a choice about the output,
+        // so both selectors are on the Output page; *how* a format writes is
+        // the format's own business and is on the page the registry fills.
+        {"sdrFormat", "Output"},
+        {"hdrFormat", "Output"},
         {"monitor", "Output"},
+        // The format parameters are built from `vshot formats --json`, so the
+        // page has to have been filled before they exist to be looked for.
+        {"format_png_compression", "Format settings"},
+        {"format_avif_quality", "Format settings"},
+        {"format_avif_speed", "Format settings"},
+        // The HDR rows are one page of their own now, rather than a card on the
+        // output page: a user who never captures HDR should not have to scroll
+        // past five rows about it to reach the output settings.
+        {"hdrReferenceWhite", "HDR"},
+        {"toneMap", "HDR"},
+        {"toneMapWhite", "HDR"},
+        {"hdrAreaTest", "HDR"},
+        {"hdrAreaRatio", "HDR"},
         {"longNotches", "Scrolling capture"},
         {"longInject", "Scrolling capture"},
         {"ocrNotify", "Text recognition"},
@@ -1478,6 +1571,15 @@ void checkTheBuiltInDefaultsAreTheClis()
         // applies would judge captures the window never saw.
         {"            ratio: ", vshot::kDefaultHdrAreaRatio,
          "the ratio the box opens on is the daemon's own floor"},
+        // The reference white is the third: the codec layer clamps the setting
+        // to a span of its own, and a box that allowed a value outside it would
+        // be a setting the daemon silently overrides.
+        {"pub const REFERENCE_WHITE_NITS: f32 = ", vshot::kDefaultHdrReferenceWhite,
+         "the white the box opens on is BT.2408's reference, as the codec layer has it"},
+        {"pub const MIN_REFERENCE_NITS: f32 = ", vshot::kMinHdrReferenceWhite,
+         "the bottom of the box is the codec layer's own floor"},
+        {"pub const MAX_REFERENCE_NITS: f32 = ", vshot::kMaxHdrReferenceWhite,
+         "the top of the box is the codec layer's own ceiling"},
     };
     for (const auto &row : mapNumbers) {
         const int at = hdr.indexOf(QString::fromLatin1(row.marker));
@@ -1485,11 +1587,14 @@ void checkTheBuiltInDefaultsAreTheClis()
         if (at >= 0) {
             const int start = at + static_cast<int>(std::strlen(row.marker));
             int end = start;
+            // Rust writes a thousands separator into a long literal (`1_000.0`),
+            // so the scan has to take it and the value has to drop it.
             while (end < hdr.size() &&
-                   (hdr.at(end).isDigit() || hdr.at(end) == QLatin1Char('.'))) {
+                   (hdr.at(end).isDigit() || hdr.at(end) == QLatin1Char('.') ||
+                    hdr.at(end) == QLatin1Char('_'))) {
                 ++end;
             }
-            rust = hdr.mid(start, end - start).toDouble();
+            rust = hdr.mid(start, end - start).remove(QLatin1Char('_')).toDouble();
         }
         expect(std::abs(rust - row.expected) < 1e-6, row.what,
                QStringLiteral("the window says %1, hdr.rs says %2")
@@ -1555,11 +1660,16 @@ void checkTheBuiltInDefaultsAreTheClis()
 
     // The leading entry of each combo box names the built-in default rather than
     // saying the word "default", so a user can read which level or codec they
-    // get without guessing.
-    QComboBox *compression = find<QComboBox>(dialog.get(), "pngCompression");
-    expect(compression->currentIndex() == 0 &&
+    // get without guessing.  The format parameters are named by the codec that
+    // declares them, so this is also the check that the registry's own wording
+    // reaches the row: the page is built before the answer lands, and a fill
+    // that dropped the declared default would show here.
+    waitForFormats(dialog.get());
+    QComboBox *compression = dialog->findChild<QComboBox *>(QStringLiteral("format_png_compression"));
+    expect(compression != nullptr && compression->currentIndex() == 0 &&
                compression->itemText(0).contains(QStringLiteral("fast")),
-           "the compression box names its built-in default", compression->itemText(0));
+           "the compression box names its built-in default",
+           compression == nullptr ? QStringLiteral("no box") : compression->itemText(0));
     QComboBox *encoder = find<QComboBox>(dialog.get(), "recordEncoder");
     expect(encoder->currentIndex() == 0 && encoder->itemText(0).contains(QStringLiteral("h264")),
            "the encoder box names its built-in default", encoder->itemText(0));

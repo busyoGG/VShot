@@ -146,7 +146,8 @@ void checkDefaultsWhenTheFileIsMissing()
     expect(config.editor.color == QColor(255, 64, 64, 255), "the color falls back to #ff4040ff",
            config.editor.color.name(QColor::HexArgb));
     expect(config.editor.width == 2, "the width falls back to 2");
-    expect(config.cli.pngCompression.isEmpty(), "no compression default is remembered");
+    expect(config.cli.sdrFormat.isEmpty() && config.cli.format.isEmpty(),
+           "no format default is remembered");
     expect(config.cli.longTimeout == 0, "no scroll timeout is remembered");
     expect(config.cli.pinDensity == 0, "no pin density is remembered");
     expect(config.cli.recordEncoder.isEmpty(), "no encoder default is remembered");
@@ -179,12 +180,16 @@ void checkUnknownKeysAreIgnored()
     // the whole section over one unrecognized name would drop every default in
     // it, which is exactly what used to happen on the CLI side.
     writeConfig(QStringLiteral(R"({
-        "cli": {"png-compression": "high", "not-a-vshot-key": 7,
+        "cli": {"sdr-format": "png", "format": {"png": {"compression": "high"}},
+                "not-a-vshot-key": 7,
                 "long": {"notches": 3, "also-not-mine": true}}
     })"));
     const vshot::Config config = vshot::loadConfig();
-    expect(config.cli.pngCompression == QStringLiteral("high"),
-           "a known key beside an unknown one still reads", config.cli.pngCompression);
+    expect(config.cli.sdrFormat == QStringLiteral("png"),
+           "a known key beside an unknown one still reads", config.cli.sdrFormat);
+    expect(config.cli.format.value(QStringLiteral("png")).value(QStringLiteral("compression"))
+               .toString() == QStringLiteral("high"),
+           "a nested format parameter still reads");
     expect(config.cli.longNotches == 3, "a known nested key still reads");
     expect(config.editor.tool.isEmpty(),
            "the absent editor section is still the defaults");
@@ -196,7 +201,7 @@ void checkBadValuesFallBackFieldByField()
     writeConfig(QStringLiteral(R"({
         "editor": {"tool": "scribble", "width": 900, "dash": "dashed", "color": "not-a-color",
                    "selectMode": "sometimes"},
-        "cli": {"png-compression": "slowest", "monitor": "DP-3"}
+        "cli": {"sdr-format": "jpeg", "monitor": "DP-3"}
     })"));
     const vshot::Config config = vshot::loadConfig();
     expect(config.editor.tool.isEmpty(),
@@ -206,7 +211,7 @@ void checkBadValuesFallBackFieldByField()
     expect(config.editor.width == 64, "an out-of-range width is clamped", QString::number(config.editor.width));
     expect(config.editor.dash == QStringLiteral("dashed"), "a good value beside bad ones survives");
     expect(config.editor.color == QColor(255, 64, 64, 255), "an unparseable color falls back");
-    expect(config.cli.pngCompression.isEmpty(), "an unknown compression name falls back");
+    expect(config.cli.sdrFormat.isEmpty(), "an unknown SDR format name falls back");
     expect(config.cli.monitor == QStringLiteral("DP-3"), "a good monitor name survives");
 }
 
@@ -302,6 +307,50 @@ void checkTheToneMapRoundTripsAndIsCleared()
            "clearing the tone map removes the key rather than writing an empty one");
 }
 
+/// The reference white is the one setting in the `cli` section that is a real
+/// number in physical units rather than a fraction or a count, so it crosses
+/// the file as it stands and is clamped by the span the codec layer clamps to.
+void checkTheHdrReferenceWhiteRoundTripsAndIsClamped()
+{
+    std::printf("--- the HDR reference white is remembered and clamped ---------------\n");
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-reference-white": 250}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrReferenceWhite - 250.0) < 1e-6,
+           "a reference white is read as it stands",
+           QString::number(vshot::loadConfig().cli.hdrReferenceWhite));
+
+    // A white outside the span is clamped rather than dropped, the same rule
+    // the tone-map level follows: it is a number the user meant, and the codec
+    // layer has a defined answer for one out of range.
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-reference-white": 0.2}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrReferenceWhite - vshot::kMinHdrReferenceWhite) <
+               1e-6,
+           "a white below the span is clamped up",
+           QString::number(vshot::loadConfig().cli.hdrReferenceWhite));
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-reference-white": 5000}})"));
+    expect(std::abs(vshot::loadConfig().cli.hdrReferenceWhite - vshot::kMaxHdrReferenceWhite) <
+               1e-6,
+           "a white above the span is clamped down",
+           QString::number(vshot::loadConfig().cli.hdrReferenceWhite));
+    writeConfig(QStringLiteral(R"({"cli": {"hdr-reference-white": "bright"}})"));
+    expect(vshot::loadConfig().cli.hdrReferenceWhite == 0.0,
+           "a white that is not a number falls back to the built-in default");
+
+    vshot::Config config = vshot::loadConfig();
+    config.cli.hdrReferenceWhite = 250.0;
+    QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
+    expect(numberAt(root, "cli/hdr-reference-white") > 249.9 &&
+               numberAt(root, "cli/hdr-reference-white") < 250.1,
+           "the reference white was written",
+           QString::number(numberAt(root, "cli/hdr-reference-white")));
+
+    // Zero is how the settings window says "the built-in default stands", so it
+    // must not be written: no output is described with a white of zero.
+    config.cli.hdrReferenceWhite = 0.0;
+    root = afterSave([&] { vshot::saveConfig(config); });
+    expect(!containsAt(root, "cli/hdr-reference-white"),
+           "a reference white of zero writes no key rather than a zero");
+}
+
 void checkTheHdrAreaTestRoundTripsAndKeepsItsZero()
 {
     std::printf("--- the HDR area test is remembered and its zero survives ----------\n");
@@ -352,7 +401,8 @@ void checkEditorSaveKeepsTheCliSection()
     std::printf("--- saving the editor style keeps the CLI section ------------------\n");
     writeConfig(QStringLiteral(R"({
         "editor": {"tool": "arrow", "color": "#00ff00"},
-        "cli": {"png-compression": "high", "monitor": "DP-2"},
+        "cli": {"sdr-format": "png", "format": {"png": {"compression": "high"}},
+                "monitor": "DP-2"},
         "some-future-section": {"keep": true}
     })"));
     vshot::EditorPreferences editor;
@@ -361,8 +411,9 @@ void checkEditorSaveKeepsTheCliSection()
     editor.width = 7;
 
     const QJsonObject root = afterSave([&] { vshot::saveEditorPreferences(editor); });
-    expect(textAt(root, "cli/png-compression") == QStringLiteral("high"),
-           "the compression default is still there", textAt(root, "cli/png-compression"));
+    expect(textAt(root, "cli/format/png/compression") == QStringLiteral("high"),
+           "the format parameter is still there",
+           textAt(root, "cli/format/png/compression"));
     expect(textAt(root, "cli/monitor") == QStringLiteral("DP-2"),
            "the monitor default is still there");
     expect(textAt(root, "some-future-section/keep").isEmpty() &&
@@ -380,20 +431,30 @@ void checkSettingsSaveKeepsWhatItDoesNotOwn()
     std::printf("--- saving both sections keeps what this build does not own --------\n");
     writeConfig(QStringLiteral(R"({
         "editor": {"tool": "arrow"},
-        "cli": {"png-compression": "high", "future-key": 7,
+        "cli": {"sdr-format": "png", "future-key": 7,
+                "format": {"png": {"compression": "high", "future-param": 3},
+                           "future-format": {"quality": 4}},
                 "long": {"notches": 2, "future-long-key": 9},
                 "pin": {"density": 2, "future-pin-key": 3}},
         "dialog": {"radius": 7, "future-dialog-key": 5}
     })"));
     vshot::Config config = vshot::loadConfig();
-    config.cli.pngCompression = QStringLiteral("balanced");
+    // A format parameter changed, and another left at what the format declares
+    // -- which is what the window produces for a parameter nobody touched, and
+    // which has to drop the key rather than leave the old one standing.
+    config.cli.format[QStringLiteral("png")].insert(QStringLiteral("compression"),
+                                                    QStringLiteral("balanced"));
     config.cli.monitor = QStringLiteral("DP-3");
     config.cli.longNotches = 5;
     config.cli.pinDensity = 0; // cleared in the window
 
     const QJsonObject root = afterSave([&] { vshot::saveConfig(config); });
-    expect(textAt(root, "cli/png-compression") == QStringLiteral("balanced"),
-           "the changed compression default was written");
+    expect(textAt(root, "cli/format/png/compression") == QStringLiteral("balanced"),
+           "the changed format parameter was written");
+    expect(numberAt(root, "cli/format/png/future-param") == 3,
+           "a parameter this build does not know is kept beside a changed one");
+    expect(numberAt(root, "cli/format/future-format/quality") == 4,
+           "a format this build does not know is kept whole");
     expect(textAt(root, "cli/monitor") == QStringLiteral("DP-3"), "the new monitor default was written");
     expect(numberAt(root, "cli/long/notches") == 5, "the changed notches default was written");
     expect(numberAt(root, "cli/future-key") == 7, "an unknown top-level cli key is kept");
@@ -475,7 +536,8 @@ void checkClearingAValueRemovesIt()
 {
     std::printf("--- clearing a value actually clears it ----------------------------\n");
     writeConfig(QStringLiteral(R"({
-        "cli": {"png-compression": "high", "monitor": "DP-2",
+        "cli": {"sdr-format": "png", "monitor": "DP-2",
+                "format": {"png": {"compression": "high"}, "avif": {"quality": 40}},
                 "long": {"notches": 2, "max-height": 9000, "timeout": 30},
                 "pin": {"density": 2},
                 "record": {"encoder": "hevc", "encoder-backend": "nvenc", "fps": 30,
@@ -493,7 +555,8 @@ void checkClearingAValueRemovesIt()
     expect(!root.contains(QStringLiteral("cli")),
            "clearing everything leaves no empty cli section behind");
     const vshot::Config reread = vshot::loadConfig();
-    expect(reread.cli.pngCompression.isEmpty() && reread.cli.longNotches == 0 &&
+    expect(reread.cli.sdrFormat.isEmpty() && reread.cli.format.isEmpty() &&
+               reread.cli.longNotches == 0 &&
                reread.cli.pinDensity == 0 && reread.cli.recordEncoder.isEmpty() &&
                reread.cli.recordFps == 0 && !reread.cli.recordPortal &&
                !reread.cli.recordMicEnabled && reread.cli.recordFollow.isEmpty() &&
@@ -583,7 +646,11 @@ void checkRoundTripOfEveryField()
     written.editor.arrowStyle = QStringLiteral("filled");
     written.editor.mosaicShape = QStringLiteral("brush");
     written.editor.mosaicStrength = 3;
-    written.cli.pngCompression = QStringLiteral("fastest");
+    written.cli.sdrFormat = QStringLiteral("png");
+    written.cli.format[QStringLiteral("png")].insert(QStringLiteral("compression"),
+                                                     QStringLiteral("fastest"));
+    written.cli.format[QStringLiteral("avif")].insert(QStringLiteral("quality"), 40);
+    written.cli.format[QStringLiteral("avif")].insert(QStringLiteral("speed"), 4);
     written.cli.monitor = QStringLiteral("HDMI-A-1");
     written.cli.longNotches = 4;
     written.cli.longMaxHeight = 12345;
@@ -647,7 +714,9 @@ void checkRoundTripOfEveryField()
     expect(read.editor.mosaicShape == written.editor.mosaicShape, "editor.mosaicShape round-trips");
     expect(read.editor.mosaicStrength == written.editor.mosaicStrength,
            "editor.mosaicStrength round-trips");
-    expect(read.cli.pngCompression == written.cli.pngCompression, "cli.png-compression round-trips");
+    expect(read.cli.sdrFormat == written.cli.sdrFormat, "cli.sdr-format round-trips");
+    expect(read.cli.format == written.cli.format,
+           "every format parameter round-trips, as the type it was written as");
     expect(read.cli.monitor == written.cli.monitor, "cli.monitor round-trips");
     expect(read.cli.longNotches == written.cli.longNotches, "cli.long.notches round-trips");
     expect(read.cli.longMaxHeight == written.cli.longMaxHeight, "cli.long.max-height round-trips");
@@ -809,12 +878,12 @@ void checkRoundTripOfEveryField()
         expect(vshot::loadConfig().cli.recordEncoderBackend == value,
                "the settings window's encoder backends all load back", value);
     }
-    for (const QString &value : vshot::compressionNames()) {
+    for (const QString &value : vshot::sdrFormatNames()) {
         vshot::Config probe = written;
-        probe.cli.pngCompression = value;
+        probe.cli.sdrFormat = value;
         vshot::saveConfig(probe);
-        expect(vshot::loadConfig().cli.pngCompression == value,
-               "the settings window's compression names all load back", value);
+        expect(vshot::loadConfig().cli.sdrFormat == value,
+               "the settings window's SDR format names all load back", value);
     }
     for (const QString &value : vshot::hdrFormatNames()) {
         vshot::Config probe = written;
@@ -1135,7 +1204,7 @@ void checkTheShortcutsSaveKeepsTheRestOfTheFile()
     std::printf("--- saving the shortcuts keeps everything else ---------------------\n");
     writeConfig(QStringLiteral(R"({
         "editor": {"tool": "arrow", "color": "#00ff00"},
-        "cli": {"png-compression": "high"},
+        "cli": {"sdr-format": "png"},
         "shortcuts": {"copy": "Ctrl+K", "an-action-of-the-future": "Ctrl+J"},
         "some-future-section": {"keep": true}
     })"));
@@ -1145,7 +1214,7 @@ void checkTheShortcutsSaveKeepsTheRestOfTheFile()
 
     expect(textAt(root, "editor/tool") == QStringLiteral("arrow"),
            "the editor's style is still there", textAt(root, "editor/tool"));
-    expect(textAt(root, "cli/png-compression") == QStringLiteral("high"),
+    expect(textAt(root, "cli/sdr-format") == QStringLiteral("png"),
            "the CLI defaults are still there");
     expect(containsAt(root, "some-future-section/keep"), "an unknown section is kept whole");
     expect(textAt(root, "shortcuts/copy") == QStringLiteral("Ctrl+K"),
@@ -1189,6 +1258,7 @@ int main(int argc, char **argv)
     checkTheRetiredSelectToolStillMeansNothingArmed();
     checkTheHdrFormatRoundTripsAndIsCleared();
     checkTheToneMapRoundTripsAndIsCleared();
+    checkTheHdrReferenceWhiteRoundTripsAndIsClamped();
     checkTheHdrAreaTestRoundTripsAndKeepsItsZero();
     checkColorsUseTheCssSpelling();
     checkTheLegacyTextSizeIsMigrated();

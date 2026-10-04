@@ -42,7 +42,7 @@ use error::{Result, VshotError};
 use geometry::Rect;
 use model::hdr::{Transfer, REFERENCE_WHITE_NITS};
 use model::{
-    Frame, HdrDecision, HdrFrame, ImageDocument, OutputColor, OutputSnapshot, SceneSnapshot,
+    codec, Frame, HdrDecision, HdrFrame, ImageDocument, OutputColor, OutputSnapshot, SceneSnapshot,
     ToneMapOptions,
 };
 use output::HdrHalf;
@@ -112,6 +112,7 @@ fn run() -> Result<()> {
             // capture, no scene, no Wayland connection of our own.
             return qt_overlay::run_settings();
         }
+        Action::Formats { json } => return run_formats(json),
         Action::Ocr {
             source,
             destination,
@@ -828,6 +829,78 @@ fn replay_background(request: &record::ReplayRequest) -> Result<()> {
     Ok(())
 }
 
+/// Prints the image formats this build was compiled with, and what each of
+/// them lets a caller tune.
+///
+/// Everything comes from the codec registry, so this is the same list the
+/// capture path offers: a format that is not here cannot be asked for, and one
+/// that is here is here with the parameters its own codec declared.  The
+/// settings window reads the `--json` form to build its rows, which is why the
+/// parameter descriptions travel rather than just the names.
+fn run_formats(json: bool) -> Result<()> {
+    if json {
+        println!("{}", codec::describe_json());
+        return Ok(());
+    }
+    // Each half is a list of (name, extension, parameters): the two registries
+    // hold different traits, and this is the part of them a reader cares about.
+    let halves = [
+        (
+            "SDR",
+            codec::sdr_codecs()
+                .into_iter()
+                .map(|codec| (codec.name(), codec.extension(), codec.specs()))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "HDR",
+            codec::codecs()
+                .into_iter()
+                .map(|codec| (codec.name(), codec.extension(), codec.specs()))
+                .collect::<Vec<_>>(),
+        ),
+    ];
+    for (half, formats) in halves {
+        println!("{half}:");
+        for (name, extension, specs) in formats {
+            println!("  {name} (.{extension})");
+            for spec in specs {
+                println!("    {:<12} {}", spec.name, describe_kind(&spec.kind));
+                println!("    {:<12} {}", "", spec.hint);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One parameter's range, as the table prints it.
+fn describe_kind(kind: &codec::ParamKind) -> String {
+    match kind {
+        codec::ParamKind::Choice { values, .. } => {
+            format!("one of {}", values.join(", "))
+        }
+        codec::ParamKind::Integer {
+            min,
+            max,
+            step,
+            default,
+        } => format!("{min}..={max} in steps of {step} (default {default})"),
+        codec::ParamKind::Number {
+            min,
+            max,
+            step,
+            decimals,
+            default,
+        } => {
+            let decimals = *decimals as usize;
+            format!(
+                "{min:.decimals$}..={max:.decimals$} in steps of {step:.decimals$} \
+                 (default {default:.decimals$})"
+            )
+        }
+    }
+}
+
 /// Reads the text out of a region of the screen, or out of an image file.
 ///
 /// The capture half is `vshot region`'s: the scene is frozen, the overlay
@@ -1258,8 +1331,10 @@ fn write_capture_and_pin(
             hdr,
             destination,
             density,
-            request.compression,
+            request.sdr_format,
+            &request.sdr_params,
             request.hdr_format,
+            &request.hdr_params,
             capture_rect.map(|rect| rect.origin),
             marks,
             base,
@@ -2248,8 +2323,14 @@ mod tests {
             target: CaptureTarget::RegionInteractive,
             destination: cli::Destination::File(PathBuf::from("/dev/null")),
             cursor: false,
-            compression: crate::model::PngCompression::default(),
+            sdr_format: crate::output::SdrFormat::default(),
+            sdr_params: crate::model::codec::ParamValues::defaults(
+                crate::output::SdrFormat::default().specs(),
+            ),
             hdr_format: crate::output::HdrFormat::default(),
+            hdr_params: crate::model::codec::ParamValues::defaults(
+                crate::output::HdrFormat::default().specs(),
+            ),
             tone_map: crate::model::hdr::ToneMapOptions::default(),
         };
         // The editor's ordinary answer: a selection, no `pin` flag.  The

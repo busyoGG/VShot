@@ -192,7 +192,7 @@ impl PinReply {
 /// A parsed `vshot pin ...` request: pin these files and/or the clipboard
 /// image, or run this one control command. Exactly one control flag is
 /// allowed, and never alongside files or `--clipboard`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PinInvocation {
     pub files: Vec<PathBuf>,
     pub clipboard: bool,
@@ -200,6 +200,10 @@ pub(crate) struct PinInvocation {
     /// Device density to stamp on the pinned images, overriding what the
     /// daemon would work out for itself. `None` leaves it to the daemon.
     pub density: Option<u32>,
+    /// The light in cd/m² an HDR half's `1.0` stands for, for the files that do
+    /// not say themselves. Resolved once here rather than at the decode, so the
+    /// flag, the config file and the built-in default are decided in one place.
+    pub reference_nits: f32,
 }
 
 /// Environment fallback for `--density`, so a screenshot hotkey can hand the
@@ -234,6 +238,7 @@ impl PinInvocation {
         quit: bool,
         list: bool,
         density: Option<u32>,
+        reference_white: Option<f32>,
     ) -> Result<Self> {
         let selected = [toggle, show, hide, close_all, quit, list]
             .into_iter()
@@ -272,6 +277,14 @@ impl PinInvocation {
             },
             None => None,
         };
+        // The flag wins, then the config file, then BT.2408's reference white.
+        // Read off the output a capture came from is the first answer, and this
+        // is the answer for the files that carry none: another writer's Radiance
+        // file, or an AVIF with no VShot box naming one.
+        let reference_nits = reference_white
+            .or_else(crate::config::hdr_reference_white_default)
+            .map(crate::model::hdr::clamp_reference_nits)
+            .unwrap_or(crate::model::hdr::REFERENCE_WHITE_NITS);
         let command = if !files.is_empty() || clipboard {
             None
         } else if quit {
@@ -292,6 +305,7 @@ impl PinInvocation {
             clipboard,
             command,
             density,
+            reference_nits,
         })
     }
 }
@@ -303,6 +317,7 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
         clipboard,
         command,
         density,
+        reference_nits,
     } = invocation;
     if let Some(command) = command {
         let list = matches!(command, PinCommand::List);
@@ -333,30 +348,258 @@ pub(crate) fn run(invocation: PinInvocation) -> Result<()> {
                 .map_err(|error| VshotError::Pin(format!("failed to resolve cwd: {error}")))?
                 .join(file)
         };
-        // The override, when one was given, rides along; otherwise the daemon
-        // sizes the image from what it can find out about it.
-        execute(PinCommand::Add {
-            path: absolute,
-            hdr: None,
+        pin_file(
+            absolute,
             density,
+            reference_nits,
             output,
-            output_name: output_name.clone(),
-            at: None,
-            annotations: None,
-            base: None,
-            // Nothing is drawing this pin, so there is no handoff to make
-            // seamless and nothing to wait for.
-            ack: false,
-        })?;
+            output_name.clone(),
+        )?;
     }
     if clipboard {
-        execute(PinCommand::AddClipboard {
-            density,
-            output,
-            output_name,
-        })?;
+        // A capture puts its own file on the clipboard as a URI, so a clipboard
+        // pin can be resolved to the file the program wrote and, beside it, the
+        // HDR half.  That is the one case where the clipboard carries more than
+        // the daemon can see for itself, and it is only taken when there really
+        // is a half to find: everything else -- an image, text, a colour, a file
+        // with no sibling -- is left to the daemon, which resolves the clipboard
+        // the way it always has.
+        match clipboard_source() {
+            Some(path) => pin_file(path, density, reference_nits, output, output_name)?,
+            None => {
+                execute(PinCommand::AddClipboard {
+                    density,
+                    output,
+                    output_name,
+                })?;
+            }
+        }
     }
     Ok(())
+}
+
+/// Pins one image file, with the HDR half a capture wrote beside it when there
+/// is one.  `density` is the override the command line or the config asked for;
+/// `None` leaves the size to the daemon, which reads it off the image and the
+/// source record.  `reference_nits` is the white to read a half at that names
+/// none of its own.
+fn pin_file(
+    path: PathBuf,
+    density: Option<u32>,
+    reference_nits: f32,
+    output: Option<WireOutputRect>,
+    output_name: Option<String>,
+) -> Result<()> {
+    let half = match hdr_half_beside(&path, reference_nits) {
+        Some(pq) => Some(PinHalf::write(&pq)?),
+        None => None,
+    };
+    execute(PinCommand::Add {
+        path,
+        hdr: half.as_ref().map(|half| half.path.clone()),
+        density,
+        output,
+        output_name,
+        at: None,
+        annotations: None,
+        base: None,
+        // Nothing is drawing this pin, so there is no handoff to make seamless
+        // and nothing to wait for.
+        ack: false,
+    })
+    .map(|_| ())
+}
+
+/// One pin's HDR half as it travels: the PQ file the daemon copies out of this
+/// directory, and the directory itself, which has to outlive the round trip
+/// because the daemon reads the file before it answers.
+struct PinHalf {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl PinHalf {
+    fn write(pq: &PqPin) -> Result<Self> {
+        let directory = pin_tempdir()?;
+        let path = write_private_file(directory.path(), "capture.pq", &pq.encode())?;
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+}
+
+/// The file a capture wrote beside `path`: the same stem with an HDR codec's
+/// suffix.  `shot.png` and `shot.avif` are one capture's two halves, so this is
+/// the name `write_capture_files` would have used for the second one.
+///
+/// A file that is itself an HDR half has no sibling: the suffix it already
+/// carries is the one being looked for, and the file next to it with the other
+/// codec's suffix is a different image, not this one's second half.
+fn hdr_sibling_path(path: &Path) -> Option<PathBuf> {
+    if crate::model::codec::from_extension(path).is_some() {
+        return None;
+    }
+    let mut sibling = path.to_path_buf();
+    for codec in crate::model::codec::codecs() {
+        sibling.set_extension(codec.extension());
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+    None
+}
+
+/// The HDR half a capture wrote beside `path`, as the PQ codes a pin travels
+/// with: the file read back through the same codec layer that wrote it, so
+/// "encode then decode" is a round trip through one currency rather than a
+/// conversion between two.
+///
+/// `None` when there is no sibling, and also when there is one this build
+/// cannot read.  The sibling is found by name, and a file beside a PNG that
+/// merely shares its stem is not necessarily this program's HDR half; the pin
+/// then shows its SDR picture alone, which is what it did before there was an
+/// HDR half to find.  A half the user *named* is a different matter -- the
+/// daemon refuses that one rather than dropping it in silence -- but a guess is
+/// not worth failing a pin over.
+fn hdr_half_beside(path: &Path, reference_nits: f32) -> Option<PqPin> {
+    let sibling = hdr_sibling_path(path)?;
+    let codec = crate::model::codec::from_extension(&sibling)?;
+    match codec.decode_path(&sibling, reference_nits) {
+        Ok(image) => {
+            // The codes go out in the file's own gamut and at the file's own
+            // reference white, which is what makes the round trip exact: the
+            // white cancels when the surface helper re-encodes, and the pin
+            // editor decodes them back to the light the capture held.
+            let white = image.white();
+            Some(PqPin {
+                words: image.frame.to_rgb10_pq_in(image.frame.primaries(), white),
+                width: image.frame.size().width,
+                height: image.frame.size().height,
+                reference_nits: white,
+                primaries: image.frame.primaries(),
+            })
+        }
+        Err(error) => {
+            if std::env::var_os("VSHOT_PIN_DEBUG").is_some() {
+                eprintln!(
+                    "vshot: pin: {} is not readable as an HDR half ({error}); \
+                     the pin is the SDR picture alone",
+                    sibling.display()
+                );
+            }
+            None
+        }
+    }
+}
+
+/// The file the clipboard names, when it names one that has an HDR half beside
+/// it.  Anything else is left to the daemon: it resolves the clipboard's image,
+/// its text and its colours itself, and this exists only to recover the second
+/// file of a capture this program wrote — `vshot region -o shot.png` leaves
+/// `shot.png` on the clipboard as a URI, and `shot.avif` is the half the daemon
+/// has no way to guess at.
+///
+/// The two shapes are the ones the daemon itself reads a path from, in its own
+/// order: a `text/uri-list`, then a plain text that is nothing but a path.  A
+/// clipboard holding only image bytes names no file, so there is nothing here to
+/// resolve and the daemon is left to pin the pixels — which is what
+/// `wl-copy < shot.png` leaves, and it is the one case where the second file
+/// cannot be found from the clipboard at all.
+fn clipboard_source() -> Option<PathBuf> {
+    let listed = paste(&["--list-types"])?;
+    let types = String::from_utf8_lossy(&listed);
+    let offers = |wanted: &str| types.lines().any(|line| line.trim() == wanted);
+    if offers("text/uri-list") {
+        // `--no-newline` keeps the list byte-exact.
+        if let Some(uris) = paste(&["--type", "text/uri-list", "--no-newline"]) {
+            if let Some(path) = uri_list_path(&String::from_utf8_lossy(&uris)) {
+                return Some(path);
+            }
+        }
+    }
+    // A plain text that is one line and names a file: the shape `wl-copy
+    // /path/shot.png` leaves, and the one the daemon reads as a path too.
+    for candidate in [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+    ] {
+        if !offers(candidate) {
+            continue;
+        }
+        let Some(bytes) = paste(&["--type", candidate, "--no-newline"]) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let text = text.trim();
+        if !text.is_empty() && !text.contains('\n') {
+            let path = PathBuf::from(text);
+            if hdr_sibling_path(&path).is_some() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// The first local file a `text/uri-list` names that has an HDR half beside it.
+/// A list may carry several files, and `#` starts a comment in the format.
+fn uri_list_path(list: &str) -> Option<PathBuf> {
+    for line in list.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(path) = file_uri_path(line) else {
+            continue;
+        };
+        if hdr_sibling_path(&path).is_some() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Runs `wl-paste` with `args` and answers its bytes.
+///
+/// `None` when it is not installed, when the clipboard does not offer the type
+/// that was asked for (which `wl-paste` reports by exiting non-zero), or when
+/// it fails for any other reason.  All of those mean the same thing here: this
+/// side cannot resolve the clipboard, so the daemon is left to.
+fn paste(args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("wl-paste").args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// The local path a `file://` URI names.
+///
+/// `file:///a/b` is a path with an empty authority; `file://host/a/b` names a
+/// host this side cannot read, and is refused rather than read as `/a/b`.
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?.strip_prefix('/')?;
+    Some(PathBuf::from(format!("/{}", percent_decode(rest)?)))
+}
+
+/// The bytes a percent-encoded URI component stands for, as text.  `None` on a
+/// `%` that is not followed by two hex digits, or on bytes that are not UTF-8 —
+/// a path this side cannot name is one it cannot read.
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            out.push(u8::from_str_radix(value.get(at + 1..at + 3)?, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The compositor's answer for "which output is the user on", in the two shapes
@@ -641,13 +884,7 @@ pub(crate) fn pin_png(
     base_png: Option<&[u8]>,
     handoff: bool,
 ) -> Result<()> {
-    let directory = tempfile::Builder::new()
-        .prefix("vshot-pin-")
-        .tempdir_in("/dev/shm")
-        .or_else(|_| tempfile::tempdir())
-        .map_err(|error| {
-            VshotError::Pin(format!("failed to create pin temp directory: {error}"))
-        })?;
+    let directory = pin_tempdir()?;
     let path = write_private_file(directory.path(), "capture.png", png)?;
     // The pristine picture the marks were drawn on, when there are marks.  It
     // travels as its own file because the daemon loads it later, per edit.
@@ -695,6 +932,20 @@ pub(crate) fn pin_png(
         remove_pin_temp(hdr_path);
     }
     result.map(|_| ())
+}
+
+/// A directory for the files one pin travels through: private to this process,
+/// and gone as soon as the request is answered.
+///
+/// `/dev/shm` when there is one, because a pinned capture is output-sized and
+/// the daemon reads it before it replies; the system temp directory is the
+/// fallback for a machine without shared memory.
+fn pin_tempdir() -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("vshot-pin-")
+        .tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .map_err(|error| VshotError::Pin(format!("failed to create pin temp directory: {error}")))
 }
 
 /// Writes `bytes` into `directory` as a private file the pin daemon can read,
@@ -1053,6 +1304,174 @@ mod tests {
         assert!(!keep_daemon_stderr());
     }
 
+    /// The sibling is the file `write_capture_files` would have written: the
+    /// same stem with the codec's own suffix, and nothing else.
+    #[cfg(feature = "avif")]
+    #[test]
+    fn the_hdr_half_is_found_beside_the_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("shot.png");
+        std::fs::write(&png, b"png").unwrap();
+        assert!(hdr_sibling_path(&png).is_none(), "no half has been written");
+        let avif = directory.path().join("shot.avif");
+        std::fs::write(&avif, b"avif").unwrap();
+        assert_eq!(hdr_sibling_path(&png), Some(avif.clone()));
+        // A file that is already an HDR half has none: the suffix it carries is
+        // the one being looked for, and the PNG beside it is the other half of
+        // the same capture rather than a capture of its own.
+        assert!(hdr_sibling_path(&avif).is_none());
+        // The lookup is by stem, so any other file of the same stem finds the
+        // half too -- the rule `write_capture_files` writes by, applied to a
+        // name the user happened to pin instead of the PNG.
+        let other = directory.path().join("shot.txt");
+        std::fs::write(&other, b"notes").unwrap();
+        assert_eq!(hdr_sibling_path(&other), Some(avif.clone()));
+        // A different stem finds nothing: the half belongs to one capture.
+        let unrelated = directory.path().join("elsewhere.png");
+        std::fs::write(&unrelated, b"png").unwrap();
+        assert!(hdr_sibling_path(&unrelated).is_none());
+        // No extension at all still looks, the way `hdr_sibling_path` writes.
+        let bare = directory.path().join("shot");
+        std::fs::write(&bare, b"png").unwrap();
+        assert_eq!(hdr_sibling_path(&bare), Some(avif));
+    }
+
+    /// The HDR half read back is the PQ codes the pin travels with: the same
+    /// codes a capture's own pin carries, which is what makes the two pins show
+    /// the same light.
+    #[cfg(feature = "radiance")]
+    #[test]
+    fn the_hdr_half_is_read_back_as_the_codes_a_pin_carries() {
+        use crate::geometry::Size;
+        use crate::model::codec::HdrImage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("shot.png");
+        std::fs::write(&png, b"png").unwrap();
+        // A capture's HDR half: two pixels of a known light, written by the
+        // codec layer the same way `write_capture_files` writes one.
+        let source = HdrImage::new(
+            HdrFrame::new(
+                Size::new(2, 1),
+                vec![[1.0, 0.5, 0.25, 1.0], [4.0, 2.0, 1.0, 1.0]],
+            )
+            .unwrap(),
+            203.0,
+        );
+        let codec = crate::model::codec::by_name("hdr").expect("the radiance codec");
+        codec
+            .encode_path(&source, &directory.path().join("shot.hdr"))
+            .unwrap();
+
+        let half = hdr_half_beside(&png, crate::model::hdr::REFERENCE_WHITE_NITS)
+            .expect("the half is found and read");
+        assert_eq!((half.width, half.height), (2, 1));
+        assert!((half.reference_nits - 203.0).abs() < 0.01);
+        // The codes are what the capture's own pin would carry: the same frame
+        // through the same encoder, so the two are byte for byte the same.
+        let expected = source
+            .frame
+            .to_rgb10_pq_in(source.frame.primaries(), source.reference_nits);
+        assert_eq!(half.words, expected);
+
+        // A sibling that is not readable as an HDR half is not a failure: the
+        // pin is the SDR picture alone, which is what it was before there was
+        // anything to look for.
+        std::fs::write(directory.path().join("shot.hdr"), b"not radiance").unwrap();
+        assert!(hdr_half_beside(&png, crate::model::hdr::REFERENCE_WHITE_NITS).is_none());
+    }
+
+    /// A half that names no white of its own is read at the setting, and the
+    /// codes it travels as are encoded against that same white — which is what
+    /// makes the pin show the light the file holds rather than the light of a
+    /// white the file never had.
+    #[cfg(feature = "radiance")]
+    #[test]
+    fn a_half_with_no_white_of_its_own_is_read_at_the_setting() {
+        use crate::geometry::Size;
+        use crate::model::codec::HdrImage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("shot.png");
+        std::fs::write(&png, b"png").unwrap();
+        // What another program's Radiance writer produces: no `REFERENCE_NITS=`
+        // and no `PRIMARIES=`, so both answers have to come from elsewhere.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n");
+        bytes.extend_from_slice(&[128, 128, 128, 129]);
+        bytes.extend_from_slice(&[64, 64, 64, 130]);
+        std::fs::write(directory.path().join("shot.hdr"), &bytes).unwrap();
+
+        let half = hdr_half_beside(&png, 250.0).expect("the half is found and read");
+        assert!(
+            (half.reference_nits - 250.0).abs() < 0.01,
+            "the setting is the white the file is read at, got {}",
+            half.reference_nits
+        );
+        // The codes are absolute PQ, so the white does not merely label them: it
+        // is what they were computed against.  A file read at a brighter white
+        // is a dimmer picture, and the codes have to say so.
+        let source = HdrImage::new(
+            HdrFrame::new(
+                Size::new(2, 1),
+                vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
+            )
+            .unwrap(),
+            250.0,
+        );
+        let expected = source.frame.to_rgb10_pq_in(source.frame.primaries(), 250.0);
+        // The two RGBE pixels hold different light, so only the first is
+        // compared: 128/128/128/129 is exactly 1.0, the file's own white.
+        assert_eq!(
+            half.words[0], expected[0],
+            "1.0 in the file is the setting's white"
+        );
+
+        // And the setting is what decides it: the same file read at BT.2408's
+        // reference is a different picture.
+        let darker = hdr_half_beside(&png, crate::model::hdr::REFERENCE_WHITE_NITS)
+            .expect("the half is found and read");
+        assert!((darker.reference_nits - 203.0).abs() < 0.01);
+        assert_ne!(darker.words[0], half.words[0]);
+    }
+
+    /// The two shapes a clipboard carries a path in, and the shapes it does
+    /// not: a bare `file://` URI, a percent-encoded one, a plain path, and
+    /// anything with no half beside it.
+    #[cfg(feature = "radiance")]
+    #[test]
+    fn a_clipboard_path_resolves_only_when_a_half_is_beside_it() {
+        assert_eq!(
+            file_uri_path("file:///tmp/shot.png"),
+            Some(PathBuf::from("/tmp/shot.png"))
+        );
+        // A percent-encoded path is decoded: a capture in a directory with a
+        // space in its name still has to resolve.
+        assert_eq!(
+            file_uri_path("file:///tmp/my%20shots/shot.png"),
+            Some(PathBuf::from("/tmp/my shots/shot.png"))
+        );
+        // A host this side cannot read is refused rather than read as a path on
+        // this machine, and a truncated escape is not a path either.
+        assert_eq!(file_uri_path("file://other/tmp/shot.png"), None);
+        assert_eq!(file_uri_path("file:///tmp/shot%2.png"), None);
+        assert_eq!(file_uri_path("/tmp/shot.png"), None);
+
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("shot.png");
+        std::fs::write(&png, b"png").unwrap();
+        let uri = format!("file://{}\n", png.display());
+        // No half beside it: the daemon is left to resolve the clipboard, which
+        // is what every clipboard without a capture behind it gets.
+        assert_eq!(uri_list_path(&uri), None);
+        std::fs::write(directory.path().join("shot.hdr"), b"hdr").unwrap();
+        assert_eq!(uri_list_path(&uri), Some(png.clone()));
+        // A comment and an empty line are skipped, and a list naming several
+        // files resolves to the one that has a half.
+        let list = format!("# a comment\n\nfile:///nonexistent.png\n{uri}");
+        assert_eq!(uri_list_path(&list), Some(png));
+    }
+
     // A pin made from an annotated capture carries the marks and the picture
     // they were drawn on, or the pin can only ever be edited once: a second
     // edit would be handed the flattening and draw every mark again on top of
@@ -1214,6 +1633,7 @@ mod tests {
                 false,
                 false,
                 density,
+                None,
             )
         };
         // Nothing stated: the daemon works the density out for itself.
@@ -1236,6 +1656,7 @@ mod tests {
             false,
             false,
             Some(2),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("--density"), "{error}");

@@ -6,6 +6,8 @@
 #include "shadow.hpp"
 
 #include <QColor>
+#include <QJsonObject>
+#include <QMap>
 #include <QPalette>
 #include <QSize>
 #include <QString>
@@ -63,10 +65,23 @@ struct EditorPreferences {
 /// built-in default for that flag.  That is what lets the settings window tell
 /// "the user wants `fast`" apart from "the user never touched this".
 struct CliPreferences {
-    QString pngCompression; ///< `none` | `fastest` | `fast` | `balanced` | `high`
+    /// Which format the SDR half is written in: `png`, or whatever else this
+    /// build's registry offers.  Empty means the file says nothing and the
+    /// built-in default (PNG) stands.
+    QString sdrFormat;
     /// How the HDR half of a capture is written: `avif` or `hdr`.  Empty means
     /// the file says nothing and the built-in default (AVIF) stands.
     QString hdrFormat;
+    /// The encoding parameters of each format, keyed by format and then by the
+    /// parameter's own name: `cli.format.png.compression`,
+    /// `cli.format.avif.quality`.
+    ///
+    /// A nested map rather than a field per parameter, because which formats
+    /// and which parameters exist is the *codec registry's* answer: the window
+    /// learns them from `vshot formats --json`, and a key whose format or
+    /// parameter this build does not have is simply never asked for.  Values
+    /// are the JSON ones, so a choice is a string and a number is a number.
+    QMap<QString, QJsonObject> format;
     /// How the SDR copy of an HDR capture is mapped down: `auto`, `fixed` or
     /// `normalize`.  Empty means the file says nothing and the built-in default
     /// (auto) stands.
@@ -88,6 +103,14 @@ struct CliPreferences {
     /// output as HDR content, so it has to be writable and has to read back as
     /// itself rather than as an absent key.
     double hdrAreaRatio = -1.0;
+    /// The light in cd/m² an HDR half's `1.0` stands for
+    /// (`cli.hdr-reference-white`), for the files that name none of their own:
+    /// a Radiance file written by another program, or an AVIF with no VShot box
+    /// saying what it was captured against.
+    ///
+    /// Zero means the file says nothing; BT.2408's reference is what stands,
+    /// which is why a written value is never zero.
+    double hdrReferenceWhite = 0.0;
     QString monitor;        ///< an output name, or `current`
     std::uint32_t longNotches = 0;
     std::uint32_t longMaxHeight = 0;
@@ -394,7 +417,10 @@ const QStringList &selectModeNames();
 const QStringList &dashNames();
 const QStringList &arrowStyleNames();
 const QStringList &mosaicShapeNames();
-const QStringList &compressionNames();
+/// The SDR half's format: `png`.  What the *loader* accepts; the settings
+/// window offers the codec registry's list instead, which is a build-time
+/// question.
+const QStringList &sdrFormatNames();
 /// The HDR half's format: `avif`, `hdr`.
 const QStringList &hdrFormatNames();
 /// How the SDR half is mapped down from the HDR one: `auto`, `fixed`,
@@ -411,6 +437,17 @@ constexpr double kDefaultToneMapWhite = 0.8;
 /// `model::hdr::HdrDecision::default` weighs a capture against, repeated here
 /// because the settings window has to open its number box on it.
 constexpr double kDefaultHdrAreaRatio = 0.0005;
+/// The span a reference white may take, in cd/m²: the same numbers
+/// `model::hdr::clamp_reference_nits` clamps to, repeated here because the
+/// settings window has to bound its number box by them.  A hundred is the
+/// dimmest SDR white any display is described with; a thousand is HLG's
+/// nominal peak, above which a reference white would be a highlight.
+constexpr double kMinHdrReferenceWhite = 1.0;
+constexpr double kMaxHdrReferenceWhite = 1000.0;
+/// What the reference white is when the file says nothing:
+/// `model::hdr::REFERENCE_WHITE_NITS`, BT.2408's reference white, repeated
+/// here for the same reason as the span above.
+constexpr double kDefaultHdrReferenceWhite = 203.0;
 const QStringList &injectNames();
 const QStringList &encoderNames();
 /// The hardware backends `record --encoder-backend` and its replay twin accept:

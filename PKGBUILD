@@ -23,7 +23,12 @@ license=('GPL-3.0-or-later')
 # every variant ships: `ort-sys` finds it through pkg-config and links it
 # dynamically.  The provider it offers is not selected by anything here, so a
 # GPU build runs the OCR on the CPU exactly like the CPU one does.
-depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt' 'onnxruntime')
+# `dav1d` is what reads an AVIF back — the `dav1d` crate links the system
+# library rather than building one, and the AVIF codec is on by default, so the
+# package depends on it.  A build with `--no-default-features --features
+# radiance` does not, but that build has no AVIF at all.  The package is named
+# for the project rather than the library: `dav1d` is what ships `libdav1d.so`.
+depends=('glibc' 'wayland' 'qt6-base' 'layer-shell-qt' 'onnxruntime' 'dav1d')
 # `ffmpeg` provides the libavcodec/libavformat headers the recording shim is
 # compiled against; at run time both libraries are dlopen'ed, so ffmpeg stays
 # an optdepend and a machine without it simply has no `vshot record`.

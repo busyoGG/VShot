@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VShot contributors
 
-pub mod avif;
+pub mod codec;
+pub mod color;
 pub mod document;
 pub mod frame;
 pub mod hdr;
