@@ -45,6 +45,10 @@ enum Probe {
     /// come from different packages: either may be the only one installed.
     KWinGdbus,
     KWinDbusSend,
+    /// vidow's own answer, over its IPC socket: the output under the pointer,
+    /// else the one holding the focus. It is the one probe here that is not a
+    /// command — see [`Probe::command`].
+    Vidow,
 }
 
 /// The compositor the session we are running in actually is.
@@ -61,6 +65,9 @@ pub(crate) enum Session {
     Sway,
     Niri,
     KWin,
+    /// vidow, named by its own IPC socket rather than by a desktop variable —
+    /// see [`super::vidow::owns_this_connection`].
+    Vidow,
     /// Nothing in the environment names a compositor, so every probe is worth
     /// trying: a foreign one fails on its own unless it is really there.
     Unknown,
@@ -78,6 +85,7 @@ impl Session {
                     "sway" => return Self::Sway,
                     "niri" => return Self::Niri,
                     "kde" | "plasma" => return Self::KWin,
+                    "vidow" => return Self::Vidow,
                     _ => {}
                 }
             }
@@ -88,23 +96,29 @@ impl Session {
     pub(crate) fn detect() -> Self {
         let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
         let session = std::env::var("XDG_SESSION_DESKTOP").ok();
-        // niri is asked directly rather than through the variables, for the
-        // reason spelled out in `from_environment`.
+        // niri and vidow are asked directly rather than through the variables,
+        // for the reason spelled out in `from_environment`.
         let niri_owns_this = super::niri::owns_this_connection();
-        let decision =
-            Self::from_environment(current.as_deref(), session.as_deref(), niri_owns_this);
+        let vidow_owns_this = super::vidow::owns_this_connection();
+        let decision = Self::from_environment(
+            current.as_deref(),
+            session.as_deref(),
+            niri_owns_this,
+            vidow_owns_this,
+        );
         report_session(
             decision,
             current.as_deref(),
             session.as_deref(),
             niri_owns_this,
+            vidow_owns_this,
         );
         decision
     }
 
     /// The session, from every piece of evidence the environment offers: the
-    /// names the desktop variables carry, and whether niri's own socket names
-    /// the display we are connected to.
+    /// names the desktop variables carry, and whether niri's or vidow's own
+    /// socket names the display we are connected to.
     ///
     /// niri comes first because the desktop variables are inherited and
     /// therefore regularly wrong about it: niri sets neither of them, so a
@@ -115,13 +129,22 @@ impl Session {
     /// overlay instead of niri's crosshair.  The socket is decisive because
     /// niri names it after the display it created, i.e. after the display we
     /// are talking to; see `niri::owns_this_connection`.
+    ///
+    /// vidow is asked the same way and for the same reason, and it is asked
+    /// *after* niri only because a display is one compositor's: the two sockets
+    /// cannot both name it, so the order is only a tie-break that never comes
+    /// up.
     fn from_environment(
         current: Option<&str>,
         session: Option<&str>,
         niri_owns_this: bool,
+        vidow_owns_this: bool,
     ) -> Self {
         if niri_owns_this {
             return Self::Niri;
+        }
+        if vidow_owns_this {
+            return Self::Vidow;
         }
         Self::from_desktops(current, session)
     }
@@ -136,6 +159,7 @@ fn report_session(
     current: Option<&str>,
     session: Option<&str>,
     niri_owns_this: bool,
+    vidow_owns_this: bool,
 ) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -144,7 +168,8 @@ fn report_session(
         }
         eprintln!(
             "vshot: session {decision:?} — XDG_CURRENT_DESKTOP={current:?}, \
-             XDG_SESSION_DESKTOP={session:?}, NIRI_SOCKET names this display: {niri_owns_this}"
+             XDG_SESSION_DESKTOP={session:?}, NIRI_SOCKET names this display: {niri_owns_this}, \
+             vidow's socket names it: {vidow_owns_this}"
         );
     });
 }
@@ -165,10 +190,11 @@ impl Probe {
             Probe::Sway => Session::Sway,
             Probe::Niri => Session::Niri,
             Probe::KWinGdbus | Probe::KWinDbusSend => Session::KWin,
+            Probe::Vidow => Session::Vidow,
         }
     }
 
-    fn command(self) -> OutputCommand {
+    fn command(self) -> Option<OutputCommand> {
         let (program, args) = match self {
             Probe::Hyprland => ("hyprctl", &["monitors", "-j"][..]),
             Probe::Sway => ("swaymsg", &["-t", "get_outputs"][..]),
@@ -199,12 +225,31 @@ impl Probe {
                     "org.kde.KWin.activeOutputName",
                 ][..],
             ),
+            // vidow answers on a unix socket, so there is no command line to
+            // run — see `Probe::ask`.
+            Probe::Vidow => return None,
         };
-        OutputCommand {
+        Some(OutputCommand {
             probe: self,
             program,
             args,
+        })
+    }
+
+    /// Run this probe and read its answer.  All but one are a command whose
+    /// stdout is parsed; vidow's is a request to its IPC socket.
+    fn ask(self) -> Option<ActiveOutput> {
+        let Some(command) = self.command() else {
+            return super::vidow::active_output();
+        };
+        let output = Command::new(command.program)
+            .args(command.args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
         }
+        self.parse(&output.stdout)
     }
 
     fn parse(self, stdout: &[u8]) -> Option<ActiveOutput> {
@@ -213,6 +258,9 @@ impl Probe {
             Probe::Sway => parse_sway_outputs(stdout),
             Probe::Niri => parse_niri_output(stdout),
             Probe::KWinGdbus | Probe::KWinDbusSend => parse_kwin_output_name(stdout),
+            // vidow's reply is JSON rather than a command's stdout; see
+            // `super::vidow::Vidow::active_output`.
+            Probe::Vidow => None,
         }
     }
 }
@@ -236,6 +284,7 @@ fn probes_for(session: Session) -> Vec<Probe> {
         Probe::Niri,
         Probe::KWinGdbus,
         Probe::KWinDbusSend,
+        Probe::Vidow,
     ]
     .into_iter()
     .filter(|probe| session == Session::Unknown || probe.session() == session)
@@ -248,14 +297,7 @@ fn probes_for(session: Session) -> Vec<Probe> {
 /// output holding the keyboard focus. Focus is the fallback.
 pub fn active_output() -> Option<ActiveOutput> {
     for probe in probes() {
-        let command = probe.command();
-        let Ok(output) = Command::new(command.program).args(command.args).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        if let Some(active) = probe.parse(&output.stdout) {
+        if let Some(active) = probe.ask() {
             return Some(active);
         }
     }
@@ -611,7 +653,7 @@ mod tests {
     fn probe_commands_name_the_focused_output_queries() {
         let commands = probes_for(Session::Unknown)
             .into_iter()
-            .map(Probe::command)
+            .filter_map(Probe::command)
             .collect::<Vec<_>>();
         assert_eq!(commands[0].program, "hyprctl");
         assert_eq!(commands[0].args, ["monitors", "-j"]);
@@ -631,6 +673,11 @@ mod tests {
             commands[4].args.last(),
             Some(&"org.kde.KWin.activeOutputName")
         );
+        // vidow is in the list but has no command: its probe is a request to
+        // its IPC socket, which is why it is filtered out here rather than
+        // being the fifth entry.
+        assert_eq!(commands.len(), 5);
+        assert!(probes_for(Session::Unknown).contains(&Probe::Vidow));
     }
 
     #[test]
@@ -647,6 +694,10 @@ mod tests {
         assert_eq!(detect(Some("KDE:GNOME"), None), Session::KWin);
         assert_eq!(detect(Some("kde"), None), Session::KWin);
         assert_eq!(detect(Some("PLASMA"), None), Session::KWin);
+        // vidow sets this itself when it is the session compositor, so a
+        // session started by a display manager is named without a socket query.
+        assert_eq!(detect(Some("Vidow"), None), Session::Vidow);
+        assert_eq!(detect(None, Some("vidow")), Session::Vidow);
         // The first variable that names a compositor decides, so a stale
         // XDG_SESSION_DESKTOP cannot override XDG_CURRENT_DESKTOP.
         assert_eq!(detect(Some("KDE"), Some("Hyprland")), Session::KWin);
@@ -661,18 +712,43 @@ mod tests {
     fn niris_own_socket_settles_what_the_desktop_variables_cannot() {
         let from = Session::from_environment;
         // A niri started from a TTY: no display manager put its name anywhere.
-        assert_eq!(from(None, None, true), Session::Niri);
+        assert_eq!(from(None, None, true, false), Session::Niri);
         // A niri nested inside another compositor: the outer name is inherited,
         // and the socket is the only thing left that knows better.
         assert_eq!(
-            from(Some("Hyprland"), Some("Hyprland"), true),
+            from(Some("Hyprland"), Some("Hyprland"), true, false),
             Session::Niri
         );
-        assert_eq!(from(Some("KDE"), Some("KDE"), true), Session::Niri);
+        assert_eq!(from(Some("KDE"), Some("KDE"), true, false), Session::Niri);
         // The other way round -- Hyprland running inside niri -- keeps the
         // outer niri's socket in the environment; it must not be read as ours.
-        assert_eq!(from(Some("Hyprland"), None, false), Session::Hyprland);
-        assert_eq!(from(None, None, false), Session::Unknown);
+        assert_eq!(
+            from(Some("Hyprland"), None, false, false),
+            Session::Hyprland
+        );
+        assert_eq!(from(None, None, false, false), Session::Unknown);
+    }
+
+    /// vidow's socket is the same kind of evidence niri's is, and it is read
+    /// the same way: a vidow nested inside another compositor keeps the outer
+    /// session's desktop variables, so the socket is what says which compositor
+    /// is actually behind this client.
+    #[test]
+    fn vidows_own_socket_settles_what_the_desktop_variables_cannot() {
+        let from = Session::from_environment;
+        // A vidow started from a TTY, with nothing naming it.
+        assert_eq!(from(None, None, false, true), Session::Vidow);
+        // A vidow nested inside Hyprland: the outer name is inherited and wrong.
+        assert_eq!(
+            from(Some("Hyprland"), Some("Hyprland"), false, true),
+            Session::Vidow
+        );
+        // vidow's own desktop variable is not needed when the socket answers,
+        // and the socket is not needed when the variable names it.
+        assert_eq!(from(Some("Vidow"), None, false, false), Session::Vidow);
+        // A display is one compositor's, so both sockets cannot name it; when
+        // they disagree, niri's answer is the one that was already there.
+        assert_eq!(from(None, None, true, true), Session::Niri);
     }
 
     #[test]
@@ -687,6 +763,7 @@ mod tests {
         assert_eq!(probes_for(Session::Hyprland), vec![Probe::Hyprland]);
         assert_eq!(probes_for(Session::Sway), vec![Probe::Sway]);
         assert_eq!(probes_for(Session::Niri), vec![Probe::Niri]);
+        assert_eq!(probes_for(Session::Vidow), vec![Probe::Vidow]);
         assert_eq!(
             probes_for(Session::Unknown),
             vec![
@@ -695,6 +772,7 @@ mod tests {
                 Probe::Niri,
                 Probe::KWinGdbus,
                 Probe::KWinDbusSend,
+                Probe::Vidow,
             ]
         );
     }

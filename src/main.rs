@@ -1866,6 +1866,7 @@ mod tests {
             Session::Hyprland,
             Session::Sway,
             Session::KWin,
+            Session::Vidow,
             Session::Unknown,
         ] {
             let never = &mut |_: &str, _: bool| -> Result<Frame> {

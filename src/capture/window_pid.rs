@@ -57,11 +57,20 @@ fn pid_for_session<R: WindowCommandRunner>(
         Session::Hyprland => hyprland_pid(runner, name),
         Session::Niri => niri_pid(runner, name),
         Session::KWin => kwin_pid(runner, name),
+        Session::Vidow => vidow_pid(runner, name),
         // Sway has no ext_foreign_toplevel, so a window recording never runs
         // on it.  That is not an error here — the caller falls back to the
         // microphone or to silence, and says which.
         _ => Ok(None),
     }
+}
+
+/// vidow: its `windows` query lists every window with its `pid`, and vidow
+/// implements the protocols a window recording is built on
+/// (`ext_foreign_toplevel_list_v1`, `ext_image_copy_capture_v1`), so this is
+/// another compositor where `--app-audio` can work.
+fn vidow_pid<R: WindowCommandRunner>(runner: &R, name: &Name) -> Result<Option<i32>> {
+    super::vidow::Vidow::new(runner).pid_for(name)
 }
 
 /// KWin: the scripting probe lists every window with its `pid`, `class` and

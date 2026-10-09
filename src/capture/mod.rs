@@ -6,6 +6,7 @@ pub mod dmabuf;
 pub mod hypr_cursor;
 pub mod kwin;
 pub mod niri;
+pub mod vidow;
 pub mod window;
 pub mod window_blend;
 pub mod window_copy;

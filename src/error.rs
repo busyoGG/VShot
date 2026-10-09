@@ -62,6 +62,11 @@ pub enum VshotError {
     KwinScreenShot(String),
     #[error("niri's window screenshot failed: {0}")]
     NiriScreenshot(String),
+    /// A query to vidow's own IPC socket — the connect, the one-line JSON
+    /// exchange, or a reply vidow refused.  Vidow is the one compositor vshot
+    /// asks this way, so the message names the socket and the command.
+    #[error("vidow's IPC failed: {0}")]
+    VidowIpc(String),
     #[error("KDE denied the screenshot: {0}")]
     ScreenshotDenied(String),
     #[error("screen capture timed out before the compositor returned a frame")]
@@ -162,6 +167,7 @@ impl VshotError {
                 | Self::MissingCapability(_)
                 | Self::NoCaptureBackend(_)
                 | Self::KwinScreenShot(_)
+                | Self::VidowIpc(_)
                 | Self::ScreenshotDenied(_)
         )
     }

@@ -44,7 +44,7 @@ Shared modifiers
   --hdr-format        avif (default)|hdr, the file beside the PNG when the
                       capture carries HDR content
 
-Compositors: wlroots sessions (Hyprland, Sway, labwc, niri) through
+Compositors: wlroots sessions (Hyprland, Sway, labwc, niri, vidow) through
 wlr-screencopy; KWin/Plasma through org.kde.KWin.ScreenShot2, granted only to a
 client whose installed desktop file declares
 `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` -- the package
@@ -192,7 +192,7 @@ composed as it is laid out and the gaps between outputs stay transparent."#
     /// Capture the focused window, or pick one interactively.
     #[command(
         after_help = r#"`active` resolves the focused window from compositor metadata where vshot can
-query it (Hyprland, Sway, KWin/Plasma) and falls back to the captured pixels;
+query it (Hyprland, Sway, KWin/Plasma, vidow) and falls back to the captured pixels;
 `pick` highlights the windows of the live desktop (the rest dimmed) and captures
 the one you click. Picking re-captures the frame after the click, so the
 annotations go on the frame captured after the pick."#
@@ -404,8 +404,8 @@ fallback composition instead of the GPU overlay."#
         no_mic: bool,
         /// Record the window's own audio, summed with `--mic` into the one
         /// track. `record window` only, and not with --portal. The pid comes
-        /// from the compositor: Hyprland, niri and KWin report it, Sway and
-        /// labwc have none and say so.
+        /// from the compositor: Hyprland, niri, KWin and vidow report it, Sway
+        /// and labwc have none and say so.
         #[arg(long = "app-audio", global = true)]
         app_audio: bool,
         /// Follow the focus between windows: `--follow NAME`, repeated, names

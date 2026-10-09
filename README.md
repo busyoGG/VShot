@@ -4,9 +4,9 @@
 
 > **本项目是纯 vibe coding 项目**：需求由人提，代码与文档由 AI 写。
 
-Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕获采用**严格冻结**：先把桌面拍成静态帧，之后所有选择与标注都在那一帧上做，选区期间屏幕上没有任何东西会动。已适配 Hyprland、niri、KWin/Plasma、Sway，以及任何提供 `wlr-screencopy` 的合成器（如 labwc）的基础截屏。
+Rust 写的 Wayland 截图工具，带 Qt 交互界面与常驻 pin 浮层。捕获采用**严格冻结**：先把桌面拍成静态帧，之后所有选择与标注都在那一帧上做，选区期间屏幕上没有任何东西会动。已适配 Hyprland、niri、vidow、KWin/Plasma、Sway，以及任何提供 `wlr-screencopy` 的合成器（如 labwc）的基础截屏。
 
-> **验证程度不一**：Hyprland 全部功能现场实测；niri 的平铺与浮窗截图、**窗口录制与回录**均已实机验证；KWin/Plasma 的 D-Bus 采集、窗口列表与长截图实测过，但 `--cursor`、滚动注入未验证；Sway 与 labwc **没有现场验证**。详见[「合成器适配与验证状态」](#合成器适配与验证状态)。
+> **验证程度不一**：Hyprland 全部功能现场实测；niri 的平铺与浮窗截图、**窗口录制与回录**均已实机验证；KWin/Plasma 的 D-Bus 采集、窗口列表与长截图实测过，但 `--cursor`、滚动注入未验证；vidow 的窗口列表、焦点窗口、窗口 pid 与「用户在哪块屏」走它自己的 IPC（单测覆盖），但**尚未在真实 vidow 会话里实测**；Sway 与 labwc **没有现场验证**。详见[「合成器适配与验证状态」](#合成器适配与验证状态)。
 
 ## 功能
 - **区域截图**——冻结桌面后拖选，或直接给固定 geometry；8 向手柄调整，放大镜与尺寸读数跟随指针
@@ -339,12 +339,14 @@ vshot ocr --json | vshot translate --stdin-ocr --json
 按以下顺序取得焦点窗口：
 
 - **KWin**（`CaptureActiveWindow`）与 **niri**（`niri msg action screenshot-window`）由合成器自己把这扇窗画出来，是唯一直接给出答案、不经过裁剪的一路：KWin 带装饰与阴影（阴影外圈透明），回复里的 `scale` 就是密度；niri 把窗口渲染成 PNG 写到临时路径再读回——niri 的 IPC 报不出平铺窗口的绝对位置，所以这是它上面唯一可行的路线。渲染不含边框（边框画在 tile 上），vshot 换算后补回；半透明窗口会对该输出再抓一帧、在帧上定位这张渲染并裁帧输出，让半透明处透出真实背景，定位失败时复核稳定性并至多重试 3 次。`--no-blend` 跳过整段定位，直接交出 niri 的渲染：绝不错位，但半透明处是空的、边框也不在内；
-- 其余按顺序回落：Hyprland `hyprctl activewindow -j` → Sway `swaymsg -t get_tree` 中 focused node 的 `rect` → KDE Plasma 的 `kdotool` 或一次性 KWin scripting 探针（读 `workspace.activeWindow.frameGeometry`）→ **像素识别**（以上都不可用时，在捕获的帧上自动检测窗口）。
+- 其余按顺序回落：Hyprland `hyprctl activewindow -j` → Sway `swaymsg -t get_tree` 中 focused node 的 `rect` → KDE Plasma 的 `kdotool` 或一次性 KWin scripting 探针（读 `workspace.activeWindow.frameGeometry`）→ **vidow 自己的 IPC**（`windows` 里被标了 `focused` 的那个窗口，连坐标带 `app_id`/`title` 一起给出）→ **像素识别**（以上都不可用时，在捕获的帧上自动检测窗口）。
 
-`--pixel` 跳过前面几路，直接在帧上做像素识别（用于测试检测器，也是只有矩形时的唯一选择）。识别**逐输出**用该输出自己的原生像素进行，候选按可信度分级（边框带 → 泛洪分割 → 闭合描边轮廓 → 整块输出），并且**把合成器画的那条边框包含在内**；合成器不给焦点窗口描有色的边时，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是你指着的那个窗口。无缝无边框平铺（无 gaps、无阴影）没有任何像素信号，此时如实报错。只问**当前会话自己的合成器**（按 `XDG_CURRENT_DESKTOP` / `XDG_SESSION_DESKTOP` 判定，两者都没写合成器名时才把所有探针都试一遍；niri 不看这两个变量，用 `NIRI_SOCKET` 的文件名 `niri.$WAYLAND_DISPLAY.$PID.sock` 认出来）。`VSHOT_PIXEL_DEBUG=1` 打印每一级的判定，`VSHOT_SESSION_DEBUG=1` 打印会话判定结果与依据。
+`--pixel` 跳过前面几路，直接在帧上做像素识别（用于测试检测器，也是只有矩形时的唯一选择）。识别**逐输出**用该输出自己的原生像素进行，候选按可信度分级（边框带 → 泛洪分割 → 闭合描边轮廓 → 整块输出），并且**把合成器画的那条边框包含在内**；合成器不给焦点窗口描有色的边时，候选按「指针所在输出 → 指针命中 → 面积」排序，给出的是你指着的那个窗口。无缝无边框平铺（无 gaps、无阴影）没有任何像素信号，此时如实报错。只问**当前会话自己的合成器**（按 `XDG_CURRENT_DESKTOP` / `XDG_SESSION_DESKTOP` 判定，两者都没写合成器名时才把所有探针都试一遍；niri 不看这两个变量，用 `NIRI_SOCKET` 的文件名 `niri.$WAYLAND_DISPLAY.$PID.sock` 认出来，vidow 同理用 `$XDG_RUNTIME_DIR/vidow-$WAYLAND_DISPLAY.sock` 认出来，配置里起子进程时 vidow 还会直接给 `VIDOW_SOCKET`）。`VSHOT_PIXEL_DEBUG=1` 打印每一级的判定，`VSHOT_SESSION_DEBUG=1` 打印会话判定结果与依据。
 
 ### window pick
-先在**实时桌面**上挑窗口：移动指针高亮指针下的窗口、其余压暗，左上角提示条给出窗口标题与尺寸，左键点击结束挑选，Esc 或右键取消；随后**重新捕获一帧**，把点击位置在当前的窗口列表上重新解析成窗口矩形，并以那一帧开一个与 `region` 相同的编辑会话——因此挑选期间切换工作区、移动窗口都不会让结果停在旧画面上。候选来自合成器的窗口列表（Hyprland `hyprctl clients`、Sway `swaymsg -t get_tree`、KDE KWin scripting 探针），按各自的叠放顺序自底向顶排列，指针命中的取**列表里最后一个包含指针的窗口**；候选跟着指针刷新，指针不动时每 300 ms 也刷一次；列表为空或查询失败时落到像素识别，`--pixel` 则跳过窗口列表、直接在冻结帧上做像素识别并把所有候选交给用户挑。
+先在**实时桌面**上挑窗口：移动指针高亮指针下的窗口、其余压暗，左上角提示条给出窗口标题与尺寸，左键点击结束挑选，Esc 或右键取消；随后**重新捕获一帧**，把点击位置在当前的窗口列表上重新解析成窗口矩形，并以那一帧开一个与 `region` 相同的编辑会话——因此挑选期间切换工作区、移动窗口都不会让结果停在旧画面上。候选来自合成器的窗口列表（Hyprland `hyprctl clients`、Sway `swaymsg -t get_tree`、KDE KWin scripting 探针、vidow 的 `windows`），按各自的叠放顺序自底向顶排列，指针命中的取**列表里最后一个包含指针的窗口**；候选跟着指针刷新，指针不动时每 300 ms 也刷一次；列表为空或查询失败时落到像素识别，`--pixel` 则跳过窗口列表、直接在冻结帧上做像素识别并把所有候选交给用户挑。
+
+**vidow 的叠放顺序问合成器自己**：它的 `windows` 是按创建顺序给的，既不是自底向顶也不是从左到右，浮窗还在平铺窗口之上——所以命中测试改问 `pick-window X Y`，那是 vidow 自己用 `wlr_scene_node_at` 算出来的、指针真正会点到的那个窗口。高亮用的列表仍是 `windows`（带坐标），但「指针下面是哪一扇」不由我们猜。
 
 **niri 是例外**：它没有窗口列表可用，改用 niri 自己的十字选窗，像素由 niri 自己渲染——因此不画压暗 overlay，也没有标注编辑器。`--pixel` 时才回到 overlay + 像素识别。
 
@@ -364,7 +366,7 @@ vshot ocr --json | vshot translate --stdin-ocr --json
 | `--max-frames N` | 6000 | 单次捕获的帧数上限 |
 | `--timeout N` | 120 | 单次捕获的时限（秒） |
 | `--ignore-top N` | 0 | 每帧顶部 N 行不参与匹配，用于会动的吸顶表头 |
-| `--inject M` | `auto` | 滚轮后端：`wlr`（合成器虚拟指针，Hyprland/sway/niri）、`portal`（XDG RemoteDesktop，KDE/GNOME 弹一次授权）、`uinput`（`/dev/uinput`，需要写权限） |
+| `--inject M` | `auto` | 滚轮后端：`wlr`（合成器虚拟指针，Hyprland/sway/niri/vidow）、`portal`（XDG RemoteDesktop，KDE/GNOME 弹一次授权）、`uinput`（`/dev/uinput`，需要写权限） |
 
 `auto` 按"打扰最少"的顺序挑。`VSHOT_LONG_DEBUG_DIR=<dir>` 把每次抓帧存成 `grab-NNNN.png`、每次拼接判定追加到 `steps.log`。
 
@@ -388,7 +390,7 @@ vshot record mics                               # 列出这台机器上能录的
 vshot record stop                               # 停止（读取 pid 文件发信号）
 ```
 
-- **`current` 是哪块屏**：录制时 vshot 在屏幕上没有自己的面、收不到指针事件，所以 `current` 不问 seat 而是问合成器（`hyprctl` / `swaymsg` / `niri msg` / KWin 的 D-Bus，与 pin 判断落点是同一个查询）：能报指针位置时（Hyprland）就是指针所在的那块，否则是焦点所在的那块；都不报告时明确报错，让你用 `monitor NAME` 或 `all`。
+- **`current` 是哪块屏**：录制时 vshot 在屏幕上没有自己的面、收不到指针事件，所以 `current` 不问 seat 而是问合成器（`hyprctl` / `swaymsg` / `niri msg` / KWin 的 D-Bus / vidow 的 IPC，与 pin 判断落点是同一个查询）：能报指针位置时（Hyprland、vidow）就是指针所在的那块，否则是焦点所在的那块；都不报告时明确报错，让你用 `monitor NAME` 或 `all`。
 - **区域录屏（`record region`）**：录一块输出上的矩形，桌面逻辑坐标与 `vshot region --geometry` 同格式（`x,y 宽x高`），必须落在单块输出内（没有合成器调用能复制跨屏区域，跨了会明确报错）。不给 `--geometry` 时在冻结桌面上拖出矩形（同一套选区器），确认前不打开麦克风、不创建文件。wlroots 会话上合成器把矩形直接渲染进 dma-buf，与 `record monitor` 一样零拷贝；编码尺寸是矩形的逻辑尺寸 × 该输出的 scale（2 倍屏上 400×300 录出 800×600）。`--portal` 与 `region` 互斥：portal 的选择器只提供整块屏幕/整扇窗口。
 - **窗口录屏 ≠ 窗口区域录屏**：`record window` 录的是窗口**自己的像素**，由合成器把窗口本身复制出来（`ext_image_copy_capture_v1`）。所以被别的窗口盖住的、被拖到屏幕外一半的、在**别的工作区甚至当前屏幕上看不到**的窗口，录出来都是完整的，窗口背后有什么都不出现在视频里。窗口怎么指定：给 app id 或标题（先整名，再大小写不敏感的子串）、`--pick` 点选，不写就是焦点那扇；合成器没有这套协议时会明确说明，让你改录屏幕。
 - **录制中缩放窗口**：窗口被**缩放**不会中断录制——新尺寸的画面会**等比缩放适配进录制自己的画布**（比画布大就缩小，小则原尺寸居中、两侧加黑边），所以一条 MP4 的帧尺寸始终不变，而文件是这扇窗完整的历史。窗口被**关闭**则在那一处结束，文件正常收尾并在 stderr 说明原因；窗口所在输出**关着/禁用/断开**时永远不会有帧，几秒后会报错而不是一直等。
@@ -396,7 +398,7 @@ vshot record stop                               # 停止（读取 pid 文件发�
 - **编码器（`--encoder`）**：h264（默认）、hevc、av1 三选一，都跑 GPU 的媒体引擎。编码与封装走 ffmpeg 的库（`libavcodec` + `libavformat`，与 wf-recorder 同一条路线），运行时用 `dlopen` 加载，所以没有 ffmpeg 库的机器上截图照常工作，只是 `record` 会说明缺什么；需要 `ffmpeg` 与 `libva`（AMD/Intel 的 VAAPI）。码流每帧都是 IDR（全帧内），任意播放器可读，任何位置都能跳。
 - **编码后端（`--encoder-backend`）**：`auto`（默认）、`vaapi`、`vulkan`、`nvenc` 四选一。`auto` 按**零拷贝优先**试：VAAPI（AMD/Intel）→ Vulkan → NVENC；写死某一个时只用那个，打不开就明确报错并说明是哪一层失败（例如 `no CUDA device for NVENC`）。**每条路都是硬件编码**（`h264/hevc/av1_vaapi`、`_vulkan` 或 `_nvenc`），vshot 里没有任何 x264/x265 之类的 CPU 编码路径；差别只在**帧怎么送到编码器**：VAAPI 与 Vulkan 都能导入合成器的 dma-buf，全程零拷贝，而 **NVENC 没有 dma-buf 导入**，它的帧要经 CPU 搬一趟（所以 CPU 占用略高，编码本身一样在 GPU 上）。**NVIDIA 上要零拷贝就得选 `vulkan`**：那里的 `*_vulkan` 底层就是同一颗 NVENC 硬件单元，而 `*_nvenc` 那条路永远拿不到 dma-buf。多显卡机器上 NVENC 默认用第一个 CUDA 设备，`VSHOT_NVENC_DEVICE=<索引>` 换一个；Vulkan 默认用第一个物理设备，`VSHOT_VULKAN_DEVICE=<索引>` 换一个。NVIDIA 机器还需要 `ffmpeg` 构建时带 `nvenc`（多数发行版默认带）。
 - **麦克风（`--mic`）**：把麦克风录进同一个 MP4，编码是 AAC（ffmpeg 自己的编码器）。不带名字用会话的默认输入设备，给名字或节点序号录别的输入（`wpctl status` 列得出来，序号比如 `--mic 55`）。麦克风在视频编码器之前打开（采样率与声道数要写进 MP4 文件头），样本在每个视频帧后抽干一次，两条轨共用一个时钟。`--no-mic` 在配置文件记着 `cli.record.mic` 时也强制不录；两个都不给就是"按配置"（默认不录）。麦克风走 PipeWire，所以和 `--portal` 一样需要 libpipewire；没有默认输入设备的会话会明确报错并提示看 `wpctl status`。
-- **逐应用音频（`--app-audio`）**：额外录一段所录那扇窗**自己在播的声音**——别的应用在响什么都不会进去。只在 `vshot record window` / `vshot replay start window` 上有意义（其它目标会被拒绝）。它可以**独立使用**，也可以**和 `--mic` 同时给**：麦克风是房间、应用音频是窗口，两者在 Rust 侧**逐样本相加**成 MP4 的那**一条**音轨（不是两条轨道）。窗口的 pid 由合成器报告（Hyprland、niri 会给，KWin 由 scripting 探针报），vshot 拿这个 pid 去 PipeWire 的客户端表里找到该进程的播放节点，只连那一个；Sway 与 labwc 不报窗口 pid，会明确说明做不到，而不是悄悄退回麦克风。窗口没在放声音时保留原有音源（首次录制则只录视频），而不是报错。`--portal` 与 `--app-audio` 互斥；音轨同样是 AAC。
+- **逐应用音频（`--app-audio`）**：额外录一段所录那扇窗**自己在播的声音**——别的应用在响什么都不会进去。只在 `vshot record window` / `vshot replay start window` 上有意义（其它目标会被拒绝）。它可以**独立使用**，也可以**和 `--mic` 同时给**：麦克风是房间、应用音频是窗口，两者在 Rust 侧**逐样本相加**成 MP4 的那**一条**音轨（不是两条轨道）。窗口的 pid 由合成器报告（Hyprland、niri、vidow 会给，KWin 由 scripting 探针报），vshot 拿这个 pid 去 PipeWire 的客户端表里找到该进程的播放节点，只连那一个；Sway 与 labwc 不报窗口 pid，会明确说明做不到，而不是悄悄退回麦克风。窗口没在放声音时保留原有音源（首次录制则只录视频），而不是报错。`--portal` 与 `--app-audio` 互斥；音轨同样是 AAC。
 - **跟随焦点（`--follow`）**：给若干窗口（`--follow NAME`，可重复），录制就跟着焦点在这些窗口之间移动——焦点落在其中哪扇就录哪扇，落在别处时**保持录上一扇**（不中断、不留空档，也不会把那扇窗录进来）。**回录读的是同一份名单、做法略有不同**：焦点不在名单里时它**继续录当前这一扇**（和录像的单向跟随一样），名单里的窗口**全都关掉**才是待机（没有可录的窗口就不录）；焦点换到名单里的另一扇时它**按那扇自己的尺寸重开一段**，而不是把画面缩进旧画布——见[「窗口回录：待机与按窗口重开」](#窗口回录待机与按窗口重开)。`--follow` 与窗口 `NAME`、`--pick` 互斥（它自己就是选窗方式），只对 `record window` 与 `replay start window` 有效。**不带 `--follow` 的 `record window` 会跟随配置里 `cli.record.follow` 记着的窗口**（回录对应 `cli.replay.follow`），`--no-follow` 则对那一次显式关掉。换源走的是**和窗口缩放同一条路**：新窗口的画面等比缩放进开录时的画布，所以**一条 MP4 只有一个帧尺寸**、时间线连续。`--app-audio` 时音轨也跟着换到新窗口的声音，而麦克风那一路**不动**；新窗口的应用若没在放声音，保留上一扇的，不退回麦克风。焦点查询每 250ms 一次，只在给了 `--follow` 时才问合成器；合成器报不出焦点时会**明确报错**而不是永不切换。注意跟随的是**焦点**，不是"正在玩的游戏"：切到不在白名单里的窗口时录制停在上一扇，但那一瞬间的操作不会被收录。
 - **宽度上限 4096**：这是硬件 H.264 编码器的限制（本机 7900 XT 的 VCN 实测如此），所以两台 4K 屏拼合出的 `record all`（5760 宽）会被拒绝并说明原因——录单块屏即可，或改用 `--encoder hevc`（本机可编 7680 宽的全桌面）。单块 4K（3840）没问题。
 - **记住的默认值**：`--encoder`、`--encoder-backend`、`--fps`、`--portal`、`--mic`、`--follow` 不写时，去配置文件的 `cli.record` 段取值（`replay` 对应 `cli.replay` 段，见 [`cli`——命令行默认值](#cli命令行默认值)）；`--no-portal`、`--no-mic` 与 `--no-follow` 是对**那一次**录制把记着的值关掉。`cli.record.follow` 只在**不带窗口名、也不给 `--pick`** 的 `record window` 上生效，别的目标会忽略它（而不是报错）。`vshot record mics` 列出这次会话里能录的音频输入，每行是 `节点序号	节点名	说明`（节点名就是 `--mic` 收的值），设置窗口的麦克风下拉读的正是它。`--app-audio` 只认命令行，不进配置文件。
@@ -596,17 +598,17 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 ## 合成器适配与验证状态
 ### 各功能在用什么机制
 
-| 功能 | Hyprland | niri | KWin/Plasma | Sway | labwc |
-| --- | --- | --- | --- | --- | --- |
-| 截屏 | wlr-screencopy | wlr-screencopy | KWin ScreenShot2 | wlr-screencopy | wlr-screencopy |
-| `window active` | `hyprctl activewindow -j` | niri 自己的 `screenshot-window` | KWin `CaptureActiveWindow` | `swaymsg -t get_tree` | ❌ 无 |
-| `window pick` | `hyprctl clients -j` | niri 自己的十字选窗 | KWin scripting 探针 / `kdotool` | `swaymsg -t get_tree` | ❌ 无 |
-| **录制/回录窗口**（`record window`、`replay start window`） | `ext_image_copy_capture_v1`（窗口自己的 dma-buf） | **合成器自己的 ScreenCast 服务**（`org.gnome.Mutter.ScreenCast`，按窗口 id 抓那扇窗自己的像素，PipeWire 流） | **KWin `ScreenShot2.CaptureWindow`**（按窗口 `QUuid` 抓，CPU 像素） | ❌ 无 | ❌ 无 |
-| 跟随焦点（`--follow`） | ✅ `hyprctl activewindow` | ⚠️ 焦点查询有（`niri msg focused-window`），但走 ScreenCast 服务的窗口录制无法中途换窗 | ✅ scripting 探针 / `kdotool` | ⚠️ 查询有，但窗口录制本身不支持 | ❌ 无 |
-| `--app-audio` 取窗口 pid | `hyprctl clients -j` | ✅ `niri msg windows` 报 pid | ✅ scripting 探针的 `pid` 字段 | ❌ 无 | ❌ 无 |
-| pin 落在哪块屏 | `hyprctl cursorpos` + `monitors -j` | `focused-output`（只跟键盘焦点） | `org.kde.KWin.activeOutputName` | `swaymsg -t get_outputs` | ❌ 无 |
-| 滚动注入 | wlr 虚拟指针 | wlr 虚拟指针 | portal / uinput | wlr 虚拟指针 | uinput |
-| **屏幕标注**（`annotate`） | ✅ wlr-layer-shell（实测） | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 |
+| 功能 | Hyprland | niri | vidow | KWin/Plasma | Sway | labwc |
+| --- | --- | --- | --- | --- | --- | --- |
+| 截屏 | wlr-screencopy | wlr-screencopy | wlr-screencopy | KWin ScreenShot2 | wlr-screencopy | wlr-screencopy |
+| `window active` | `hyprctl activewindow -j` | niri 自己的 `screenshot-window` | vidow IPC 的 `windows`（被标了 `focused` 的那扇） | KWin `CaptureActiveWindow` | `swaymsg -t get_tree` | ❌ 无 |
+| `window pick` | `hyprctl clients -j` | niri 自己的十字选窗 | vidow IPC 的 `windows`（高亮）+ `pick-window X Y`（命中） | KWin scripting 探针 / `kdotool` | `swaymsg -t get_tree` | ❌ 无 |
+| **录制/回录窗口**（`record window`、`replay start window`） | `ext_image_copy_capture_v1`（窗口自己的 dma-buf） | **合成器自己的 ScreenCast 服务**（`org.gnome.Mutter.ScreenCast`，按窗口 id 抓那扇窗自己的像素，PipeWire 流） | `ext_image_copy_capture_v1`（同 Hyprland 一路） | **KWin `ScreenShot2.CaptureWindow`**（按窗口 `QUuid` 抓，CPU 像素） | ❌ 无 | ❌ 无 |
+| 跟随焦点（`--follow`） | ✅ `hyprctl activewindow` | ⚠️ 焦点查询有（`niri msg focused-window`），但走 ScreenCast 服务的窗口录制无法中途换窗 | ✅ `windows` 里的 `focused` 标记 | ✅ scripting 探针 / `kdotool` | ⚠️ 查询有，但窗口录制本身不支持 | ❌ 无 |
+| `--app-audio` 取窗口 pid | `hyprctl clients -j` | ✅ `niri msg windows` 报 pid | ✅ `windows` 报 pid | ✅ scripting 探针的 `pid` 字段 | ❌ 无 | ❌ 无 |
+| pin 落在哪块屏 | `hyprctl cursorpos` + `monitors -j` | `focused-output`（只跟键盘焦点） | `cursor` + `outputs`（指针在哪块就是哪块，否则跟焦点） | `org.kde.KWin.activeOutputName` | `swaymsg -t get_outputs` | ❌ 无 |
+| 滚动注入 | wlr 虚拟指针 | wlr 虚拟指针 | wlr 虚拟指针 | portal / uinput | wlr 虚拟指针 | uinput |
+| **屏幕标注**（`annotate`） | ✅ wlr-layer-shell（实测） | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 | ⚠️ 未测试 |
 
 没有适配的地方会**自动降级**而不是报错：没有窗口列表就落到像素识别，问不到指针在哪块屏就落到 Qt 报的主屏。
 
@@ -615,6 +617,7 @@ X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
 - **逐应用音频 / 麦克风**——在 Hyprland 上实测过隔离（两个 mpv 分别播 880 Hz 与 220 Hz，`--app-audio` 只录到所录窗口的那一路）与混音（`--mic --app-audio` 出**单条** AAC 音轨，两路同时检出）；niri 与 KWin 的 pid 路径只有单元测试与无头实测，未在真实音频会话上验证隔离；Sway 与 labwc 没有窗口 pid 来源，会明确拒绝。**跟随焦点（`--follow`）** 在 Hyprland 上实测过（两个不同尺寸/音调的 mpv，切焦点得到一个连续文件）；**报不出焦点的合成器未实测**。
 - **niri**——平铺与浮窗两条**截图**路径已实机验证（`--no-blend` 可绕开浮窗定位）；**窗口录制/回录走合成器自己的 ScreenCast 服务**（`org.gnome.Mutter.ScreenCast`，不需要 portal、没有 picker、没有授权弹窗），4K 窗口录制、中途改尺寸、窗口关闭收尾、回录的 `status`/`save`/`stop` 都实测过；`--follow` 在这条路上不可用（服务 cast 的是启动时那一扇窗）。**注意一个 niri 侧的限流**：它的 cast 是在**输出渲染循环**里画的，所以会话不活动时渲染基本停摆（实测掉到约 1.3fps）；要让 niri 以正常帧率录制，它的 VT 必须是当前活动 VT。**KWin/Plasma** 的 D-Bus 采集、窗口列表、长截图、窗口录制与回录都已在**无头 `--virtual` KWin** 上实测（含授权被 ksycoca 重写临时拒绝时的重试规则）；**仍未验证**：`--cursor`、窗口点选时的 `--pick` 整段交互、以及滚动注入（需要 KDE 上验收）。
 - **Sway / labwc / GNOME**——Sway 只有探针实现与单元测试，**没有现场验证**；**labwc 等其它提供 wlr-screencopy 的合成器**理论上基础截屏可用，但没有窗口列表与 pin 落点探针，且**没有现场验证**；**GNOME** 不支持，没有实现计划（Mutter 不提供 wlr-screencopy、KWin 那套 D-Bus 服务，也没有 layer-shell）。
+- **vidow**——窗口列表、焦点窗口、窗口 pid、`pick-window` 命中测试与「用户在哪块屏」都走 vidow 自己的 IPC（`$XDG_RUNTIME_DIR/vidow-$WAYLAND_DISPLAY.sock`，或配置起子进程时给的 `VIDOW_SOCKET`），会话判定与 niri 一样靠 socket 名而不是桌面变量；协议侧需要的东西 vidow 都有（`wlr-screencopy`、`wlr-layer-shell`、`ext_foreign_toplevel_list_v1`、`ext_image_copy_capture_v1`、`wlr-virtual-pointer`），所以录屏、窗口录制、长截图的滚动注入都走与 Hyprland 相同的路。**验证程度**：解析与选路有单测（含一个 `--ignored` 的现场用例），但**还没有在真实 vidow 会话里跑过**——窗口录制那条路 vidow 自己也从未被真实的逐窗口客户端跑过。**HDR 不适用**：vidow 没有 `wp_color_manager_v1`，也没有任何色彩变换，它交出的缓冲区就是 sRGB 编码的（10 位输出只是位深更大），所以 vshot 按 SDR 读是对的、不会写出第二份 HDR 文件；要让 vidow 上有 HDR 截图，得先由 vidow 实现 `wp_color_manager_v1`。
 - **屏幕标注（`annotate`）**——只在 **Hyprland** 上实测（画笔、擦除、文字、撤销/重做、每块输出各自的画布与工具栏、截图/录屏时自动藏工具栏）；niri、KWin/Plasma、Sway、labwc 均**未经测试**。
 
 ### 光标（`--cursor`）

@@ -45,6 +45,8 @@ pub enum WindowSource {
     Sway,
     Niri,
     KWin,
+    /// vidow's own window list, over its IPC socket.
+    Vidow,
     /// Detected from the captured frame (accent outline / segmentation).
     Pixel,
 }
@@ -376,6 +378,21 @@ printf '%s\n' "$payload"
 
 pub trait WindowCommandRunner {
     fn run(&self, command: &WindowCommand) -> Result<Output>;
+
+    /// One request to a compositor's own IPC socket, and its reply.
+    ///
+    /// vidow is the compositor this exists for: it answers on a unix socket
+    /// rather than through a command line, and it installs no client to speak
+    /// to it with (`vidowmsg` is `install: false` in its build), so the query
+    /// has to be made from here.  The default is "this runner cannot", which is
+    /// what keeps a test's scripted runner from reaching a real compositor by
+    /// accident — a vidow probe on a machine that happens to be running one
+    /// would otherwise answer with windows that are not the ones under test.
+    fn ask(&self, request: &Value) -> Result<Value> {
+        Err(VshotError::VidowIpc(format!(
+            "this runner has no compositor socket to send `{request}` to"
+        )))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -390,6 +407,10 @@ impl WindowCommandRunner for ProcessWindowRunner {
                 program: command.program.to_string_lossy().into_owned(),
                 source,
             })
+    }
+
+    fn ask(&self, request: &Value) -> Result<Value> {
+        super::vidow::ask_live(request)
     }
 }
 
@@ -426,6 +447,9 @@ impl ProcessWindowProvider {
     /// `None` means the compositor cannot answer (no window list, or nothing
     /// there), which is not an error: the caller keeps what the picker had.
     pub fn window_at(&self, point: Point) -> Option<Rect> {
+        if Session::detect() == Session::Vidow {
+            return self.vidow_window_at(point).map(|window| window.geometry);
+        }
         let windows = self.windows().ok()?;
         topmost_containing(windows.iter().map(|window| window.geometry), point)
     }
@@ -435,11 +459,25 @@ impl ProcessWindowProvider {
     /// compositor's app id and title against the foreign-toplevel list, and a
     /// bare rectangle cannot do that.
     pub fn candidate_at(&self, point: Point) -> Option<WindowCandidate> {
+        if Session::detect() == Session::Vidow {
+            return self.vidow_window_at(point);
+        }
         let windows = self.windows().ok()?;
         windows
             .into_iter()
             .rev()
             .find(|window| window.geometry.contains(point))
+    }
+
+    /// vidow hit-tests a point itself (`pick-window`, through
+    /// `wlr_scene_node_at`), and its answer is the one the pointer gets.  The
+    /// list walk above cannot reproduce it: vidow's list is in creation order
+    /// rather than stacking order, and floating windows sit above tiled ones.
+    fn vidow_window_at(&self, point: Point) -> Option<WindowCandidate> {
+        super::vidow::Vidow::new(&ProcessWindowRunner)
+            .window_at(point)
+            .ok()
+            .flatten()
     }
 }
 
@@ -456,13 +494,22 @@ enum Compositor {
     Sway,
     Niri,
     KWin,
+    /// The one compositor here that answers over a socket rather than a
+    /// command line: its queries go through [`WindowCommandRunner::ask`] and
+    /// [`super::vidow`].  It is last in the list because it is also the one
+    /// whose evidence is checked before this list is walked at all — a vidow
+    /// session is named by its own socket in `Session::detect`, so a session
+    /// that reaches this list as `Unknown` has already been told there is no
+    /// vidow answering.
+    Vidow,
 }
 
-const COMPOSITORS: [Compositor; 4] = [
+const COMPOSITORS: [Compositor; 5] = [
     Compositor::Hyprland,
     Compositor::Sway,
     Compositor::Niri,
     Compositor::KWin,
+    Compositor::Vidow,
 ];
 
 impl Compositor {
@@ -472,6 +519,7 @@ impl Compositor {
             Self::Sway => "Sway",
             Self::Niri => "niri",
             Self::KWin => "KWin",
+            Self::Vidow => "vidow",
         }
     }
 
@@ -481,16 +529,22 @@ impl Compositor {
             Self::Sway => Session::Sway,
             Self::Niri => Session::Niri,
             Self::KWin => Session::KWin,
+            Self::Vidow => Session::Vidow,
         }
     }
 
-    fn active_window_command(self) -> WindowCommand {
-        match self {
+    /// The command that names this compositor's focused window, where there is
+    /// one.  vidow has none: it answers over its own IPC socket, which is what
+    /// [`WindowCommandRunner::ask`] is for, so it is handled before this is
+    /// ever asked.
+    fn active_window_command(self) -> Option<WindowCommand> {
+        Some(match self {
             Self::Hyprland => WindowCommand::hyprland(),
             Self::Sway => WindowCommand::sway(),
             Self::Niri => WindowCommand::niri(),
             Self::KWin => WindowCommand::kwin(),
-        }
+            Self::Vidow => return None,
+        })
     }
 
     fn parse_active_window(self, stdout: &[u8]) -> Result<ActiveWindow> {
@@ -499,12 +553,19 @@ impl Compositor {
             Self::Sway => parse_sway_active_window(stdout),
             Self::Niri => parse_niri_active_window(stdout),
             Self::KWin => parse_kwin_active_window(stdout),
+            // vidow's reply is a JSON object rather than a command's stdout;
+            // `vidow::Vidow::active_window` is what reads it.
+            Self::Vidow => Err(VshotError::ActiveWindowUnavailable(
+                "vidow answers over its IPC socket, not a command line".into(),
+            )),
         }
     }
 
     /// The focused window as this compositor reports it.
     fn active_window<R: WindowCommandRunner>(self, runner: &R) -> Result<ActiveWindow> {
-        let command = self.active_window_command();
+        let Some(command) = self.active_window_command() else {
+            return super::vidow::Vidow::new(runner).active_window();
+        };
         let output = runner.run(&command)?;
         if !output.status.success() {
             return Err(VshotError::ActiveWindowUnavailable(match self {
@@ -544,6 +605,9 @@ impl Compositor {
             )),
             Self::KWin => run_command(runner, &WindowCommand::kwin_list())
                 .and_then(|bytes| parse_kwin_windows(&bytes)),
+            // vidow's list is the query itself: every window it manages, with
+            // the layout rectangle the picker highlights with.
+            Self::Vidow => super::vidow::Vidow::new(runner).windows(),
         }
     }
 }
@@ -589,8 +653,8 @@ fn find_windows_for<R: WindowCommandRunner>(
     }
     if reasons.is_empty() {
         return Err(VshotError::WindowPickUnavailable(
-            "this session's compositor has no window list to offer (only Hyprland, Sway and \
-             KWin have one; niri picks through its own crosshair)"
+            "this session's compositor has no window list to offer (only Hyprland, Sway, KWin \
+             and vidow have one; niri picks through its own crosshair)"
                 .into(),
         ));
     }
@@ -638,8 +702,8 @@ fn find_active_window_for<R: WindowCommandRunner>(
     }
     if reasons.is_empty() {
         return Err(VshotError::ActiveWindowUnavailable(
-            "this session's compositor has no active-window query (only Hyprland, Sway, niri \
-             and KWin have one)"
+            "this session's compositor has no active-window query (only Hyprland, Sway, niri, \
+             KWin and vidow have one)"
                 .into(),
         ));
     }
@@ -1801,6 +1865,52 @@ mod tests {
         }
     }
 
+    /// Answers vidow's IPC queries from a canned window list.
+    ///
+    /// It exists for two reasons: the queries are not commands, so no
+    /// `ScriptedRunner` can stand in for them, and a test must never reach the
+    /// vidow that may be running on the machine — the whole point of asking
+    /// through the runner is that the socket is only opened in production.
+    struct VidowRunner {
+        windows: Value,
+        asked: RefCell<Vec<String>>,
+    }
+
+    impl VidowRunner {
+        fn listing(windows: Value) -> Self {
+            Self {
+                windows,
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl WindowCommandRunner for VidowRunner {
+        fn run(&self, command: &WindowCommand) -> Result<Output> {
+            self.asked
+                .borrow_mut()
+                .push(command.program.to_string_lossy().into_owned());
+            Err(VshotError::VidowIpc(
+                "vidow answers over its socket, not by running a command".into(),
+            ))
+        }
+
+        fn ask(&self, request: &Value) -> Result<Value> {
+            let command = request.get("cmd").and_then(Value::as_str).unwrap_or("");
+            self.asked.borrow_mut().push(command.to_owned());
+            match command {
+                "windows" => Ok(serde_json::json!({ "ok": true, "result": self.windows })),
+                other => Err(VshotError::VidowIpc(format!(
+                    "this test has no answer for `{other}`"
+                ))),
+            }
+        }
+    }
+
     /// Only the session's own compositor is asked. A Plasma session started
     /// from a Hyprland terminal keeps `HYPRLAND_INSTANCE_SIGNATURE`, so
     /// `hyprctl` goes on answering — and its answer is a window on a desktop
@@ -1856,6 +1966,7 @@ mod tests {
         assert_eq!(compositors_for(Session::Hyprland), [Compositor::Hyprland]);
         assert_eq!(compositors_for(Session::Sway), [Compositor::Sway]);
         assert_eq!(compositors_for(Session::KWin), [Compositor::KWin]);
+        assert_eq!(compositors_for(Session::Vidow), [Compositor::Vidow]);
         assert_eq!(compositors_for(Session::Unknown), COMPOSITORS);
         // niri is asked about the focused window (which `--follow` and
         // `record window active` need) but not about a rectangle list, which
@@ -1884,5 +1995,58 @@ mod tests {
         let error = find_windows_for(Session::Niri, &runner).unwrap_err();
         assert!(format!("{error}").contains("no rectangle list"), "{error}");
         assert!(runner.asked().is_empty(), "no command should have run");
+    }
+
+    /// vidow is asked over its IPC socket, and its reply carries everything
+    /// `window active` needs in one object: the geometry, the labels, and the
+    /// window id a later query can be aimed at.  No command runs — there is
+    /// none to run.
+    #[test]
+    fn a_vidow_session_reads_the_focused_window_from_its_ipc() {
+        let runner = VidowRunner::listing(serde_json::json!([
+            { "id": 4, "app_id": "mpv", "title": "video.mp4", "pid": 4004,
+              "mapped": true, "visible": true, "minimized": false, "popup": false,
+              "focused": false,
+              "geometry": { "x": 1000, "y": 40, "width": 400, "height": 300 } },
+            { "id": 3, "app_id": "Alacritty", "title": "~/Dev", "pid": 4003,
+              "mapped": true, "visible": true, "minimized": false, "popup": false,
+              "focused": true,
+              "geometry": { "x": 100, "y": 40, "width": 800, "height": 600 } },
+        ]));
+        let window = find_active_window_for(Session::Vidow, &runner).unwrap();
+        assert_eq!(window.source, WindowSource::Vidow);
+        assert_eq!(window.geometry, Some(Rect::new(100, 40, 800, 600)));
+        assert_eq!(window.app_id, "Alacritty");
+        assert_eq!(window.title, "~/Dev");
+        assert_eq!(window.handle.as_deref(), Some("3"));
+        assert_eq!(runner.asked(), ["windows"]);
+    }
+
+    /// The same reply is the picker's list, minus the windows the user cannot
+    /// point at.
+    #[test]
+    fn a_vidow_session_lists_windows_for_picking() {
+        let runner = VidowRunner::listing(serde_json::json!([
+            { "id": 3, "app_id": "Alacritty", "title": "~/Dev",
+              "mapped": true, "visible": true, "minimized": false, "popup": false,
+              "focused": true,
+              "geometry": { "x": 100, "y": 40, "width": 800, "height": 600 } },
+            { "id": 5, "app_id": "a", "title": "scrolled away",
+              "mapped": true, "visible": false, "minimized": false, "popup": false,
+              "focused": false,
+              "geometry": { "x": 0, "y": 0, "width": 100, "height": 100 } },
+        ]));
+        let windows = find_windows_for(Session::Vidow, &runner).unwrap();
+        assert_eq!(
+            windows,
+            [WindowCandidate {
+                geometry: Rect::new(100, 40, 800, 600),
+                label: "Alacritty — ~/Dev".into(),
+                app_id: "Alacritty".into(),
+                title: "~/Dev".into(),
+                handle: None,
+            }]
+        );
+        assert_eq!(runner.asked(), ["windows"]);
     }
 }
