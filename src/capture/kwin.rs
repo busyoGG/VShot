@@ -555,7 +555,10 @@ fn map_method_error(name: &str, detail: Option<&str>, target: &str) -> VshotErro
 /// with that path, and requires it to declare the restricted interface — there
 /// is nothing for the user to click, which is why a session that only ever sees
 /// this error cannot be talked into granting it.  Naming the running executable
-/// keeps the desktop file to write unambiguous.
+/// keeps the desktop file unambiguous, and the command to write one is spelled
+/// out because the people who hit this are exactly the ones who built from
+/// source and copied the binary into place, where no package ever wrote a
+/// desktop file for them.
 fn not_authorized_hint() -> String {
     let executable = std::env::current_exe()
         .map(|path| path.display().to_string())
@@ -563,13 +566,14 @@ fn not_authorized_hint() -> String {
     format!(
         "KWin shows no permission prompt: it authorizes the ScreenShot2 interface \
          only for a client whose desktop file declares \
-         `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`.  This binary \
-         is `{executable}`.  Installing the package provides such a desktop file \
-         for `/usr/bin/vshot`; a build run straight out of `target/` needs its own \
-         desktop file whose `Exec=` starts with `{executable}` plus that key, and \
-         then `kbuildsycoca6 --noincremental`.  The compositor-side \
-         KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 disables the check and is meant \
-         for development only."
+         `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` and whose `Exec=` \
+         names this binary (`{executable}`).  The package installs that file for \
+         `/usr/bin/vshot`; a build run from `target/` or copied into place by hand has \
+         none, which is what this error means.  Write one for this binary, then rebuild \
+         KWin's service cache:\n  \
+         mkdir -p ~/.local/share/applications && printf '[Desktop Entry]\\nType=Application\\nName=VShot\\nExec=%s\\nNoDisplay=true\\nX-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\\n' '{executable}' > ~/.local/share/applications/vshot.desktop && kbuildsycoca6 --noincremental\n  \
+         The compositor-side KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 disables the check \
+         and is meant for development only."
     )
 }
 
@@ -901,6 +905,11 @@ mod tests {
             "{hint}"
         );
         assert!(hint.contains("kbuildsycoca6"), "{hint}");
+        // The people who hit this built from source, so the hint has to say
+        // where to put the file and give them a command they can paste, not
+        // just name the key and leave them to compose it.
+        assert!(hint.contains("~/.local/share/applications"), "{hint}");
+        assert!(hint.contains("printf '[Desktop Entry]"), "{hint}");
         assert!(
             hint.contains("KWIN_SCREENSHOT_NO_PERMISSION_CHECKS"),
             "{hint}"
