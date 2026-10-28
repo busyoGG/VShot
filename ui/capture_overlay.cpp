@@ -659,18 +659,17 @@ QString toolName(Tool tool)
 
 /// The inverse of [`toolName`], for a name that came out of the config file.
 ///
-/// "select" is the name the old Select tool was remembered under -- still the
-/// default in every config file written before that tool went away -- and it
-/// names the state a session opens in rather than a tool to arm: nothing
-/// drawing, the marks and the selection the only things a press can act on, and
-/// no button lit.  The toolbar has a Select button again, but arming *it* is not
-/// something the file remembers: it is the same state with one difference -- a
-/// bare drag on a framed selection moves the frame instead of reframing with it
-/// -- and nothing a session has ever done needs that difference to outlive it.
-/// An unrecognized name is a typo in a file the user can edit; it comes back
-/// empty and lands on the same state.
+/// "select" names the Select tool, which arms like any other: the toolbar
+/// lights its button and a bare drag on a framed selection moves the frame
+/// instead of reframing with it.  An empty name is the other state -- nothing
+/// armed, no button lit -- and a fresh region session opens there when the
+/// user did not choose a tool.  An unrecognized name is a typo in a file the
+/// user can edit; it comes back empty and lands on that state.
 std::optional<Tool> toolForName(const QString &name)
 {
+    if (name == QStringLiteral("select")) {
+        return Tool::Select;
+    }
     if (name == QStringLiteral("rectangle")) {
         return Tool::Rectangle;
     }
@@ -5253,26 +5252,16 @@ OverlayController::OverlayController(Session session, QObject *parent)
         style.wavelength = std::max(6u * preferences.width, 18u);
         toolStyles_.insert(toolName(entry), style);
     }
-    // The remembered tool is restored where a tool is already meaningful, and
-    // *not* at the open of a session whose first gesture is the frame itself.
-    //
-    // A session that arrives with its selection made -- the window picker's
-    // follow-up (`beginPresetEdit`) and the pin editor, whose whole image is
-    // preselected in `beginPinEdit` -- has nothing left to frame, so it opens
-    // on the user's tool.  A fresh region session does not: its first step is
-    // dragging the rectangle, and arming a tool there would make that first
-    // click start a mark instead, which reads as "region capture is broken".
-    // Nor does it arm one when the frame is done.  The frame is a frame, and
-    // the tool the config remembers is a default for a *new* mark, not a
-    // decision the session gets to make for the user: opening armed meant the
-    // first click inside a fresh region inked instead of letting the user
-    // adjust the frame they had just drawn.  Region stays unarmed until a tool
-    // is picked, and an unarmed drag re-frames.  Scrolling capture
-    // (`selectOnly_`) and picking (`pickMode_`) stay unarmed either way: they
-    // have no annotation step for a tool to belong to.
-    const bool startsInEdit =
-        session_.selection.has_value() || session_.mode == QStringLiteral("pin-edit");
-    if (!selectOnly_ && !pickMode_ && !translateMode_ && startsInEdit) {
+    // The remembered tool is what the session opens on, wherever a tool can be
+    // in hand.  An empty value means nothing armed -- the default -- so a fresh
+    // region session still starts with the frame itself, and its first drag
+    // frames the region rather than starting a mark.  A user who picked a tool
+    // in the settings asked for it to be in hand from the first click; a user
+    // who picked Select gets Select's own difference (a bare drag on a framed
+    // selection moves the frame).  Scrolling capture (`selectOnly_`) and
+    // picking (`pickMode_`) stay unarmed either way: they have no annotation
+    // step for a tool to belong to.
+    if (!selectOnly_ && !pickMode_ && !translateMode_) {
         tool_ = toolForName(preferences.tool);
     }
 }

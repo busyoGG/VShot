@@ -187,13 +187,15 @@ fn run() -> Result<()> {
     // scene the mark was placed on is the file's own SDR half.
     capture.set_tone_map(request.tone_map);
 
-    // Everything below freezes the desktop, and the annotation overlay is a
-    // window like any other: left alone, its toolbar would be baked into the
-    // frozen frame and then into the file.  The guard hides it for as long as
-    // this process lives, so it covers every route here -- and it drops on the
-    // way out, error or not, so nothing stays hidden.  Annotations themselves
-    // are meant to be in the picture, which is why this hides the toolbar and
-    // not the overlay.
+    // Only the routes that draw on or read the desktop map an overlay (see
+    // `show_frozen` below): a plain monitor or whole-workspace capture takes
+    // its frame and writes it without freezing anything.  The annotation
+    // overlay is a window like any other, so wherever it does appear, its
+    // toolbar would be baked into the frozen frame and then into the file.
+    // The guard hides it for as long as this process lives, and it drops on
+    // the way out, error or not, so nothing stays hidden.  Annotations
+    // themselves are meant to be in the picture, which is why this hides the
+    // toolbar and not the overlay.
     let _annotate = annotate::CaptureGuard::for_screenshot();
 
     // niri picks the window itself and then hands over its picture, which is
@@ -466,17 +468,13 @@ fn run() -> Result<()> {
             }
             CaptureTarget::Monitor(name) => {
                 let frame = selection::crop_monitor(&scene, name)?;
-                wayland.show_frozen(false)?;
                 let density = scene
                     .output_by_name(name)
                     .map_or(scene.scale(), |output| output.scale);
                 hdr_frame = hdr_for_name(&hdr_outputs, &scene, name, None, request.tone_map.hdr);
                 (frame, density)
             }
-            CaptureTarget::All => {
-                wayland.show_frozen(false)?;
-                (scene.frame().clone(), scene.scale())
-            }
+            CaptureTarget::All => (scene.frame().clone(), scene.scale()),
             // A window the compositor drew itself never reaches this arm — that
             // happens above, before the scene is composed.  So this is the
             // window list, and then the frozen frame.
@@ -485,7 +483,6 @@ fn run() -> Result<()> {
                 // tiled windows) falls through to the pixel fallback below,
                 // which at least finds the window under the pointer.
                 if let Some(geometry) = metadata_window.and_then(|window| window.geometry) {
-                    wayland.show_frozen(false)?;
                     let geometry = selection::validate_selection(&scene, geometry)?;
                     hdr_frame =
                         hdr_for_region(&hdr_outputs, &scene, geometry, request.tone_map.hdr);
@@ -1022,9 +1019,9 @@ fn run_translate(
             let scene = capture_scene(&mut capture, &topology, false)?;
             let geometry = selection::validate_selection(&scene, geometry)?;
             let (frame, _density) = crop_native(&scene, geometry)?;
-            // The overlays have to be gone before anything is printed: an
-            // error path that leaves them mapped would freeze the desktop.
-            wayland.show_frozen(false)?;
+            // Nothing was mapped on this route -- the geometry came from the
+            // command line -- but a cleanup that is already a no-op is cheaper
+            // than reasoning about every error path above.
             let cleanup = wayland.destroy_overlays();
             let lines = ocr::recognize(&frame);
             cleanup?;

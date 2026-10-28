@@ -29,11 +29,11 @@ namespace {
 /// at the call sites because two readers depend on them: the loader below, and
 /// the settings window's combo boxes, which must offer exactly what the loader
 /// will accept.
-const QStringList kToolNames = {QStringLiteral("rectangle"), QStringLiteral("ellipse"),
-                                QStringLiteral("arrow"), QStringLiteral("line"),
-                                QStringLiteral("wave"), QStringLiteral("bezier"),
-                                QStringLiteral("pen"), QStringLiteral("text"),
-                                QStringLiteral("mosaic")};
+const QStringList kToolNames = {QStringLiteral("select"), QStringLiteral("rectangle"),
+                                QStringLiteral("ellipse"), QStringLiteral("arrow"),
+                                QStringLiteral("line"), QStringLiteral("wave"),
+                                QStringLiteral("bezier"), QStringLiteral("pen"),
+                                QStringLiteral("text"), QStringLiteral("mosaic")};
 const QStringList kSelectModeNames = {QStringLiteral("precise"), QStringLiteral("loose")};
 const QStringList kDashNames = {QStringLiteral("solid"), QStringLiteral("dashed"),
                                 QStringLiteral("dotted")};
@@ -459,17 +459,14 @@ void writeCliSection(QJsonObject &root, const QJsonObject &cli)
 EditorPreferences readEditor(const QJsonObject &editor)
 {
     EditorPreferences preferences;
-    // "select" is accepted as a synonym for nothing armed: it is the name the
-    // tool that went away was remembered under, and every config file written
-    // before then carries it.  Reading it as a typo would silently move the
-    // user onto the first tool in the list.  The toolbar has a Select button
-    // again, but it is not one of the names here: arming it is the same state
-    // as opening unarmed except for what a bare drag on a framed selection
-    // does, and no session has ever needed that difference to be remembered.
+    // The opening tool is one of the tools the toolbar offers, Select
+    // included.  An empty value is a real choice -- open with nothing armed,
+    // the state a fresh region session needs so its first drag frames the
+    // region instead of starting a mark -- and it is the default for a file
+    // that says nothing.
     const QString remembered =
-        readChoice(editor, QStringLiteral("tool"), QStringLiteral("select"),
-                   QStringList(kToolNames) << QStringLiteral("select"));
-    preferences.tool = remembered == QStringLiteral("select") ? QString() : remembered;
+        readChoice(editor, QStringLiteral("tool"), QString(), kToolNames);
+    preferences.tool = remembered;
     preferences.selectMode =
         readChoice(editor, QStringLiteral("selectMode"), preferences.selectMode,
                    kSelectModeNames);

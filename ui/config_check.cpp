@@ -210,15 +210,15 @@ void checkBadValuesFallBackFieldByField()
     expect(config.cli.monitor == QStringLiteral("DP-3"), "a good monitor name survives");
 }
 
-// A config file written before the Select tool went away names it, and the state
-// it named is the one the editor still opens in: nothing armed.  Reading the
-// name as a typo would quietly move the user onto the first tool in the list.
-void checkTheRetiredSelectToolStillMeansNothingArmed()
+// Select is a tool the toolbar offers again, so the config keeps it like any
+// other: a file that names it opens on it.  An empty value is the other state
+// -- nothing armed -- and stays the default.
+void checkTheSelectToolRoundTrips()
 {
-    std::printf("--- the retired select tool still means nothing armed ---------------\n");
+    std::printf("--- the Select tool survives the config ----------------------------\n");
     writeConfig(QStringLiteral(R"({"editor": {"tool": "select"}})"));
-    expect(vshot::loadConfig().editor.tool.isEmpty(),
-           "a config naming the retired Select tool opens unarmed",
+    expect(vshot::loadConfig().editor.tool == QStringLiteral("select"),
+           "a config naming the Select tool opens on it",
            vshot::loadConfig().editor.tool);
 }
 
@@ -1186,7 +1186,7 @@ int main(int argc, char **argv)
     checkDefaultsWhenTheFileIsMissing();
     checkUnknownKeysAreIgnored();
     checkBadValuesFallBackFieldByField();
-    checkTheRetiredSelectToolStillMeansNothingArmed();
+    checkTheSelectToolRoundTrips();
     checkTheHdrFormatRoundTripsAndIsCleared();
     checkTheToneMapRoundTripsAndIsCleared();
     checkTheHdrAreaTestRoundTripsAndKeepsItsZero();
