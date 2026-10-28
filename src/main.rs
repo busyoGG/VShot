@@ -171,7 +171,29 @@ fn run() -> Result<()> {
         }
         Action::Capture(request) => request,
     };
+    // `VSHOT_TIMING=1` prints how long each phase took.  A capture that feels
+    // slow is otherwise a single number, and the phases behind it -- the
+    // connection, the compositor's frame, the crop, the encode -- are fixed by
+    // different code and by different compositors.
+    let timing = std::env::var_os("VSHOT_TIMING").is_some();
+    let mut mark_at = std::time::Instant::now();
+    macro_rules! mark {
+        ($label:expr) => {
+            if timing {
+                eprintln!(
+                    "vshot timing: {} = {:.1} ms",
+                    $label,
+                    mark_at.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            mark_at = std::time::Instant::now();
+            // The last mark is never read; this keeps the reset honest to the
+            // compiler without a blanket allow.
+            let _ = &mark_at;
+        };
+    }
     let mut wayland = WaylandSession::connect()?;
+    mark!("wayland connect");
     // The topology is what the scene is composed from, so most routes need it.
     // A compositor's own window screenshot does not: it hands over the window's
     // pixels itself and never looks at an output.  A flipped or rotated output
@@ -180,6 +202,7 @@ fn run() -> Result<()> {
     let topology = wayland.output_infos();
     let known_outputs: &[OutputInfo] = topology.as_deref().unwrap_or(&[]);
     let mut capture = Capturer::connect()?;
+    mark!("capturer connect");
     // An HDR output's frozen scene is tone-mapped down by the capture itself,
     // and the SDR half of the file is tone-mapped later from the annotated HDR
     // frame.  Both have to be the same map: the user draws over the frozen
@@ -330,6 +353,7 @@ fn run() -> Result<()> {
     } else {
         let output_infos = topology?;
         let scene = capture_scene(&mut capture, &output_infos, request.cursor)?;
+        mark!("scene capture");
         // One HDR readback per output that offers it, taken now so the SDR and
         // HDR halves describe the same instant.  Targets that reconstruct a
         // window or compose every output never keep an HDR half.
@@ -450,21 +474,38 @@ fn run() -> Result<()> {
                 (frame, density)
             }
             CaptureTarget::Monitor(name) if name == "current" => {
-                wayland.show_frozen(false)?;
-                let output_id = wayland.wait_for_current_output()?;
-                let density = scene
-                    .output(output_id)
-                    .map_or(scene.scale(), |output| output.scale);
-                hdr_frame = scene.output(output_id).and_then(|output| {
-                    hdr_for_name(
-                        &hdr_outputs,
-                        &scene,
-                        &output.name,
-                        None,
-                        request.tone_map.hdr,
-                    )
-                });
-                (selection::crop_output(&scene, output_id)?, density)
+                // The compositor knows which output the user is on, and asking
+                // it is one round trip.  Mapping an overlay and waiting for a
+                // pointer enter is the fallback; it costs the whole five-second
+                // timeout on a compositor that only maps surfaces carrying a
+                // buffer -- vidow is one -- because the enter never arrives.
+                if let Some(output) =
+                    capture::active_output::active_output().and_then(|active| active.name)
+                {
+                    let frame = selection::crop_monitor(&scene, &output)?;
+                    hdr_frame =
+                        hdr_for_name(&hdr_outputs, &scene, &output, None, request.tone_map.hdr);
+                    let density = scene
+                        .output_by_name(&output)
+                        .map_or(scene.scale(), |output| output.scale);
+                    (frame, density)
+                } else {
+                    wayland.show_frozen(false)?;
+                    let output_id = wayland.wait_for_current_output()?;
+                    let density = scene
+                        .output(output_id)
+                        .map_or(scene.scale(), |output| output.scale);
+                    hdr_frame = scene.output(output_id).and_then(|output| {
+                        hdr_for_name(
+                            &hdr_outputs,
+                            &scene,
+                            &output.name,
+                            None,
+                            request.tone_map.hdr,
+                        )
+                    });
+                    (selection::crop_output(&scene, output_id)?, density)
+                }
             }
             CaptureTarget::Monitor(name) => {
                 let frame = selection::crop_monitor(&scene, name)?;
@@ -668,7 +709,9 @@ fn run() -> Result<()> {
             pin_result,
         );
     }
-    finish_capture(
+    mark!("route and crop");
+    let finishing_at = std::time::Instant::now();
+    let written = finish_capture(
         &edits,
         frame,
         hdr_frame,
@@ -680,7 +723,14 @@ fn run() -> Result<()> {
         &request,
         &mut wayland,
         pin_result,
-    )
+    );
+    if timing {
+        eprintln!(
+            "vshot timing: write = {:.1} ms",
+            finishing_at.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    written
 }
 
 /// Reports a finished scrolling capture: what it stitched, and -- when not one

@@ -94,26 +94,33 @@ impl Session {
     }
 
     pub(crate) fn detect() -> Self {
-        let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
-        let session = std::env::var("XDG_SESSION_DESKTOP").ok();
-        // niri and vidow are asked directly rather than through the variables,
-        // for the reason spelled out in `from_environment`.
-        let niri_owns_this = super::niri::owns_this_connection();
-        let vidow_owns_this = super::vidow::owns_this_connection();
-        let decision = Self::from_environment(
-            current.as_deref(),
-            session.as_deref(),
-            niri_owns_this,
-            vidow_owns_this,
-        );
-        report_session(
-            decision,
-            current.as_deref(),
-            session.as_deref(),
-            niri_owns_this,
-            vidow_owns_this,
-        );
-        decision
+        // The session is a property of the process, not of the call: neither
+        // the desktop variables nor the compositor's socket changes while it
+        // runs.  The probe is two socket round trips, and the window picker
+        // asks for the session on every pointer move, so it is cached.
+        static DETECTED: std::sync::OnceLock<Session> = std::sync::OnceLock::new();
+        *DETECTED.get_or_init(|| {
+            let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
+            let session = std::env::var("XDG_SESSION_DESKTOP").ok();
+            // niri and vidow are asked directly rather than through the variables,
+            // for the reason spelled out in `from_environment`.
+            let niri_owns_this = super::niri::owns_this_connection();
+            let vidow_owns_this = super::vidow::owns_this_connection();
+            let decision = Self::from_environment(
+                current.as_deref(),
+                session.as_deref(),
+                niri_owns_this,
+                vidow_owns_this,
+            );
+            report_session(
+                decision,
+                current.as_deref(),
+                session.as_deref(),
+                niri_owns_this,
+                vidow_owns_this,
+            );
+            decision
+        })
     }
 
     /// The session, from every piece of evidence the environment offers: the

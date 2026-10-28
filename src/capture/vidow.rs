@@ -128,9 +128,18 @@ fn socket_candidates_from(
 /// therefore falls through to the derived name rather than taking the whole
 /// session down with it.
 pub(crate) fn live_socket() -> Option<PathBuf> {
-    socket_candidates()
-        .into_iter()
-        .find(|path| ask_raw(path, &json!({ "cmd": "focused" })).is_ok())
+    // The socket a session talks to does not move for the life of this
+    // process, and the probe is a connect and a round trip.  Without the
+    // cache every `window_at` during a pick -- and every `Session::detect`
+    // behind it -- pays for it again; the picker calls this many times a
+    // second while the pointer moves.
+    static LIVE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    LIVE.get_or_init(|| {
+        socket_candidates()
+            .into_iter()
+            .find(|path| ask_raw(path, &json!({ "cmd": "focused" })).is_ok())
+    })
+    .clone()
 }
 
 /// Is the vidow answering on this display the compositor of *this* session?
