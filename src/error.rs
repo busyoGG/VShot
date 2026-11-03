@@ -32,6 +32,13 @@ pub enum VshotError {
     /// be written in (see `output::HdrFormat`).
     #[error("failed to encode AVIF: {0}")]
     AvifEncode(String),
+    /// Reading an HDR file back.  The counterpart of
+    /// [`VshotError::AvifEncode`], and the one that matters to a pin: a pin is
+    /// handed a file the program wrote earlier, so this is what a corrupt or
+    /// half-written one reports instead of showing the SDR half as if the HDR
+    /// one had never been there.
+    #[error("failed to read {path}: {reason}")]
+    HdrDecode { path: PathBuf, reason: String },
     #[error("failed to write {path}: {source}")]
     WriteFile {
         path: PathBuf,

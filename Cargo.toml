@@ -17,8 +17,17 @@ memmap2 = "0.9.11"
 # hardcodes sRGB / BT.709 whatever the pixels are.  `rav1e` writes the AV1
 # payload and `avif-serialize` the container, so both the sequence header and
 # the `colr` box can say BT.2020 PQ.  See `src/model/avif.rs`.
-rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
-avif-serialize = "0.8.9"
+#
+# Reading AVIF back is `dav1d` (the AV1 decoder, over the system `libdav1d`)
+# and `mp4parse` (the ISOBMFF container).  Both are behind the `avif` feature:
+# they are the expensive part of the build, and a build that does not want the
+# AVIF codec should not pay for them.  `image`'s own `avif-native` feature is
+# the same two crates plus its own YUV handling, but it hands back an RGB image
+# and drops the CICP triple this side needs, so the crates are used directly.
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
+avif-serialize = { version = "0.8.9", optional = true }
+dav1d = { version = "0.11.0", optional = true }
+mp4parse = { version = "0.17.0", optional = true }
 # OCR, for `vshot ocr` and the editor's text tool. `oar-ocr` runs PaddleOCR's
 # own PP-OCR models (converted to ONNX) on ONNX Runtime, and the ONNX Runtime
 # it links against is the system one rather than a downloaded copy, so the
@@ -71,13 +80,35 @@ zbus = "5.19.0"
 cc = "1.2"
 
 [features]
+# Every HDR file format is on by default; a build that wants fewer turns them
+# off.  The one that costs anything is `avif`, which is most of the build time
+# an HDR capture path adds.
+default = ["avif", "radiance", "png"]
+
+# The AVIF codec: `rav1e` and `avif-serialize` to write a ten-bit PQ file, and
+# `dav1d` and `mp4parse` to read one back.  `dav1d-sys` links the system
+# `libdav1d`, so a build without this feature needs no dav1d at all.
+avif = ["dep:rav1e", "dep:avif-serialize", "dep:dav1d", "dep:mp4parse"]
+
+# The Radiance RGBE codec.  It has no dependencies of its own, so this buys no
+# build time; it is a feature so that the codec list has one shape rather than
+# an exception, and so a build can offer exactly the formats it wants.
+radiance = []
+
+# The PNG codec, the SDR half of every capture.  It has no dependencies of its
+# own either -- the `png` crate is unconditional, because a capture cannot be
+# written without it -- but it is a feature for the same reason `radiance` is:
+# the registry offers what was compiled in, and this is what says so.
+png = []
+
 # `rav1e`'s hand-written x86 SIMD, which needs `nasm` on PATH at build time.
 # Off by default so a build without nasm still works; worth turning on for a
-# package, because it is most of the time an AVIF of a 4K capture takes.
+# package, because it is most of the time an AVIF of a 4K capture takes.  It
+# implies `avif`, since the SIMD it turns on is the encoder's.
 #
 #     cargo build --release --features avif-asm
 #
-avif-asm = ["rav1e/asm"]
+avif-asm = ["avif", "rav1e/asm"]
 
 [profile.release]
 lto = "thin"

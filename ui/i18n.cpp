@@ -408,18 +408,56 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Strength"), QString::fromUtf8("强度")},
         {QStringLiteral("1-3"), QString::fromUtf8("1-3")},
         {QStringLiteral("Output"), QString::fromUtf8("输出")},
-        {QStringLiteral("PNG compression"), QString::fromUtf8("PNG 压缩")},
-        {QStringLiteral("All levels are lossless; slower ones buy a smaller file"),
-         QString::fromUtf8("各档全部无损；越慢换来越小的文件")},
+        {QStringLiteral("SDR format"), QString::fromUtf8("SDR 格式")},
+        {QStringLiteral("The format the SDR half of a capture is written in, and the one "
+                        "the clipboard carries. PNG is lossless, so it is the only format "
+                        "this build has; the parameters of whichever format is chosen are "
+                        "on the Format settings page"),
+         QString::fromUtf8("截图的 SDR 那一半写成什么格式，剪贴板也用它。"
+                           "PNG 无损，是本构建唯一的格式；所选格式的参数在「格式设置」页")},
         {QStringLiteral("HDR format"), QString::fromUtf8("HDR 格式")},
         {QStringLiteral("The second file of a capture that carries HDR content, written "
-                        "beside the PNG with the same name. AVIF is ten-bit BT.2020 PQ and "
-                        "says so in the file, so every reader shows it right, but it is "
+                        "beside the SDR one with the same name. AVIF is ten-bit BT.2020 PQ "
+                        "and says so in the file, so every reader shows it right, but it is "
                         "lossy; Radiance RGBE is the light exactly as captured, and is read "
-                        "by few"),
-         QString::fromUtf8("截图带 HDR 内容时，与 PNG 同名并排写出的第二个文件。"
+                        "by few. Its parameters are on the Format settings page"),
+         QString::fromUtf8("截图带 HDR 内容时，与 SDR 那个同名并排写出的第二个文件。"
                            "AVIF 是 10 位 BT.2020 PQ 并在文件里声明，所有读取器都能正确"
-                           "显示，但为有损；Radiance RGBE 是原样记录的光，但读取器很少")},
+                           "显示，但为有损；Radiance RGBE 是原样记录的光，但读取器很少。"
+                           "它的参数在「格式设置」页")},
+        {QStringLiteral("Format settings"), QString::fromUtf8("格式设置")},
+        {QStringLiteral("How each file format writes. The formats listed are the ones "
+                        "this build was compiled with, and the settings under each are "
+                        "the ones that format itself declares."),
+         QString::fromUtf8("每种文件格式怎么写。列出的格式是本构建编译进来的，"
+                           "每种格式下面的设置由该格式自己声明。")},
+        {QStringLiteral("Asking this build which formats it has…"),
+         QString::fromUtf8("正在询问本构建有哪些格式…")},
+        {QStringLiteral("This build reports no file formats, so there is nothing "
+                        "to set here."),
+         QString::fromUtf8("本构建没有报告任何文件格式，这里没有可设的项。")},
+        {QStringLiteral("Nothing to tune"), QString::fromUtf8("没有可调的项")},
+        {QStringLiteral("This format takes no settings: it writes what it is given, at "
+                        "its own defaults"),
+         QString::fromUtf8("这种格式不接受设置：给什么写什么，用它自己的默认值")},
+        {QStringLiteral("No parameters"), QString::fromUtf8("无参数")},
+        {QStringLiteral("SDR"), QString::fromUtf8("SDR")},
+        {QStringLiteral("HDR"), QString::fromUtf8("HDR")},
+        // The parameters themselves.  A codec declares its own label and hint in
+        // Rust, so these are keyed by the English text it declares.
+        {QStringLiteral("Compression"), QString::fromUtf8("压缩")},
+        {QStringLiteral("All levels are lossless; slower ones buy a smaller file"),
+         QString::fromUtf8("各档全部无损；越慢换来越小的文件")},
+        {QStringLiteral("Quality"), QString::fromUtf8("质量")},
+        {QStringLiteral("Higher keeps more of the picture and writes a bigger file; 90 is "
+                        "about what other AVIF encoders call quality 90"),
+         QString::fromUtf8("越高保留的画面越多、文件越大；90 大致相当于其他 AVIF "
+                           "编码器所说的质量 90")},
+        {QStringLiteral("Speed"), QString::fromUtf8("速度")},
+        {QStringLiteral("How hard the encoder works, 0 (slowest, smallest) to 10. This is "
+                        "most of the time an HDR capture takes"),
+         QString::fromUtf8("编码器用多大功夫，0（最慢、最小）到 10。"
+                           "一次 HDR 截图的时间大半花在这里")},
         {QStringLiteral("HDR to SDR"), QString::fromUtf8("HDR 转 SDR")},
         {QStringLiteral("How the SDR half of an HDR capture is made from the HDR one. "
                         "Auto reads each capture: an SDR picture comes out exactly as it "

@@ -11,12 +11,13 @@
 //! or malformed file yields the built-in defaults, and a bad value inside a
 //! valid file falls back field by field.  Nothing here can fail a capture.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::model::{HdrDecision, PngCompression, ToneMap, ToneMapOptions};
-use crate::output::HdrFormat;
+use crate::model::{codec, HdrDecision, ToneMap, ToneMapOptions};
+use crate::output::{HdrFormat, SdrFormat};
 
 /// Reads an optional number, treating a value of any other type as absent.
 ///
@@ -37,10 +38,12 @@ where
 
 /// The defaults a command-line flag falls back to when it is not given.
 ///
-/// The JSON keys are the flag names, so `--png-compression` is written
-/// `"png-compression"` and `--max-height` is `"max-height"`; that is what a
+/// The JSON keys are the flag names, so `--hdr-format` is written
+/// `"hdr-format"` and `--max-height` is `"max-height"`; that is what a
 /// user editing the file by hand would reach for, and it matches the Qt side's
-/// camelCase habit of naming things as they appear in the UI.
+/// camelCase habit of naming things as they appear in the UI.  The one
+/// exception is [`CliDefaults::format`], whose keys are the codec registry's
+/// own names — a format's parameters belong to the format, not to a flag.
 ///
 /// Unknown keys are ignored rather than rejected: this is a file the user may
 /// edit by hand and that a newer vshot may write, and refusing the whole
@@ -48,12 +51,21 @@ where
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct CliDefaults {
-    /// `--png-compression`, one of `none` / `fastest` / `fast` / `balanced` /
-    /// `high`.
-    pub png_compression: Option<String>,
     /// `--hdr-format`, one of `avif` / `hdr`: how the second file of an HDR
     /// capture is written.
     pub hdr_format: Option<String>,
+    /// `--sdr-format`, one of `png`: how the file at `--output` is written.
+    pub sdr_format: Option<String>,
+    /// The encoding parameters of each format, keyed by format and then by the
+    /// parameter's own name: `format.png.compression`, `format.avif.quality`.
+    ///
+    /// A nested map rather than a struct per format, because which formats and
+    /// which parameters exist is the codec registry's answer, not this file's —
+    /// a key whose format or parameter this build does not have is simply never
+    /// asked for.  The values are JSON's own, so a choice arrives as a string
+    /// and a number as a number, and the codec's [`codec::ParamSpec`] is what
+    /// decides whether either is usable.
+    pub format: HashMap<String, HashMap<String, serde_json::Value>>,
     /// `--tone-map`, one of `auto` / `fixed` / `normalize`: how the SDR copy of
     /// an HDR capture is mapped down.
     pub tone_map: Option<String>,
@@ -74,6 +86,16 @@ pub struct CliDefaults {
     /// [`de_optional_number`] for the same reason as `tone_map_white`.
     #[serde(default, deserialize_with = "de_optional_number")]
     pub hdr_area_ratio: Option<f32>,
+    /// `--hdr-reference-white`, the light in cd/m² an HDR half's `1.0` stands
+    /// for.
+    ///
+    /// A capture reads the reference white off the output it came from, so this
+    /// is only the answer for a file that has none of its own: a Radiance file
+    /// written by something else, or an AVIF with no `vshot.refwhite01` box.
+    /// Read through [`de_optional_number`] for the same reason as
+    /// `tone_map_white`.
+    #[serde(default, deserialize_with = "de_optional_number")]
+    pub hdr_reference_white: Option<f32>,
     /// `monitor`'s output name when none is given; `current` means the output
     /// under the pointer.
     pub monitor: Option<String>,
@@ -388,20 +410,41 @@ pub fn load() -> CliDefaults {
 
 /// The compression the config file remembers, or `None` when it says nothing
 /// usable.  The caller keeps its own built-in default.
-pub fn compression_default() -> Option<PngCompression> {
-    parse_compression(load().png_compression.as_deref()?)
+///
+/// The SDR format the config file remembers, or `None` when it says nothing
+/// usable.  The caller keeps its own built-in default (PNG).
+pub fn sdr_format_default() -> Option<SdrFormat> {
+    SdrFormat::parse(load().sdr_format.as_deref()?).ok()
 }
 
-/// The names are the ones `--png-compression` accepts, so a value copied out
-/// of `vshot --help` works in the file unchanged.
-fn parse_compression(name: &str) -> Option<PngCompression> {
-    match name {
-        "none" => Some(PngCompression::None),
-        "fastest" => Some(PngCompression::Fastest),
-        "fast" => Some(PngCompression::Fast),
-        "balanced" => Some(PngCompression::Balanced),
-        "high" => Some(PngCompression::High),
-        _ => None,
+/// The parameters the config file remembers for `format`, as values the codec
+/// layer reads.
+///
+/// A key whose JSON type does not match what the parameter takes is dropped
+/// here rather than clamped into something: `ParamValues::set` reads a value of
+/// the wrong kind as the format's own default, which is the same answer the
+/// file would get from a key it did not have.
+pub fn format_params(format: &str) -> HashMap<String, codec::ParamValue> {
+    let defaults = load();
+    let Some(remembered) = defaults.format.get(format) else {
+        return HashMap::new();
+    };
+    remembered
+        .iter()
+        .map(|(name, value)| (name.clone(), json_to_param(value)))
+        .collect()
+}
+
+/// One config value as the codec layer reads it.
+fn json_to_param(value: &serde_json::Value) -> codec::ParamValue {
+    match value {
+        serde_json::Value::String(text) => codec::ParamValue::Text(text.clone()),
+        serde_json::Value::Number(number) => match number.as_i64() {
+            Some(whole) => codec::ParamValue::Integer(whole),
+            None => codec::ParamValue::Number(number.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::Bool(flag) => codec::ParamValue::Text(flag.to_string()),
+        _ => codec::ParamValue::Text(String::new()),
     }
 }
 
@@ -437,18 +480,41 @@ pub fn hdr_area_ratio_default() -> Option<f32> {
     load().hdr_area_ratio.map(HdrDecision::clamp_ratio)
 }
 
+/// The reference white the config file remembers, already clamped to the range
+/// the model accepts, or `None` when it says nothing usable.  A value outside
+/// the range is clamped rather than dropped, the same way the tone-map level is.
+pub fn hdr_reference_white_default() -> Option<f32> {
+    load()
+        .hdr_reference_white
+        .map(crate::model::hdr::clamp_reference_nits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn every_compression_name_the_cli_accepts_is_parsed() {
-        for name in ["none", "fastest", "fast", "balanced", "high"] {
-            assert!(parse_compression(name).is_some(), "{name} must parse");
-        }
-        // An unknown name is a typo in a hand-edited file: ignore it and let
-        // the built-in default stand.
-        assert!(parse_compression("slowest").is_none());
+    fn every_parameter_of_every_format_is_read_back_typed() {
+        // The shape the settings window writes: one object per format, holding
+        // that format's own parameter names.
+        let file: ConfigFile = serde_json::from_str(
+            r#"{"cli":{"format":{"png":{"compression":"high"},
+                                 "avif":{"quality":40,"speed":4,"gamma":0.8}}}}"#,
+        )
+        .expect("a format section parses");
+        let png = &file.cli.format["png"];
+        assert_eq!(png["compression"], serde_json::json!("high"));
+        let avif = &file.cli.format["avif"];
+        // A whole number stays whole, a real one stays real, and a key no
+        // format declares is kept as it was found -- dropping it is the
+        // codec's job, not the file's.
+        assert_eq!(avif["quality"], serde_json::json!(40));
+        assert_eq!(avif["gamma"], serde_json::json!(0.8));
+
+        // A file with no format section says nothing, which is not the same as
+        // saying "the default": the codec's own default is what stands.
+        let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).unwrap();
+        assert!(bare.cli.format.is_empty());
     }
 
     #[test]
@@ -503,17 +569,21 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "radiance")]
     #[test]
     fn the_hdr_format_section_is_read_and_a_bad_name_is_ignored() {
         let file: ConfigFile = serde_json::from_str(r#"{"cli":{"hdr-format":"hdr"}}"#)
             .expect("an hdr-format key parses");
         assert_eq!(file.cli.hdr_format.as_deref(), Some("hdr"));
+        // The name resolves to the codec that owns it, which is the round trip
+        // the capture path takes: a config value, through `parse`, to a format.
         assert_eq!(
             file.cli
                 .hdr_format
                 .as_deref()
-                .and_then(|name| HdrFormat::parse(name).ok()),
-            Some(HdrFormat::Radiance)
+                .and_then(|name| HdrFormat::parse(name).ok())
+                .map(|format| format.name()),
+            Some("hdr")
         );
         // Absent is absent: the caller keeps its own default (AVIF).
         let bare: ConfigFile = serde_json::from_str(r#"{"cli":{}}"#).expect("an empty cli parses");
@@ -529,7 +599,7 @@ mod tests {
     fn a_config_without_the_cli_section_reads_as_defaults() {
         let file: ConfigFile = serde_json::from_str(r##"{"editor":{"color":"#ff0000"}}"##)
             .expect("an editor-only file is valid");
-        assert!(file.cli.png_compression.is_none());
+        assert!(file.cli.sdr_format.is_none());
         assert!(file.cli.long.notches.is_none());
         assert!(file.cli.pin.density.is_none());
     }
@@ -553,10 +623,10 @@ mod tests {
     #[test]
     fn cli_values_are_read_field_by_field() {
         let file: ConfigFile = serde_json::from_str(
-            r#"{"cli":{"png-compression":"high","long":{"notches":3,"max-height":1000}}}"#,
+            r#"{"cli":{"sdr-format":"png","long":{"notches":3,"max-height":1000}}}"#,
         )
         .expect("a cli section parses");
-        assert_eq!(file.cli.png_compression.as_deref(), Some("high"));
+        assert_eq!(file.cli.sdr_format.as_deref(), Some("png"));
         assert_eq!(file.cli.long.notches, Some(3));
         assert_eq!(file.cli.long.max_height, Some(1000));
         // Absent fields stay absent rather than becoming zero, so the caller's

@@ -45,6 +45,10 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
@@ -128,7 +132,7 @@ constexpr int kDefaultReplayFps = 30;
 // The same idea for the ones a combo box carries: the name of the entry the
 // CLI falls back to, which the box's leading entry shows so the default is
 // readable rather than implied by the word "default".
-constexpr const char *kDefaultPngCompression = "fast";
+constexpr const char *kDefaultSdrFormat = "png";
 constexpr const char *kDefaultHdrFormat = "avif";
 constexpr const char *kDefaultToneMap = "auto";
 constexpr const char *kDefaultEncoder = "h264";
@@ -650,6 +654,10 @@ QStringList parseFollowText(const QString &text)
 /// How long to wait for the input listing.  `vshot` gives up on PipeWire
 /// itself after five seconds, so this is that plus room to start and exit.
 constexpr int kMicrophoneListTimeoutMs = 8000;
+/// The same, for `vshot formats --json`: a registry read and a few strings
+/// written, with no device to bring up, so it answers in milliseconds -- the
+/// allowance is only here so a wedged process cannot leave the page waiting.
+constexpr int kFormatListTimeoutMs = 4000;
 
 /// Reads what `vshot record mics` printed into `(node name, label)` pairs.
 ///
@@ -799,6 +807,207 @@ private:
     QProcess *process_ = nullptr;
     QList<QPair<QString, QString>> inputs_;
     bool finished_ = false;
+};
+
+/// One parameter of one format, as the codec registry describes it.
+///
+/// This is the whole vocabulary the settings window has for a format's
+/// settings, and it is deliberately small: the registry is where a parameter is
+/// declared, and a kind this side does not recognize is a parameter this side
+/// draws nothing for rather than a guess at what it might be.
+struct FormatParam {
+    QString name;
+    QString label;
+    QString hint;
+    /// `choice`, `integer` or `number`; anything else is skipped.
+    QString kind;
+    QStringList values;
+    double minimum = 0.0;
+    double maximum = 0.0;
+    double step = 1.0;
+    int decimals = 0;
+    /// The declared default: a string for a choice, a number otherwise.
+    QJsonValue fallback;
+};
+
+/// One format: the SDR or HDR half's `png`, `avif`, `hdr`.
+struct FormatInfo {
+    QString name;
+    QString extension;
+    QVector<FormatParam> params;
+};
+
+/// The two halves of the registry, in the order `vshot formats` lists them.
+struct FormatRegistry {
+    QVector<FormatInfo> sdr;
+    QVector<FormatInfo> hdr;
+
+    const FormatInfo *find(const QString &name) const
+    {
+        for (const FormatInfo &format : sdr) {
+            if (format.name == name) {
+                return &format;
+            }
+        }
+        for (const FormatInfo &format : hdr) {
+            if (format.name == name) {
+                return &format;
+            }
+        }
+        return nullptr;
+    }
+};
+
+/// Reads one parameter out of the registry's JSON, or nothing if the kind is
+/// one this side does not know how to draw.
+FormatParam readParam(const QJsonObject &object)
+{
+    FormatParam param;
+    param.name = object.value(QStringLiteral("name")).toString();
+    param.label = object.value(QStringLiteral("label")).toString();
+    param.hint = object.value(QStringLiteral("hint")).toString();
+    param.kind = object.value(QStringLiteral("kind")).toString();
+    param.fallback = object.value(QStringLiteral("default"));
+    if (param.kind == QLatin1String("choice")) {
+        for (const QJsonValue &value : object.value(QStringLiteral("values")).toArray()) {
+            param.values.append(value.toString());
+        }
+    } else if (param.kind == QLatin1String("integer") || param.kind == QLatin1String("number")) {
+        param.minimum = object.value(QStringLiteral("min")).toDouble();
+        param.maximum = object.value(QStringLiteral("max")).toDouble();
+        param.step = object.value(QStringLiteral("step")).toDouble(1.0);
+        param.decimals = object.value(QStringLiteral("decimals")).toInt();
+    }
+    return param;
+}
+
+/// Parses `vshot formats --json` into `registry`, and reports whether the
+/// answer was a document at all.  A failure leaves the registry empty, which
+/// the page reads as "nothing to show" -- the same thing it says for a build
+/// with no codec compiled in.
+bool parseFormatRegistry(const QByteArray &json, FormatRegistry &registry)
+{
+    registry = FormatRegistry();
+    QJsonParseError error{};
+    const QJsonDocument document = QJsonDocument::fromJson(json, &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject()) {
+        return false;
+    }
+    const QJsonObject root = document.object();
+    const std::pair<const char *, QVector<FormatInfo> *> halves[] = {
+        {"sdr", &registry.sdr},
+        {"hdr", &registry.hdr},
+    };
+    for (const auto &[key, half] : halves) {
+        for (const QJsonValue &entry : root.value(QString::fromLatin1(key)).toArray()) {
+            const QJsonObject object = entry.toObject();
+            FormatInfo format;
+            format.name = object.value(QStringLiteral("name")).toString();
+            format.extension = object.value(QStringLiteral("extension")).toString();
+            for (const QJsonValue &param : object.value(QStringLiteral("params")).toArray()) {
+                const FormatParam read = readParam(param.toObject());
+                if (!read.name.isEmpty()) {
+                    format.params.append(read);
+                }
+            }
+            if (!format.name.isEmpty()) {
+                half->append(format);
+            }
+        }
+    }
+    return true;
+}
+
+/// The formats this build was compiled with, and what each one lets a caller
+/// tune, as `vshot formats --json` describes them.
+///
+/// The registry lives on the Rust side -- it is what the `avif`, `radiance` and
+/// `png` features decide -- and this is the only way the window can know what
+/// it holds.  So the window asks, and it asks the same way the microphone row
+/// asks for its inputs: in the background, once, never while a page is being
+/// built.  A build without the `avif` feature must not offer AVIF here, and
+/// with the answer coming from the binary that will do the encoding it cannot.
+///
+/// Nothing here can fail the settings window: a vshot that cannot be found, a
+/// process that hangs, and a document that will not parse all yield an empty
+/// registry, and the Format settings page then says so in one line.
+class FormatProbe : public QObject {
+public:
+    explicit FormatProbe(QObject *parent = nullptr)
+        : QObject(parent)
+    {
+    }
+
+    /// Fires when the answer lands, from the event loop -- never from inside
+    /// [`start`].  `parsed` is false when the answer was not a document at all.
+    std::function<void(bool parsed)> onFinished;
+
+    /// Asks for the registry, unless it is already on its way or already in.
+    void start()
+    {
+        if (finished_ || process_ != nullptr) {
+            return;
+        }
+        process_ = new QProcess(this);
+        process_->setProgram(helperProgram());
+        process_->setArguments({QStringLiteral("formats"), QStringLiteral("--json")});
+        process_->setStandardInputFile(QProcess::nullDevice());
+        // Both are wired, for the reason the microphone probe wires both: a
+        // program that cannot be started reports through `errorOccurred` and
+        // never reaches `finished`, and one that hangs would leave the page
+        // waiting forever.
+        connect(process_, &QProcess::finished, this, [this] { finish(true); });
+        connect(process_, &QProcess::errorOccurred, this, [this] { finish(false); });
+        process_->start();
+        QTimer::singleShot(kFormatListTimeoutMs, this, [this] { finish(false); });
+    }
+
+    /// The registry, empty until the answer lands.
+    const FormatRegistry &registry() const { return registry_; }
+    /// Whether the answer has landed, whether or not it found anything.
+    bool finished() const { return finished_; }
+
+private:
+    void finish(bool readable)
+    {
+        // The timeout, the process and the error can all arrive: the first one
+        // here is the answer, and the rest are the same answer said again.
+        if (finished_) {
+            return;
+        }
+        finished_ = true;
+        bool parsed = false;
+        if (process_ != nullptr) {
+            if (readable) {
+                parsed = parseFormatRegistry(process_->readAllStandardOutput(), registry_);
+            }
+            if (process_->state() != QProcess::NotRunning) {
+                process_->kill();
+                process_->waitForFinished(100);
+            }
+            process_->deleteLater();
+            process_ = nullptr;
+        }
+        if (onFinished) {
+            onFinished(parsed);
+        }
+    }
+
+    QProcess *process_ = nullptr;
+    FormatRegistry registry_;
+    bool finished_ = false;
+};
+
+/// One control on the Format settings page, and what the config file should
+/// call the value it holds.  The spec travels with it so a control can be read
+/// back without the registry being consulted again -- the page and the file
+/// then agree about which parameters exist even if the answer somehow changed
+/// between the two.
+struct FormatWidget {
+    QString format;
+    QString param;
+    FormatParam spec;
+    QWidget *control = nullptr;
 };
 
 /// A small square of a colour, drawn with the same rounding as the swatch
@@ -1470,6 +1679,21 @@ QIcon sectionIcon(int index, const QColor &color)
         painter.drawLine(QPointF(3.0, 10.5), QPointF(7.5, 6.0));
         painter.drawLine(QPointF(7.5, 6.0), QPointF(11.0, 9.5));
     } else if (index == 2) {
+        // Three stacked squares, the back two offset: the formats this build
+        // registers, each with its own settings behind it.
+        painter.drawRect(QRectF(3.5, 3.5, 8.0, 8.0));
+        painter.drawRect(QRectF(6.5, 6.5, 8.0, 8.0));
+    } else if (index == 3) {
+        // Three bars of rising height with a dot above the tallest: the
+        // dynamic range an HDR capture is written from, SDR white at the
+        // bottom and the highlights above it.
+        painter.setBrush(color);
+        painter.drawRect(QRectF(3.5, 11.5, 3.0, 5.0));
+        painter.drawRect(QRectF(7.5, 8.0, 3.0, 8.5));
+        painter.drawRect(QRectF(11.5, 5.0, 3.0, 11.5));
+        painter.drawEllipse(QPointF(13.0, 2.6), 1.2, 1.2);
+        painter.setBrush(Qt::NoBrush);
+    } else if (index == 4) {
         // A page with an arrow down it: the scrolling capture, which stitches
         // one long page out of many frames of a scroll.
         painter.drawLine(QPointF(4.0, 3.5), QPointF(14.0, 3.5));
@@ -1477,7 +1701,7 @@ QIcon sectionIcon(int index, const QColor &color)
         painter.drawLine(QPointF(9.0, 5.5), QPointF(9.0, 13.0));
         painter.drawLine(QPointF(9.0, 13.0), QPointF(6.5, 10.5));
         painter.drawLine(QPointF(9.0, 13.0), QPointF(11.5, 10.5));
-    } else if (index == 3) {
+    } else if (index == 5) {
         // A pair of brackets around two short lines: text recognition, which
         // reads the words out of the picture.
         painter.drawLine(QPointF(4.0, 3.5), QPointF(4.0, 6.5));
@@ -1490,14 +1714,14 @@ QIcon sectionIcon(int index, const QColor &color)
         painter.drawLine(QPointF(14.0, 14.5), QPointF(11.0, 14.5));
         painter.drawLine(QPointF(6.5, 7.5), QPointF(11.5, 7.5));
         painter.drawLine(QPointF(6.5, 10.5), QPointF(9.5, 10.5));
-    } else if (index == 4) {
+    } else if (index == 6) {
         // A lens with a dot at its centre: recording, one window or one
         // output, which is what this section's defaults are for.
         painter.drawEllipse(QPointF(9.0, 9.0), 5.0, 5.0);
         painter.setBrush(color);
         painter.drawEllipse(QPointF(9.0, 9.0), 1.8, 1.8);
         painter.setBrush(Qt::NoBrush);
-    } else if (index == 5) {
+    } else if (index == 7) {
         // A window with a rounded top-left corner and a title strip: the
         // file dialog's own shape, which is what this section configures.
         QPainterPath frame;
@@ -1509,7 +1733,7 @@ QIcon sectionIcon(int index, const QColor &color)
         frame.closeSubpath();
         painter.drawPath(frame);
         painter.drawLine(QPointF(3.0, 7.0), QPointF(15.0, 7.0));
-    } else if (index == 6) {
+    } else if (index == 8) {
         // A pushpin: the pin overlay, which is what this section configures.
         painter.drawLine(QPointF(9.0, 3.0), QPointF(15.0, 3.0));
         painter.drawLine(QPointF(12.0, 3.0), QPointF(12.0, 8.5));
@@ -1582,6 +1806,8 @@ public:
         const QStringList sections = {
             uiTr("Annotation editor"),
             uiTr("Output"),
+            uiTr("Format settings"),
+            uiTr("HDR"),
             uiTr("Scrolling capture"),
             uiTr("Text recognition"),
             uiTr("Recording"),
@@ -1604,6 +1830,8 @@ public:
         // is what `currentRowChanged` below relies on.
         pages_->addWidget(buildEditorPage());
         pages_->addWidget(buildOutputPage());
+        pages_->addWidget(buildFormatsPage());
+        pages_->addWidget(buildHdrPage());
         pages_->addWidget(buildScrollingPage());
         pages_->addWidget(buildRecognitionPage());
         pages_->addWidget(buildRecordingPage());
@@ -1628,6 +1856,9 @@ public:
         // window is on screen before the probe starts, which is what makes the
         // two boxes fill in visibly rather than after a pause.
         QTimer::singleShot(0, this, [this] { askForMicrophones(); });
+        // The format registry is asked for the same way and for the same
+        // reason: it is a second process, and the page is readable without it.
+        QTimer::singleShot(0, this, [this] { askForFormats(); });
     }
 
 private:
@@ -1925,110 +2156,46 @@ private:
                             "wins over these."));
 
         // One card per subject, because a subject is what a user opens the page
-        // for: how the PNG is written, how an HDR capture is split into two
-        // files, and which output a capture takes when the command line names
-        // none. Under one card they were told apart by a rule and a bold label
-        // between rows that looked like every other row; a card apiece gives
-        // each subject an edge of its own. They are ordered by how often each is
-        // the reason someone opened this page.
-        QWidget *output = addCard(page, uiTr("PNG"));
-        compressionBox_ =
-            choiceBox(output, compressionNames(), QString::fromLatin1(kDefaultPngCompression));
-        compressionBox_->setObjectName(QStringLiteral("pngCompression"));
-        compressionBox_->setMinimumWidth(200);
-        selectChoice(compressionBox_, config_.cli.pngCompression);
-        addRow(output, uiTr("PNG compression"),
-               uiTr("All levels are lossless; slower ones buy a smaller file"),
-               compressionBox_, true);
+        // for: which format the SDR half is written in, and which output a
+        // capture takes when the command line names none. Under one card they
+        // were told apart by a rule and a bold label between rows that looked
+        // like every other row; a card apiece gives each subject an edge of its
+        // own. They are ordered by how often each is the reason someone opened
+        // this page.
+        //
+        // *Which* format each half is written in is asked here, because it is a
+        // choice about the output; *how* each format writes is a page of its own
+        // -- see `buildFormatsPage` -- because a format's parameters are the
+        // codec's business and there is one set of them per format compiled in.
+        // How an HDR capture is written used to be a third card here. It has a
+        // page of its own now -- see `buildHdrPage` -- because it had grown to
+        // five rows that are all one subject, and because a user who never
+        // captures HDR should not have to scroll past them to reach the output.
+        QWidget *output = addCard(page, uiTr("SDR format"));
+        sdrFormatBox_ =
+            choiceBox(output, sdrFormatNames(), QString::fromLatin1(kDefaultSdrFormat));
+        sdrFormatBox_->setObjectName(QStringLiteral("sdrFormat"));
+        sdrFormatBox_->setMinimumWidth(200);
+        selectChoice(sdrFormatBox_, config_.cli.sdrFormat);
+        addRow(output, uiTr("SDR format"),
+               uiTr("The format the SDR half of a capture is written in, and the one "
+                    "the clipboard carries. PNG is lossless, so it is the only format "
+                    "this build has; the parameters of whichever format is chosen are "
+                    "on the Format settings page"),
+               sdrFormatBox_, true);
 
-        output = addCard(page, uiTr("HDR"));
-        hdrFormatBox_ =
-            choiceBox(output, hdrFormatNames(), QString::fromLatin1(kDefaultHdrFormat));
+        output = addCard(page, uiTr("HDR format"));
+        hdrFormatBox_ = choiceBox(output, hdrFormatNames(), QString::fromLatin1(kDefaultHdrFormat));
         hdrFormatBox_->setObjectName(QStringLiteral("hdrFormat"));
         hdrFormatBox_->setMinimumWidth(200);
         selectChoice(hdrFormatBox_, config_.cli.hdrFormat);
         addRow(output, uiTr("HDR format"),
                uiTr("The second file of a capture that carries HDR content, written "
-                    "beside the PNG with the same name. AVIF is ten-bit BT.2020 PQ and "
-                    "says so in the file, so every reader shows it right, but it is "
+                    "beside the SDR one with the same name. AVIF is ten-bit BT.2020 PQ "
+                    "and says so in the file, so every reader shows it right, but it is "
                     "lossy; Radiance RGBE is the light exactly as captured, and is read "
-                    "by few"),
+                    "by few. Its parameters are on the Format settings page"),
                hdrFormatBox_, true);
-
-        toneMapBox_ = choiceBox(output, toneMapNames(), QString::fromLatin1(kDefaultToneMap));
-        toneMapBox_->setObjectName(QStringLiteral("toneMap"));
-        toneMapBox_->setMinimumWidth(200);
-        selectChoice(toneMapBox_, config_.cli.toneMap);
-        addRow(output, uiTr("HDR to SDR"),
-               uiTr("How the SDR half of an HDR capture is made from the HDR one. "
-                    "Auto reads each capture: an SDR picture comes out exactly as it "
-                    "was, and one with highlights makes room for them. Fixed always "
-                    "maps SDR white to the level below, so a pixel's value does not "
-                    "depend on what else is in the picture. Normalize scales the "
-                    "capture so its brightest point becomes white"),
-               toneMapBox_, false);
-
-        toneMapWhiteSpin_ = new ModernDoubleSpinBox(output);
-        toneMapWhiteSpin_->setObjectName(QStringLiteral("toneMapWhite"));
-        // The map works in fractions and the box shows percentages, so the two
-        // are converted on the way in and on the way out -- including the span,
-        // which is why it is scaled here rather than taken as it comes.
-        toneMapWhiteSpin_->setRange(kMinToneMapWhite * 100.0, kMaxToneMapWhite * 100.0);
-        toneMapWhiteSpin_->setSuffix(uiTr(" %"));
-        toneMapWhiteSpin_->setMinimumWidth(120);
-        toneMapWhiteSpin_->setValue(
-            (config_.cli.toneMapWhite > 0.0 ? config_.cli.toneMapWhite : kDefaultToneMapWhite) *
-            100.0);
-        addRow(output, uiTr("SDR white level"),
-               uiTr("Where SDR white lands in the range, as a percentage. The rest is "
-                    "spent on light above white, so a lower level keeps highlights more "
-                    "apart and makes the picture dimmer. Used by Auto (only for a "
-                    "capture that has highlights) and by Fixed"),
-               toneMapWhiteSpin_, false);
-        // A level is only read by two of the three modes, and Normalize works
-        // its own out from the capture's peak: a box that did nothing would
-        // read as a setting that was ignored.
-        connect(toneMapBox_, &QComboBox::currentIndexChanged, this,
-                [this] { updateToneMapWhiteEnabled(); });
-        updateToneMapWhiteEnabled();
-
-        hdrAreaSwitch_ = new ModernSwitch(output);
-        hdrAreaSwitch_->setObjectName(QStringLiteral("hdrAreaTest"));
-        hdrAreaSwitch_->setChecked(config_.cli.hdrAreaTest);
-        hdrAreaSwitch_->setToolTip(
-            uiTr("Off: one bright pixel is enough. On: the ratio below has to be met"));
-        addRow(output, uiTr("Judge HDR by area"),
-               uiTr("Whether a capture counts as HDR content by how much of it is brighter "
-                    "than SDR white rather than by any single pixel. A ten-bit PQ screen "
-                    "rounds ordinary SDR white a few thousandths over, so with this off a "
-                    "handful of rounding pixels can pass a whole desktop off as HDR and dim "
-                    "it. Only outputs the compositor describes as HDR are asked at all"),
-               hdrAreaSwitch_, false);
-
-        hdrAreaRatioSpin_ = new ModernDoubleSpinBox(output);
-        hdrAreaRatioSpin_->setObjectName(QStringLiteral("hdrAreaRatio"));
-        hdrAreaRatioSpin_->setDecimals(4);
-        hdrAreaRatioSpin_->setSingleStep(0.0005);
-        // The ratio is a share of the frame, shown as a percentage of it: the
-        // box's own arithmetic is in fractions, but "0.05 %" is what a user can
-        // picture.  Four decimals of a percent is the resolution the built-in
-        // default needs.
-        hdrAreaRatioSpin_->setRange(0.0, 100.0);
-        hdrAreaRatioSpin_->setSuffix(uiTr(" %"));
-        hdrAreaRatioSpin_->setMinimumWidth(120);
-        hdrAreaRatioSpin_->setValue((config_.cli.hdrAreaRatio >= 0.0 ? config_.cli.hdrAreaRatio
-                                                                     : kDefaultHdrAreaRatio) *
-                                    100.0);
-        addRow(output, uiTr("HDR area"),
-               uiTr("How much of the capture has to be brighter than SDR white to count as "
-                    "HDR content, as a percentage of it. Zero means every capture of an HDR "
-                    "output is HDR content, with no test at all"),
-               hdrAreaRatioSpin_, false);
-        // A ratio is only read when the switch above is on, so a live box under
-        // an off switch would read as a setting that was ignored.
-        connect(hdrAreaSwitch_, &QAbstractButton::toggled, this,
-                [this] { updateHdrAreaRatioEnabled(); });
-        updateHdrAreaRatioEnabled();
 
         output = addCard(page, uiTr("Which output"));
         monitorEdit_ = new QLineEdit(output);
@@ -2043,6 +2210,345 @@ private:
                monitorEdit_, true);
 
         return scroll;
+    }
+
+    /// How an HDR capture is written: the SDR half made from it, and what "HDR
+    /// content" means to the daemon.
+    ///
+    /// These rows were a card on the Output page, and they are the whole page
+    /// now.  They are one subject -- what happens to a capture whose content is
+    /// brighter than SDR white -- and a user who never captures HDR should not
+    /// have to scroll past them to reach the output settings they did open the
+    /// window for.
+    ///
+    /// Which format the second file is written in is *not* here: it is a choice
+    /// about the output, so it sits on the Output page beside the SDR one.
+    QWidget *buildHdrPage()
+    {
+        QScrollArea *scroll = newScrollPage(pages_);
+        QWidget *page = newPage(scroll);
+        addPageHeading(page, uiTr("HDR"),
+                       uiTr("What a capture of HDR content is written as. Used only where "
+                            "the command line gives nothing: an argument, or an "
+                            "environment variable, always wins over these."));
+
+        QWidget *card = addCard(page, uiTr("The second file"));
+        hdrReferenceWhiteSpin_ = new ModernDoubleSpinBox(card);
+        hdrReferenceWhiteSpin_->setObjectName(QStringLiteral("hdrReferenceWhite"));
+        hdrReferenceWhiteSpin_->setDecimals(0);
+        hdrReferenceWhiteSpin_->setSingleStep(1.0);
+        hdrReferenceWhiteSpin_->setRange(kMinHdrReferenceWhite, kMaxHdrReferenceWhite);
+        hdrReferenceWhiteSpin_->setSuffix(uiTr(" cd/m²"));
+        hdrReferenceWhiteSpin_->setMinimumWidth(140);
+        hdrReferenceWhiteSpin_->setValue(config_.cli.hdrReferenceWhite > 0.0
+                                             ? config_.cli.hdrReferenceWhite
+                                             : kDefaultHdrReferenceWhite);
+        addRow(card, uiTr("Reference white"),
+               uiTr("The light an HDR file's 1.0 stands for, in cd/m², for a file that "
+                    "does not say itself -- one written by another program. A capture "
+                    "always reads the white off the output it came from, and an AVIF "
+                    "this program wrote carries it in the file, so this is only the "
+                    "answer for the files that have no answer of their own. BT.2408's "
+                    "reference white is 203"),
+               hdrReferenceWhiteSpin_, true);
+
+        card = addCard(page, uiTr("The SDR half"));
+        toneMapBox_ = choiceBox(card, toneMapNames(), QString::fromLatin1(kDefaultToneMap));
+        toneMapBox_->setObjectName(QStringLiteral("toneMap"));
+        toneMapBox_->setMinimumWidth(200);
+        selectChoice(toneMapBox_, config_.cli.toneMap);
+        addRow(card, uiTr("HDR to SDR"),
+               uiTr("How the SDR half of an HDR capture is made from the HDR one. "
+                    "Auto reads each capture: an SDR picture comes out exactly as it "
+                    "was, and one with highlights makes room for them. Fixed always "
+                    "maps SDR white to the level below, so a pixel's value does not "
+                    "depend on what else is in the picture. Normalize scales the "
+                    "capture so its brightest point becomes white"),
+               toneMapBox_, true);
+
+        toneMapWhiteSpin_ = new ModernDoubleSpinBox(card);
+        toneMapWhiteSpin_->setObjectName(QStringLiteral("toneMapWhite"));
+        // The map works in fractions and the box shows percentages, so the two
+        // are converted on the way in and on the way out -- including the span,
+        // which is why it is scaled here rather than taken as it comes.
+        toneMapWhiteSpin_->setRange(kMinToneMapWhite * 100.0, kMaxToneMapWhite * 100.0);
+        toneMapWhiteSpin_->setSuffix(uiTr(" %"));
+        toneMapWhiteSpin_->setMinimumWidth(120);
+        toneMapWhiteSpin_->setValue(
+            (config_.cli.toneMapWhite > 0.0 ? config_.cli.toneMapWhite : kDefaultToneMapWhite) *
+            100.0);
+        addRow(card, uiTr("SDR white level"),
+               uiTr("Where SDR white lands in the range, as a percentage. The rest is "
+                    "spent on light above white, so a lower level keeps highlights more "
+                    "apart and makes the picture dimmer. Used by Auto (only for a "
+                    "capture that has highlights) and by Fixed"),
+               toneMapWhiteSpin_, false);
+        // A level is only read by two of the three modes, and Normalize works
+        // its own out from the capture's peak: a box that did nothing would
+        // read as a setting that was ignored.
+        connect(toneMapBox_, &QComboBox::currentIndexChanged, this,
+                [this] { updateToneMapWhiteEnabled(); });
+        updateToneMapWhiteEnabled();
+
+        card = addCard(page, uiTr("What counts as HDR"));
+        hdrAreaSwitch_ = new ModernSwitch(card);
+        hdrAreaSwitch_->setObjectName(QStringLiteral("hdrAreaTest"));
+        hdrAreaSwitch_->setChecked(config_.cli.hdrAreaTest);
+        hdrAreaSwitch_->setToolTip(
+            uiTr("Off: one bright pixel is enough. On: the ratio below has to be met"));
+        addRow(card, uiTr("Judge HDR by area"),
+               uiTr("Whether a capture counts as HDR content by how much of it is brighter "
+                    "than SDR white rather than by any single pixel. A ten-bit PQ screen "
+                    "rounds ordinary SDR white a few thousandths over, so with this off a "
+                    "handful of rounding pixels can pass a whole desktop off as HDR and dim "
+                    "it. Only outputs the compositor describes as HDR are asked at all"),
+               hdrAreaSwitch_, false);
+
+        hdrAreaRatioSpin_ = new ModernDoubleSpinBox(card);
+        hdrAreaRatioSpin_->setObjectName(QStringLiteral("hdrAreaRatio"));
+        hdrAreaRatioSpin_->setDecimals(4);
+        hdrAreaRatioSpin_->setSingleStep(0.0005);
+        // The ratio is a share of the frame, shown as a percentage of it: the
+        // box's own arithmetic is in fractions, but "0.05 %" is what a user can
+        // picture.  Four decimals of a percent is the resolution the built-in
+        // default needs.
+        hdrAreaRatioSpin_->setRange(0.0, 100.0);
+        hdrAreaRatioSpin_->setSuffix(uiTr(" %"));
+        hdrAreaRatioSpin_->setMinimumWidth(120);
+        hdrAreaRatioSpin_->setValue((config_.cli.hdrAreaRatio >= 0.0 ? config_.cli.hdrAreaRatio
+                                                                     : kDefaultHdrAreaRatio) *
+                                    100.0);
+        addRow(card, uiTr("HDR area"),
+               uiTr("How much of the capture has to be brighter than SDR white to count as "
+                    "HDR content, as a percentage of it. Zero means every capture of an HDR "
+                    "output is HDR content, with no test at all"),
+               hdrAreaRatioSpin_, false);
+        // A ratio is only read when the switch above is on, so a live box under
+        // an off switch would read as a setting that was ignored.
+        connect(hdrAreaSwitch_, &QAbstractButton::toggled, this,
+                [this] { updateHdrAreaRatioEnabled(); });
+        updateHdrAreaRatioEnabled();
+
+        return scroll;
+    }
+
+    /// The encoding parameters of every format this build has, one card per
+    /// format.
+    ///
+    /// The page is built twice over: once now, empty but for a line saying what
+    /// it is waiting for, and once when the registry answers.  It is built from
+    /// the registry rather than from a list written down here because the list
+    /// is not this side's to know -- which formats exist is the `avif`,
+    /// `radiance` and `png` features' answer, and what each one can be tuned by
+    /// is the codec's own declaration.  A parameter added to a codec in Rust
+    /// grows a row here without this file being touched, which is the whole
+    /// point of the registry.
+    QWidget *buildFormatsPage()
+    {
+        formatsScroll_ = newScrollPage(pages_);
+        formatsPage_ = newPage(formatsScroll_);
+        addPageHeading(formatsPage_, uiTr("Format settings"),
+                       uiTr("How each file format writes. The formats listed are the ones "
+                            "this build was compiled with, and the settings under each are "
+                            "the ones that format itself declares."));
+        fillFormatsPage();
+        return formatsScroll_;
+    }
+
+    /// Fills the Format settings page from whatever the registry currently
+    /// holds -- nothing at all on the first call, the whole registry when the
+    /// answer lands.
+    ///
+    /// Everything but the heading is thrown away and rebuilt, so calling this
+    /// twice does not leave two sets of rows behind, and the widgets are made
+    /// fresh each time rather than kept: a control that remembers a value from
+    /// a registry that no longer declares it is exactly the stale row this page
+    /// must not have.
+    void fillFormatsPage()
+    {
+        auto *layout = qobject_cast<QVBoxLayout *>(formatsPage_->layout());
+        // Everything between the heading and the page's trailing stretch goes:
+        // the stretch is what keeps the cards at their own height (see
+        // `newPage`), so it is the one item this must not take with it.
+        while (layout->count() > 2) {
+            QLayoutItem *item = layout->takeAt(1);
+            if (QWidget *widget = item->widget()) {
+                widget->deleteLater();
+            }
+            delete item;
+        }
+        formatWidgets_.clear();
+
+        if (formatsProbe_ == nullptr || !formatsProbe_->finished()) {
+            addFormatsNote(uiTr("Asking this build which formats it has…"));
+            return;
+        }
+        const FormatRegistry &registry = formatsProbe_->registry();
+        if (registry.sdr.isEmpty() && registry.hdr.isEmpty()) {
+            addFormatsNote(uiTr("This build reports no file formats, so there is nothing "
+                                "to set here."));
+            return;
+        }
+        for (const FormatInfo &format : registry.sdr) {
+            addFormatCard(format, uiTr("SDR"));
+        }
+        for (const FormatInfo &format : registry.hdr) {
+            addFormatCard(format, uiTr("HDR"));
+        }
+    }
+
+    void addFormatsNote(const QString &text)
+    {
+        auto *note = new QLabel(text, formatsPage_);
+        note->setObjectName(QStringLiteral("rowHint"));
+        note->setWordWrap(true);
+        auto *layout = qobject_cast<QVBoxLayout *>(formatsPage_->layout());
+        layout->insertWidget(layout->count() - 1, note);
+    }
+
+    /// One format's card: its name and which half of a capture it writes, then
+    /// one row per parameter it declares.
+    void addFormatCard(const FormatInfo &format, const QString &half)
+    {
+        QWidget *card = addCard(formatsPage_, uiTr("%1 (%2)").arg(format.name, half));
+        // A format with nothing to tune still gets a card, saying so: a format
+        // missing from the page entirely would read as a format this build does
+        // not have, which is the one thing the registry's answer must not be
+        // misread as.
+        if (format.params.isEmpty()) {
+            addRow(card, uiTr("Nothing to tune"),
+                   uiTr("This format takes no settings: it writes what it is given, at "
+                        "its own defaults"),
+                   new QLabel(uiTr("No parameters"), card), true);
+            return;
+        }
+        bool first = true;
+        for (const FormatParam &param : format.params) {
+            QWidget *control = addParamControl(card, format, param);
+            if (control == nullptr) {
+                continue;
+            }
+            addRow(card, uiTr(param.label), uiTr(param.hint), control, first);
+            first = false;
+        }
+    }
+
+    /// The control one parameter is edited with, chosen by the kind the codec
+    /// declared -- and remembered in [`formatWidgets_`] so Save can read every
+    /// one of them back without knowing what any of them is.
+    ///
+    /// A kind this side does not know is skipped rather than guessed at: the
+    /// alternative is a control whose value means something other than what the
+    /// codec will read, which is worse than a parameter that is not offered.
+    QWidget *addParamControl(QWidget *card, const FormatInfo &format, const FormatParam &param)
+    {
+        const QString objectName =
+            QStringLiteral("format_%1_%2").arg(format.name, param.name);
+        // The remembered value, or nothing when the file does not mention this
+        // parameter.  A parameter left at what the format declares writes no
+        // key at all, which is the same rule every other optional setting in
+        // this window follows.
+        const QJsonObject remembered = config_.cli.format.value(format.name);
+        const bool hasRemembered = remembered.contains(param.name);
+        const QJsonValue stored = remembered.value(param.name);
+
+        if (param.kind == QLatin1String("choice")) {
+            auto *box = choiceBox(card, param.values, param.fallback.toString());
+            box->setObjectName(objectName);
+            box->setMinimumWidth(200);
+            selectChoice(box, hasRemembered ? stored.toString() : QString());
+            formatWidgets_.append({format.name, param.name, param, box});
+            return box;
+        }
+        if (param.kind == QLatin1String("integer")) {
+            auto *spin = new ModernSpinBox(card);
+            spin->setObjectName(objectName);
+            spin->setMinimumWidth(120);
+            spin->setRange(static_cast<int>(param.minimum), static_cast<int>(param.maximum));
+            spin->setSingleStep(static_cast<int>(std::max(1.0, param.step)));
+            const int builtin = param.fallback.toInt();
+            // The box opens on the built-in default rather than on zero, the
+            // way every other optional spin box in this window does: what a
+            // user reads is what the encoder will use.  `paramValue` below
+            // writes the default back as "nothing", so a value left alone
+            // stays out of the file.
+            spin->setValue(hasRemembered ? stored.toInt() : builtin);
+            spin->setProperty("builtin", builtin);
+            formatWidgets_.append({format.name, param.name, param, spin});
+            return spin;
+        }
+        if (param.kind == QLatin1String("number")) {
+            auto *spin = new ModernDoubleSpinBox(card);
+            spin->setObjectName(objectName);
+            spin->setMinimumWidth(140);
+            spin->setDecimals(param.decimals);
+            spin->setSingleStep(param.step > 0.0 ? param.step : 1.0);
+            spin->setRange(param.minimum, param.maximum);
+            const double builtin = param.fallback.toDouble();
+            spin->setValue(hasRemembered ? stored.toDouble() : builtin);
+            spin->setProperty("builtin", builtin);
+            formatWidgets_.append({format.name, param.name, param, spin});
+            return spin;
+        }
+        return nullptr;
+    }
+
+    /// One parameter's value as the config file should carry it, or an invalid
+    /// `QJsonValue` when the file should say nothing about it.
+    ///
+    /// A value still sitting on the format's own default is written as nothing,
+    /// the rule the rest of this window follows: writing the number out would
+    /// freeze today's default into the file and stop a later version's better
+    /// one from reaching this user.  A choice's "nothing" is its leading
+    /// entry, whose data is the empty string.
+    QJsonValue paramValue(const FormatWidget &widget) const
+    {
+        if (const auto *box = qobject_cast<QComboBox *>(widget.control)) {
+            const QString chosen = box->currentData().toString();
+            return chosen.isEmpty() ? QJsonValue() : QJsonValue(chosen);
+        }
+        if (const auto *spin = qobject_cast<QSpinBox *>(widget.control)) {
+            const int builtin = spin->property("builtin").toInt();
+            return spin->value() == builtin ? QJsonValue() : QJsonValue(spin->value());
+        }
+        if (const auto *spin = qobject_cast<QDoubleSpinBox *>(widget.control)) {
+            const double builtin = spin->property("builtin").toDouble();
+            return qFuzzyCompare(spin->value(), builtin) ? QJsonValue()
+                                                         : QJsonValue(spin->value());
+        }
+        return QJsonValue();
+    }
+
+    /// Writes the format map back out of the widgets: one object per format,
+    /// one entry per parameter that was changed from what the format declares.
+    QMap<QString, QJsonObject> formatValues() const
+    {
+        QMap<QString, QJsonObject> values;
+        for (const FormatWidget &widget : formatWidgets_) {
+            const QJsonValue value = paramValue(widget);
+            if (value.isUndefined()) {
+                continue;
+            }
+            values[widget.format].insert(widget.param, value);
+        }
+        return values;
+    }
+
+    /// Asks for the registry, once, in the background.
+    void askForFormats()
+    {
+        if (formatsProbe_ == nullptr) {
+            formatsProbe_ = new FormatProbe(this);
+            formatsProbe_->onFinished = [this](bool) {
+                fillFormatsPage();
+                // A property rather than a member, because the only thing that
+                // reads it is the offline check: it drives the rows the
+                // registry grew, and it has to know the answer has landed
+                // before it looks for them.
+                formatsPage_->setProperty("formatsLanded", true);
+            };
+        }
+        formatsProbe_->start();
     }
 
     QWidget *buildScrollingPage()
@@ -2092,7 +2598,7 @@ private:
         addRow(scrolling, uiTr("Ignore top"),
                uiTr("Rows at the top of every frame left out of the match, for sticky "
                     "headers"),
-               ignoreTopSpin_, false);
+               ignoreTopSpin_, true);
 
         injectBox_ = choiceBox(scrolling, injectNames(), QString::fromLatin1(kDefaultLongInject));
         injectBox_->setObjectName(QStringLiteral("longInject"));
@@ -2778,8 +3284,12 @@ private:
             static_cast<std::uint32_t>(std::max(1, mosaicStrengthSpin_->value()));
 
         CliPreferences &cli = config.cli;
-        cli.pngCompression = compressionBox_->currentData().toString();
+        cli.sdrFormat = sdrFormatBox_->currentData().toString();
         cli.hdrFormat = hdrFormatBox_->currentData().toString();
+        // The encoding parameters are read back off the widgets the registry
+        // grew, rather than out of named members: which parameters exist is the
+        // codec layer's answer, and this side only knows what it drew.
+        cli.format = formatValues();
         cli.toneMap = toneMapBox_->currentData().toString();
         // A box still sitting on the built-in default writes nothing, exactly
         // like the spin boxes: the file then keeps following the map's own
@@ -2795,6 +3305,12 @@ private:
         const double ratio = hdrAreaRatioSpin_->value() / 100.0;
         cli.hdrAreaRatio =
             std::abs(ratio - kDefaultHdrAreaRatio) < 1e-9 ? -1.0 : ratio;
+        // A reference white left on the built-in default writes nothing, the
+        // same rule as the two above: the file then follows the codec layer's
+        // own reference instead of freezing today's number into it.
+        const double reference = hdrReferenceWhiteSpin_->value();
+        cli.hdrReferenceWhite =
+            std::abs(reference - kDefaultHdrReferenceWhite) < 1e-6 ? 0.0 : reference;
         cli.monitor = monitorEdit_->text().trimmed();
         // Every spin box is read back with the built-in default it opened on: a
         // value still sitting there is written as the sentinel, which is what
@@ -2924,12 +3440,13 @@ private:
     QComboBox *fontBox_ = nullptr;
     QComboBox *mosaicShapeBox_ = nullptr;
     QSpinBox *mosaicStrengthSpin_ = nullptr;
-    QComboBox *compressionBox_ = nullptr;
+    QComboBox *sdrFormatBox_ = nullptr;
     QComboBox *hdrFormatBox_ = nullptr;
     QComboBox *toneMapBox_ = nullptr;
     QDoubleSpinBox *toneMapWhiteSpin_ = nullptr;
     ModernSwitch *hdrAreaSwitch_ = nullptr;
     QDoubleSpinBox *hdrAreaRatioSpin_ = nullptr;
+    QDoubleSpinBox *hdrReferenceWhiteSpin_ = nullptr;
     QLineEdit *monitorEdit_ = nullptr;
     QSpinBox *densitySpin_ = nullptr;
     QSpinBox *notchesSpin_ = nullptr;
@@ -2975,6 +3492,14 @@ private:
     ColorButton *pinActiveColorButton_ = nullptr;
     QColor pinBorderColor_;
     QColor pinActiveColorColor_;
+    /// One control per parameter of one format, in the order the Format
+    /// settings page drew them; Save reads the whole list back rather than
+    /// naming any of them, because which ones exist is the codec layer's
+    /// answer and not this side's.
+    QVector<FormatWidget> formatWidgets_;
+    QScrollArea *formatsScroll_ = nullptr;
+    QWidget *formatsPage_ = nullptr;
+    FormatProbe *formatsProbe_ = nullptr;
     QLabel *status_ = nullptr;
 };
 

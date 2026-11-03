@@ -23,7 +23,7 @@
 use crate::error::{Result, VshotError};
 use crate::geometry::{Point, Rect, Size};
 use crate::model::Frame;
-use crate::parallel::{collect_rows, map_rows};
+use crate::parallel::map_rows;
 
 /// The scRGB reference white: linear value 1.0 is this many cd/m².
 ///
@@ -36,6 +36,28 @@ pub const REFERENCE_WHITE_NITS: f32 = 203.0;
 pub const PQ_PEAK_NITS: f32 = 10_000.0;
 /// The nominal peak of an HLG signal (BT.2100).
 pub const HLG_PEAK_NITS: f32 = 1_000.0;
+
+/// The span a reference white may take, in cd/m²: below the floor no display's
+/// SDR white has ever been described, and above the ceiling a "white" would be
+/// a highlight rather than a white.  Named because the settings window bounds
+/// its number box by the same pair — a box that allowed a value this clamps
+/// would be a setting the daemon silently overrides.
+pub const MIN_REFERENCE_NITS: f32 = 1.0;
+pub const MAX_REFERENCE_NITS: f32 = 1_000.0;
+
+/// The reference white a file with none of its own is read at, clamped to the
+/// range a reference white can sensibly take.
+///
+/// The setting behind this is a number the user typed, so it is clamped rather
+/// than refused — the same rule [`ToneMapOptions::clamp_white`] follows.  A
+/// value outside the span is a typo, and the nearest answer it could have meant
+/// is more useful than a refusal.
+pub fn clamp_reference_nits(nits: f32) -> f32 {
+    if !nits.is_finite() {
+        return REFERENCE_WHITE_NITS;
+    }
+    nits.clamp(MIN_REFERENCE_NITS, MAX_REFERENCE_NITS)
+}
 
 /// Content above SDR white by this much counts as light the frame carries above
 /// white.
@@ -367,7 +389,7 @@ impl Rgb10Summary {
 
 /// The PQ EOTF (ST 2084): a 0..1 code to linear luminance, normalised so 1.0
 /// is 10 000 cd/m².
-fn pq_eotf(code: f32) -> f32 {
+pub(crate) fn pq_eotf(code: f32) -> f32 {
     const M1: f32 = 2610.0 / 16384.0;
     const M2: f32 = 2523.0 / 4096.0 * 128.0;
     const C1: f32 = 3424.0 / 4096.0;
@@ -394,7 +416,7 @@ pub(crate) fn pq_encode(luminance: f32) -> f32 {
     pq_oetf(luminance)
 }
 
-fn pq_oetf(luminance: f32) -> f32 {
+pub(crate) fn pq_oetf(luminance: f32) -> f32 {
     const M1: f32 = 2610.0 / 16384.0;
     const M2: f32 = 2523.0 / 4096.0 * 128.0;
     const C1: f32 = 3424.0 / 4096.0;
@@ -406,7 +428,7 @@ fn pq_oetf(luminance: f32) -> f32 {
 }
 
 /// The HLG inverse OETF (BT.2100): a 0..1 signal to scene-linear 0..1.
-fn hlg_inverse_oetf(signal: f32) -> f32 {
+pub(crate) fn hlg_inverse_oetf(signal: f32) -> f32 {
     const A: f32 = 0.178_832_8;
     const B: f32 = 0.284_668_9;
     const C: f32 = 0.559_910_7;
@@ -419,7 +441,7 @@ fn hlg_inverse_oetf(signal: f32) -> f32 {
 }
 
 /// The sRGB EOTF (IEC 61966-2-1): a 0..1 code to linear light, 1.0 = white.
-fn srgb_eotf(value: f32) -> f32 {
+pub(crate) fn srgb_eotf(value: f32) -> f32 {
     let v = value.clamp(0.0, 1.0);
     if v <= 0.040_45 {
         v / 12.92
@@ -429,7 +451,7 @@ fn srgb_eotf(value: f32) -> f32 {
 }
 
 /// The sRGB OETF: linear light back to a 0..1 code.
-fn srgb_oetf(linear: f32) -> f32 {
+pub(crate) fn srgb_oetf(linear: f32) -> f32 {
     let l = linear.clamp(0.0, 1.0);
     if l <= 0.003_130_8 {
         12.92 * l
@@ -490,9 +512,9 @@ const XYZ_TO_BT709: [[f32; 3]; 3] = [
 ];
 
 /// The D65 white point, the one `wp_color_manager_v1` assumes.
-const D65: (f32, f32) = (0.3127, 0.3290);
+pub(crate) const D65: (f32, f32) = (0.3127, 0.3290);
 
-fn multiply(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
+pub(crate) fn multiply(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
     [
         matrix[0][0] * rgb[0] + matrix[0][1] * rgb[1] + matrix[0][2] * rgb[2],
         matrix[1][0] * rgb[0] + matrix[1][1] * rgb[1] + matrix[1][2] * rgb[2],
@@ -920,6 +942,13 @@ impl HdrFrame {
         self.size
     }
 
+    /// The pixels, row-major, one `[r, g, b, a]` each.  A codec needs the whole
+    /// buffer at once — a scanline at a time is not enough to run its encoder
+    /// over — and the row split it wants is its own to make.
+    pub fn pixels(&self) -> &[[f32; 4]] {
+        &self.pixels
+    }
+
     pub fn pixel(&self, x: u32, y: u32) -> Option<[f32; 4]> {
         if x >= self.size.width || y >= self.size.height {
             return None;
@@ -1022,25 +1051,17 @@ impl HdrFrame {
         map_rows(&mut pixels, size.width as usize, |offset, row| {
             for (index, destination) in row.iter_mut().enumerate() {
                 let word = words[offset + index];
-                let mut rgb = [
-                    decode_transfer(
+                // The colour management module owns the curves: this side only
+                // unpacks the ten-bit words into the codes it takes.
+                let rgb = crate::model::color::Transfer::to_linear_rgb(
+                    transfer,
+                    [
                         ((word >> 20) & 0x3ff) as f32 / 1023.0,
-                        transfer,
-                        reference_nits,
-                    ),
-                    decode_transfer(
                         ((word >> 10) & 0x3ff) as f32 / 1023.0,
-                        transfer,
-                        reference_nits,
-                    ),
-                    decode_transfer((word & 0x3ff) as f32 / 1023.0, transfer, reference_nits),
-                ];
-                // HLG needs the whole triple: BT.2100's opto-optical transfer
-                // takes the frame's own luma, so it cannot ride on a per-channel
-                // decode.
-                if transfer == Transfer::Hlg {
-                    rgb = hlg_ootf(rgb, reference_nits);
-                }
+                        (word & 0x3ff) as f32 / 1023.0,
+                    ],
+                    reference_nits,
+                );
                 // The gamut is *kept*, not converted: a colour-managed surface
                 // is described in this same space, so the HDR half reaches the
                 // panel with its wide gamut intact.  The 8-bit consumers
@@ -1242,58 +1263,12 @@ impl HdrFrame {
     /// that ignore it (ffmpeg and ImageMagick both do) assume Rec.709 and show
     /// a wide gamut over-saturated; the SDR half beside it is the one that is
     /// converted for them.
+    ///
+    /// The encoder itself lives in [`crate::model::codec::radiance`], beside the
+    /// decoder that reads it back; this is the frame's own way in, for the
+    /// callers that have a frame and not an [`crate::model::codec::HdrImage`].
     pub fn encode_radiance(&self) -> Vec<u8> {
-        let width = self.size.width;
-        let height = self.size.height;
-        let mut out = Vec::new();
-        out.extend_from_slice(b"#?RADIANCE\n");
-        out.extend_from_slice(b"FORMAT=32-bit_rle_rgbe\n");
-        let [r, g, b] = self.primaries.chromaticities();
-        out.extend_from_slice(
-            format!(
-                "PRIMARIES={:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}\n",
-                r.0, r.1, g.0, g.1, b.0, b.1, D65.0, D65.1
-            )
-            .as_bytes(),
-        );
-        out.extend_from_slice(b"\n");
-        out.extend_from_slice(format!("-Y {height} +X {width}\n").as_bytes());
-        let rle = (8..=0x7fff).contains(&width);
-        // Scanlines are independent — a run never crosses one — so each is
-        // encoded on its own and they are laid down in order.  The chunks the
-        // encoder is split into are whole rows, and every row in one gets its
-        // own scanline: emitting a chunk as a single scanline would shift every
-        // row after the first.
-        for rows in collect_rows(&self.pixels, width as usize, |chunk| {
-            let mut bytes = Vec::new();
-            for scanline in chunk.chunks(width as usize) {
-                encode_scanline(scanline, width, rle, &mut bytes);
-            }
-            bytes
-        }) {
-            out.extend_from_slice(&rows);
-        }
-        out
-    }
-}
-
-/// Appends one Radiance scanline: the run-length form when the width allows it,
-/// which is every width but a tiny one, and the flat form otherwise.
-fn encode_scanline(scanline: &[[f32; 4]], width: u32, rle: bool, out: &mut Vec<u8>) {
-    if rle {
-        out.extend_from_slice(&[2, 2, (width >> 8) as u8, (width & 0xff) as u8]);
-        // Four component planes, each run-length encoded on its own.
-        for channel in 0..4 {
-            let plane: Vec<u8> = scanline
-                .iter()
-                .map(|pixel| to_rgbe(*pixel)[channel])
-                .collect();
-            encode_rle_plane(&plane, out);
-        }
-    } else {
-        for pixel in scanline {
-            out.extend_from_slice(&to_rgbe(*pixel));
-        }
+        crate::model::codec::radiance::encode(self, REFERENCE_WHITE_NITS)
     }
 }
 
@@ -1559,7 +1534,7 @@ fn average_of(sums: [f64; 4], count: u64) -> [f32; 4] {
     ]
 }
 
-fn decode_transfer(value: f32, transfer: Transfer, reference_nits: f32) -> f32 {
+pub(crate) fn decode_transfer(value: f32, transfer: Transfer, reference_nits: f32) -> f32 {
     let reference = if reference_nits.is_finite() && reference_nits > 0.0 {
         reference_nits
     } else {
@@ -1587,7 +1562,7 @@ fn decode_transfer(value: f32, transfer: Transfer, reference_nits: f32) -> f32 {
 /// HLG's reference white — lands on 203 cd/m² of a 1 000-nit display, the BT.2408
 /// reference white, which the test pins.  The result is brought into the same
 /// reference-white-relative scale as PQ's.
-fn hlg_ootf(scene: [f32; 3], reference_nits: f32) -> [f32; 3] {
+pub(crate) fn hlg_ootf(scene: [f32; 3], reference_nits: f32) -> [f32; 3] {
     // The BT.2020 luma weights, which is the space the signal is in here.
     let luma = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
     // A 1 000-nit HLG system, the reference display the curve is scaled for.
@@ -1603,62 +1578,6 @@ fn hlg_ootf(scene: [f32; 3], reference_nits: f32) -> [f32; 3] {
 
 fn to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-}
-
-/// Linear RGB to Radiance RGBE: one shared exponent, three 8-bit mantissas.
-fn to_rgbe(pixel: [f32; 4]) -> [u8; 4] {
-    let r = pixel[0].max(0.0);
-    let g = pixel[1].max(0.0);
-    let b = pixel[2].max(0.0);
-    let peak = r.max(g).max(b);
-    if !peak.is_finite() || peak < 1.0e-32 {
-        return [0, 0, 0, 0];
-    }
-    // v = mantissa * 2^exponent with mantissa in [0.5, 1).
-    let exponent = peak.log2().floor() as i32 + 1;
-    let mantissa = peak / 2f32.powi(exponent);
-    let scale = mantissa * 256.0 / peak;
-    [
-        (r * scale).clamp(0.0, 255.0) as u8,
-        (g * scale).clamp(0.0, 255.0) as u8,
-        (b * scale).clamp(0.0, 255.0) as u8,
-        (exponent + 128).clamp(0, 255) as u8,
-    ]
-}
-
-/// One Radiance run-length plane: runs of four or more bytes are stored as
-/// `(128 + count, byte)`, everything else as a literal `(count, bytes...)`.
-fn encode_rle_plane(plane: &[u8], out: &mut Vec<u8>) {
-    let mut index = 0;
-    while index < plane.len() {
-        let mut run = 1;
-        while index + run < plane.len() && plane[index + run] == plane[index] && run < 127 {
-            run += 1;
-        }
-        if run >= 4 {
-            out.push(128 + run as u8);
-            out.push(plane[index]);
-            index += run;
-            continue;
-        }
-        // Gather literals until a run of four starts.
-        let start = index;
-        while index < plane.len() {
-            if index + 3 < plane.len()
-                && plane[index] == plane[index + 1]
-                && plane[index] == plane[index + 2]
-                && plane[index] == plane[index + 3]
-            {
-                break;
-            }
-            index += 1;
-            if index - start == 128 {
-                break;
-            }
-        }
-        out.push((index - start) as u8);
-        out.extend_from_slice(&plane[start..index]);
-    }
 }
 
 #[cfg(test)]
@@ -2516,7 +2435,7 @@ mod tests {
         )
         .unwrap();
         let encoded = frame.encode_radiance();
-        let decoded = decode_radiance(&encoded, 16, 1);
+        let decoded = decode_radiance(&encoded);
         for x in 0..16u32 {
             let expected = frame.pixel(x, 0).unwrap();
             let got = decoded[x as usize];
@@ -2653,7 +2572,7 @@ mod tests {
         // every row after the first of each chunk in the wrong place, so the
         // decoder has to hand back what went in.
         let encoded = frame.encode_radiance();
-        let decoded = decode_radiance(&encoded, width as usize, height as usize);
+        let decoded = decode_radiance(&encoded);
         for y in [0usize, 1, 100, 639] {
             let expected = frame.pixel(0, y as u32).unwrap();
             let got = decoded[y * width as usize];
@@ -2698,84 +2617,15 @@ mod tests {
         assert_eq!(&pixels[start..start + 4], &[0, 128, 0, 129]);
     }
 
-    /// A tiny Radiance RGBE decoder, enough to check the encoder: header,
-    /// then either flat scanlines or the 2,2,hi,lo run-length form.
-    fn decode_radiance(bytes: &[u8], width: usize, height: usize) -> Vec<[f32; 3]> {
-        let header_end = bytes
-            .windows(2)
-            .position(|pair| pair == b"\n\n")
-            .expect("header terminator")
-            + 2;
-        // Skip the resolution line, "-Y <height> +X <width>".
-        let mut offset = header_end;
-        while bytes[offset] != b'\n' {
-            offset += 1;
-        }
-        offset += 1;
-        let mut pixels = Vec::with_capacity(width * height);
-        for _ in 0..height {
-            let rle = width >= 8 && bytes[offset] == 2 && bytes[offset + 1] == 2;
-            if rle {
-                assert_eq!(
-                    ((bytes[offset + 2] as usize) << 8) | bytes[offset + 3] as usize,
-                    width
-                );
-                offset += 4;
-                let mut planes: [Vec<u8>; 4] = [
-                    Vec::with_capacity(width),
-                    Vec::with_capacity(width),
-                    Vec::with_capacity(width),
-                    Vec::with_capacity(width),
-                ];
-                for plane in planes.iter_mut() {
-                    while plane.len() < width {
-                        let count = bytes[offset] as usize;
-                        offset += 1;
-                        if count > 128 {
-                            let value = bytes[offset];
-                            offset += 1;
-                            for _ in 0..count - 128 {
-                                plane.push(value);
-                            }
-                        } else {
-                            plane.extend_from_slice(&bytes[offset..offset + count]);
-                            offset += count;
-                        }
-                    }
-                }
-                for (((a, b), c), d) in planes[0]
-                    .iter()
-                    .zip(&planes[1])
-                    .zip(&planes[2])
-                    .zip(&planes[3])
-                {
-                    pixels.push(rgbe_to_rgb([*a, *b, *c, *d]));
-                }
-            } else {
-                for _ in 0..width {
-                    let rgbe = [
-                        bytes[offset],
-                        bytes[offset + 1],
-                        bytes[offset + 2],
-                        bytes[offset + 3],
-                    ];
-                    offset += 4;
-                    pixels.push(rgbe_to_rgb(rgbe));
-                }
-            }
-        }
-        pixels
-    }
-
-    fn rgbe_to_rgb(rgbe: [u8; 4]) -> [f32; 3] {
-        if rgbe[3] == 0 {
-            return [0.0, 0.0, 0.0];
-        }
-        let scale = 2f32.powi(rgbe[3] as i32 - 128 - 8);
-        [
-            (rgbe[0] as f32 + 0.5) * scale,
-            (rgbe[1] as f32 + 0.5) * scale,
-            (rgbe[2] as f32 + 0.5) * scale,
-        ]
+    /// The encoder's own file, read back through the production decoder — the
+    /// same one a pin uses — so this checks the pair rather than a test double.
+    fn decode_radiance(bytes: &[u8]) -> Vec<[f32; 3]> {
+        crate::model::codec::radiance::decode(bytes, REFERENCE_WHITE_NITS, "<test>")
+            .expect("the file this program just wrote reads back")
+            .frame
+            .pixels()
+            .iter()
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect()
     }
 }
