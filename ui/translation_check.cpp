@@ -37,6 +37,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPoint>
@@ -1202,6 +1203,10 @@ void checkTheSumButton()
     controller.setSumResultCallback(
         [&outcomes](vshot::TextOutcome outcome, const QString &) { outcomes.push_back(outcome); });
 
+    // What the PNG holds before the sum, to prove afterwards that the card is
+    // chrome and not a mark painted into it.
+    const QImage beforeSum = renderSelection(controller);
+
     button->click();
     expect(!outcomes.isEmpty() && outcomes.constFirst() == vshot::TextOutcome::Busy,
            "the controller reports the wait first");
@@ -1209,40 +1214,52 @@ void checkTheSumButton()
            "then that the total is on the picture and in the clipboard");
     expect(copied == QStringLiteral("42.5"), "the clipboard gets the plain number", copied);
 
-    expect(controller.annotations().size() == 1, "the button lands one annotation",
+    expect(controller.annotations().isEmpty(),
+           "the total is chrome, so no mark lands in the annotation list",
            QString::number(controller.annotations().size()));
-    if (controller.annotations().size() == 1) {
-        const vshot::Annotation &annotation = controller.annotations().constFirst();
-        expect(annotation.kind == vshot::Annotation::Kind::Text, "of the text kind");
-        expect(annotation.tool == QStringLiteral("text"),
-               "written as an ordinary label, so a re-edit reads it back", annotation.tool);
-        expect(annotation.text == QStringLiteral("Σ 42.5"),
-               "carrying the total the step printed", annotation.text);
-        // A label off the canvas would be saved as a mark the renderer has to
-        // clip, and a pin would reopen with a mark it cannot place.  The
-        // placement is pulled back onto the canvas for exactly this reason.
-        const vshot::LogicalRect &canvas = *controller.selection();
-        expect(annotation.origin.x >= canvas.x && annotation.origin.y >= canvas.y &&
-                   annotation.origin.x < canvas.right() && annotation.origin.y < canvas.bottom(),
-               "and it is placed inside the selection",
-               QStringLiteral("%1,%2").arg(annotation.origin.x).arg(annotation.origin.y));
+
+    auto *card = overlay->findChild<QWidget *>(QStringLiteral("sumCard"));
+    auto *label =
+        card != nullptr ? card->findChild<QLabel *>(QStringLiteral("sumTotalLabel")) : nullptr;
+    expect(card != nullptr, "the total is a floating card");
+    expect(label != nullptr && label->text() == QStringLiteral("Σ 42.5"),
+           "carrying the total the step printed", label != nullptr ? label->text() : QString());
+    if (card != nullptr) {
+        expect(!card->isHidden(), "and it is shown");
+        expect(overlay->rect().contains(card->geometry()),
+               "placed over the capture rather than off it",
+               QStringLiteral("%1,%2 %3x%4")
+                   .arg(card->x())
+                   .arg(card->y())
+                   .arg(card->width())
+                   .arg(card->height()));
+        // The card exists so it can be moved out of the way: a press and a
+        // drag have to actually move it.
+        const QPoint before = card->pos();
+        const QPoint from = card->mapToGlobal(card->rect().center());
+        QMouseEvent press(QEvent::MouseButtonPress, QPointF(card->rect().center()),
+                          QPointF(from), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(card, &press);
+        const QPoint to = from + QPoint(30, 20);
+        QMouseEvent move(QEvent::MouseMove, QPointF(card->rect().center()), QPointF(to),
+                         Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(card, &move);
+        QMouseEvent release(QEvent::MouseButtonRelease, QPointF(card->rect().center()),
+                            QPointF(to), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(card, &release);
+        expect(card->pos() != before, "and a drag moves it out of the way",
+               QStringLiteral("%1,%2 -> %3,%4")
+                   .arg(before.x())
+                   .arg(before.y())
+                   .arg(card->x())
+                   .arg(card->y()));
     }
 
-    // The commit path: the label is drawn by the helper and reaches the canvas,
-    // so what the user sees and what the PNG holds are the same mark.
+    // The card is not part of the saved picture: the composite is the same
+    // before and after the sum, so it never covers the numbers it added up.
     const QImage composite = renderSelection(controller);
-    expect(!composite.isNull(), "the session renders with the label on it");
-    if (!composite.isNull()) {
-        int ink = 0;
-        for (int y = 0; y < composite.height(); ++y) {
-            for (int x = 0; x < composite.width(); ++x) {
-                if (composite.pixelColor(x, y).lightness() < 80) {
-                    ++ink;
-                }
-            }
-        }
-        expect(ink > 0, "and the render holds the label's ink", QString::number(ink));
-    }
+    expect(!composite.isNull(), "the session still renders");
+    expect(composite == beforeSum, "and the saved picture is untouched by the card");
     qunsetenv("VSHOT_BIN");
 }
 

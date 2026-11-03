@@ -79,10 +79,9 @@ namespace vshot {
 namespace {
 
 constexpr int kHandleRadius = 6;
-// How far inside the selection's top-left corner the sum's label is placed.
-// It reads as belonging to the region rather than floating beside it, and the
-// label is pulled back onto the canvas when the selection is against an edge.
-constexpr int kSumLabelInset = 8;
+// How far the sum's floating card is set off from the selection, and how far
+// inside its top-left corner the card goes when there is no room outside.
+constexpr int kSumCardInset = 8;
 // How many pixels one cursor step covers while the step modifier is held. One
 // pixel is the point of walking the cursor at all -- a corner the mouse cannot
 // land on exactly -- and ten is the coarse half of the same trip.
@@ -5266,6 +5265,110 @@ private:
     Finished finished_;
 };
 
+// The answer a Sum produces, as a floating card: a rounded rectangle the user
+// can drag anywhere on the surface.
+//
+// It is chrome, not a mark.  A text mark at the selection's corner was the
+// first version, and it is the wrong shape: the total covers the very numbers
+// it added up, and it stays in the saved picture and in a pin.  This card sits
+// above the picture instead -- it is not in the composite, not in the pin and
+// not in the undo stack -- and dragging it is the escape hatch when it still
+// lands over something worth reading.
+class OverlayController::SumCard final : public QWidget {
+public:
+    SumCard(OverlayController *controller, QWidget *parent)
+        : QWidget(parent)
+        , controller_(controller)
+    {
+        setObjectName(QStringLiteral("sumCard"));
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setCursor(Qt::OpenHandCursor);
+        setToolTip(uiTr("Drag to move"));
+        auto *layout = new QHBoxLayout(this);
+        layout->setContentsMargins(14, 8, 14, 8);
+        label_ = new QLabel(this);
+        label_->setObjectName(QStringLiteral("sumTotalLabel"));
+        // The card handles the drag, so the label must not eat the press.
+        label_->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        QFont font = label_->font();
+        font.setBold(true);
+        font.setPointSizeF(std::max(11.0, font.pointSizeF() + 2.0));
+        label_->setFont(font);
+        label_->setStyleSheet(
+            QStringLiteral("color: rgb(238, 240, 244); background: transparent;"));
+        layout->addWidget(label_);
+    }
+
+    /// Shows `total` and sizes the card around it.  `total` is the CLI's own
+    /// plain decimal, so the card and the clipboard never disagree.
+    void setTotal(const QString &total)
+    {
+        label_->setText(QStringLiteral("Σ %1").arg(total));
+        adjustSize();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        Q_UNUSED(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+        painter.setPen(QPen(QColor(74, 82, 96), 1.0));
+        painter.setBrush(QColor(30, 34, 41, 235));
+        painter.drawRoundedRect(box, 10.0, 10.0);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            dragging_ = true;
+            dragOffset_ = event->globalPosition().toPoint() - mapToGlobal(QPoint(0, 0));
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
+            return;
+        }
+        QWidget::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        if (dragging_ && (event->buttons() & Qt::LeftButton) && parentWidget() != nullptr) {
+            const QPoint target = event->globalPosition().toPoint() - dragOffset_;
+            const QPoint local = parentWidget()->mapFromGlobal(target);
+            const int x = std::clamp(local.x(), 0,
+                                     std::max(0, parentWidget()->width() - width()));
+            const int y = std::clamp(local.y(), 0,
+                                     std::max(0, parentWidget()->height() - height()));
+            move(x, y);
+            // In the pin editor the surface carries an input region, so the
+            // card's own clickable box has to travel with it.
+            controller_->scheduleInputMask();
+            event->accept();
+            return;
+        }
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (dragging_) {
+            dragging_ = false;
+            setCursor(Qt::OpenHandCursor);
+            controller_->scheduleInputMask();
+            event->accept();
+            return;
+        }
+        QWidget::mouseReleaseEvent(event);
+    }
+
+private:
+    OverlayController *controller_ = nullptr;
+    QLabel *label_ = nullptr;
+    bool dragging_ = false;
+    QPoint dragOffset_;
+};
+
 OverlayController::OverlayController(Session session, QObject *parent)
     : QObject(parent)
     , session_(std::move(session))
@@ -5340,6 +5443,11 @@ OverlayController::~OverlayController()
     removeTextEditor();
     delete toolbar_;
     toolbar_ = nullptr;
+    // The card is a child of an overlay, and the overlays outlive the
+    // controller: deleting it here keeps it from outliving the callback it
+    // calls into, and QWidget unhooks it from the parent on the way out.
+    delete sumCard_;
+    sumCard_ = nullptr;
     delete gesture_;
     // Explicit rather than parented: the controller is not a QObject.
     delete pinSocket_;
@@ -6874,6 +6982,9 @@ void OverlayController::applyPinEditInputMask()
         };
         addWidget(toolbar_);
         addWidget(textEdit_);
+        // The Sum card, when it is up: it is a child of this overlay too, and
+        // dragging it is the one thing it has to receive presses for.
+        addWidget(sumCard_);
         if (toolbar_ != nullptr) {
             for (const QWidget *popup : toolbar_->popups()) {
                 addWidget(popup);
@@ -9866,53 +9977,78 @@ bool OverlayController::sumSelection(QString *error)
         return fail(uiTr("No numbers were found in the selection."));
     }
 
-    // The answer is a label, drawn where the selection starts: one text mark, so
-    // it undoes, moves and travels to the pin renderer like any other label.
-    Annotation annotation;
-    annotation.kind = Annotation::Kind::Text;
-    annotation.tool = QStringLiteral("text");
-    annotation.text = QStringLiteral("Σ %1").arg(total);
-    annotation.font = currentFont_;
-    annotation.textPixels = textSize_;
-    annotation.color = toolStyle(QStringLiteral("text")).color;
-    annotation.origin = Point{static_cast<std::int32_t>(canvas.x + kSumLabelInset),
-                              static_cast<std::int32_t>(canvas.y + kSumLabelInset)};
-    // Keep the whole label on the canvas: a selection against the right or
-    // bottom edge would otherwise place half of it outside the picture.
-    LogicalRect bounds;
-    if (annotationLogicalBounds(annotation, &bounds)) {
-        const LogicalRect &limits = annotationLimits();
-        std::int64_t dx = 0;
-        std::int64_t dy = 0;
-        if (bounds.right() > limits.right()) {
-            dx = static_cast<std::int64_t>(limits.right()) - bounds.right();
-        }
-        if (bounds.bottom() > limits.bottom()) {
-            dy = static_cast<std::int64_t>(limits.bottom()) - bounds.bottom();
-        }
-        if (bounds.x + dx < limits.x) {
-            dx = static_cast<std::int64_t>(limits.x) - bounds.x;
-        }
-        if (bounds.y + dy < limits.y) {
-            dy = static_cast<std::int64_t>(limits.y) - bounds.y;
-        }
-        annotation.origin.x += static_cast<std::int32_t>(dx);
-        annotation.origin.y += static_cast<std::int32_t>(dy);
-    }
-    QVector<Annotation> next = annotations_;
-    next.push_back(annotation);
-    const int newIndex = next.size() - 1;
-    mutateAnnotations(std::move(next));
-    selectAnnotation(newIndex);
+    // The answer is chrome, not a mark: a floating card over the picture, which
+    // the user can drag off whatever it covers.  It is deliberately outside the
+    // annotation list, so it is not in the saved PNG, not in a pin, and not a
+    // step in the undo stack -- the numbers it adds up stay readable.
+    showSumTotal(total);
 
     // The plain number is the useful half: it goes to the clipboard as the
     // program would write it, so it can be pasted into a calculator or a
-    // spreadsheet.  A clipboard that refuses does not undo the label.
+    // spreadsheet.  A clipboard that refuses does not take the card down.
     const bool copied = writeClipboard(total);
     if (sumResultCallback_) {
         sumResultCallback_(copied ? TextOutcome::Copied : TextOutcome::Idle, QString());
     }
     return true;
+}
+
+void OverlayController::showSumTotal(const QString &total)
+{
+    if (overlays_.isEmpty()) {
+        return;
+    }
+    // The surface the numbers came from: the overlay showing the selection, or
+    // the first one when there is no selection to place against.
+    LogicalRect canvas;
+    CaptureOverlay *target = overlays_.constFirst();
+    if (selection_.has_value() && !selection_->isEmpty()) {
+        canvas = *selection_;
+        const int index = outputContaining(canvas);
+        for (CaptureOverlay *overlay : overlays_) {
+            if (overlay->outputIndex() == index) {
+                target = overlay;
+                break;
+            }
+        }
+    } else {
+        canvas = target->output().geometry;
+    }
+
+    if (sumCard_ == nullptr) {
+        sumCard_ = new SumCard(this, target);
+    } else if (sumCard_->parentWidget() != target) {
+        // A second sum on another output: the card travels to the surface its
+        // numbers came from rather than floating over the wrong screen.
+        sumCard_->setParent(target);
+    }
+    sumCard_->setTotal(total);
+
+    // Below the selection, where it covers nothing that was just read; above it
+    // when the bottom of the surface is in the way; inside its top-left corner
+    // when neither side has room.  A card dragged off is dragged by the user,
+    // so this placement only has to be the readable default.
+    const QRectF local = localRect(target->output(), canvas, target->size());
+    const QSize size = sumCard_->size();
+    int x = qRound(local.left());
+    const qreal top = std::min(local.top(), local.bottom());
+    const qreal bottom = std::max(local.top(), local.bottom());
+    int y = qRound(bottom) + kSumCardInset;
+    if (y + size.height() > target->height()) {
+        y = qRound(top) - kSumCardInset - size.height();
+    }
+    if (y < 0) {
+        y = qRound(top) + kSumCardInset;
+    }
+    x = std::clamp(x, 0, std::max(0, target->width() - size.width()));
+    y = std::clamp(y, 0, std::max(0, target->height() - size.height()));
+    sumCard_->move(x, y);
+    sumCard_->show();
+    sumCard_->raise();
+    // The pin editor's surface carries an input region: without the card's own
+    // box in it the card would be painted but not clickable, and so not
+    // draggable.
+    scheduleInputMask();
 }
 
 bool OverlayController::computeTranslation(QVector<TranslatedLine> *lines, QString *text,

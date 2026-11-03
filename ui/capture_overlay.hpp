@@ -667,11 +667,16 @@ public:
 private:
     class FloatingToolbar;
     class InlineTextEdit;
+    class SumCard;
     struct Gesture;
 
     Session session_;
     QVector<CaptureOverlay *> overlays_;
     FloatingToolbar *toolbar_ = nullptr;
+    // The floating card a Sum leaves behind.  It is chrome rather than a mark
+    // (see SumCard), so it is owned and deleted here instead of travelling with
+    // the annotations.
+    SumCard *sumCard_ = nullptr;
     InlineTextEdit *textEdit_ = nullptr;
     std::optional<LogicalRect> selection_;
     QVector<Annotation> annotations_;
@@ -1205,6 +1210,10 @@ private:
     int sceneScale() const;
     void showToolbar();
     void hideToolbar();
+    // Puts the Sum result on the surface as a floating card: below the
+    // selection, above it when the bottom is in the way, and inside its corner
+    // when neither side has room.  The card is chrome, not a mark.
+    void showSumTotal(const QString &total);
     void updateToolbarGeometry();
     int outputIndexForSelection() const;
     void settlePanelAtGlobal(QPoint topLeft);
