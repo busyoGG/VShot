@@ -106,6 +106,55 @@ pub fn ocr_failed(reason: &str) {
     );
 }
 
+/// Says that the numbers in a piece of text were added up.
+///
+/// The switch is `ocr.notify`, which is the one the text it read belongs to:
+/// both commands read text off the screen, and a session that turned that
+/// report off turned off this one too.
+pub fn sum_finished(total: &str, count: usize, to_clipboard: bool) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    if count == 0 {
+        // An empty result is a result: a "finished" note over an unchanged
+        // clipboard would leave the user pasting whatever was there before.
+        send(
+            Kind::Ocr,
+            if chinese {
+                "没有找到数字"
+            } else {
+                "No numbers found"
+            },
+            "",
+        );
+        return;
+    }
+    let summary = match (chinese, to_clipboard) {
+        (true, true) => "合计已复制到剪贴板",
+        (true, false) => "求和完成",
+        (false, true) => "Sum copied to the clipboard",
+        (false, false) => "Numbers added up",
+    };
+    let body = if chinese {
+        format!("Σ {total}（{count} 个数）")
+    } else {
+        format!("Σ {total} ({count} numbers)")
+    };
+    send(Kind::Ocr, summary, &preview(&body));
+}
+
+/// Says that the addition itself failed, with the reason it gives.
+pub fn sum_failed(reason: &str) {
+    let chinese = crate::cli_i18n::prefers_chinese();
+    send(
+        Kind::Ocr,
+        if chinese {
+            "求和失败"
+        } else {
+            "Adding up failed"
+        },
+        &preview(reason),
+    );
+}
+
 /// Says that a translation is ready, having just been sent to `destination`.
 ///
 /// The shape is `ocr_finished`'s: the summary states where the text went and

@@ -79,6 +79,10 @@ namespace vshot {
 namespace {
 
 constexpr int kHandleRadius = 6;
+// How far inside the selection's top-left corner the sum's label is placed.
+// It reads as belonging to the region rather than floating beside it, and the
+// label is pulled back onto the canvas when the selection is against an edge.
+constexpr int kSumLabelInset = 8;
 // How many pixels one cursor step covers while the step modifier is held. One
 // pixel is the point of walking the cursor at all -- a corner the mouse cannot
 // land on exactly -- and ten is the coarse half of the same trip.
@@ -1224,6 +1228,24 @@ QIcon translateIcon(const QColor &color = QColor(230, 225, 229),
     painter.drawLine(QPointF(13.0, 12.5), QPointF(21.0, 12.5));
     painter.drawPolyline(QPolygonF{QPointF(17.5, 8.5), QPointF(21.5, 12.5),
                                    QPointF(17.5, 16.5)});
+    return QIcon(pixmap);
+}
+
+// The sum action's icon: a capital sigma, drawn from strokes for the same
+// reason as the others -- no font, no dependency on the machine's glyphs.
+QIcon sumIcon(const QColor &color = QColor(230, 225, 229), qreal devicePixelRatio = 1.0)
+{
+    const qreal ratio = std::max(1.0, devicePixelRatio);
+    QPixmap pixmap(qRound(24 * ratio), qRound(24 * ratio));
+    pixmap.setDevicePixelRatio(ratio);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawPolyline(QPolygonF{QPointF(18.0, 4.5), QPointF(6.5, 4.5),
+                                   QPointF(13.0, 12.0), QPointF(6.5, 19.5),
+                                   QPointF(18.0, 19.5)});
     return QIcon(pixmap);
 }
 
@@ -3173,6 +3195,46 @@ public:
                 translateButton_->setText(uiTr("Translate"));
             });
         });
+        // Sum: reads the same selection, adds up every number in it and drops
+        // the total on the picture as a text label, copying the plain number to
+        // the clipboard.  A one-shot action like `Text+` and `Translate`, so it
+        // stays out of `toolButtons_`; the controller reports its recognition
+        // wait and its outcome through the callback below.
+        auto *sum = addToolAction(uiTr("Sum"), sumIcon(QColor(230, 225, 229), devicePixelRatioF()),
+                                  uiTr("Add up the numbers in the selection and copy the total"),
+                                  QStringLiteral("sumButton"),
+                                  {uiTr("Summing…"), uiTr("Copied"), uiTr("Failed")});
+        sumButton_ = sum;
+        connect(sum, &QToolButton::clicked, [controller = controller_] {
+            // Not a toggle: a second press reads the selection again, which is
+            // what a user who just corrected a typo on screen would expect.
+            controller->sumSelection(nullptr);
+        });
+        controller_->setSumResultCallback([this](TextOutcome outcome, const QString &) {
+            if (sumButton_ == nullptr) {
+                return;
+            }
+            switch (outcome) {
+            case TextOutcome::Busy:
+                sumButton_->setText(uiTr("Summing…"));
+                return;
+            case TextOutcome::Idle:
+                sumButton_->setText(uiTr("Sum"));
+                return;
+            case TextOutcome::Copied:
+                sumButton_->setText(uiTr("Copied"));
+                break;
+            case TextOutcome::Failed:
+                sumButton_->setText(uiTr("Failed"));
+                break;
+            }
+            QTimer::singleShot(1200, sumButton_, [this] {
+                if (controller_->isFinished() || controller_->isCancelled()) {
+                    return;
+                }
+                sumButton_->setText(uiTr("Sum"));
+            });
+        });
         // Scrolling capture: the region the user drew is scrolled with
         // synthetic wheels and stitched into one tall image.  It is not a mode
         // -- nothing stays selected -- and it is not the ordinary confirmation
@@ -3766,6 +3828,11 @@ public:
             // the button is drawn the way the Text+ button is drawn while its
             // mode is on: pressed, not just available.
             setButtonActive(translateButton_, controller_->hasPlacedTranslation());
+        }
+        if (sumButton_ != nullptr) {
+            // Summing reads the same selection, so it is out of reach while the
+            // recognized text is being selected.
+            sumButton_->setEnabled(!textMode);
         }
         const Annotation *selected = nullptr;
         if (controller_->selectedAnnotation_ >= 0 &&
@@ -5086,6 +5153,8 @@ private:
     // The Translate button, whose label reports the two-subprocess wait and its
     // outcome the same way the text button's does.
     QToolButton *translateButton_ = nullptr;
+    // The Sum button: one recognition-and-add run, reported on the label.
+    QToolButton *sumButton_ = nullptr;
     // The scrolling-capture button, enabled only when the session offers the
     // action and the selection fits in one output; its state is set by
     // `syncState` along with every other button's.
@@ -9687,6 +9756,163 @@ void OverlayController::removePlacedTranslation()
     // Through the ordinary commit path, so the step back is one Ctrl+Z the way
     // every other change to the list is, and so the toolbar redraws from it.
     mutateAnnotations(std::move(next));
+}
+
+void OverlayController::setSumResultCallback(
+    std::function<void(TextOutcome, const QString &)> callback)
+{
+    sumResultCallback_ = std::move(callback);
+}
+
+bool OverlayController::sumSelection(QString *error)
+{
+    // Every way this can fail is reported to the button the user pressed: it is
+    // a one-shot action, so the button's own label is the only place the user
+    // is looking for the answer.
+    const auto fail = [this, error](const QString &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        if (sumResultCallback_) {
+            sumResultCallback_(TextOutcome::Failed, message);
+        }
+        return false;
+    };
+    if (finished_ || cancelled_) {
+        return fail(uiTr("Adding up needs a selection to read from."));
+    }
+    // The pixels to read: the selection, or -- for the pin editor, whose
+    // session opens with the whole image selected -- the whole captured image.
+    // The same fallback `computeTranslation` makes, and for the same reason.
+    LogicalRect canvas;
+    int index = -1;
+    if (selection_.has_value() && !selection_->isEmpty()) {
+        canvas = *selection_;
+        index = outputContaining(canvas);
+    } else if (!session_.outputs.isEmpty()) {
+        index = 0;
+        canvas = session_.outputs.at(0).geometry;
+    }
+    if (index < 0 || index >= session_.outputs.size()) {
+        return fail(uiTr("Adding up needs a selection to read from."));
+    }
+    const OutputSession &output = session_.outputs.at(index);
+    if (output.image.isNull()) {
+        return fail(uiTr("The captured frame is not available."));
+    }
+    const QRect source = sourceRect(output, canvas)
+                             .intersected(QRect(0, 0, output.image.width(), output.image.height()));
+    if (source.isEmpty()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+    const QImage pixels = output.image.copy(source);
+    if (pixels.isNull()) {
+        return fail(uiTr("The selection has no pixels on this output."));
+    }
+
+    QTemporaryDir directory;
+    if (!directory.isValid()) {
+        return fail(uiTr("Cannot create a temporary directory for the text."));
+    }
+    const QString path = directory.filePath(QStringLiteral("selection.png"));
+    if (!pixels.save(path, "PNG")) {
+        return fail(uiTr("Cannot write the selection to read its text."));
+    }
+    const QString program = vshotProgram();
+    if (program.isEmpty()) {
+        return fail(uiTr("Cannot locate vshot to add up the numbers."));
+    }
+
+    // Recognition takes a moment -- a model load on the first run -- and the
+    // wait runs on the GUI thread, so the button says what it is waiting for
+    // before the wait begins.
+    if (sumResultCallback_) {
+        sumResultCallback_(TextOutcome::Busy, QString());
+    }
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+    // One subprocess: `sum --input` recognizes the crop and adds the numbers up
+    // itself, so the rule for what counts as a number lives beside the engine
+    // that produced the text rather than being repeated here.
+    const ProcessRun run =
+        runProcess(program,
+                   {QStringLiteral("sum"), QStringLiteral("--input"), path,
+                    QStringLiteral("--json")},
+                   QByteArray(), kTextProcessTimeoutMs);
+    if (!run.started) {
+        return fail(uiTr("Cannot start vshot to add up the numbers."));
+    }
+    if (!run.finished) {
+        return fail(uiTr("Adding up the numbers took too long."));
+    }
+    if (run.exitCode != 0) {
+        const QString stderr = QString::fromUtf8(run.errorOutput).trimmed();
+        return fail(stderr.isEmpty() ? uiTr("Adding up the numbers failed.") : stderr);
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(run.output, &parseError);
+    const QJsonObject answer = document.object();
+    const QString total = answer.value(QStringLiteral("total")).toString();
+    const int count = answer.value(QStringLiteral("count")).toInt(-1);
+    if (!document.isObject() || total.isEmpty() || count < 0) {
+        // A parser's own message is a diagnostic rather than something to show
+        // the user; the button says the action failed.
+        std::fprintf(stderr, "vshot-qt-ui: cannot read the sum answer: %s\n",
+                     parseError.errorString().toUtf8().constData());
+        std::fflush(stderr);
+        return fail(uiTr("Adding up the numbers failed."));
+    }
+    if (count == 0) {
+        return fail(uiTr("No numbers were found in the selection."));
+    }
+
+    // The answer is a label, drawn where the selection starts: one text mark, so
+    // it undoes, moves and travels to the pin renderer like any other label.
+    Annotation annotation;
+    annotation.kind = Annotation::Kind::Text;
+    annotation.tool = QStringLiteral("text");
+    annotation.text = QStringLiteral("Σ %1").arg(total);
+    annotation.font = currentFont_;
+    annotation.textPixels = textSize_;
+    annotation.color = toolStyle(QStringLiteral("text")).color;
+    annotation.origin = Point{static_cast<std::int32_t>(canvas.x + kSumLabelInset),
+                              static_cast<std::int32_t>(canvas.y + kSumLabelInset)};
+    // Keep the whole label on the canvas: a selection against the right or
+    // bottom edge would otherwise place half of it outside the picture.
+    LogicalRect bounds;
+    if (annotationLogicalBounds(annotation, &bounds)) {
+        const LogicalRect &limits = annotationLimits();
+        std::int64_t dx = 0;
+        std::int64_t dy = 0;
+        if (bounds.right() > limits.right()) {
+            dx = static_cast<std::int64_t>(limits.right()) - bounds.right();
+        }
+        if (bounds.bottom() > limits.bottom()) {
+            dy = static_cast<std::int64_t>(limits.bottom()) - bounds.bottom();
+        }
+        if (bounds.x + dx < limits.x) {
+            dx = static_cast<std::int64_t>(limits.x) - bounds.x;
+        }
+        if (bounds.y + dy < limits.y) {
+            dy = static_cast<std::int64_t>(limits.y) - bounds.y;
+        }
+        annotation.origin.x += static_cast<std::int32_t>(dx);
+        annotation.origin.y += static_cast<std::int32_t>(dy);
+    }
+    QVector<Annotation> next = annotations_;
+    next.push_back(annotation);
+    const int newIndex = next.size() - 1;
+    mutateAnnotations(std::move(next));
+    selectAnnotation(newIndex);
+
+    // The plain number is the useful half: it goes to the clipboard as the
+    // program would write it, so it can be pasted into a calculator or a
+    // spreadsheet.  A clipboard that refuses does not undo the label.
+    const bool copied = writeClipboard(total);
+    if (sumResultCallback_) {
+        sumResultCallback_(copied ? TextOutcome::Copied : TextOutcome::Idle, QString());
+    }
+    return true;
 }
 
 bool OverlayController::computeTranslation(QVector<TranslatedLine> *lines, QString *text,

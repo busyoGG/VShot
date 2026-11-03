@@ -991,6 +991,12 @@ case "$1" in
     esac
     printf '%s\n' '{"from":"en","geometry":true,"lines":[{"rect":{"height":30,"width":90,"x":10,"y":10},"source":"HELLO","text":"你好"}],"provider":"stub","to":"zh","version":1}'
     ;;
+  sum)
+    # The editor hands this step the crop as `sum --input PATH --json`; a
+    # missing file is a failed read rather than an empty answer.
+    [ -f "$3" ] || exit 5
+    printf '%s\n' '{"total":"42.5","count":2}'
+    ;;
   *)
     exit 2
     ;;
@@ -1139,6 +1145,151 @@ void checkControllerWithStub()
                "and the render holds both the fill and the translated glyphs",
                QStringLiteral("%1 fill, %2 ink").arg(fillPixels).arg(inkPixels));
     }
+    qunsetenv("VSHOT_BIN");
+}
+
+// The Sum button: the same selection the text tools read, added up, with the
+// total left on the picture as a text label and the plain number on the
+// clipboard.  Driven through the stub, so what is checked is the wiring the
+// editor really uses -- the subprocess, the wire shape, the mark and the copy.
+void checkTheSumButton()
+{
+    std::printf("--- the Sum button, driven by a vshot stub --------------------\n");
+    QScreen *screen = QApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir directory;
+    if (!directory.isValid()) {
+        expect(false, "a temporary directory for the stub");
+        return;
+    }
+    const QString stub = directory.filePath(QStringLiteral("vshot"));
+    expect(writeExecutable(stub, QByteArray(kStubScript)), "the vshot stub is written");
+    qputenv("VSHOT_BIN", stub.toUtf8());
+
+    vshot::OverlayController controller(controllerSession(lightFrame(), QStringLiteral("region")));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        qunsetenv("VSHOT_BIN");
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+
+    auto *surface = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
+    auto *button =
+        surface != nullptr ? surface->findChild<QToolButton *>(QStringLiteral("sumButton")) : nullptr;
+    expect(button != nullptr, "the toolbar carries a sum button");
+    if (button == nullptr) {
+        qunsetenv("VSHOT_BIN");
+        return;
+    }
+    expect(button->text() == vshot::uiTr(QStringLiteral("Sum")), "it is labelled", button->text());
+    expect(!button->toolTip().isEmpty(), "it explains itself");
+    expect(!button->icon().isNull(), "it draws its own icon");
+    expect(button->toolButtonStyle() == Qt::ToolButtonTextUnderIcon,
+           "it is drawn like the tool buttons");
+
+    QString copied;
+    controller.setClipboardWriter([&copied](const QString &text) {
+        copied = text;
+        return true;
+    });
+    QVector<vshot::TextOutcome> outcomes;
+    controller.setSumResultCallback(
+        [&outcomes](vshot::TextOutcome outcome, const QString &) { outcomes.push_back(outcome); });
+
+    button->click();
+    expect(!outcomes.isEmpty() && outcomes.constFirst() == vshot::TextOutcome::Busy,
+           "the controller reports the wait first");
+    expect(!outcomes.isEmpty() && outcomes.constLast() == vshot::TextOutcome::Copied,
+           "then that the total is on the picture and in the clipboard");
+    expect(copied == QStringLiteral("42.5"), "the clipboard gets the plain number", copied);
+
+    expect(controller.annotations().size() == 1, "the button lands one annotation",
+           QString::number(controller.annotations().size()));
+    if (controller.annotations().size() == 1) {
+        const vshot::Annotation &annotation = controller.annotations().constFirst();
+        expect(annotation.kind == vshot::Annotation::Kind::Text, "of the text kind");
+        expect(annotation.tool == QStringLiteral("text"),
+               "written as an ordinary label, so a re-edit reads it back", annotation.tool);
+        expect(annotation.text == QStringLiteral("Σ 42.5"),
+               "carrying the total the step printed", annotation.text);
+        // A label off the canvas would be saved as a mark the renderer has to
+        // clip, and a pin would reopen with a mark it cannot place.  The
+        // placement is pulled back onto the canvas for exactly this reason.
+        const vshot::LogicalRect &canvas = *controller.selection();
+        expect(annotation.origin.x >= canvas.x && annotation.origin.y >= canvas.y &&
+                   annotation.origin.x < canvas.right() && annotation.origin.y < canvas.bottom(),
+               "and it is placed inside the selection",
+               QStringLiteral("%1,%2").arg(annotation.origin.x).arg(annotation.origin.y));
+    }
+
+    // The commit path: the label is drawn by the helper and reaches the canvas,
+    // so what the user sees and what the PNG holds are the same mark.
+    const QImage composite = renderSelection(controller);
+    expect(!composite.isNull(), "the session renders with the label on it");
+    if (!composite.isNull()) {
+        int ink = 0;
+        for (int y = 0; y < composite.height(); ++y) {
+            for (int x = 0; x < composite.width(); ++x) {
+                if (composite.pixelColor(x, y).lightness() < 80) {
+                    ++ink;
+                }
+            }
+        }
+        expect(ink > 0, "and the render holds the label's ink", QString::number(ink));
+    }
+    qunsetenv("VSHOT_BIN");
+}
+
+// A sum step that fails is reported on the button and leaves the picture
+// alone: a failed read must not place a label with a made-up number.
+void checkTheSumButtonFailure()
+{
+    std::printf("--- a failed sum says so --------------------------------------\n");
+    QScreen *screen = QApplication::primaryScreen();
+    if (screen == nullptr) {
+        expect(false, "a screen to hang an overlay off");
+        return;
+    }
+    QTemporaryDir directory;
+    if (!directory.isValid()) {
+        expect(false, "a temporary directory for the stub");
+        return;
+    }
+    const QString stub = directory.filePath(QStringLiteral("vshot"));
+    expect(writeExecutable(stub, QByteArray("#!/bin/sh\nexit 3\n")), "the failing stub is written");
+    qputenv("VSHOT_BIN", stub.toUtf8());
+
+    vshot::OverlayController controller(controllerSession(lightFrame(), QStringLiteral("region")));
+    QString error;
+    vshot::CaptureOverlay *overlay = controller.addOverlay(0, screen, &error);
+    if (overlay == nullptr) {
+        qunsetenv("VSHOT_BIN");
+        expect(false, "the controller accepts an overlay", error);
+        return;
+    }
+    controller.beginPresetEdit();
+    auto *surface = overlay->findChild<QWidget *>(QStringLiteral("toolbarCommandSurface"));
+    auto *button =
+        surface != nullptr ? surface->findChild<QToolButton *>(QStringLiteral("sumButton")) : nullptr;
+    if (button == nullptr) {
+        qunsetenv("VSHOT_BIN");
+        expect(false, "the toolbar carries a sum button");
+        return;
+    }
+    QVector<vshot::TextOutcome> outcomes;
+    controller.setSumResultCallback(
+        [&outcomes](vshot::TextOutcome outcome, const QString &) { outcomes.push_back(outcome); });
+    button->click();
+    expect(!outcomes.isEmpty() && outcomes.constLast() == vshot::TextOutcome::Failed,
+           "the failure reaches the button");
+    expect(controller.annotations().isEmpty(), "and nothing is placed",
+           QString::number(controller.annotations().size()));
     qunsetenv("VSHOT_BIN");
 }
 
@@ -1391,6 +1542,8 @@ int main(int argc, char **argv)
     checkSessionParsing();
     checkControllerWithStub();
     checkControllerFailure();
+    checkTheSumButton();
+    checkTheSumButtonFailure();
     checkStandaloneFlow();
     checkButtonToggles();
 

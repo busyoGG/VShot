@@ -226,6 +226,24 @@ const QHash<QString, QString> &chineseTable()
         {QStringLiteral("Reading the text failed."), QString::fromUtf8("取字失败。")},
         {QStringLiteral("No text was found in the selection."),
          QString::fromUtf8("选区里没找到文字。")},
+        // Adding up the numbers in a capture: the same selection, read and
+        // summed, with the total left on the picture as a label.
+        {QStringLiteral("Sum"), QString::fromUtf8("求和")},
+        {QStringLiteral("Add up the numbers in the selection and copy the total"),
+         QString::fromUtf8("把选区里的数字加起来，并复制合计")},
+        {QStringLiteral("Summing…"), QString::fromUtf8("求和中")},
+        {QStringLiteral("Adding up needs a selection to read from."),
+         QString::fromUtf8("要先有选区才能求和。")},
+        {QStringLiteral("Cannot locate vshot to add up the numbers."),
+         QString::fromUtf8("找不到 vshot，求不了和。")},
+        {QStringLiteral("Cannot start vshot to add up the numbers."),
+         QString::fromUtf8("启动不了 vshot，求不了和。")},
+        {QStringLiteral("Adding up the numbers took too long."),
+         QString::fromUtf8("求和超时。")},
+        {QStringLiteral("Adding up the numbers failed."),
+         QString::fromUtf8("求和失败。")},
+        {QStringLiteral("No numbers were found in the selection."),
+         QString::fromUtf8("选区里没找到数字。")},
         // Screenshot translation: the same selection the text tool reads is
         // translated and drawn over the text it replaces.
         {QStringLiteral("Translate"), QString::fromUtf8("翻译")},

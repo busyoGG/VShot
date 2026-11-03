@@ -24,6 +24,7 @@ mod qt_overlay;
 mod record;
 mod selection;
 mod stitch;
+mod sum;
 mod translate;
 mod wayland;
 
@@ -118,6 +119,11 @@ fn run() -> Result<()> {
             destination,
             json,
         } => return run_ocr(source, destination, json),
+        Action::Sum {
+            source,
+            destination,
+            json,
+        } => return run_sum(source, destination, json),
         Action::Translate {
             source,
             destination,
@@ -1078,6 +1084,79 @@ fn write_ocr_text(text: &str, destination: cli::OcrDestination) -> Result<()> {
         }
         cli::OcrDestination::Clipboard => output::copy_text_to_clipboard(text),
     }
+}
+
+/// Adds up the numbers a region, an image file, or an OCR envelope holds.
+///
+/// The recognition is `vshot ocr`'s own: the same engine, the same region
+/// capture, the same file route.  What differs is the last step -- the lines'
+/// numbers are added instead of the text being handed back -- which is what the
+/// editor's Sum button asks for: it crops the selection to a PNG and reads this
+/// command's `--json` answer, so the arithmetic lives in one place and the
+/// helper only draws the total.
+fn run_sum(source: cli::SumSource, destination: cli::OcrDestination, json: bool) -> Result<()> {
+    let totals = match source {
+        // The editor's other route: an envelope `vshot ocr --json` already
+        // printed, piped in.  No capture and no OCR run, exactly like
+        // `translate --stdin-ocr`.
+        cli::SumSource::StdinOcr => {
+            let document = sum::read_stdin()?;
+            sum::sum_texts(&sum::texts_from_envelope(&document)?)
+        }
+        cli::SumSource::File(path) => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                VshotError::Ocr(format!("cannot read `{}`: {error}", path.display()))
+            })?;
+            let frame = Frame::from_png(&bytes)?;
+            sum::sum_lines(&ocr::recognize(&frame)?)
+        }
+        cli::SumSource::Geometry(geometry) => {
+            let mut wayland = WaylandSession::connect()?;
+            let topology = wayland.output_infos()?;
+            let mut capture = Capturer::connect()?;
+            let scene = capture_scene(&mut capture, &topology, false)?;
+            let geometry = selection::validate_selection(&scene, geometry)?;
+            let (frame, _density) = crop_native(&scene, geometry)?;
+            // The overlays have to be gone before the answer is printed: an
+            // error path that leaves them mapped would freeze the desktop
+            // behind the output.
+            wayland.show_frozen(false)?;
+            let cleanup = wayland.destroy_overlays();
+            let lines = ocr::recognize(&frame);
+            cleanup?;
+            sum::sum_lines(&lines?)
+        }
+    };
+    if json {
+        // A caller that asked for JSON is a program, not a person: nothing is
+        // announced, and a failure is returned as itself.
+        let mut written = sum::to_json(&totals);
+        written.push('\n');
+        let mut stdout = std::io::stdout();
+        return stdout
+            .write_all(written.as_bytes())
+            .and_then(|()| stdout.flush())
+            .map_err(|error| VshotError::Ocr(format!("cannot write to stdout: {error}")));
+    }
+    let total = totals.total_text();
+    let to_clipboard = matches!(destination, cli::OcrDestination::Clipboard);
+    let outcome = match destination {
+        cli::OcrDestination::Stdout => {
+            let mut written = total.clone();
+            written.push('\n');
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(written.as_bytes())
+                .and_then(|()| stdout.flush())
+                .map_err(|error| VshotError::Ocr(format!("cannot write to stdout: {error}")))
+        }
+        cli::OcrDestination::Clipboard => output::copy_text_to_clipboard(&total),
+    };
+    match &outcome {
+        Ok(()) => notify::sum_finished(&total, totals.count, to_clipboard),
+        Err(error) => notify::sum_failed(&error.to_string()),
+    }
+    outcome
 }
 
 /// Reads what to translate from the route the request named, translates it,

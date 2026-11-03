@@ -759,13 +759,32 @@ mod tests {
 }
 
 #[cfg(test)]
+pub(crate) mod test_environment {
+    /// Serializes the tests that point `XDG_CONFIG_HOME` at a directory of
+    /// their own.
+    ///
+    /// The variable is process-wide and the tests run in parallel, so without
+    /// this a test that reads the config while another one has moved the
+    /// variable reads that other test's file.  The failure is a wrong value
+    /// rather than a crash -- a `cli.format.png.compression` test saw the
+    /// built-in defaults instead of the file it had just written -- which makes
+    /// it look like a broken default rather than a race.  A test that only
+    /// *reads* can still observe another one's directory, which is harmless:
+    /// none of them asserts a value it did not write.
+    pub(crate) static XDG_CONFIG_HOME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+#[cfg(test)]
 mod path_tests {
     use super::*;
 
     #[test]
     fn the_config_path_honours_xdg_config_home() {
-        // SAFETY: single-threaded test body, and the variable is restored
-        // before returning.
+        // SAFETY: the lock keeps the other tests that move the variable from
+        // running at the same time, and it is restored before returning.
+        let _environment = test_environment::XDG_CONFIG_HOME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/vshot-cfg-probe");
         assert_eq!(

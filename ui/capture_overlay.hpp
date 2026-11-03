@@ -443,6 +443,10 @@ public:
     /// second press of the button means, and what the first Escape means, so
     /// neither ends the capture the way a bare Escape would.
     void removePlacedTranslation();
+    /// Adds up the numbers in the selection and drops the total on the picture
+    /// as a text label, copying the plain number to the clipboard.  The
+    /// editor's Sum button is the only caller.
+    bool sumSelection(QString *error);
     /// Whether the session is the standalone `translate` overlay: a region-only
     /// frame, the translation drawn over the frozen scene as soon as that frame
     /// is finished, and an Enter that accepts, writing the composited PNG.
@@ -458,6 +462,10 @@ public:
     /// The same for the translate button: `Busy` while the two subprocesses
     /// run, then the outcome.
     void setTranslateResultCallback(std::function<void(TextOutcome, const QString &)> callback);
+    /// The same for the sum button: `Busy` while the recognition and the
+    /// addition run, then `Copied` (or `Idle` when the clipboard refused) once
+    /// the total is on the picture.
+    void setSumResultCallback(std::function<void(TextOutcome, const QString &)> callback);
     /// Replaces the clipboard write the text paths use.  It exists so a check
     /// can verify what would be copied without a clipboard; the default writes
     /// through `wl-copy`.
@@ -714,6 +722,7 @@ private:
     /// Told when a translation starts and how it ended, so the button the user
     /// pressed can say so.
     std::function<void(TextOutcome outcome, const QString &error)> translateResultCallback_;
+    std::function<void(TextOutcome outcome, const QString &error)> sumResultCallback_;
     QVector<WindowCandidate> candidates_;
     int hoveredCandidate_ = -1;
     // Live candidate refresh: the picker's stdin carries fresh lists from the

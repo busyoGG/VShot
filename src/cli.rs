@@ -655,6 +655,42 @@ stdout. See the README's OCR section."#
         #[arg(long, conflicts_with = "clipboard")]
         json: bool,
     },
+    /// Add up the numbers in a region, an image file, or an OCR envelope.
+    #[command(
+        after_help = r#"The numbers a region holds are read with the same engine `vshot ocr`
+uses, then added: `--input` reads an image file, `--geometry` reads one fixed
+region of the screen, and `--stdin-ocr` reads the JSON envelope `vshot ocr
+--json` prints. The total goes to stdout, or to the clipboard with --clipboard.
+
+Every number in the recognized text is added -- integers, decimals, thousands
+groups (`1,234.50`), full-width digits, and a sign that belongs to the number.
+A currency symbol or a unit beside it is not part of the value (`¥1,200` is
+1200). The values are added exactly, not as floating point, so a column of
+prices comes out as the decimal a person would write.
+
+--json prints `{"total":"...","count":N}` instead of the total alone; `count`
+is how many numbers went in, so a caller can tell an empty sum from a zero.
+
+The editor's Sum button is this command: it crops the selection to a PNG and
+reads `--input`'s JSON answer, so the toolbar and a script share one adding-up
+rule."#
+    )]
+    Sum {
+        /// Fixed global geometry in `x,y widthxheight` form.
+        #[arg(long, conflicts_with_all = ["input", "stdin_ocr"], allow_hyphen_values = true)]
+        geometry: Option<String>,
+        /// Read an image from this file instead of the screen; the annotation
+        /// editor's Sum button takes this route.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["geometry", "stdin_ocr"])]
+        input: Option<PathBuf>,
+        /// Read the OCR JSON envelope `vshot ocr --json` prints from stdin and
+        /// add up its lines: no capture and no recognition run.
+        #[arg(long = "stdin-ocr", conflicts_with_all = ["geometry", "input"])]
+        stdin_ocr: bool,
+        /// Write `{"total":"...","count":N}` as JSON instead of the total.
+        #[arg(long, conflicts_with = "clipboard")]
+        json: bool,
+    },
     /// Translate the text of a region, an image file, or an OCR envelope
     /// already on stdin.
     #[command(
@@ -1080,6 +1116,15 @@ pub enum Action {
         /// instead of plain text.
         json: bool,
     },
+    /// Add up the numbers in a region, a file, or an OCR envelope on stdin.
+    Sum {
+        /// Where the numbers come from.
+        source: SumSource,
+        /// Where the total goes: stdout or the clipboard.
+        destination: OcrDestination,
+        /// Write `{"total":"...","count":N}` instead of the total alone.
+        json: bool,
+    },
     /// Translate the text of a region, a file, or an OCR envelope on stdin.
     Translate {
         /// Where the source lines come from.
@@ -1140,6 +1185,17 @@ pub enum OcrSource {
     /// A fixed region of the frozen screen.
     Geometry(Rect),
     /// An image file on disk.
+    File(PathBuf),
+}
+
+/// Where `vshot sum` gets its numbers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SumSource {
+    /// The OCR JSON envelope on stdin, `vshot ocr --json`'s own shape.
+    StdinOcr,
+    /// A fixed region of the frozen screen, recognized without an overlay.
+    Geometry(Rect),
+    /// An image file on disk, recognized and then added up.
     File(PathBuf),
 }
 
@@ -1868,6 +1924,44 @@ impl Cli {
                 json: *json,
             });
         }
+        if let Command::Sum {
+            geometry,
+            input,
+            stdin_ocr,
+            json,
+        } = &self.command
+        {
+            // The total is the whole result, so the destinations are stdout and
+            // the clipboard; --output would write an image and --pin has
+            // nothing to pin, exactly as for `ocr`.
+            if self.output.is_some() || self.pin {
+                return Err(VshotError::InvalidDestination(
+                    "--output and --pin do not apply to the sum subcommand; the total goes to \
+                     stdout, or to the clipboard with --clipboard"
+                        .into(),
+                ));
+            }
+            let source = match (input, stdin_ocr, geometry) {
+                (Some(path), _, _) => SumSource::File(path.clone()),
+                (None, true, _) => SumSource::StdinOcr,
+                (None, false, Some(geometry)) => SumSource::Geometry(parse_geometry(geometry)?),
+                (None, false, None) => {
+                    return Err(VshotError::InvalidDestination(
+                        "`vshot sum` needs a source: --input PATH, --geometry, or --stdin-ocr"
+                            .into(),
+                    ))
+                }
+            };
+            return Ok(Action::Sum {
+                source,
+                destination: if self.clipboard {
+                    OcrDestination::Clipboard
+                } else {
+                    OcrDestination::Stdout
+                },
+                json: *json,
+            });
+        }
         if let Command::Translate {
             geometry,
             interactive: _,
@@ -2139,6 +2233,11 @@ impl Cli {
             Command::Ocr { .. } => {
                 return Err(VshotError::InvalidDestination(
                     "the ocr subcommand is not a capture target".into(),
+                ))
+            }
+            Command::Sum { .. } => {
+                return Err(VshotError::InvalidDestination(
+                    "the sum subcommand is not a capture target".into(),
                 ))
             }
             Command::Translate { .. } => {
@@ -2547,6 +2646,11 @@ mod tests {
     /// `true` is turned off for one recording.
     #[test]
     fn the_record_section_is_what_a_flag_falls_back_to() {
+        // The config variable is process-wide; this keeps the other tests that
+        // move it from doing so in the middle of this one's reads.
+        let _environment = crate::config::test_environment::XDG_CONFIG_HOME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join("vshot-cli-record-defaults");
         let path = dir.join("vshot").join("config.json");
         std::fs::create_dir_all(path.parent().expect("a parent directory")).unwrap();
@@ -2555,11 +2659,12 @@ mod tests {
             r#"{"cli":{"record":{"encoder":"hevc","fps":30,"portal":true,"mic":"alsa_input.x","follow":["game","chat"]},"replay":{"follow":["game"],"save-dir":"/tmp/vshot-clips"}}}"#,
         )
         .unwrap();
-        // SAFETY: the variable is put back below.  A test in another thread
-        // that parses a record command while this one runs reads whatever
-        // config the variable points at, and none of them asserts a
-        // remembered default, so the worst a stray read can do is parse a
-        // different encoder than the file this test wrote.
+        // SAFETY: the lock above keeps the other writers of the variable out,
+        // and it is put back below.  A test in another thread that parses a
+        // record command while this one runs reads whatever config the
+        // variable points at, and none of them asserts a remembered default,
+        // so the worst a stray read can do is parse a different encoder than
+        // the file this test wrote.
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
@@ -2688,6 +2793,11 @@ mod tests {
     /// the file can only configure a parameter its format declares.
     #[test]
     fn the_format_section_is_what_a_parameter_flag_falls_back_to() {
+        // The config variable is process-wide; this keeps the other tests that
+        // move it from doing so in the middle of this one's reads.
+        let _environment = crate::config::test_environment::XDG_CONFIG_HOME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join("vshot-cli-format-defaults");
         let path = dir.join("vshot").join("config.json");
         std::fs::create_dir_all(path.parent().expect("a parent directory")).unwrap();
@@ -2698,11 +2808,12 @@ mod tests {
                  "avif":{"quality":40,"speed":4,"sharpness":9}}}}"#,
         )
         .unwrap();
-        // SAFETY: the variable is put back below.  A test in another thread
-        // that parses a capture while this one runs reads whatever config the
-        // variable points at; none of them asserts a remembered format
-        // parameter, so the worst a stray read can do is parse a different
-        // quality than the file this test wrote.
+        // SAFETY: the lock above keeps the other writers of the variable out,
+        // and it is put back below.  A test in another thread that parses a
+        // capture while this one runs reads whatever config the variable
+        // points at; none of them asserts a remembered format parameter, so
+        // the worst a stray read can do is parse a different quality than the
+        // file this test wrote.
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
@@ -3187,6 +3298,53 @@ mod tests {
             }
             other => panic!("expected a scrolling capture, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sum_takes_a_file_a_region_or_an_envelope_and_needs_one_of_them() {
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "sum", "--input", "shot.png", "--json"]).unwrap(),
+            Action::Sum {
+                source: SumSource::File(PathBuf::from("shot.png")),
+                destination: OcrDestination::Stdout,
+                json: true,
+            }
+        );
+        // The envelope route, with the clipboard as the destination: the two
+        // flags are independent, exactly as they are for `ocr`.
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "sum", "--stdin-ocr", "--clipboard"]).unwrap(),
+            Action::Sum {
+                source: SumSource::StdinOcr,
+                destination: OcrDestination::Clipboard,
+                json: false,
+            }
+        );
+        assert_eq!(
+            Cli::try_parse_action_from(["vshot", "sum", "--geometry", "1,2 3x4"]).unwrap(),
+            Action::Sum {
+                source: SumSource::Geometry(Rect {
+                    origin: crate::geometry::Point { x: 1, y: 2 },
+                    size: crate::geometry::Size {
+                        width: 3,
+                        height: 4
+                    },
+                }),
+                destination: OcrDestination::Stdout,
+                json: false,
+            }
+        );
+        // With no source there is nothing to add up, and a destination that
+        // names an image is a misunderstanding worth naming.
+        assert!(Cli::try_parse_action_from(["vshot", "sum"]).is_err());
+        assert!(
+            Cli::try_parse_action_from(["vshot", "sum", "--stdin-ocr", "--output", "x.png"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_action_from(["vshot", "sum", "--stdin-ocr", "--input", "x.png"])
+                .is_err()
+        );
     }
 
     #[test]
