@@ -1,0 +1,12 @@
+--- fontconfig-parser-0.5.8/Cargo.toml	1970-01-01T00:00:01+00:00
++++ fontconfig-parser-0.5.8/Cargo.toml	2026-10-16T06:03:11.497074+00:00
+@@ -72,9 +72,6 @@
+ features = ["derive"]
+ optional = true
+ 
+-[dev-dependencies.criterion]
+-version = "0.5"
+-
+ [dev-dependencies.glob]
+ version = "0.3"
+ 

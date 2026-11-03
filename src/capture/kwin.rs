@@ -567,11 +567,12 @@ fn not_authorized_hint() -> String {
         "KWin shows no permission prompt: it authorizes the ScreenShot2 interface \
          only for a client whose desktop file declares \
          `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` and whose `Exec=` \
-         names this binary (`{executable}`).  The package installs that file for \
-         `/usr/bin/vshot`; a build run from `target/` or copied into place by hand has \
-         none, which is what this error means.  Write one for this binary, then rebuild \
-         KWin's service cache:\n  \
-         mkdir -p ~/.local/share/applications && printf '[Desktop Entry]\\nType=Application\\nName=VShot\\nExec=%s\\nNoDisplay=true\\nX-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\\n' '{executable}' > ~/.local/share/applications/vshot.desktop && kbuildsycoca6 --noincremental\n  \
+         names this binary (`{executable}`).  Some setups also want \
+         `X-DBUS-StartupType=Unique` before KWin accepts the file at all, so write \
+         both.  The package installs that file for `/usr/bin/vshot`; a build run from \
+         `target/` or copied into place by hand has none, which is what this error \
+         means.  Write one for this binary, then rebuild KWin's service cache:\n  \
+         mkdir -p ~/.local/share/applications && printf '[Desktop Entry]\\nType=Application\\nName=VShot\\nExec=%s\\nNoDisplay=true\\nX-DBUS-StartupType=Unique\\nX-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2\\n' '{executable}' > ~/.local/share/applications/vshot.desktop && kbuildsycoca6 --noincremental\n  \
          The compositor-side KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 disables the check \
          and is meant for development only."
     )

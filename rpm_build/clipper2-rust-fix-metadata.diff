@@ -1,0 +1,11 @@
+--- clipper2-rust-1.2.0/Cargo.toml	1970-01-01T00:00:01+00:00
++++ clipper2-rust-1.2.0/Cargo.toml	2026-10-17T04:16:08.897592+00:00
+@@ -87,8 +87,5 @@
+ [dependencies.num-traits]
+ version = "0.2"
+ 
+-[dev-dependencies.criterion]
+-version = "0.5"
+-
+ [dev-dependencies.rand]
+ version = "0.8"

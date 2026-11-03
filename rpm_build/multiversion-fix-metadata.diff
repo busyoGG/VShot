@@ -1,0 +1,12 @@
+--- multiversion-0.8.0/Cargo.toml	1970-01-01T00:00:01+00:00
++++ multiversion-0.8.0/Cargo.toml	2026-10-17T04:09:38.594911+00:00
+@@ -93,9 +93,6 @@
+ [dependencies.target-features]
+ version = "0.1"
+ 
+-[dev-dependencies.criterion]
+-version = "0.4"
+-
+ [dev-dependencies.rustversion]
+ version = "1"
+ 

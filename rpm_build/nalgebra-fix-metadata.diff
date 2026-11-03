@@ -1,0 +1,35 @@
+--- nalgebra-0.35.0/Cargo.toml	2006-07-24T01:21:28+00:00
++++ nalgebra-0.35.0/Cargo.toml	2026-10-17T13:35:32.050659+00:00
+@@ -84,10 +84,6 @@
+ ]
+ libm = [
+     "simba/libm",
+-    "glam030?/libm",
+-    "glam031?/libm",
+-    "glam032?/libm",
+-    "glam033?/libm",
+ ]
+ libm-force = ["simba/libm_force"]
+ macros = ["nalgebra-macros"]
+@@ -127,10 +123,6 @@
+     "num-rational/std",
+     "approx/std",
+     "simba/std",
+-    "glam030?/std",
+-    "glam031?/std",
+-    "glam032?/std",
+-    "glam033?/std",
+ ]
+ 
+ [lib]
+@@ -348,10 +340,6 @@
+ [dev-dependencies.cool_asserts]
+ version = "2.0.3"
+ 
+-[dev-dependencies.criterion]
+-version = "0.7"
+-features = ["html_reports"]
+-
+ [dev-dependencies.itertools]
+ version = "0.14"
+ 

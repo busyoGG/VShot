@@ -12,4 +12,5 @@ Exec=/usr/bin/vshot
 Terminal=true
 NoDisplay=true
 Categories=Graphics;
+X-DBUS-StartupType=Unique
 X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

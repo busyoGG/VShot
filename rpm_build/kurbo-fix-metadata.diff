@@ -1,0 +1,17 @@
+--- kurbo-0.13.1/Cargo.toml	2006-07-24T01:21:28+00:00
++++ kurbo-0.13.1/Cargo.toml	2026-10-16T07:56:55.484378+00:00
+@@ -164,14 +164,6 @@
+ [dependencies.smallvec]
+ version = "1.15.1"
+ features = ["const_new"]
+-
+-[dev-dependencies.criterion]
+-version = "0.7.0"
+-features = [
+-    "plotters",
+-    "cargo_bench_support",
+-]
+-default-features = false
+ 
+ [dev-dependencies.rand]
+ version = "0.9.4"

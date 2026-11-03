@@ -1,0 +1,12 @@
+--- tokenizers-0.23.2/Cargo.toml	2006-07-24T01:21:28+00:00
++++ tokenizers-0.23.2/Cargo.toml	2026-10-17T04:22:08.874908+00:00
+@@ -250,9 +250,6 @@
+ [dev-dependencies.assert_approx_eq]
+ version = "1.1"
+ 
+-[dev-dependencies.criterion]
+-version = "0.6"
+-
+ [dev-dependencies.tempfile]
+ version = "3.10"
+ 
